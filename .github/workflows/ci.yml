@@ -94,24 +94,29 @@ jobs:
           fi
           echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> "$GITHUB_ENV"
 
-      # vcpkg resolves the manifest baseline with `git show <sha>:versions/baseline.json`.
-      # The vcpkg preinstalled on hosted runners is a shallow clone, so a pinned baseline
-      # that is not that clone's HEAD cannot be resolved and `vcpkg install` aborts before
-      # building a single port (this is what made every run fail in ~2 seconds).
-      # Fetch the pinned baseline into the clone first. The SHA is read from vcpkg.json so
-      # that file stays the single source of truth.
-      - name: Fetch pinned vcpkg baseline
+      # The vcpkg preinstalled on hosted runners is a shallow clone whose work tree
+      # (ports/ and versions/) is older than the pinned baseline. vcpkg reads ports and
+      # the version database from that work tree while reading baseline.json at the
+      # pinned commit, so this mismatch aborts the install with messages such as
+      #   error: no version database entry for expat at 2.8.5
+      # (and, before the commit was even present, with
+      #   failed to `git show` versions/baseline.json ).
+      # Fetch AND check out the pinned commit so the clone is self-consistent.
+      # The SHA is read from vcpkg.json so that file stays the single source of truth.
+      - name: Align vcpkg with pinned baseline
         shell: bash
         run: |
           BASELINE=$(grep -o '"builtin-baseline"[[:space:]]*:[[:space:]]*"[0-9a-f]*"' vcpkg.json | grep -o '[0-9a-f]\{40\}')
           echo "pinned baseline: $BASELINE"
-          if git -C "$VCPKG_ROOT" cat-file -e "$BASELINE:versions/baseline.json" 2>/dev/null; then
-            echo "baseline already resolvable in the runner vcpkg clone"
+          if [ "$(git -C "$VCPKG_ROOT" rev-parse HEAD)" = "$BASELINE" ]; then
+            echo "runner vcpkg is already at the pinned baseline"
           else
             git -C "$VCPKG_ROOT" fetch --depth=1 origin "$BASELINE" || git -C "$VCPKG_ROOT" fetch --unshallow
+            git -C "$VCPKG_ROOT" checkout --detach FETCH_HEAD
           fi
+          git -C "$VCPKG_ROOT" rev-parse HEAD
           git -C "$VCPKG_ROOT" cat-file -e "$BASELINE:versions/baseline.json"
-          echo "baseline is now resolvable"
+          echo "runner vcpkg is now consistent with the pinned baseline"
 
       - name: Configure
         shell: bash
