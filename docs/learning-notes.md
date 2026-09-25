@@ -264,14 +264,19 @@
 | SDL3 | 3.4.16#1（vcpkg） | 构建期由 vcpkg 提供 | 窗口 + 输入 + **SDL3_gpu** 渲染后端 |
 | GoogleTest | 1.18.0（vcpkg） | 同上 | 单元测试框架 |
 | GLM | vcpkg | 同上 | 数学库（向量 / 矩阵 / 四元数） |
+| gh（GitHub CLI） | 2.74.2 | `D:\dev\tools\gh\bin` | 查 CI 运行状态、拉取失败日志。**Actions 的日志下载接口对公开仓库也要求鉴权**（未鉴权返回 403 `Must have admin rights to Repository`），没有 gh 时只能开网页看 |
 
 **尚未安装**：Python（纹理打包工具将需要）、Tracy（性能分析）、RenderDoc（图形调试）。
 
-### 环境要点（三条易错）
+**已装但未登录**：`gh` 尚未认证，`gh run list` 会报 `To use GitHub CLI in automation, set the GH_TOKEN environment variable`。
+需先执行 `gh auth login`（交互式，走浏览器/设备码），或设置 `GH_TOKEN` 环境变量。
+
+### 环境要点（四条易错）
 
 1. **探测环境不能只信 `PATH`**：工具装在 `C:\Program Files\CMake` 时 `Get-Command cmake` 仍可能找不到，需先从注册表重建 `Machine` + `User` 的 PATH 再判断，否则会得出"工具全缺"的错误结论。
 2. **装完必须重开终端 / 编辑器**：PATH 与 `VCPKG_ROOT` 等环境变量在旧进程里不会刷新。
 3. **`VCPKG_ROOT` 会被 VS 开发者环境覆盖**：`Enter-VsDevShell` / `vcvars` 会把它设成 VS 自带的 vcpkg，必须在加载 VS 环境**之后**再设置。
+4. **官方 ZIP 手动解压是可靠的兜底安装路径**：当 winget 的 MSI 受提权限制、portable 受 `WinGet\Links` 目录缺失影响时，直接从 GitHub Release 下载官方 ZIP、**校验 SHA256**（对着同期的 `*_checksums.txt` 比对）后解压到 `D:\dev\tools\<工具>`，再把其 `bin` 目录追加进 **User PATH** 即可。ninja、sccache、gh 都走这条路，不需要管理员权限。
 
 ---
 

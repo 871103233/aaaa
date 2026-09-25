@@ -123,3 +123,32 @@
   4. 测试：`ctest --preset debug` → **6/6 passed**，0.07s。
   5. 行尾与编码：全仓库已跟踪文件 + 3 个新文件，CR 字节 = -1、BOM = False。
 - 下一步 / 遗留：① 本轮与上一轮改动**均未提交**（累计 17 改 + 3 新）。② `NOTICE.md` 标 `*` 的许可仍未逐字核对；`LICENSE` 的 `<COPYRIGHT HOLDER>` 仍是占位符。③ CI 仍未实测。④ 待收敛项表两项（遮挡剔除、LOD 接缝）**必须在 V0.5 开工前经 ADR 收敛**，否则按违规处理。⑤ 下一阶段：开新会话进入 V0.1（单区块 + 面剔除 + 破/放方块 + 走动跳跃），施工按 `references/gameplay-v0.1.md`。
+
+---
+
+## 2026-09-25  上两轮改动已提交推送；装 gh 并首次查得 CI 真相——Configure 早退，且非本次改动所致
+
+- 做了什么：
+  1. 把上两轮积压改动一次提交并推送：`fbcfe4e`（20 文件，+533 / −63，含 3 个新文件），`main` 与 `origin/main` 同步，工作树干净。**上一条遗留①（未提交）就此关闭。**
+  2. 安装 **GitHub CLI（gh）2.74.2**：从官方 Release 下 `gh_2.74.2_windows_amd64.zip`，对着同期 `gh_2.74.2_checksums.txt` **校验 SHA256（一致）** 后解压到 `D:\dev\tools\gh`，并把 `D:\dev\tools\gh\bin` 追加进 User `PATH`（沿用 ninja / sccache 的"手动解压"路径，无需提权、不受沙箱写入拦截影响）。
+  3. **首次查清 CI 状态**（gh 未登录，故先用公开仓库的免鉴权 API）：
+     - `total_count = 3`，其中 run #2（`a81aaaf`）与 run #3（`fbcfe4e`）**结论均为 `failure`**。
+     - 两个门禁 job（Gate Linux / Windows）**均 `success`**——说明本次对门禁脚本的改动可用。
+     - 4 个 build matrix job **全部在 `Configure` 步失败**，其后 `Build` / `Unit tests` 均为 `skipped`。
+     - **关键：run #2 是我动手之前的提交，同样在 `Configure` 失败，Linux 侧仅 2 秒、Windows 8 秒。**
+- 为什么：CI 从未跑绿这件事在 devlog 里挂了两轮，一直是"未验证"状态。装了 gh 才能自助查询，而不是让用户反复开网页截图。查之前最大的怀疑是"是不是我把 shaderc / sdl3-shadercross 加成 host 依赖把 CI 弄坏了"——**对比 run #2 后该假设被推翻**：
+  - 反证一：run #2 的 `vcpkg.json` 只有 sdl3 / glm / gtest，仍同样失败；
+  - 反证二：失败耗时 2~8 秒，连 vcpkg 解析清单都不够，更像是 CMake 在极早期就退出（如 `CMAKE_TOOLCHAIN_FILE` 解析失败、生成器缺失一类的"启动即失败"），而不是依赖安装或编译失败；
+  - 反证三：基线提交里 `ports/shaderc` 与 `ports/sdl3-shadercross` **确实存在**（`git ls-tree 10541e31… ports/` 已确认），"端口不在基线里"这条也排除。
+  - 结论：**这是既有的 CI 配置缺陷，与双格式 Shader、host 依赖两轮改动无关。** 若不做这次对比，很可能误改 vcpkg.json 去找一个不存在的问题。
+- 验证：
+  1. `gh --version` → `gh version 2.74.2 (2025-06-18)`；`D:\dev\tools\gh\bin` 已写入 User PATH。
+  2. 下载物 SHA256 与官方 `checksums.txt` 逐字符一致（`3ac27af5…eb29`），大小 13956052 字节。
+  3. 免鉴权 API：`/actions/runs` → run #2/#3 均 `failure`；`/actions/runs/<id>/jobs` → 门禁 `success`、4 个 build job 在 `Configure` 处 `failure`；`/actions/jobs/<id>/logs` → **403 `Must have admin rights to Repository`**（公开仓库的日志下载仍要求鉴权）。
+  4. `gh run list` → 退出码 4，报 `To use GitHub CLI in automation, set the GH_TOKEN environment variable`（未认证，符合预期）。
+- 下一步 / 遗留：
+  ① **需要用户认证 gh**（`gh auth login` 走浏览器/设备码，或设置 `GH_TOKEN`）——认证后即可 `gh run view <run-id> --log-failed` 直接拿到 `Configure` 的真实报错，无需再猜。这是当前唯一阻塞项。
+  ② CI 自建仓以来从未跑绿，`Configure` 早退的根因**尚未定位**（候选：`CMakePresets.json` 里 `$env{VCPKG_ROOT}` 未生效导致工具链文件找不到、或 runner 上 Ninja 生成器不可用），待拿到日志后按证据判定。
+  ③ `NOTICE.md` 标 `*` 的许可仍未逐字核对；`LICENSE` 的 `<COPYRIGHT HOLDER>` 仍是占位符。
+  ④ 待收敛项表两项（遮挡剔除、LOD 接缝）必须在 V0.5 开工前经 ADR 收敛。
+  ⑤ 本轮文档改动（learning-notes C 区与四条环境要点、本条 devlog）**尚未提交**。
