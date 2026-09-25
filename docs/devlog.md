@@ -152,3 +152,29 @@
   ③ `NOTICE.md` 标 `*` 的许可仍未逐字核对；`LICENSE` 的 `<COPYRIGHT HOLDER>` 仍是占位符。
   ④ 待收敛项表两项（遮挡剔除、LOD 接缝）必须在 V0.5 开工前经 ADR 收敛。
   ⑤ 本轮文档改动（learning-notes C 区与四条环境要点、本条 devlog）**尚未提交**。
+
+---
+
+## 2026-09-25  ★ CI 根因定案：锁定的 vcpkg 基线取不到（shallow 克隆），非编译问题
+
+- 做了什么：用刚装好的 `gh`（用户完成浏览器登录后）执行 `gh run view 36136188745 --log-failed`，拿到了那个挂了三轮的 `Configure` 报错原文；据此在 `.github/workflows/ci.yml` 的 `Locate vcpkg` 与 `Configure` 之间插入新步骤 **`Fetch pinned vcpkg baseline`**，在 configure 之前把锁定的基线提交 fetch 进 runner 的 vcpkg 克隆。
+- 为什么：报错全文如下（Linux 与 Windows 一致）——
+  ```
+  -- Running vcpkg install
+  error: while checking out baseline from commit '10541e317a660f4165ba4ac2851ab54a8d4577b1',
+         failed to `git show` versions/baseline.json. This may be fixed by fetching commits with `git fetch`.
+  fatal: path 'versions/baseline.json' exists on disk, but not in '10541e31...'
+  -- Running vcpkg install - failed
+  ```
+  根因链条：
+  1. `vcpkg.json` 的 `builtin-baseline` 是 `x-update-baseline` 从**本机 vcpkg 当时的 main HEAD** 抓来的，该提交日期是 **2026-09-25 01:53** —— 也就是当天最新；
+  2. runner 镜像里预装的 vcpkg 是 **shallow 克隆**，HEAD 早于今天，因此取不到这个提交；
+  3. vcpkg 解析清单第一件事就是 `git show <baseline>:versions/baseline.json`，失败即中止 —— 所以 `Configure` 在 **2 秒（Linux）/ 8 秒（Windows）** 内退出，`Build`/`Unit tests` 根本没跑。
+  → **这是"把基线锁成当天最新提交" + "shallow 克隆"两者叠加的必然结果，与双格式 Shader、host 依赖、门禁改动全部无关**（run #2 已从时间上排除）。日志里随后出现的 `unable to find a build program corresponding to "Ninja"` / `CMAKE_CXX_COMPILER not set` 是同一中止的连带报告，待下一轮 CI 确认是否随之消失。
+- 修法要点（避免埋下新的"双份事实"）：SHA **不在 `ci.yml` 里硬编码**，而是用 `grep` 从 `vcpkg.json` 现场提取，保证 `vcpkg.json` 仍是基线的唯一来源——这与本轮刚建立的「技术栈口径统一」原则一致。步骤内先做 `git cat-file -e "<sha>:versions/baseline.json"` 存在性判断：已可解析则跳过，否则 `git fetch --depth=1 origin <sha>`，退一步用 `--unshallow`；最后再断言一次存在性，失败即显式报错，不留"静默降级"。
+- 验证：
+  1. 基线合法性（本机）：`git -C D:\dev\vcpkg cat-file -t 10541e31…` → `commit`；`ls-tree … versions/` → `100644 blob 494ba512… versions/baseline.json`；`log -1` → `2026-09-25 01:53:17 -0700 | PASSING REMOVE FROM FAIL LISTS 2026-09-24 (#54102)`；`rev-parse HEAD` 与该基线**完全相同**，且 `--is-shallow-repository` = `true`（说明本机能解析是因为它恰是 HEAD，runner 不能解析是因为它不是）。
+  2. `ci.yml` 合规：非 ASCII 字节 **0**、CR 字节 **-1**（该文件要求纯 ASCII + 纯 LF）。
+  3. `gh auth status` → `✓ Logged in to github.com account 871103233 (keyring)`，scopes `gist, read:org, repo, workflow`；`gh run view <id> --log-failed` 成功返回 62822 字节日志。
+  4. **CI 结果待本轮推送后的运行确认**（见下条记录）；`Build`/`Test` 从未在本仓库跑通过，因此它们是否还有独立问题属于未知。
+- 下一步 / 遗留：① 观察新 run：基线 fetch 是否成功、Linux 侧 Ninja/编译器报错是否随之消失、若消失则首次真正跑通编译与测试。② runner 上 `C:\vcpkg` 是否为 shallow、`git fetch --depth=1 origin <sha>` 是否被 GitHub 接受，都以新 run 的日志为准（本机无法预演该网络行为）。③ 若 `--depth=1` 取不到，备选是改用自建完整 vcpkg 克隆（代价是 CI 时间）。④ 本轮 `ci.yml` 改动**尚未提交**。

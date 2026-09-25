@@ -94,6 +94,25 @@ jobs:
           fi
           echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> "$GITHUB_ENV"
 
+      # vcpkg resolves the manifest baseline with `git show <sha>:versions/baseline.json`.
+      # The vcpkg preinstalled on hosted runners is a shallow clone, so a pinned baseline
+      # that is not that clone's HEAD cannot be resolved and `vcpkg install` aborts before
+      # building a single port (this is what made every run fail in ~2 seconds).
+      # Fetch the pinned baseline into the clone first. The SHA is read from vcpkg.json so
+      # that file stays the single source of truth.
+      - name: Fetch pinned vcpkg baseline
+        shell: bash
+        run: |
+          BASELINE=$(grep -o '"builtin-baseline"[[:space:]]*:[[:space:]]*"[0-9a-f]*"' vcpkg.json | grep -o '[0-9a-f]\{40\}')
+          echo "pinned baseline: $BASELINE"
+          if git -C "$VCPKG_ROOT" cat-file -e "$BASELINE:versions/baseline.json" 2>/dev/null; then
+            echo "baseline already resolvable in the runner vcpkg clone"
+          else
+            git -C "$VCPKG_ROOT" fetch --depth=1 origin "$BASELINE" || git -C "$VCPKG_ROOT" fetch --unshallow
+          fi
+          git -C "$VCPKG_ROOT" cat-file -e "$BASELINE:versions/baseline.json"
+          echo "baseline is now resolvable"
+
       - name: Configure
         shell: bash
         run: cmake --preset ${{ matrix.preset }}
