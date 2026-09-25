@@ -23,16 +23,38 @@ namespace {
     return data;
 }
 
-[[nodiscard]] SDL_GPUShader* create_spirv_shader(SDL_GPUDevice* device,
-                                                 const std::filesystem::path& spv_path,
-                                                 SDL_GPUShaderStage stage) {
-    std::vector<std::uint8_t> code = read_binary_file(spv_path);
+/// SDL3_gpu 要求的 Shader 格式随后端而变（Vulkan 用 SPIR-V，D3D12 用 DXIL），
+/// 因此需要按设备能力选择构建期产出的哪一种，否则会触发
+/// "Incompatible shader format for GPU backend"。
+struct ShaderArtifact {
+    SDL_GPUShaderFormat format;
+    const char*         extension;
+};
+
+[[nodiscard]] ShaderArtifact select_shader_artifact(SDL_GPUDevice* device) {
+    const SDL_GPUShaderFormat formats = SDL_GetGPUShaderFormats(device);
+
+    if ((formats & SDL_GPU_SHADERFORMAT_DXIL) != 0) {
+        return ShaderArtifact { SDL_GPU_SHADERFORMAT_DXIL, ".dxil" };
+    }
+    if ((formats & SDL_GPU_SHADERFORMAT_SPIRV) != 0) {
+        return ShaderArtifact { SDL_GPU_SHADERFORMAT_SPIRV, ".spv" };
+    }
+
+    throw std::runtime_error("当前 GPU 后端既不支持 DXIL 也不支持 SPIR-V，无法加载 Shader");
+}
+
+[[nodiscard]] SDL_GPUShader* create_shader_from_file(SDL_GPUDevice* device,
+                                                     const std::filesystem::path& path,
+                                                     SDL_GPUShaderStage stage,
+                                                     SDL_GPUShaderFormat format) {
+    std::vector<std::uint8_t> code = read_binary_file(path);
 
     SDL_GPUShaderCreateInfo info {};
     info.code_size            = code.size();
     info.code                 = code.data();
     info.entrypoint           = "main";
-    info.format               = SDL_GPU_SHADERFORMAT_SPIRV;
+    info.format               = format;
     info.stage                = stage;
     info.num_samplers         = 0;
     info.num_uniform_buffers  = 0;
@@ -41,7 +63,7 @@ namespace {
 
     SDL_GPUShader* shader = SDL_CreateGPUShader(device, &info);
     if (shader == nullptr) {
-        throw std::runtime_error("SDL_CreateGPUShader 失败（" + spv_path.string() + "）：" + SDL_GetError());
+        throw std::runtime_error("SDL_CreateGPUShader 失败（" + path.string() + "）：" + SDL_GetError());
     }
     return shader;
 }
@@ -51,10 +73,15 @@ namespace {
 TriangleRenderer::TriangleRenderer(SDL_GPUDevice* device, SDL_Window* window,
                                    std::filesystem::path shader_dir)
     : m_device(device), m_window(window), m_shader_dir(std::move(shader_dir)) {
-    SDL_GPUShader* vert = create_spirv_shader(m_device, m_shader_dir / "triangle.vert.spv",
-                                              SDL_GPU_SHADERSTAGE_VERTEX);
-    SDL_GPUShader* frag = create_spirv_shader(m_device, m_shader_dir / "triangle.frag.spv",
-                                              SDL_GPU_SHADERSTAGE_FRAGMENT);
+    const ShaderArtifact artifact = select_shader_artifact(m_device);
+    const std::string    extension = artifact.extension;
+
+    SDL_GPUShader* vert = create_shader_from_file(
+        m_device, m_shader_dir / ("triangle.vert" + extension), SDL_GPU_SHADERSTAGE_VERTEX,
+        artifact.format);
+    SDL_GPUShader* frag = create_shader_from_file(
+        m_device, m_shader_dir / ("triangle.frag" + extension), SDL_GPU_SHADERSTAGE_FRAGMENT,
+        artifact.format);
 
     // PoC 不提交顶点缓冲：顶点位置写死在 Vertex Shader 内，
     // 目的是隔离出"设备 + 管线 + 换链"这条链路是否可用。
