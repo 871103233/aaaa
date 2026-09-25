@@ -7,6 +7,10 @@
     "sdl3",
     "glm",
     "gtest",
+    "tomlplusplus",
+    "joltphysics",
+    "stb",
+    { "name": "imgui", "features": [ "sdl3-binding", "sdlgpu3-binding" ] },
     { "name": "shaderc", "host": true },
     { "name": "sdl3-shadercross", "host": true }
   ],

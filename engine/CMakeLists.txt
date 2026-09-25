@@ -1,10 +1,16 @@
-# 引擎核心层：平台抽象 + 渲染封装
+# 引擎核心层：平台抽象 + 核心设施（时钟 / 固定步长 / 日志）+ 输入抽象 + 渲染封装
 #
 # 注意：engine/ 内不得出现体素或游戏专有类型（Chunk / BlockId / Biome 等），
 # 见技能规范 §2「分层与依赖方向」。
 
 add_library(voxel_engine STATIC
+    core/clock.cpp
+    core/fixed_step.cpp
+    core/log.cpp
+    input/input_map.cpp
     platform/window.cpp
+    render/camera.cpp
+    render/mesh_renderer.cpp
     render/triangle_renderer.cpp
 )
 

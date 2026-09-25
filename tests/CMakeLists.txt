@@ -11,10 +11,14 @@ find_package(GTest CONFIG REQUIRED)
 
 add_executable(voxel_tests
     chunk_state_test.cpp
+    fixed_step_test.cpp
+    input_map_test.cpp
+    render_camera_test.cpp
 )
 
 target_link_libraries(voxel_tests
     PRIVATE voxel_build_options
+    PRIVATE voxel_engine
     PRIVATE voxel_world
     PRIVATE GTest::gtest_main
 )

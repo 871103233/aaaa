@@ -29,9 +29,12 @@ voxel-engine/
 │   ├── shaders/               GLSL 源
 │   └── textures/              纹理源 + 层号分配表
 ├── cmake/                     自写构建辅助模块
-├── docs/                      方案文档 / ADR / 本索引 / 开发记录
-│   └── adr/                   架构决策记录
+├── docs/                      方案文档 / ADR / 本索引 / 开发记录 / 阶段计划
+│   ├── adr/                   架构决策记录
+│   └── plans/                 阶段计划（接手者每次开工先读）
 ├── engine/                    引擎核心层
+│   ├── core/                  主循环 / 固定步长 / 计时 / 日志
+│   ├── input/                 输入动作状态层（上层只消费动作，不读 SDL 事件）
 │   ├── platform/              平台抽象
 │   └── render/                渲染封装
 ├── game/                      游戏逻辑层
@@ -65,20 +68,25 @@ voxel-engine/
 
 | 条目 | 职责 | 依赖方向 | 约束 |
 | --- | --- | --- | --- |
-| `engine/` | 引擎核心：可复用的通用能力 | 可依赖 `platform` 与第三方 | 不放体素 / 游戏专有类型（`Chunk`、`BlockId`、`Biome` 等），不含游戏内容 |
+| `engine/` | 引擎核心：可复用的通用能力 | 可依赖 `platform` 与第三方 | 不放世界 / 游戏专有类型（`TerrainTile`、`DigVolume`、`Biome` 等），不含游戏内容 |
+| `engine/core/` | 主循环装配、固定步长累加器、单调计时、统一日志接口 | 可依赖 `engine/platform` 与第三方 | 不放渲染与世界逻辑 |
+| `engine/input/` | 输入动作状态层：按键 / 鼠标 → 动作，每帧采样一次 | 可依赖 `engine/platform` | 上层只消费动作；**本层之外不得读 SDL 事件队列** |
 | `engine/platform/` | 平台抽象：窗口、输入、计时、文件 IO | 可依赖第三方（SDL3） | 不放渲染与游戏逻辑 |
 | `engine/render/` | 渲染封装（RHI 薄层） | 可依赖 `engine/platform` | 不把具体图形 API 语义泄漏到上层 |
 | `engine/CMakeLists.txt` | 聚合 `engine/` 源文件为 `voxel_engine` 静态库 | — | 新增源文件须在此登记 |
 
 ---
 
-## 体素世界层
+## 体素世界层（迁移中：见 ADR 0004）
+
+> ⚠ 该层已被 **ADR 0004** 取代为"分层混合世界"：**地表高度场 + 可挖标记区域内的有界 SDF 体积 + 物件/建造层**。
+> 下表为**现状**（旧方块体素实现），重写前不得据此扩展；新目录结构与职责待 `tech-plan-v2.0.md` 定稿后回填。
 
 | 条目 | 职责 | 依赖方向 | 约束 |
 | --- | --- | --- | --- |
-| `voxel/` | 体素世界：生成、网格化、光照、流式加载、存档、体素碰撞 | 可依赖 `engine` | 硬件访问一律经引擎核心 / 平台抽象，不直接调用平台 API |
-| `voxel/chunk/` | 区块数据与状态机 | 可依赖 `engine` | 区块状态的**唯一判据**在 `chunk_types.hpp`；不在此目录做网格化 |
-| `voxel/CMakeLists.txt` | 体素层构建目标 | — | 新增子目录须在此登记 |
+| `voxel/` | ~~体素世界~~ → **待改为世界层**：地表高度场、可挖体积、物件层、生成、网格化、流式加载、存档 | 可依赖 `engine` | 硬件访问一律经引擎核心 / 平台抽象，不直接调用平台 API |
+| `voxel/chunk/` | ~~区块数据与状态机~~ → **待重写**为地表 tile / 可挖体积块的数据与状态 | 可依赖 `engine` | 现状只有 `chunk_types.hpp`；其尺寸常量与状态判据**已随 ADR 0004 作废**，迁移期不修不删 |
+| `voxel/CMakeLists.txt` | 世界层构建目标 | — | 新增子目录须在此登记 |
 
 ---
 
@@ -107,8 +115,8 @@ voxel-engine/
 | --- | --- | --- | --- |
 | `assets/` | 运行时资源源文件 | — | 生成物放 `assets/generated/`（已忽略） |
 | `assets/shaders/` | GLSL 源（`.vert` / `.frag` / `.comp`） | — | 只放源；`.spv` / `.dxil` 由构建生成到 `<build>/assets/shaders/` |
-| `assets/textures/` | 纹理源 + `layers.toml`（纹理数组层号分配表） | — | 层号一经分配**不可复用**——存档与网格依赖它 |
-| `assets/blocks.toml` | 方块注册表数据源 | — | 与 `BlockRegistry` 保持同步 |
+| `assets/textures/` | 纹理源（供地表多纹理权重混合使用） | — | 现状含 `layers.toml`（纹理数组层号表）——**已随 ADR 0004 作废待替换**为材质 / 生物群系配置 |
+| `assets/blocks.toml` | ~~方块注册表数据源~~（**已随 ADR 0004 作废待删除**） | — | 方块世界专属；替换为材质表 / 可挖区域表 / 生成参数（格式待收敛） |
 
 ---
 
@@ -119,8 +127,9 @@ voxel-engine/
 | `cmake/` | 自写构建辅助模块 | — | 不放业务逻辑；工具缺失时降级为**警告**，不阻断配置 |
 | `cmake/Shaders.cmake` | 两段式 Shader 编译：GLSL →(glslc) SPIR-V →(shadercross) DXIL | — | 两种格式**都必须产出**：Vulkan 用 SPIR-V，D3D12 用 DXIL |
 | `.github/workflows/` | CI：门禁 → 构建 → 测试 | — | 文件与 CI 脚本保持**纯 ASCII**（原因见 `ci.yml` 顶部注释）；新增步骤须本地可复现 |
-| `docs/` | 方案文档、ADR、文件索引、开发记录、学习笔记 | — | 与代码同步 |
-| `docs/adr/` | 架构决策记录，`NNNN-<主题>.md` 递增编号 | — | 一经写入不回改；被取代时新增一条并互相链接 |
+| `docs/` | 方案文档、ADR、文件索引、开发记录、学习笔记、阶段计划 | — | 与代码同步 |
+| `docs/adr/` | 架构决策记录（`NNNN-<主题>.md`）**+ `README.md` 决策索引** | — | 正文一经写入不回改；被取代时新增一条并互相链接；**每次决策变动须在同一次提交内更新索引** |
+| `docs/plans/` | 阶段计划：当前阶段的任务分解、顺序、进度、下一步 | — | 只写计划与进度，不写技术结论（选型一律指向方案 / ADR）；阶段闭环后冻结不回改 |
 | `.trae/skills/` | AI 开发规范技能（正文 + references + 门禁脚本） | — | 规范变更时同步更新 |
 
 ---
@@ -129,9 +138,14 @@ voxel-engine/
 
 | 入口 | 说明 |
 | --- | --- |
+| `engine/core/fixed_step.hpp` | 固定步长累加器（单帧补步封顶、渲染插值 alpha） |
+| `engine/core/log.hpp` | 统一日志接口（`VX_LOG_*`） |
+| `engine/input/input_map.hpp` | 输入动作状态层（上层只消费动作） |
 | `engine/platform/window.hpp` | 窗口与事件循环 |
-| `engine/render/triangle_renderer.hpp` | 渲染入口（当前为 PoC 冒烟测试用，后续由真正的渲染器取代） |
-| `voxel/chunk/chunk_types.hpp` | 区块状态机与 `can_build_mesh` 唯一判据 |
+| `engine/render/triangle_renderer.hpp` | 渲染入口（当前为 PoC 冒烟测试用，将由网格渲染路径取代） |
+| `engine/render/mesh_renderer.hpp` | 通用网格渲染路径（顶点/索引缓冲、相机 UBO、索引绘制） |
+| `engine/render/camera.hpp` | 第三人称相机 + 避障；`ITerrainQuery` 查询契约（由世界层实现） |
+| `voxel/chunk/chunk_types.hpp` | ~~区块状态机与 `can_build_mesh` 唯一判据~~ —— **已随 ADR 0004 作废**，迁移期不修不删 |
 
 ---
 
@@ -139,5 +153,5 @@ voxel-engine/
 
 | 规划路径 | 用途 | 备注 |
 | --- | --- | --- |
-| `tools/` | 离线工具：纹理数组打包、资源生成 | 见方案 §9.2；创建时须在此登记 |
+| `tools/` | 离线工具：纹理打包、可挖区域标记生成、资源生成 | 目录结构待 `tech-plan-v2.0.md` 定稿；创建时须在此登记 |
 | `editor/` | 场景编辑器 | POST-V0.5 暂缓项，默认不创建 |

@@ -10,13 +10,14 @@
 | SDL3 | 窗口 / 输入 / 音频 / GPU 抽象 | zlib | V0.1 |
 | GLM | 数学库 | MIT（另有 Happy Bunny License 双许可） | V0.1 |
 | FastNoiseLite | 噪声生成 | MIT | V0.2 |
-| stb_image | 纹理加载 | Public Domain / MIT 双许可 | V0.1 |
-| Dear ImGui | 调试 UI | MIT | V0.1 |
+| stb_image（`stb`） | 纹理加载 | Public Domain / MIT 双许可 | V0.1 |
+| Dear ImGui（`imgui`，含 SDL3 与 SDL3_gpu 绑定） | 调试 UI | MIT | V0.1 |
+| toml++（`tomlplusplus`） | 配置解析 | MIT | V0.1 |
 | GoogleTest | 单元测试 | BSD-3-Clause | V0.1 |
 | enkits（enkiTS）\* | 任务调度 | zlib | V0.3 |
 | Taskflow \* | 任务调度（备选） | MIT | V0.3（备选） |
 | EnTT | ECS | MIT | V0.4 |
-| Jolt Physics | 动态刚体物理 | MIT | V0.4 |
+| Jolt Physics（`joltphysics`） | 刚体物理 / 角色碰撞与地形碰撞 | MIT | V0.1 |
 | zstd | 存档压缩 | BSD-3-Clause（另有 GPLv2 双许可） | V0.3 |
 | Assimp | 3D 模型加载 | BSD-3-Clause | V0.5 |
 | Tracy | 性能分析 | BSD-3-Clause | V0.2 |

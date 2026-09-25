@@ -178,3 +178,89 @@
   3. `gh auth status` → `✓ Logged in to github.com account 871103233 (keyring)`，scopes `gist, read:org, repo, workflow`；`gh run view <id> --log-failed` 成功返回 62822 字节日志。
   4. **CI 结果待本轮推送后的运行确认**（见下条记录）；`Build`/`Test` 从未在本仓库跑通过，因此它们是否还有独立问题属于未知。
 - 下一步 / 遗留：① 观察新 run：基线 fetch 是否成功、Linux 侧 Ninja/编译器报错是否随之消失、若消失则首次真正跑通编译与测试。② runner 上 `C:\vcpkg` 是否为 shallow、`git fetch --depth=1 origin <sha>` 是否被 GitHub 接受，都以新 run 的日志为准（本机无法预演该网络行为）。③ 若 `--depth=1` 取不到，备选是改用自建完整 vcpkg 克隆（代价是 CI 时间）。④ 本轮 `ci.yml` 改动**尚未提交**。
+
+---
+
+## 2026-09-25  规范新增「阶段计划」：每次任务下发必须先有可被直接读取的进度与规划
+
+- 做了什么：
+  1. `SKILL.md` 新增「**任务下发：每次任务都必须先有『进度 + 规划』**」一节：任何任务（新需求 / 继续开发 / 修 bug / 纯文档改动）动手前必须先把本次任务写进 `docs/plans/<当前阶段>.md`，条目须含**范围 / 顺序 / 落点 / 验收**四项，**无计划条目即违规**。
+  2. 交接包由 5 份扩为 **6 份**：第 3 位插入 `docs/plans/<当前阶段>.md`；「切换前必须落盘」的目标补上计划的「阻塞 / 未决」；新增「阶段切换时必须新建计划」；frontmatter `description` 同步。
+  3. 常驻文档由 3 份扩为 **4 份**，新增 **六.4 阶段计划**（用途 / 命名粒度 / 四段模板 / 维护规则），「分工边界」由三者改为四者。
+  4. DoD 由 14 项增至 **15 项**：新增「当前阶段计划已更新，且与本次改动同一次提交」。
+  5. 未决项登记：把**配置解析（`blocks.toml` / `layers.toml`）方案**写入「待收敛项」表，时限 **V0.1 的 T4 开工前经 ADR 收敛**。
+  6. 新建 `docs/plans/v0.1.md`：前置条件 P1~P5、任务分解 T1~T10（含落点与验收判据）、当前进度、阶段验收对照（10 维度，只引用方案 §8）。
+  7. 同步 `docs/file-index.md`（新增 `docs/plans/` 目录与条目）、`docs/learning-notes.md`（B 区新增「阶段计划（Plan）」，DoD 条目数 14 → 15）。
+- 为什么：原规范只要求「开发后记录进度」（六.2 devlog，格式含「下一步 / 遗留」），**没有要求产出可执行的规划**——devlog 的「下一步」是备忘式要点，没有任务分解、顺序、落点与验收判据。上一条记录结尾的「下一阶段：开新会话进入 V0.1」挂在「下一步 / 遗留」里数轮仍未开工，正说明「有进度、无规划」时接手者还得自己重新推导要做哪些事、按什么顺序。补上阶段计划后，大模型或新接手者**只读一份文件**即可知道「现在到哪、下一步做什么、做到什么算完」。另外把配置解析方案登记进待收敛项表，是为避免 V0.1 施工时被自选——本仓库已因「同一结论散落多处、改一漏三」翻过一次车（见 ADR 0002）。
+- 验证：
+  1. 门禁：`powershell -NoProfile -File .trae/skills/voxel-engine-dev-standards/scripts/check-banned-identifiers.ps1 -SelfTest` → `Self-test passed: 18 case(s)`，退出码 **0**；同脚本 `-RepoRoot .` → `scanned 7 file(s), 0 violation(s)`，`PASS`，退出码 **0**。
+  2. 行尾与编码（逐字节检查 `SKILL.md` / `docs/plans/v0.1.md` / `docs/file-index.md` / `docs/learning-notes.md` / `docs/devlog.md`）→ **CR = -1、BOM = False**，即纯 LF、无 BOM，符合仓库约定。
+  3. `SKILL.md` frontmatter 仍为合法 YAML 纯量：`---` 起止成对，`name` / `description` 各一行，`description` 内无冒号。
+  4. 互链可达：`docs/plans/v0.1.md` 中的 `../tech-plan-v1.3.md`、`../../.trae/skills/.../references/gameplay-v0.1.md`，以及 `SKILL.md` 待收敛项表指向的 `docs/plans/v0.1.md` 均存在。
+- 下一步 / 遗留：① 本规范变更**尚未提交**。② `docs/plans/v0.1.md` 的 P1（配置解析方案未收敛）与 P4（CI 未全绿）开放；V0.1 首个编码任务 T1 可在 P1 收敛前开工，但 **T4 之前必须完成 P1**。③ 上一条记录的遗留（`LICENSE` 占位符、`NOTICE.md` 星号未核对、Python 未装）仍开放。
+
+---
+
+## 2026-09-25  ★ 世界表示改案：由方块体素改为分层混合；规范新增「方案与方向的留档义务」
+
+- 做了什么：
+  1. **需求澄清后确认方向变更并落盘**：目标不是"类 MC 的方块放置游戏"，而是"地图按逻辑塞元素 + **平滑地表**可挖可堆 + **有限空间内**三维挖掘 + 浮空内容 + 胶囊体自由活动"。据此世界表示由「体素 Section + 面剔除 + 贪婪网格化 + 体素光照 BFS + 自研 swept AABB」改为**分层混合**：① 高度场地表 ② 可挖标记区域内的有界 SDF 体积 ③ 物件/建造层 ④ 实体。
+  2. 新增 **ADR 0004**（世界表示）：四条硬约束（浮空与建造**绝不写入地形场**；可挖范围由**显式标记区域**决定；体积按固定网格对齐、共享边界采样，与地表相接处由体积接管该列高度；飞行元素不引入新表示）、六方案备选对比（含「全世界 SDF 体素」**不采纳**及其量化理由）、后果与四条重审条件。
+  3. 新增 **`docs/adr/README.md` 决策索引**：登记 ADR 状态（有效 / 被取代 / 作废）与取代者、方案文档版本状态、当前阶段计划。
+  4. **SKILL 新增第 8 节「方案与方向的留档义务」**：任何"选定技术方案 / 确定或调整开发方向"都必须**先落盘**（技术方案 → ADR；方向与阶段目标 → 方案章节 + 阶段计划）；重大方向变更须**新建版本文件**并在新版 §0 列「沿用 / 取代 / 待定」三张清单，旧版头部加取代互链；允许"部分章节被 ADR 取代"的过渡态，但须登记重写任务与时限；**禁止同一方向在两处各写一份不同的值**。同步清单 9 项 → **10 项**（新增决策索引与版本头），DoD 15 项 → **16 项**。
+  5. **口径表与红线表改口径 + 迁移期声明**：口径表新增/替换「世界表示 / 可挖范围 / 浮空与建造 / 地形网格化 / 材质与光照 / 物理与角色 / 预算与精度」7 行；旧行（16×16×384、光照 96 KB、Draw Call ≤700）标注**已失效待重算**。红线表按"已取代 / 原则仍成立待更新 / 不受影响"三分类标注（#5、#13、#14、#16 已取代；#1、#12 措辞待更新）。
+  6. **待收敛项表重写为 6 项**：① 配置解析 ② 可挖标记规则与文件格式 ③ 可挖体积网格化算法 ④ 地表 LOD 与接缝 ⑤ 预算与精度口径重算 ⑥ 遮挡剔除。并新增口径漂移自查关键词 `96 KB|16×16×384|Section 16³|贪婪合并|swept AABB|quadSize`。
+  7. **失效文档显式标注**：`tech-plan-v1.3.md` 头部加"已被 ADR 0004 **部分**取代"及取代范围清单；4 份 `references` 各加声明（chunk-and-streaming **整体失效**、仅原则层可用；meshing-and-render §1~§5 作废、§6 有效；save-and-serialization 原则层有效、`.voxr` v1 字段规格作废；gameplay-v0.1 §1/§2/§8/§9 有效、§4~§7 作废）。
+  8. **`docs/plans/v0.1.md` 按新方向重写**：阶段目标改为"验证平滑地形 + 可挖可堆 + 胶囊体自由活动"；前置条件 P1~P8、迁移任务 **M1**（重写 `tech-plan-v2.0.md` 与 4 份 references）、任务 T1~T10、阶段验收 10 维度（性能维度因待收敛项 5 未收敛而**不设数字**）。
+  9. 同步 `docs/file-index.md`（`docs/adr/` 加决策索引、世界层标"迁移中"、`assets/blocks.toml` 与 `layers.toml` 标作废、`tools/` 用途更新）、`docs/learning-notes.md`（A 区新增分层混合世界 / 高度场 / SDF 与等值面网格化 / Splat / CSM 五条，B 区新增决策索引与版本取代一条，D 区块状态机条目标注被取代）。
+- 为什么：三条独立理由。① **量级**：全世界三维体素的数据量约为高度场的 **34 倍**、网格化遍历量高**两个数量级**，而它换来的"全世界任意三维重塑"**并不是需求**（需求是"一定空间内可自由挖掘"），属过度设计。② **解耦**：浮空内容与玩家建造若塞进地形场会在地表"打出柱子"；归物件层后与地形表示解耦，并复用已选定的 EnTT + Jolt。③ **防止方向矛盾**：仓库此前只规定"**选型变更**"要留档，**没有规定"开发方向变更"也要留档，也没有版本取代与索引机制**——方向改了而旧文档仍在写方块体素，施工者就会照旧施工。补上第 8 节与决策索引后，"哪份还生效"有了唯一答案。
+- 验证：
+  1. 门禁：`-SelfTest` → `Self-test passed: 18 case(s)`，退出码 **0**；`-RepoRoot .` → `scanned 7 file(s), 0 violation(s)` + `PASS`，退出码 **0**。
+  2. 行尾与编码：本次改动的 11 个文件逐字节检查 → **CR = -1、BOM = False**（纯 LF、无 BOM）。
+  3. 互链可达：ADR 0001~0004、`docs/adr/README.md`、`docs/plans/v0.1.md`、`references/gameplay-v0.1.md` 的 `Test-Path` 全为真；过程中发现并修正 `learning-notes.md` 里两处相对路径写错（`../docs/adr/...` → `adr/...`）。
+  4. CI：本轮未触碰 `ci.yml`；run `36146153279` 结果仍未取。
+- 下一步 / 遗留：① 本批改动**尚未提交**。② CI run `36146153279` 结果待取（`docs/plans/v0.1.md` P7）。③ **M1 待执行**：重写 `tech-plan-v2.0.md`（含 §0「沿用 / 取代 / 待定」）与 4 份 `references`；完成前不得据 v1.3 世界表示章节施工。④ 待收敛项 1~3 须在 T4 / T8 前经 ADR 收敛；待收敛项 5 未收敛前不得引用任何旧预算数字。⑤ 依赖待补：`jolt`（T7 前必须）、`imgui`、`assimp`。⑥ `LICENSE` 占位符、`NOTICE.md` 标 `*` 未核对、Python 未装，三项仍开放。
+
+---
+
+## 2026-09-25  收敛 4 项未决选型、M1 方案重写落地、引擎层 T1/T2 与依赖补齐
+
+- 做了什么：
+  1. **新增 ADR 0005~0008，把 4 个待收敛项全部关闭**：
+     - **ADR 0005** 配置解析 → **toml++**（vcpkg 端口 `tomlplusplus 3.4.0#1`），header-only、报错带行列号；备选留档（手写子集解析器 / nlohmann-json / INI / 编译期常量）并写明切换条件。
+     - **ADR 0006** 可挖区域标记 → **程序化纯函数规则 + `assets/config/dig_regions.toml` 叠加**（字段规格含 `schema_version` / `mode`（diggable·sealed）/ `priority` / `min`·`max`）；明确「标记 = **世界定义**（不落盘，只记版本与哈希）、玩家挖掘 = **世界状态**（落盘为脏体积）」，重建顺序固定为「标记 → 生成 → 叠加改动」。
+     - **ADR 0007** 体积网格化 → **Surface Nets 起步**（`int8` 距离场、32³ 体素 / 33³ 采样、块边界共享采样）；备选 MC / Dual Contouring / Transvoxel 与**可触发的切换条件**（要锐利硬边则升级 DC）。
+     - **ADR 0008** 尺寸·精度·预算口径 → 冻结 64×64 tile、`int16`(1/16 格) 高度、32³ 体积块；**明确作废** v1.3 的 16×16×384 / 光照 96 KB / ≤700 draw call / 3×3×3 方块查询；**Draw Call 与视距内存改为"只记录、不验收"**（因 LOD 未收敛），并给出按新方向修订的固定基准场景。
+  2. **SKILL 同步**：名称陷阱表补 `joltphysics`（**不是 `jolt`**）/ `tomlplusplus` / `imgui[...]` / `stb` / `tracy`；待收敛项表加「状态」列（1/2/3/5 标已收敛并互链 ADR，4/6 标开放）；口径表与红线表的迁移期声明升级为「口径现状」（v2.0 已落地为现行方案，逐条给出新做法出处）。
+  3. **M1 完成**：新建 `docs/tech-plan-v2.0.md`（411 行，含 §0「沿用 12 项 / 取代 15 项 / 待定 3 项」三张清单 + §1~§9 新方向权威章节），并**原地重写 4 份 `references`**（tile 流式与生成、高度场网格 + Surface Nets + splat + CSM、存档 v2 内容模型、笔刷挖堆与第三人称相机的调用侧约束）；`meshing-and-render.md` §6 双格式 Shader 管线（ADR 0002）按原样保留。
+  4. **依赖补齐**（P5）：`vcpkg.json` 新增 `tomlplusplus` / `joltphysics` / `stb` / `imgui`（features `sdl3-binding` + `sdlgpu3-binding`），`builtin-baseline` 未动；`NOTICE.md` 同步（Jolt 引入阶段由 V0.4 更正为 V0.1）。
+  5. **T1 完成**：新增 `engine/core/`（`clock` 单调计时、`fixed_step` 固定步长累加器含单帧 ≤5 步封顶与插值 alpha、`log` 统一日志接口 + `VX_LOG_*` 宏）。
+  6. **T2 完成**：新增 `engine/input/`（`action_state` 动作定义、`input_map` 每帧一次采样 + 同帧只消费一次的 `ConsumedPressed` 契约）。
+  7. 新增 11 个单元测试（`tests/fixed_step_test.cpp` 5 项、`tests/input_map_test.cpp` 6 项）；`docs/file-index.md` 登记 `engine/core/`、`engine/input/`；`docs/learning-notes.md` 新增「世界定义 vs 世界状态」「固定步长累加器与动作状态输入」两条；`docs/adr/README.md` 补 0005~0008 并把 v2.0 标为**现行**。
+- 为什么：这 4 项未决选型的收敛时限分别是"V0.1 前置条件完成前"与"v2.0 落地时"，不收敛就直接开工，施工者只能自选（本仓库已因"同一结论散落多处、改一漏三"翻过一次车，见 ADR 0002）。其中 ADR 0008 尤其关键：**若不显式作废旧预算数字，性能验收会拿"96 KB 光照""≤700 draw call"这类已不存在的指标去量新架构**。T1/T2 之所以优先：它们是唯一不依赖世界表示的引擎层任务，可在方案重写期间并行推进。
+- 验证：
+  1. **构建**：`cmake --build --preset debug` → 10/10 目标，**零错误零警告**（`/W4` + `/WX`）。
+  2. **测试**：`ctest --preset debug` → **17/17 passed**（6 原有 + 11 新增），总耗时 0.22 s；其中 `FixedStep.LogicStepCountIsFrameRateIndependent`（30 vs 144 FPS 步数一致）、`FixedStep.HugeFrameIsClampedAndDoesNotSpiral`（10 s 帧被钳到 ≤5 步）、`FixedStep.NoDriftBetweenStepsAccumulatorAndElapsed`、`InputMap.PressedIsConsumedExactlyOncePerFrame` 均通过。
+  3. **门禁**：`check-banned-identifiers.ps1 -RepoRoot .` → `scanned 18 file(s), 0 violation(s)`，`PASS`，退出码 0。
+  4. **依赖**：`cmake --preset debug` → 装齐 `imgui 1.92.9[sdl3-binding,sdlgpu3-binding]` / `joltphysics 5.6.0#1` / `stb 2024-07-29#1` / `tomlplusplus 3.4.0#1`，`Configuring done (96.2s)`，退出码 0。
+  5. **编码与行尾**：本批所有新文件与改动文件均为**纯 LF、无 BOM**（子代理逐字节复核）。
+  6. v2.0 与 4 份 references 已按 SKILL 口径漂移表自查：旧口径关键词（`16×16×384`、`贪婪合并`、`swept AABB`、`quadSize`、`96 KB`）的全部命中**只出现在"被取代"声明与历史条目中**，无现行规则误用。
+- 下一步 / 遗留：① 本批改动**尚未提交**。② **T3~T10 未开始**：`engine/render` 网格渲染路径 + 第三人称相机 → 世界层（高度场 tile / splat 材质 / 笔刷挖堆）→ Jolt 角色 / 可挖体积 / ImGui 面板 → 阶段验收。③ **世界层更名待执行**：v2.0 §9.1 用 `world/` 取代 `voxel/`，须在 T4 落地时一并完成目录搬迁与 `file-index.md`、构建脚本同步。④ 待收敛项 **4（地表 LOD）与 6（遮挡剔除）仍开放**；收敛前不得给 Draw Call 与视距内存设数字。⑤ 本机构建需在同一条命令内先初始化 VS DevShell（否则 `C1083 "cstdint"`）——已记入 `docs/plans/v0.1.md` 遗留。⑥ CI run `36146153279` 结果仍未取；`LICENSE` 占位符、Python 未装仍开放。
+
+---
+
+## 2026-09-25  T3 完成：通用网格渲染路径与第三人称相机（含避障）
+
+- 做了什么：
+  1. 新增 `engine/render/mesh_renderer.hpp/.cpp`：通用网格渲染路径——图形管线（3 顶点属性、背面剔除、深度测试）、顶点/索引缓冲上传、**每帧相机常量缓冲**（storage buffer，绑到顶点槽 0）、索引绘制；深度目标按交换链尺寸惰性重建。顶点格式为**相机相对 position + normal + 材质权重 ×4**，头文件完整文档化，**不含任何方块语义**。
+  2. 新增 `engine/render/camera.hpp/.cpp`：第三人称相机（yaw/pitch，pitch 钳 **±89°**、跟随距离、沿视线**避障**把相机拉近、并用地表高度做离地安全网），以及最小地形查询契约 **`ITerrainQuery`**（height + 线段遮挡两个纯虚方法）——由世界层后续实现，因此相机**现在就能用桩单测**，且 `engine/` 不引入地形专有类型。
+  3. 新增 6 个单测（`tests/render_camera_test.cpp`）：pitch 钳制、无遮挡时恰在请求距离、遮挡时被拉近且**不在实心体内**、离地间隙安全网、**alpha 应用后模拟状态逐字段不变**、pivot 在上一/当前逻辑步之间插值且不外插。
+  4. 登记 `engine/CMakeLists.txt` 与 `tests/CMakeLists.txt`；`docs/file-index.md` 补两个模块入口；`docs/plans/v0.1.md` 勾选 T3。
+- 为什么：T3 是 T4 的**目视前提**（没有网格渲染路径就无法看到高度场网格是否平滑），也是"相机不穿地形"这条验收项的实现主体。把地形查询抽成 `ITerrainQuery` 而不是直接调世界层，是为了**在 `world/` 尚不存在时就能把相机逻辑测掉**，同时不破坏"`engine/` 不依赖 `world/`"的分层红线（相机 `Evaluate` 声明为 `const`，插值 alpha 只用于渲染，编译期即杜绝回写模拟状态）。
+- 验证：
+  1. **构建**：`cmake --build --preset debug --clean-first` → 20/20 目标，`BUILD_EXIT=0`，**警告行数 0**（`/W4` + `/WX`）。
+  2. **测试**：`ctest --preset debug` → **23/23 passed**（17 原有 + 6 新增）。
+  3. **门禁**：`check-banned-identifiers.ps1 -RepoRoot .` → `scanned 23 file(s), 0 violation(s)`，`PASS`，退出码 0。
+  4. **行尾与编码**：5 个新文件 + 2 个构建脚本逐字节复核 → `CR=0`、`BOM=False`（纯 LF）。
+  5. `engine/render/triangle_renderer.*` 未改动，PoC 冒烟路径仍可编译。
+- 下一步 / 遗留：① **T3 的运行期接线未做**：`MeshRenderer` 需 `<shader_dir>/mesh.vert|.frag`，而这两个 Shader 源尚未加入 `assets/shaders/`、也未在 `game/CMakeLists.txt` 注册 `add_shader`（本轮任务禁止改 `game/`）——**须在 T4/T5 接入地形网格时一并补上**，否则网格渲染路径只有静态正确性、没有运行时验证。② 剩余任务：**T4~T6**（世界层：高度场 tile / splat 材质 / 笔刷挖堆）、**T7~T9**（Jolt 角色 / 可挖体积 / ImGui 面板）、**T10** 阶段验收。③ **世界层更名待执行**（`voxel/` → `world/`，与 T4 同批）。④ 待收敛项 4（地表 LOD）与 6（遮挡剔除）仍开放。⑤ 本批改动**尚未提交**。
