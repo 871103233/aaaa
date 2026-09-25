@@ -1,0 +1,112 @@
+# 方块注册表（初版）
+#
+# 依据 docs/tech-plan-v1.3.md §4.1：
+#   方块属性不随方块实例重复存储，启动时一次性载入全局 BlockRegistry。
+#
+# 字段说明：
+#   id           方块 ID。会被存档中的调色板引用，**一经分配不得修改或复用**
+#   name         唯一名字（日志/调试用）
+#   solid        是否阻挡玩家与实体
+#   opaque       是否完全不透光（同时影响面剔除与光照传播）
+#   light_level  自发光等级 0~15（15 为最高）
+#   texture      纹理数组层号，-1 表示不渲染（见 assets/textures/layers.toml）
+#   hardness     破坏耗时基准（秒）；-1 表示不可破坏
+
+[[block]]
+id = 0
+name = "air"
+solid = false
+opaque = false
+light_level = 0
+texture = -1
+hardness = -1
+
+[[block]]
+id = 1
+name = "stone"
+solid = true
+opaque = true
+light_level = 0
+texture = 1
+hardness = 1.5
+
+[[block]]
+id = 2
+name = "dirt"
+solid = true
+opaque = true
+light_level = 0
+texture = 2
+hardness = 0.5
+
+[[block]]
+id = 3
+name = "grass"
+solid = true
+opaque = true
+light_level = 0
+texture = 3
+hardness = 0.6
+
+[[block]]
+id = 4
+name = "sand"
+solid = true
+opaque = true
+light_level = 0
+texture = 4
+hardness = 0.5
+
+[[block]]
+id = 5
+name = "wood"
+solid = true
+opaque = true
+light_level = 0
+texture = 5
+hardness = 2.0
+
+[[block]]
+id = 6
+name = "leaves"
+solid = true
+opaque = false      # 透明方块：不阻挡光照，面剔除时按"非实心"处理
+light_level = 0
+texture = 6
+hardness = 0.2
+
+[[block]]
+id = 7
+name = "water"
+solid = false       # 不阻挡移动，但仍参与碰撞的特殊处理
+opaque = false
+light_level = 0
+texture = 7
+hardness = -1
+
+[[block]]
+id = 8
+name = "glass"
+solid = true
+opaque = false
+light_level = 0
+texture = 8
+hardness = 0.3
+
+[[block]]
+id = 9
+name = "torch"
+solid = false
+opaque = false
+light_level = 14
+texture = 9
+hardness = 0.1
+
+[[block]]
+id = 10
+name = "glowstone"
+solid = true
+opaque = true
+light_level = 15
+texture = 10
+hardness = 0.3

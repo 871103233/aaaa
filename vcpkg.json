@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "voxel-engine",
+  "version-semver": "0.1.0",
+  "description": "自研体素引擎与类 MC 游戏",
+  "dependencies": [
+    "sdl3",
+    "glm",
+    "gtest"
+  ]
+}

@@ -1,0 +1,71 @@
+# 纹理数组层号分配表
+#
+# 依据 docs/tech-plan-v1.3.md §4.4：
+#   优先使用纹理数组（Texture Array）而非纹理图集，以规避 mipmap 渗色。
+#   本文件是「层号 -> 纹理」的唯一分配来源，由离线工具读取并打包。
+#
+# 规则：
+#   1. 所有 tile 尺寸必须一致（当前 16×16）。
+#   2. **层号一经分配不得复用或重排**——否则老存档与老资源包会错位。
+#   3. 新增纹理只能追加到末尾。
+#   4. 每层独立生成 mipmap，因此层之间不会互相渗色。
+
+[atlas]
+tile_size = 16
+max_layers = 256        # 纹理数组容量上限
+
+# 保留层：0 号用于"缺失纹理"的调试占位，不参与正式渲染
+[[layer]]
+index = 0
+name = "debug_missing"
+source = "textures/debug_missing.png"
+
+[[layer]]
+index = 1
+name = "stone"
+source = "textures/stone.png"
+
+[[layer]]
+index = 2
+name = "dirt"
+source = "textures/dirt.png"
+
+[[layer]]
+index = 3
+name = "grass_top"
+source = "textures/grass_top.png"
+
+[[layer]]
+index = 4
+name = "sand"
+source = "textures/sand.png"
+
+[[layer]]
+index = 5
+name = "wood_side"
+source = "textures/wood_side.png"
+
+[[layer]]
+index = 6
+name = "leaves"
+source = "textures/leaves.png"
+
+[[layer]]
+index = 7
+name = "water"
+source = "textures/water.png"
+
+[[layer]]
+index = 8
+name = "glass"
+source = "textures/glass.png"
+
+[[layer]]
+index = 9
+name = "torch"
+source = "textures/torch.png"
+
+[[layer]]
+index = 10
+name = "glowstone"
+source = "textures/glowstone.png"

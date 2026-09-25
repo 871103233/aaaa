@@ -1,0 +1,109 @@
+name: CI
+
+# 执行顺序（见 docs/tech-plan-v1.3.md §3.4）：
+#   门禁 → 构建 → 测试
+# 任一步失败即终止；红灯不得合并。
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+  #
+  # ⚠️ 依赖可复现性：请先在本地执行
+  #      vcpkg x-update-baseline --add-initial-baseline
+  #    并把生成的 builtin-baseline 提交进 vcpkg.json。
+  #    未锁定基线时，CI 与各开发机的依赖版本可能漂移。
+  #
+
+jobs:
+  # ==========================================================
+  # 1. 结构性禁止门禁（最先执行）
+  #    把 docs/tech-plan-v1.3.md 中的结构性约定变成硬失败，
+  #    不依赖阅读者是否正确处理否定表述。
+  # ==========================================================
+  gate:
+    name: Gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            shell: pwsh          # GitHub 的 ubuntu runner 预装 PowerShell Core
+          - os: windows-latest
+            shell: powershell    # Windows PowerShell 5.1，脚本按 ASCII 编写故兼容
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 结构性禁止门禁
+        shell: ${{ matrix.shell }}
+        run: |
+          & "./.trae/skills/voxel-engine-dev-standards/scripts/check-banned-identifiers.ps1" -RepoRoot .
+
+      - name: 门禁规则自检
+        shell: ${{ matrix.shell }}
+        run: |
+          & "./.trae/skills/voxel-engine-dev-standards/scripts/check-banned-identifiers.ps1" -SelfTest
+
+  # ==========================================================
+  # 2. 构建 + 3. 测试
+  #    Windows：Debug / Release
+  #    Linux  ：ASAN、TSan（两者互斥，必须拆成独立配置）
+  # ==========================================================
+  build:
+    name: Build & Test (${{ matrix.name }})
+    needs: gate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-debug,   os: windows-latest, preset: debug,   compiler: default }
+          - { name: windows-release, os: windows-latest, preset: release, compiler: default }
+          - { name: linux-asan,      os: ubuntu-latest,  preset: asan,    compiler: clang   }
+          - { name: linux-tsan,      os: ubuntu-latest,  preset: tsan,    compiler: clang   }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Linux 依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang libvulkan-dev
+
+      - name: 选用 Clang（ASAN / TSan）
+        if: matrix.compiler == 'clang'
+        shell: bash
+        run: |
+          echo "CC=clang"   >> "$GITHUB_ENV"
+          echo "CXX=clang++" >> "$GITHUB_ENV"
+
+      - name: 缓存 vcpkg
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_ROOT }}
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+
+      - name: 获取 vcpkg
+        shell: bash
+        run: |
+          if [ ! -d "$VCPKG_ROOT" ]; then
+            git clone --depth 1 https://github.com/microsoft/vcpkg "$VCPKG_ROOT"
+            "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+          fi
+
+      - name: 配置
+        shell: bash
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: 构建
+        shell: bash
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      - name: 单元测试
+        shell: bash
+        run: ctest --preset ${{ matrix.preset }} --output-on-failure

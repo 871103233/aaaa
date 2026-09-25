@@ -1,0 +1,52 @@
+# ============================================================
+# 行尾与文本处理统一（Windows 项目尤其重要，否则会产生
+# "整个文件都改了" 的假 diff）
+# ============================================================
+* text=auto eol=lf
+
+# 批处理脚本对行尾敏感（标签/goto 在 LF 下可能异常），必须 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 注意：.ps1 刻意不声明 eol=crlf，保持与全仓库一致的 LF：
+#   - Windows PowerShell 5.1 与 pwsh 均能正常解析 LF 脚本（本项目脚本已验证）
+#   - 同一个脚本还要在 Linux CI 上以 pwsh 运行
+# 强制 CRLF 只会让 git 反复提示"下次检出会被替换"。
+
+# 源码与构建脚本显式声明为 LF
+*.c            text eol=lf
+*.h            text eol=lf
+*.cpp          text eol=lf
+*.hpp          text eol=lf
+*.cc           text eol=lf
+*.glsl         text eol=lf
+*.vert         text eol=lf
+*.frag         text eol=lf
+*.comp         text eol=lf
+*.cmake        text eol=lf
+CMakeLists.txt text eol=lf
+
+# ============================================================
+# 二进制（体积小或属生成物，不进 LFS）
+# ============================================================
+*.spv   binary
+*.voxr  binary
+*.pak   binary
+*.exe   binary
+*.dll   binary
+*.lib   binary
+*.pdb   binary
+
+# ============================================================
+# Git LFS 追踪（大资源）
+# 需先执行：git lfs install
+# ============================================================
+*.png  filter=lfs diff=lfs merge=lfs -text
+*.jpg  filter=lfs diff=lfs merge=lfs -text
+*.jpeg filter=lfs diff=lfs merge=lfs -text
+*.tga  filter=lfs diff=lfs merge=lfs -text
+*.fbx  filter=lfs diff=lfs merge=lfs -text
+*.glb  filter=lfs diff=lfs merge=lfs -text
+*.gltf filter=lfs diff=lfs merge=lfs -text
+*.ogg  filter=lfs diff=lfs merge=lfs -text
+*.wav  filter=lfs diff=lfs merge=lfs -text

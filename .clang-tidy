@@ -1,0 +1,37 @@
+# 见 docs/tech-plan-v1.3.md §9.3：至少启用 bugprone-* / performance-* / modernize-*
+Checks: >
+  bugprone-*,
+  performance-*,
+  modernize-*,
+  clang-analyzer-*,
+  -modernize-use-trailing-return-type,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-unchecked-optional-access,
+  -modernize-use-nodiscard,
+  -modernize-concat-nested-namespaces
+
+WarningsAsErrors: ''
+
+# 只检查项目源码，不检查第三方
+HeaderFilterRegex: '^(engine|voxel|game|tests|benchmarks)/.*'
+
+FormatStyle: file
+
+CheckOptions:
+  - key: readability-identifier-naming.ClassCase
+    value: CamelCase
+  - key: readability-identifier-naming.StructCase
+    value: CamelCase
+  - key: readability-identifier-naming.FunctionCase
+    value: CamelCase
+  - key: readability-identifier-naming.MemberPrefix
+    value: m_
+  - key: readability-identifier-naming.MemberCase
+    value: camelBack
+  - key: readability-identifier-naming.ConstexprVariableCase
+    value: CamelCase
+  - key: readability-identifier-naming.ConstexprVariablePrefix
+    value: k
+
+# 项目使用 C++17：避免 clang-tidy 建议 C++20 写法
+Standard: c++17

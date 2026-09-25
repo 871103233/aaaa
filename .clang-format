@@ -1,0 +1,32 @@
+# 基于 LLVM 风格，仅按项目约定调整缩进与列宽（见 docs/tech-plan-v1.3.md §9.3）
+BasedOnStyle: LLVM
+Language: Cpp
+Standard: c++17
+
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 120
+
+# 与命名约定保持一致
+PointerAlignment: Left
+DerivePointerAlignment: false
+
+# 头文件排序稳定，避免无意义 diff
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
+
+# 允许简单函数单行，减少冗余换行
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AlwaysBreakTemplateDeclarations: Yes
+
+# 命名空间内容不额外缩进
+NamespaceIndentation: None
+
+# 换行细节
+BinPackArguments: false
+BinPackParameters: false
+AllowAllArgumentsOnNextLine: true
+AllowAllParametersOfDeclarationOnNextLine: true

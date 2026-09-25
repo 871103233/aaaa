@@ -1,0 +1,41 @@
+root = true
+
+[*]
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# C++ 源码统一 UTF-8 with BOM：
+# MSVC 在无 BOM 时会按本地代码页解释源文件，中文注释/字符串会乱码。
+# 与 CMakeLists.txt 中的 /utf-8 编译选项配套使用。
+[*.{c,h,cpp,hpp,cc,cxx}]
+charset = utf-8-bom
+indent_size = 4
+
+[*.{glsl,vert,frag,comp,hlsl}]
+charset = utf-8
+indent_size = 4
+
+[*.{json,yml,yaml,toml}]
+charset = utf-8
+indent_size = 2
+
+[*.md]
+charset = utf-8
+trim_trailing_whitespace = false
+
+[*.ps1]
+charset = utf-8
+end_of_line = crlf
+indent_size = 4
+
+[*.{bat,cmd}]
+end_of_line = crlf
+
+[CMakeLists.txt]
+indent_size = 4
+
+[*.cmake]
+indent_size = 4
