@@ -4,6 +4,9 @@
 - **日期**：2026-09-25
 - **相关**：`docs/tech-plan-v1.3.md` §3.2 图形渲染；技能规范 `references/meshing-and-render.md`
 - **取代**：v1.1 方案中「OpenGL 3.3 Core 为首选渲染 API」的决定
+- **后续更新**：本 ADR 中「Shader 仅离线编译为 SPIR-V」与「必须安装 Vulkan SDK」两点，已被
+  [ADR 0002](0002-shader-dual-format-pipeline.md)（SPIR-V + DXIL 双格式并存）取代；
+  「渲染后端采用 SDL3_gpu」这一主体决策不变。下文按记录原样保留，不回改。
 
 ## 背景
 

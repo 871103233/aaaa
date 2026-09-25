@@ -1,6 +1,6 @@
 ---
 name: voxel-engine-dev-standards
-description: Enforces this voxel engine repo's architecture and coding standards - chunk states, task system, thread roles, precision, save versioning. Use when writing or editing engine and voxel code.
+description: Enforces this voxel engine repo's architecture and coding standards - chunk states, task system, thread roles, precision, save versioning. Load at the start of any new session or when resuming work on this repo, so the handoff docs are read first (SKILL.md, docs/devlog.md, docs/tech-plan-v1.3.md, docs/file-index.md, docs/learning-notes.md). Use when writing or editing engine and voxel code.
 ---
 
 # 体素引擎开发规范
@@ -15,23 +15,133 @@ description: Enforces this voxel engine repo's architecture and coding standards
 每条禁止都对应一个必须执行的正向做法，**一律以正向做法为准**。
 「备选方案」是默认不启用的兜底项，不是并行候选，仅在出现明确切换条件并经确认后采用。
 
-## 技术白名单（默认采用，照此执行）
+### 会话启动：先读「交接包」
 
-| 领域 | 一律使用 |
+**任何一次新会话**（新开对话、换人接手、上下文被重置）**在动手前必须先读以下 5 份「交接包」**，
+按此顺序读，**不得凭对话记忆或印象推断项目状态**：
+
+| # | 文件 | 读它回答什么 |
+| --- | --- | --- |
+| 1 | 本文件 `SKILL.md` | 规则是什么（红线、分层、DoD、范围控制） |
+| 2 | `docs/devlog.md` | 已经做完什么、还剩什么（**看文末最新条目**） |
+| 3 | `docs/tech-plan-v1.3.md` | 技术决策与备选方案（选了哪个、为什么） |
+| 4 | `docs/file-index.md` | 目录结构与各层职责（什么该放哪里） |
+| 5 | `docs/learning-notes.md` | 名词与概念（不懂的先查这里，**不要重复问**） |
+
+- **不要求用户重述历史**：凡已写入上述文件的，一律以文件为准。
+- 读完交接包后，再按下方「任务路由」读与当前任务相关的那一份 `references/*.md`。
+- **一份都没读就开工 = 违规**；若某份文件缺失或与实际不符，**先报告再继续**，不要默默绕开。
+
+### 会话边界：按任务阶段开新会话
+
+- **同一任务未闭环** → 留在当前会话，不切换。
+- **任务已闭环、进入新阶段**（例如从 PoC 转入 V0.1 开发）→ **开新会话**，开场即按上面的交接包清单启动。
+- **切换前必须落盘**：任何未决项、口头约定、待确认结论，都要写进 `docs/devlog.md` 的「下一步 / 遗留」或对应文档。
+  **只存在于对话里的信息，换会话即丢失，等同于没记录。**
+
+## 技术栈：单一事实来源与口径统一
+
+本节是**防止"同一条技术结论在不同文档里被写成不同样子"的机制**。上次的教训是：
+"Shader 只编 SPIR-V"这条结论同时散落在技能、方案、ADR 三处，改了一处、漏了三处，
+于是后来按旧结论施工直接断言失败。规则与红线表同等强制。
+
+### 1. 三层职责（谁写什么）
+
+| 层 | 位置 | 只允许写 |
+| --- | --- | --- |
+| **权威层** | `docs/tech-plan-v1.3.md` 各章、`docs/adr/*.md` | 决策本身、选型理由、备选方案、**切换条件**。**只有这里能写"为什么"** |
+| **索引层** | 本节下方的「唯一口径表」 | "是什么"——每格**只能有一个值**；不写理由、不写备选、不写版本号，细节一律指向权威层 |
+| **执行层** | 本技能 `references/*.md` | "怎么落地"的硬约束与检查项；不重复决策与理由 |
+
+**核心规则**：任何技术结论**只在权威层展开一次**；索引层与执行层只能**引用**，
+不得改写、不得补细节、不得留第二个候选。
+
+### 2. 唯一口径表（照此执行，除此别无第二写法）
+
+| 领域 | 唯一口径 | 权威位置 |
+| --- | --- | --- |
+| 语言标准 | **C++17**（唯一标准；升到 C++20 须走 ADR） | 方案 §3.1 |
+| 渲染后端 | **SDL3_gpu**（Vulkan / Direct3D 12 / Metal） | ADR 0001 |
+| Shader 与工具链 | **SPIR-V + DXIL 双格式**；`glslc` → `SDL_shadercross` 两段式 | ADR 0002 |
+| 任务调度 | **enkits**（vcpkg 端口 `enkits`） | ADR 0003 |
+| ECS | **EnTT**（仅服务动态实体；方块绝不进 ECS） | ADR 0003 |
+| 存档 | **自定义二进制 + zstd** + `.voxr` 区域文件 | 方案 §4.7 |
+| 程序化生成 | **FastNoiseLite** + **分块确定性网格抖动** | 方案 §4.2 |
+| 网格与纹理 | 面剔除 + **贪婪合并**（作用域 = 单 Section）+ 纹理数组 | 方案 §4.1 / §4.4 |
+| 物理 | **自研 swept AABB**（子步进 + 上台阶）；Jolt 仅动态刚体 | 方案 §4.5 |
+| 区块尺寸 | **16×16×384**，Section **16³**，共 24 段 | 方案 §4.1 |
+| 光照口径 | 单区块未压缩 **96 KB**（不是 48 KB） | 方案 §4.1 |
+| Draw Call 预算 | **≤700/帧 @16 区块；≤1500/帧 @24 区块** | 方案 §4.4 |
+| 单元测试 | **GoogleTest + CTest** | 方案 §9.3 |
+| 性能与调试 | **Tracy**（V0.2 起）；图形调试 **RenderDoc** | 方案 §3.4 |
+
+### 3. 名称陷阱：vcpkg 端口名 ≠ 业界通称
+
+写进构建配置时**一律用 vcpkg 端口名**；文档里首次出现用"通称（端口名）"形式：
+
+| 通称 | 实际端口名 |
 | --- | --- |
-| 渲染后端 | **SDL3_gpu**（Vulkan / Direct3D 12 / Metal）+ SPIR-V（**SDL_shadercross** 离线编译） |
-| 任务调度 | **enkiTS** 或 **Taskflow** |
-| 存档 | **自定义二进制 + zstd** + `.voxr` 区域文件 |
-| 程序化生成 | **FastNoiseLite** + **分块确定性网格抖动** |
-| 网格 | 面剔除 + **贪婪合并**（作用域 = 单 Section） |
-| 单元测试 | **GoogleTest + CTest** |
-| 物理 | **自研 swept AABB**（子步进 + 上台阶）；Jolt 仅用于动态刚体 |
-| 性能分析 | **Tracy**；图形调试 **RenderDoc** |
+| enkiTS | `enkits`（**无连字符，也不是 `enki-ts`**） |
+| EnTT | `entt` |
+| Taskflow（备选） | `taskflow` |
+| SDL_shadercross | `sdl3-shadercross` |
+| GoogleTest | `gtest` |
+| GLM | `glm` |
+| zstd | `zstd` |
+
+### 4. 选型变更：四步流程（缺一步即未完成）
+
+1. **写 ADR**：背景 / 决策 / 备选对比 / 后果 / 何时重新审视。**未采纳方案必须留档并写明切换条件**。
+2. **改权威层原文**：方案文档对应章节 + §5 清单。
+3. **按下方「同步清单」逐处改口径**：用第 2 节表里的措辞，**逐字照抄**，不改写、不节选。
+4. **追加 `docs/devlog.md`**，并跑一次第 6 节的「口径漂移自查」。
+
+### 5. 同步清单（改选型时必须逐处核对，不留"以后再补"）
+
+| # | 位置 | 会镜像什么 |
+| --- | --- | --- |
+| 1 | 本文件：唯一口径表 / 编码约定 / 性能预算 / 范围控制 | 结论与口径 |
+| 2 | `references/` 全部文件 | 落地约束 |
+| 3 | 方案文档 §3.x 选型、§4.x 模块、§5 清单、§7 红线、§8 路线图、§9.x 环境 | 决策与理由 |
+| 4 | `docs/adr/`：新增 ADR + 被取代者的互链 | 决策链 |
+| 5 | `NOTICE.md` | 第三方组件与许可 |
+| 6 | `vcpkg.json` / `CMakeLists.txt` / `CMakePresets.json` / `cmake/*.cmake` | 端口名与构建参数 |
+| 7 | `docs/learning-notes.md`（A 名词 / C 工具 / D 项目概念 / E 问答） | 概念与工具 |
+| 8 | `docs/file-index.md`（条目、依赖方向、约束列） | 结构 |
+| 9 | **源码注释里复述技术结论的地方**（渲染 / 平台 / 构建脚本周边的头顶注释） | 零散复述 |
+
+第 9 条最容易被漏：**源码注释不是权威层**，改选型时必须一并搜、一并改。
+
+### 6. 口径漂移自查（改完跑一次）
+
+用 Grep 搜下列关键词，逐条确认不存在第二种写法（每行都可直接作为 `pattern` 使用）：
+
+- `enkiTS|Taskflow|enkits` —— 没有"A 或 B"、没有把旧通称当端口名用
+- `SPIR-V` —— 没有写成单一格式、没有仍要求安装 Vulkan SDK
+- `C\+\+20` —— 没有与"C++17 唯一标准"冲突的表述
+- `自研稀疏集|自研 ECS` —— 没有与"EnTT 起步"冲突的表述
+- `V 或 Vendored|或 \*\*|/ \*\*` —— 不存在并列候选
+
+**预期的合法命中**：只有本表自身，以及"备选方案说明"「端口名对照」与 devlog / 方案文档的**历史修订记录**。
+除这三类之外的任何命中，都视为口径漂移，必须当场改掉。
+
+### 7. 待收敛项（必须显式登记，不许留在正文里当"或"）
+
+**禁止**在口径表、references 或源码注释里写"A 或 B"。确实未决定时登记到下表，
+并写明"必须在哪个阶段前经 ADR 收敛"——**下表为空即表示当前无未决项**：
+
+| 待收敛项 | 收敛时限 |
+| --- | --- |
+| 遮挡剔除：硬件遮挡查询 vs 软件分层 | V0.5 开工前经 ADR 收敛 |
+| LOD 接缝：裙边 vs 顶点吸附 | V0.5 开工前经 ADR 收敛 |
+
+> 表中两项目前写在 `references/meshing-and-render.md` §5，属 V0.5 才落地的细节；
+> 到该阶段仍未收敛，即视为违规。
 
 ## 适用范围
 
 **适用**：`engine/`、`voxel/`、`game/` 下的任何 C++ 改动；区块 / 生成 / 网格化 / 光照 / 流式加载 / 存档；
-构建配置、目录结构、第三方库引入；测试与 CI；性能优化。
+构建配置、目录结构、第三方库引入；测试与 CI；性能优化；**技术选型变更与口径同步（见上一节）**。
 
 **不适用**：纯玩法数值调整；与引擎无关的独立脚本工具。
 
@@ -46,6 +156,7 @@ description: Enforces this voxel engine repo's architecture and coding standards
 | 存档、序列化、压缩、版本迁移 | `references/save-and-serialization.md` |
 | 线程、任务系统、异步管线、GPU 上传 | `references/concurrency.md` |
 | 构建、Sanitizer、单元测试、CI | `references/build-and-tests.md` |
+| 输入、玩家控制、固定时间步长、方块破坏/放置、方块注册表与纹理层号 | `references/gameplay-v0.1.md` |
 
 只读与当前任务相关的那一份。
 
@@ -94,7 +205,9 @@ description: Enforces this voxel engine repo's architecture and coding standards
 - 常量正确性：能 `const` 一律 `const`。
 - 日志走统一日志宏 / 接口，不散落 `std::cout` / `printf`。
 - 注释：公共接口用 Doxygen 说明意图与前置条件；实现内不复述代码。
-- Shader：GLSL 源 + 自写 include 预处理，经 **SDL_shadercross** 离线编译为 SPIR-V（SDL3_gpu 必需）。
+- Shader：GLSL 源 + 自写 include 预处理，经 `glslc` → **SDL_shadercross** **两段式**离线编译，
+  **同时产出 SPIR-V 与 DXIL**（格式由渲染后端决定，只产一种会在另一种后端上断言失败）；
+  运行时按 `SDL_GetGPUShaderFormats()` 选择加载哪一种。见 ADR 0002。
 
 ## 四、性能预算（超出即视为缺陷）
 
@@ -229,6 +342,7 @@ description: Enforces this voxel engine repo's architecture and coding standards
 - [ ] 已在 `docs/devlog.md` 追加一条记录（做了什么 / 为什么 / 验证 / 遗留）
 - [ ] 本次解释的名词、答过的技术疑问、引入的新技术或工具，已记入 `docs/learning-notes.md`
 - [ ] 方案文档与实际代码同步
+- [ ] 技术选型有变更时，已按「同步清单」逐处更新，且未引入新的"A 或 B"并列写法（含源码注释）
 
 ## 八、发现冲突时
 

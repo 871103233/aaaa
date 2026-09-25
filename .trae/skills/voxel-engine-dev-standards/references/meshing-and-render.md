@@ -71,7 +71,10 @@
 
 ## 6. SDL3_gpu 专属约束
 
-- Shader 须**离线编译为 SPIR-V**：GLSL 源 + 自写 include 预处理，经 **SDL_shadercross**（或 glslc/dxc）产出 SPIR-V / DXIL / MSL。
+- Shader 须**离线编译为双格式**：GLSL 源 + 自写 include 预处理，经 `glslc` 产出 SPIR-V、
+  再由 **SDL_shadercross** 转为 DXIL，**两种都必须产出**（见 ADR 0002）。
+  Vulkan 只接受 SPIR-V、D3D12 只接受 DXIL，喂错会在 `SDL_CreateGPUShader` 处断言失败；
+  运行时按 `SDL_GetGPUShaderFormats()` 的返回值选择加载哪一种。
 - 渲染线程是**唯一**可调用图形 API 的线程；顶点数据由 Worker 产出"上传包"，渲染线程执行上传。
 - 命令缓冲支持多线程录制，但须按正确顺序提交。
 - 抽象粒度不足时（bindless texture、mesh shader、GPU-driven 管线）才考虑下沉到手写 Vulkan 后端（V1.0 之后）。

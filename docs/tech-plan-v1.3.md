@@ -103,7 +103,7 @@
 | 项目 | 选型 | 选型理由 |
 | --- | --- | --- |
 | 语言 | **C++** | 游戏引擎行业事实标准，性能可控、底层控制力强、生态成熟；Unreal / Godot / 几乎所有商业 3A 引擎核心都使用 C++；方便直接对接 OpenGL/Vulkan/Jolt 等 C API 与 C++ 库 |
-| 标准 | **C++17（主力），预留 C++20 升级路径** | C++17 提供 `std::optional`、`std::variant`、`std::string_view`、结构化绑定、`if constexpr`，足够覆盖引擎开发需求且三大编译器（MSVC/Clang/GCC）已全面支持；C++20 Modules/Concepts 能改善编译时间与接口约束，但 vcpkg 下部分三方库的 C++20 支持仍在过渡，**先用 C++17 保稳，子模块逐步试点 C++20** |
+| 标准 | **C++17（唯一标准）** | C++17 提供 `std::optional`、`std::variant`、`std::string_view`、结构化绑定、`if constexpr`，足够覆盖引擎开发需求且三大编译器（MSVC/Clang/GCC）已全面支持。**本项目只使用 C++17 及以下的语言与库设施**，由 `CMAKE_CXX_STANDARD 17` 与门禁脚本共同保证 | **备选项：C++20（Modules / Concepts / `std::jthread`）**。优点：编译时间与接口约束可改善；缺点：vcpkg 下部分三方库的 C++20 支持仍在过渡，且与现有门禁规则冲突。**当前不启用；确需引入时须另开 ADR，并同步解除门禁规则与 CMake 标准** |
 | 编译器 | **MSVC 2022（Windows 主开发），Clang（备用），GCC（Linux 验证）** | MSVC 调试体验（Edit and Continue、NatVis、可视化 STL 容器）在 Windows 下最强；Clang 报错信息更友好、跨平台行为一致，可作为 CI 第二编译器；GCC 为 Linux 默认选择 |
 
 > **备选项：Rust**。Rust 的所有权模型天然规避 UAF/数据竞争，且已有 Bevy 这样优秀的 ECS 引擎；但游戏引擎生态（图形调试、物理、模型加载、跨平台打包）整体仍落后 C++ 一到两个身位，体素引擎开源参考（如 bevy_voxel）规模与成熟度远不及 C++ 生态。**个人项目若以"学习引擎底层 + 长期可维护"为目标，C++ 仍是更稳妥的起步选择**；若你本人已经非常熟悉 Rust，Bevy + 自研 voxel 插件是一条可行但资料更少的路。
@@ -134,7 +134,7 @@
 | 项目 | 选型 | 选型理由 | 备选项与对比 |
 | --- | --- | --- | --- |
 | 架构模式 | **ECS（Entity-Component-System）** | 组合优于继承，避免"Entity → LivingEntity → Mob → Monster → Zombie"这种继承爆炸；数据按组件类型连续存储，CPU 缓存命中率高，体素世界里上千个怪物、掉落物、粒子天然适合批量处理 | **备选项 A：传统组件模式（GameObject + Component 指针链表，类似 Unity）**。优点：易理解；缺点：组件内存离散、每次虚函数调用都跳指针，批量更新性能差。**备选项 B：纯 OOP 继承树**。体素游戏实体种类多（方块、怪物、掉落物、弹射物、载具），继承树会迅速膨胀，不可维护。**结论：ECS 是现代游戏引擎的主流选择，选 ECS。** |
-| ECS 实现 | **自研稀疏集（Sparse Set）ECS** | 体素项目 ECS 只需要管理玩家、怪物、掉落物、粒子这类**动态实体**（数量级万级），不需要管理方块（方块是区块内数组，绝不放 ECS）。EnTT 功能强大但学习曲线陡、编译时间长；自研一个支持稀疏集 + 类型擦除视图的轻量 ECS 代码量约 1000~2000 行，完全可控 | **备选项：EnTT**。header-only、工业级、性能极高（Minecraft 社区多个项目在用）；缺点：模板代码极重，编译时间显著增加，错误信息几乎不可读；对单人项目，出 bug 调试成本高。**建议：V0.1 可直接用 EnTT 快速起步，V0.4 之前评估是否切换到自研（那时你已清楚自己用了 EnTT 百分之几的功能）。** |
+| ECS 实现 | **EnTT（起步，vcpkg 端口 `entt`）** | 体素项目 ECS 只需要管理玩家、怪物、掉落物、粒子这类**动态实体**（数量级万级），不需要管理方块（方块是区块内数组，绝不放 ECS）。EnTT header-only、MIT、工业级，省掉自研 ECS 的全部工期，让 V0.4 的精力留给生成与玩法 | **备选项：自研稀疏集（Sparse Set）ECS**。支持稀疏集 + 类型擦除视图的轻量实现约 1000~2000 行，换取编译期与依赖完全可控；缺点是需自担边界 bug，且属范围控制中的暂缓项。**切换条件：V0.4 评估 EnTT 的实际使用面（若只用到极少特性），经 ADR 决定是否切换。见 `docs/adr/0003-task-scheduler-and-ecs.md`** |
 | 所有权管理 | **`std::unique_ptr` 为主，`std::shared_ptr` 仅用于跨系统共享资源** | `unique_ptr` 零开销、所有权明确，适合 Engine、ChunkManager、Renderer 这类"有唯一拥有者"的对象；`shared_ptr` 有原子引用计数开销，不应滥用 | **备选项：裸指针 + 手动 new/delete**。性能最高但极易泄漏/悬垂，现代 C++ 项目不推荐；**只有在热路径、自定义分配器管理的内存里才允许裸指针持有**，接口层仍用智能指针。 |
 | 自定义分配器 | **对象池（Object Pool）+ 线性分配器（LinearAllocator）** | 对象池复用子弹、粒子、掉落物等高频创建销毁对象，避免堆碎片；线性分配器用于每帧临时数据（如构建中的网格顶点数组、culling 结果），帧末一次性重置，零碎片、极快 | **备选项 A：全用 `std::vector::reserve` 复用容器**。部分场景可行，但语义不如专用分配器清晰。**备选项 B：jemalloc / mimalloc 替换系统 malloc**。对大块分配有提升，但体素项目真正的热路径还是对象池和栈/线性分配。 |
 | 坐标类型 | **BlockPos 用 `int32`，WorldPos 用 `double`** | 单精度浮点在距离原点 2^24 格（约 1600 万格）时精度降到 1 格以下，超大世界会出现"远处方块抖动"；玩家/相机世界坐标必须用双精度，上传给 GPU 时再做"相对相机偏移"（Camera-Relative Rendering）转为单精度 | **备选项：全用 `float`**。距离玩家 8192 格外就会出现明显抖动，对超大世界不可接受。**备选项：全用 `int64`**。渲染管线需要浮点，转换成本高、Shader 端不自然。**结论："存储用 double、渲染时相对化"是业界标准做法。** |
@@ -256,7 +256,7 @@
 
 - **视距管理**：以玩家为中心，按曼哈顿/切比雪夫距离维护 `(2*viewDistance+1)^2` 个已加载区块；超出距离的区块卸载、释放内存。
 - **加载优先级**：按"玩家当前列 → 玩家面向方向前方 → 其他已加载区"三级队列调度，保证玩家面前不出现空洞。
-- **多线程异步任务系统**：**首选现成的高性能任务图库 enkiTS 或 Taskflow**（原生支持依赖计数与工作窃取，零自研成本），分阶段任务：
+- **多线程异步任务系统**：**采用现成的高性能任务图库 enkits**（vcpkg 端口名 `enkits`；原生支持依赖计数与工作窃取，零自研成本。见 `docs/adr/0003-task-scheduler-and-ecs.md`），分阶段任务：
   1. **生成阶段**（后台线程）：按种子生成方块数据；
   2. **光照阶段**（后台线程）：BFS 光照传播，注意跨区块边界；
   3. **网格阶段**（后台线程）：贪婪网格化，产出顶点/索引缓冲上传命令；
@@ -266,10 +266,11 @@
 - **双缓冲区块数据**：主线程渲染只读"当前版本"的区块网格，后台生成"新版本"，上传完成后原子指针交换，避免读写竞争。
 
 > **多线程模型对比**：
-> - **首选：直接套用 TaskFlow / enkiTS**。现成的现代任务图库，支持依赖计数与工作窃取，**零自研成本**，符合"低成本跑通 + 优先现有高性能库"原则。**推荐。**
-> - **备选项 A：自研无锁线程池 + 工作窃取（Work Stealing）**。最灵活、可裁剪，实现约 300 行；缺点是依赖图与唤醒逻辑易出竞态 bug（须用 TSan 验证），属"造轮子"。适合以学习为目的。
-> - **备选项 B：`std::async` / 每任务一线程**。实现最简单，但线程数不可控、频繁创建销毁开销大，**不推荐**。
-> - **与 Jolt 共享线程池的时序（原方案漏洞修正）**：Jolt 到 **V0.4** 才引入，而任务系统在 **V0.3** 就要用——**V0.3 阶段无 Jolt 可复用**，必须使用 TaskFlow/enkiTS（或自研）；**V0.4 引入 Jolt 后，再评估把 Jolt 的 JobSystem 桥接到同一线程池**，避免线程数翻倍。
+> - **采用：enkits**（vcpkg 端口名 `enkits`）。单 `.cpp` + `.h`，无 header-only 的重复解析开销；依赖用 `TaskSet` 的 prerequisites 显式表达，与"自身生成完成 + 4 邻居光照完成 → 网格化"这一依赖计数语义直接对应；zlib 许可。**见 `docs/adr/0003-task-scheduler-and-ecs.md`。**
+> - **备选项 A：Taskflow**（端口 `taskflow`）。DAG API 更直观（`precede` / `succeed` / subflow）、header-only 免构建；缺点是模板代码重，编译时间与错误信息质量明显变差。**默认不启用；切换条件见 ADR 0003。**
+> - **备选项 B：自研无锁线程池 + 工作窃取（Work Stealing）**。最灵活、可裁剪，实现约 300 行；缺点是依赖图与唤醒逻辑易出竞态 bug（须用 TSan 验证），属"造轮子"。**默认不启用；仅当以学习为目的且已过 V0.5 时考虑。**
+> - **本方案不采用的做法**：`std::async` / 每任务一线程 —— 线程数不可控、频繁创建销毁开销大（门禁脚本已机械拦截 `std::async`）。
+> - **与 Jolt 共享线程池的时序（原方案漏洞修正）**：Jolt 到 **V0.4** 才引入，而任务系统在 **V0.3** 就要用——**V0.3 阶段无 Jolt 可复用**，必须使用 enkits；**V0.4 引入 Jolt 后，再评估把 Jolt 的 JobSystem 桥接到同一线程池**，避免线程数翻倍。
 
 ### 4.4 体素专属渲染优化
 
@@ -361,15 +362,15 @@
 | ECS | **EnTT** [V]（起步） | 起步快速迭代；仅用于动态实体 | V0.4 之后评估自研稀疏集（约 2000 行，换取编译期与依赖可控） |
 | 动态物理 | **Jolt Physics** [V] | 现代、多线程、MIT | Bullet（较老、多线程弱）；PhysX（许可与编译体量） |
 | 3D 模型加载 | **Assimp** [V] [Later，V0.5] | 怪物模型时再引入 | cgltf + 自写 OBJ 加载器（轻量、格式覆盖少） |
-| 数据压缩 | **zstd** [V 或 Vendored] | 比 zlib 更快更高压缩率 | zlib（较慢）；LZ4（压缩率较低） |
+| 数据压缩 | **zstd 单文件 amalgamation** [Vendored 到 `third_party/`] | 比 zlib 更快、压缩率更高；单文件 amalgamation 零构建成本、格式完全可控 | **备选：zstd 走 vcpkg**（`zstd` 端口，省去手工更新 amalgamation，代价是依赖构建）；zlib（较慢）；LZ4（压缩率较低） |
 | 序列化 | **自写二进制 + zstd** | 区块序列化简单可控、零模板膨胀 | cereal（对象序列化、模板膨胀）；JSON/XML（仅适合 `level.dat` 等元数据） |
 | 脚本绑定 | **Lua 5.4 + sol2** [V] [V1.0+] | Lua 轻量、sol2 是现代 C++ 绑定 | Python + pybind11（解释器重、发布难）；LuaBridge（老旧） |
 | 调试 UI | **Dear ImGui** [V] | 即时模式 GUI，10 分钟集成调试面板 | Qt / CEF（体量大，事件循环冲突） |
 | 图形调试 | **RenderDoc** | Vulkan / D3D12 / OpenGL 截帧首选，与 SDL3_gpu 的 Vulkan/D3D12 后端配合良好 | PIX（仅 D3D）；Nsight（绑 NVIDIA）；Metal 后端改用 Xcode Metal Debugger |
 | 帧/性能分析 | **Tracy** [Vendored] | 专为游戏引擎设计，CPU/GPU/内存/锁全看到 | VS Profiler（辅助）；Intel VTune（微架构级，底层优化时用） |
 | 内存错误检测 | **ASAN/UBSAN** | 编译器内置，比 Valgrind 快一个数量级 | Valgrind（Windows 不可用且慢）；TSan（仅 Linux/Clang，且与 ASAN 互斥，需独立配置） |
-| 任务调度 | **enkiTS / Taskflow** [V] | 现成任务图库，原生支持依赖计数与工作窃取，免自研 | 自研无锁线程池（学习目的，依赖图易出竞态） |
-| Shader 工具链 | **SDL_shadercross**（SDL 官方）/ glslc / dxc | 把 GLSL/HLSL 交叉编译为 SPIR-V/DXIL/MSL，SDL3_gpu 必备 | 运行时编译 GLSL（仅改用手写 OpenGL 方案时可用） |
+| 任务调度 | **enkits** [V]（vcpkg 端口名 `enkits`） | 现成任务图库，原生支持依赖计数与工作窃取，免自研；单 `.cpp` + `.h`，无 header-only 的重复解析开销 | **备选：Taskflow**（[V] 端口 `taskflow`，DAG API 更直观，代价是编译时间与错误信息质量）；**自研无锁线程池**（学习目的，依赖图易出竞态，须 TSan 验证）。**默认均不启用，切换条件见 `docs/adr/0003-task-scheduler-and-ecs.md`** |
+| Shader 工具链 | **`glslc` → `SDL_shadercross` 两段式**（vcpkg 端口 `shaderc` + `sdl3-shadercross`，均以 host 依赖声明） | 把 GLSL 交叉编译为 **SPIR-V + DXIL 双格式**，SDL3_gpu 必备；无需 Vulkan SDK（见 ADR 0002） | **备选：dxc 直接产出 DXIL**（省去一段转换，但要维护 HLSL 源，且 Vulkan 仍需 SPIR-V）；运行时编译 GLSL（仅改用手写 OpenGL 方案时可用） |
 | 单元测试 | **GoogleTest** [V] | 与 CTest 集成成熟、社区最大 | Catch2（轻量）；doctest（编译最快） |
 | 网络（多人联机） | **GameNetworkingSockets** [V] [V1.0+] | Valve 出品、加密+NAT 穿透 | ENet（无加密、无 NAT 穿透）；RakNet（已停更） |
 
@@ -397,7 +398,7 @@
 - **异步加载**：所有资源（纹理、网格、音效、Shaders）通过 `AssetManager::LoadAsync<T>()` 返回 `shared_future<T*>`，后台线程加载、主线程可用。
 - **引用计数**：`AssetPtr<T>` 本质是带引用计数的句柄，归零自动卸载（或进入 LRU 队列延迟卸载）。
 - **热重载（Hot Reload）**：文件系统 watcher（SDL3 提供目录监视 API，或用 inotify/ReadDirectoryChanges）检测资源文件变更，自动重载 Shader/纹理/Lua 脚本；开发期改 Shader/纹理不用重启游戏。
-- **支持格式**：纹理（.png/.jpg/.dds，BCn 压缩在加载时离线做一次）；模型（.glb/.gltf 通过 Assimp）；音频（.wav/.ogg，SDL3 内置）；Shader（.glsl，自写 include 预处理，并经 SDL_shadercross 离线编译为 SPIR-V 供 SDL3_gpu 使用）。
+- **支持格式**：纹理（.png/.jpg/.dds，BCn 压缩在加载时离线做一次）；模型（.glb/.gltf 通过 Assimp）；音频（.wav/.ogg，SDL3 内置）；Shader（.glsl，自写 include 预处理，经 `glslc` + SDL_shadercross 离线编译为 **SPIR-V + DXIL 双格式**供 SDL3_gpu 使用，见 ADR 0002）。
 - **资源打包（V1.0+）**：发布时把 assets/ 打包成自定义 `.pak` 文件（简单的"文件名 → 偏移/大小/CRC"表 + zstd 压缩），减少小文件 IO。
 
 ### 6.3 场景编辑器（Editor）
@@ -463,7 +464,7 @@
 - 实现**面剔除**（先做朴素 culled meshing，greedy 留到 V0.2）。
 - 放置 / 破坏方块 + 射线检测（DDA 算法）。
 - 玩家自由视角 + WASD 走动、跳跃、重力 + 自研 AABB 碰撞（不接 Jolt）。
-- 技术栈：CMake + SDL3（窗口 + 输入 + **SDL3_gpu 渲染**）+ GLM + stb_image + Dear ImGui 调试面板；Shader 用 SDL_shadercross 离线编译为 SPIR-V。
+- 技术栈：CMake + SDL3（窗口 + 输入 + **SDL3_gpu 渲染**）+ GLM + stb_image + Dear ImGui 调试面板；Shader 经 `glslc` + SDL_shadercross 离线编译为 **SPIR-V + DXIL 双格式**（见 ADR 0002）。
 - **固定时间步长主循环 + 渲染插值**（见 §3.2），以及极简 CVar/调试控制台（传送、切视距、暂停区块更新）。
 - 里程碑：能在一个 16×16×16 的方块堆里飞来飞去、放块拆块。
 - **验收标准（V0.1 完成判据，逐项可测）**：
@@ -493,7 +494,7 @@
 
 ### V0.3 流式加载（预计 3~4 周）
 
-- 实现任务系统（**首选 enkiTS / Taskflow**，见 §4.3）+ 异步区块生成/网格构建/卸载；Linux/Clang 配置启用 **TSan** 跑竞争检测（Windows 用 ASAN，两者互斥需分开配置）。
+- 实现任务系统（**采用 enkits**，vcpkg 端口名 `enkits`；见 §4.3 与 `docs/adr/0003-task-scheduler-and-ecs.md`）+ 异步区块生成/网格构建/卸载；Linux/Clang 配置启用 **TSan** 跑竞争检测（Windows 用 ASAN，两者互斥需分开配置）。
 - 区块依赖调度（邻居就绪才建网格）。
 - 渲染距离拉到 **8 区块**。
 - 脏区块 zstd 压缩序列化到区域文件（`.voxr`），退出/进入存档可持久化玩家修改。
@@ -545,13 +546,20 @@
 2. **CMake ≥ 3.21** 与 **Ninja** —— 随 VS 安装即可，或使用官方安装包。
 3. **vcpkg** —— `git clone https://github.com/microsoft/vcpkg`，运行 `bootstrap-vcpkg.bat`，并设置环境变量 `VCPKG_ROOT`。
 4. **锁定依赖基线（必做）** —— 在仓库根执行 `vcpkg x-update-baseline --add-initial-baseline`，把生成的 `builtin-baseline` 提交进 `vcpkg.json`；否则各开发机与 CI 的依赖版本会漂移。
-5. **Shader 工具链** —— 安装 Vulkan SDK（含 `glslc`）或 SDL 官方 `SDL_shadercross`；本项目 Shader 在**构建期**编译为 SPIR-V。
+5. **Shader 工具链** —— 已并入 vcpkg：`vcpkg.json` 以 **host 依赖**声明 `shaderc`（给 `glslc`）与
+   `sdl3-shadercross`（给 `shadercross`），随 `cmake --preset` 自动装入，**无需单独安装 Vulkan SDK**。
+   本项目 Shader 在**构建期**编译为 **SPIR-V 与 DXIL 双格式**（见 `docs/adr/0002-shader-dual-format-pipeline.md`）。
 6. **ccache / sccache**（可选）—— 加速重复编译。
 7. **Git + Git LFS** —— 初始化仓库并启用 LFS（PNG / FBX / 音效走 LFS）。
 8. **调试工具** —— RenderDoc（截帧分析）、Tracy（性能）。
 9. **环境核验** —— `cmake --preset debug` 与 `ctest --preset debug` 均成功，即视为环境就绪。
 
-> **当前开发机核查记录（2026-09-25）**：`cmake / ninja / glslc / dxc / vcpkg / MSVC(cl) / clang-cl / git` **均未安装**，仅 Python 可用。**环境尚未就绪，上述 1~4 项为开工前置条件。**
+> **当前开发机核查记录（2026-09-25）**：`cmake 4.4.3 / ninja 1.13.2 / sccache 0.17.0 / vcpkg 2026-07-27 /
+> MSVC 工具集 14.44.35207 / clang 23.1.2 / git 2.55.0` **均已安装**，`VCPKG_ROOT=D:\dev\vcpkg`；
+> `glslc` 与 `shadercross` 由 vcpkg 提供。**Python 仍未安装**（纹理打包工具需要时再补）。
+> 上述 1~4 项已满足。
+>
+> 旧记录（称工具"均未安装、仅 Python 可用"）已被实测推翻，过程见 [devlog.md](devlog.md) 2026-09-25 第 3 条。
 
 ### 9.2 建议目录结构
 
@@ -634,6 +642,7 @@ project/
 ---
 
 *文档版本：v1.3（表述极性修订版）｜ 生成日期：2026-09-25*
+*口径统一补丁 A（2026-09-25，不改版本号）：按技能规范「技术栈口径统一与变更传播」清理未收敛与漂移表述——① 标准由「C++17 主力 + 预留 C++20」收敛为 **C++17 唯一标准**（C++20 移入备选，引入须走 ADR）；② §3.2 ECS 实现由「自研稀疏集」更正为 **EnTT（起步）**，自研移入备选并给出 V0.4 切换条件，消除与 §5 / §9.2 的内部矛盾；③ 任务调度由「enkiTS / Taskflow」收敛为 **enkits**（vcpkg 端口名 `enkits`），Taskflow 与自研无锁池移入备选，见 `docs/adr/0003-task-scheduler-and-ecs.md`；④ §5 zstd 由"引入方式未定"收敛为 **Vendored 单文件 amalgamation**，vcpkg 走法移入备选；⑤ §5 Shader 工具链由「三工具斜杠并列」收敛为 **`glslc` → `SDL_shadercross` 两段式**；⑥ 同步 §6.2 资源格式中遗留的"仅 SPIR-V"表述为双格式。*
 *修订说明（v1.3）：按「正向优先」原则做表述极性修订，降低否定项被误读为待办的风险——① 文档顶部新增「阅读约定」，明确「采用」为实际决策、「备选方案」默认不启用、「暂缓项」属范围控制而非待办；② §5 第三方库表列名由「备选 / 不选」改为「备选方案（默认不启用）」，18 行单元格由「不选 X」改写为中性备选表述；③ §7 表头由「禁忌 / 正确做法」改为「需绕开的写法 / 必须执行」并加使用说明；④ §4.2 结构生成改为正向主导，移除具名的被否方案及其「何时可用」邀请式说明，改以「约束」条目表达；⑤ 清理 §4.7 序列化条目、§5 学习参考与结语中的具名否定，全部改为正向表述。*
 *修订说明（v1.2）：按"低成本跑通 + 优先现有高性能库"原则统一全部矛盾项——① 渲染后端定稿为 **SDL3_gpu**（后端为 Vulkan/D3D12/Metal，含 Shader 离线编译为 SPIR-V），手写 OpenGL 3.3 移入备选项，Vulkan 接入时点统一为 V1.0；② 新增 **§3.2「主循环与时间步」**（固定时间步长 + 渲染插值）；③ 任务系统首选 **enkiTS/Taskflow**，修正与 Jolt 的引入时序，移除 C++20 `std::jthread`；④ 光照内存由 48 KB **更正为 96 KB**，内存估算**分列 CPU 内存与显存**；⑤ 明确贪婪合并**作用域 = 单 Section**、新增 **UV 平铺约定**、预留 **AO 合并判据**；⑥ 碰撞查询单位由"3×3×3 section"**更正为"3×3×3 方块"**；⑦ Draw Call 目标改为**按视距分档（≤1500/24 区块）**，MDI 列为优化备选；⑧ **TSan 限定 Linux/Clang** 并与 ASAN 拆分配置；⑨ 补齐固定时间步长、单元测试（GoogleTest + CTest）、存档版本迁移、Tracy 排期等缺失项；⑩ 更正 SDL3_gpu 后端范围与 SDL3 发布年份。*
 *上一版（v1.1）修订说明：修复排版回归；补入 Section/Palette 分段存储、内存估算与视距对齐、网格抖动替代泊松盘、子步进+自动上台阶修正碰撞建议、Greedy 提前到 V0.2、方块实体、双精度坐标、Texture Array、zstd 替换 cereal、GameNetworkingSockets 替换 ENet/RakNet、删除 Box2D、SDL3 统一音频；技术选型补全选型理由与备选项对比。*

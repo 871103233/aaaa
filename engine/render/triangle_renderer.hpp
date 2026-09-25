@@ -6,11 +6,11 @@
 
 namespace vx {
 
-/// 最小渲染路径：加载 SPIR-V、建立图形管线、绘制一个三角形。
+/// 最小渲染路径：加载构建期产出的 Shader 字节码、建立图形管线、绘制一个三角形。
 ///
 /// 存在意义是**验证风险假设**，而不是提供渲染能力：
 ///   1. SDL3_gpu 能否在本机创建设备并拿到交换链；
-///   2. 离线编译出的 SPIR-V 能否被 SDL3_gpu 接受。
+///   2. 构建期产出的 **SPIR-V + DXIL 双格式**（见 ADR 0002）能否被 SDL3_gpu 接受。
 /// 验证通过后，本类会被真正的 ChunkRenderer 取代。
 class TriangleRenderer {
 public:

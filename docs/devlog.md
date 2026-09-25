@@ -65,3 +65,61 @@
   3. **测试**：`ctest --preset debug` → **6/6 passed**（`ChunkStateMachine` ×5、`ChunkGeometry` ×1），0.16s
   4. **运行**：进程持续运行且 `Responding = True`；窗口标题 `Voxel Engine - SDL3_gpu smoke test`，窗口 1296×759；截屏采样 109296 像素中 **10441（9.6%）为高饱和亮像素**、最大饱和度 176 → 彩色三角形确实已渲染
 - 下一步 / 遗留：① CI 尚未跑绿——`vcpkg.json` 未含 `shaderc` / `sdl3-shadercross` 的 host 依赖，CI 上 Shader 会被跳过（构建能过但程序跑不起来），需决定是否补入；② Python 未装；③ 技能与方案文档的 Shader 表述待同步；④ 之后进入 V0.1 正式开发（单区块 + 面剔除 + 破坏放置 + 走动跳跃）。
+
+---
+
+## 2026-09-25  规范补「会话交接」约定；Shader 双格式与常驻文档入库
+
+- 做了什么：提交并推送 `a81aaaf`（9 个文件，+848 / −85）——Shader 双格式管线、`ci.yml` 保守重写、`CMakePresets.json` 补 `testPresets`、`vcpkg.json` 补 `builtin-baseline`，并新增三份常驻文档 `docs/devlog.md`、`docs/file-index.md`、`docs/learning-notes.md`。随后在 `SKILL.md` 的「阅读约定」下新增两节——**会话启动先读 5 份「交接包」**、**会话边界按任务阶段开新会话**，并扩展 frontmatter `description`，让新会话开场即触发本技能加载。
+- 为什么：项目知识此前只活在对话里，换会话即丢失。把"读什么、按什么顺序读、什么情况换会话、换之前必须落盘"写成硬规则，交接才不依赖人记——这是"能让完全不会写代码的人接手"这条门槛的最后一环。
+- 验证：`SKILL.md` 结构完整（frontmatter 仍为合法 YAML 纯量，无引号无冒号），两节均位于「阅读约定（先读这一节）」之下、先于「技术白名单」；`git log --oneline` 显示 `a81aaaf` 已推送，`main` 与 `origin/main` 同步、工作树干净。
+- 下一步 / 遗留：① **Trae 的 Markdown 预览只渲染标题**——文件侧已排除（无 BOM、纯 LF、无 Tab/全角空格/零宽字符、无 HTML 注释或标签、代码围栏成对、正文行号可查），GitHub 渲染正常；已按官方排错在 `~/.trae/argv.json` 加 `"disable-hardware-acceleration": true`，**待重启 Trae 验证**。② `vcpkg.json` 未含 `shaderc` / `sdl3-shadercross`，CI 上 Shader 会被跳过（能编过但跑不起来），需决定是否补入。③ `LICENSE` 的 `<COPYRIGHT HOLDER>` 仍是占位符。④ 下一阶段：开新会话进入 V0.1（单区块 + 面剔除 + 破/放方块 + 走动跳跃）。
+
+---
+
+## 2026-09-25  补齐五处规范欠账：NOTICE 回归、ADR 0002、host 依赖、门禁边界、V0.1 玩法引用
+
+- 做了什么：
+  1. **修复 `NOTICE.md` 回归**——上一次未提交的表格重排顺手删掉了「待办」下的全部 3 条清单，并把 RenderDoc 行的「引入阶段」误写成"区块状态机与跨区块唯一判据V0.1"。本次回填待办、修正该单元格，并新增 `shaderc`（`glslc`，Apache-2.0）一行（因它本次成了直接依赖）。
+  2. **新增 `docs/adr/0002-shader-dual-format-pipeline.md`**（SPIR-V + DXIL 双格式并存：背景、决策、备选对比、后果、重现条件），并在 ADR 0001 头部加「后续更新」互链而不回改其正文。同步 6 处旧表述：`SKILL.md` 技术白名单与第三节编码约定、`references/meshing-and-render.md` §6、`tech-plan-v1.3.md` §8 V0.1 与 §9.1 环境清单及其过时核查记录、`engine/platform/window.cpp` 的 `pick_shader_format` 注释。
+  3. **`vcpkg.json` 补 `shaderc` / `sdl3-shadercross` 的 host 依赖**（`{ "name": "...", "host": true }`），并在 `references/build-and-tests.md` §1 写明 host 依赖写法、以及它会传递性拉入 `sdl3[vulkan]` 等带来的首次 configure 代价。
+  4. **门禁补 `no-rand` 规则**（`rand()` / `srand()` 破坏生成确定性），自检用例 14 → 18；修正 `.PARAMETER IncludeDir` 注释（漏了 `tests`）；`references/build-and-tests.md` 新增 §6.1「门禁的覆盖边界」，列明哪些红线不可机械化、只能靠 DoD 自检与评审；`learning-notes.md` 的 DoD 条目数 12 → 13，并把 ADR、双格式 Shader、门禁三处交叉引用补齐。
+  5. **新增 `references/gameplay-v0.1.md`**（主循环与固定时间步 / 输入 / 玩家移动与碰撞调用侧约定 / DDA 拾取与破坏放置 / `blocks.toml` / `layers.toml` / 调试设施 / 内存与日志 / 两张表的交叉一致性），并在 `SKILL.md` 任务路由表补对应行。
+- 为什么：这五条都是架构审查查出的「文档与实测不符」或「规则覆盖不全」，属 DoD 的「方案文档与实际代码同步」欠账。留着的直接后果是下一个人或 AI 会按已推翻的旧结论施工——只编 SPIR-V、以为必须装 Vulkan SDK、以为 CI 上 Shader 工具链可以缺。**附带更正**：上一条记录的「验证」写成"工作树干净"，但该记录所述工作当时并未提交，且其未提交的 `NOTICE.md` 改动含有信息丢失——「工作树干净」不应在未提交时写入。
+- 验证：
+  1. 门禁：`powershell -NoProfile -File .trae/skills/voxel-engine-dev-standards/scripts/check-banned-identifiers.ps1 -SelfTest` → `Self-test passed: 18 case(s)`；同脚本 `-RepoRoot .` → `Banned-identifier gate: scanned 7 file(s), 0 violation(s). PASS`，退出码 0。
+  2. 依赖安装：`cmake --preset debug` → vcpkg 装入 9 个包（新增 `shaderc 2026.2`、`sdl3-shadercross 3.0.0-preview2`，连带 `glslang`、`spirv-tools`、`spirv-cross`、`directx-dxc`），`Configuring done (505.7s)`，退出码 0。
+  3. **host 依赖确实让工具可见（CI 路径已证）**：先 `cmake --preset debug -U VOXEL_GLSLC -U VOXEL_SHADERCROSS` 清掉缓存里的旧搜索值使其重新搜索 → `Configuring done (3.0s)`，得
+     `VOXEL_GLSLC = D:/…/build/debug/vcpkg_installed/x64-windows/tools/shaderc/glslc.exe`、
+     `VOXEL_SHADERCROSS = D:/…/build/debug/vcpkg_installed/x64-windows/tools/sdl3-shadercross/shadercross.exe`。
+     即工具来自**本工程**的 `vcpkg_installed`，不依赖全局 vcpkg 或手工 `PATH`。
+  4. 编译：`cmake --build --preset debug` → 7/7 目标，退出码 0，零错误零警告（`/W4` + `/WX`）；
+     `build/debug/assets/shaders/` 下 `triangle.vert.spv`(1260B) / `triangle.vert.dxil`(3308B) / `triangle.frag.spv`(432B) / `triangle.frag.dxil`(2844B) **四种产物齐全**。
+  5. 测试：`ctest --preset debug` → **6/6 passed**，总耗时 0.18s。
+- 下一步 / 遗留：① `NOTICE.md` 中新增的 `shaderc` 与既有 `enkiTS` / `Taskflow` / `Lua 5.4` / `sol2` / `SDL_shadercross` 仍标 `*`（未逐字核对上游 LICENSE）。② `LICENSE` 的 `<COPYRIGHT HOLDER>` 仍是占位符。③ 本轮只验证了本机链路，**CI 仍未实测**；注意 `sdl3-shadercross` 会连带要求 `sdl3[vulkan]`，Linux 侧需 `libvulkan-dev`（`ci.yml` 现有步骤已装）。④ Python 仍未安装。⑤ `references/build-and-tests.md` 的命令示例全写 `pwsh`，而本机只有 Windows PowerShell 5.1，需临时改用 `powershell`；待决定是改示例还是在文档注明二者等价。⑥ 下一阶段：开新会话进入 V0.1（单区块 + 面剔除 + 破/放方块 + 走动跳跃），施工按 `references/gameplay-v0.1.md`。
+
+---
+
+## 2026-09-25  收敛两项未决选型；技能新增「技术栈口径统一」机制
+
+- 做了什么：
+  1. **收敛两处从未拍板的选型**（原文长期写成"A 或 B"，无法据以开工）：
+     - 任务调度 → **enkits**（vcpkg 端口名 `enkits`，无连字符）；未采纳的 Taskflow 与自研无锁线程池写入备选并给出切换条件。
+     - ECS → **EnTT（起步）**；未采纳的自研稀疏集写入备选，切换条件为"V0.4 评估 EnTT 实际使用面"。
+     新建 `docs/adr/0003-task-scheduler-and-ecs.md` 承载两项的备选对比表与切换条件（上一轮 ADR 0002 只修了"结果"，本轮补的是"从未决策"）。
+  2. **消除方案文档的内部矛盾**：§3.1 标准由"C++17 主力 + 预留 C++20 / 子模块逐步试点"收敛为 **C++17 唯一标准**（C++20 移入备选并要求引入走 ADR，与 `CMAKE_CXX_STANDARD 17` 及门禁规则一致）；§3.2「ECS 实现」选型列由"自研稀疏集"更正为 **EnTT**，消除与 §5 / §9.2 / 技能范围控制的矛盾。
+  3. **钉死两处模棱表述**：§5 zstd 由"引入方式未定"→ **Vendored 单文件 amalgamation**；§5 Shader 工具链由三工具斜杠并列 → **`glslc` → `SDL_shadercross` 两段式**；并同步 §6.2 资源格式里遗留的"仅 SPIR-V"。
+  4. **技能新增防复发机制**：`SKILL.md` 原「技术白名单」升级为「**技术栈：单一事实来源与口径统一**」，含 7 小节——三层职责（**权威层**方案+ADR / **索引层**唯一口径表 / **执行层** references）、唯一口径表（一格一个值并标注权威位置）、vcpkg 端口名与业界通称对照、**选型变更四步流程**、**同步清单 9 项**（第 9 项"源码注释"是上轮实际漏掉的那类）、**口径漂移自查**（可执行的 Grep 关键词表）、**待收敛项登记表**（现登记"遮挡剔除方案"与"LOD 接缝"两项，均要求 V0.5 开工前经 ADR 收敛）。DoD 由 13 项增至 **14 项**：选型变更须按同步清单逐处更新且不得引入新的"A 或 B"。
+  5. **按同步清单逐处执行**（这是新规则第一次被自己执行）：`references/concurrency.md`（任务调度口径 + 移除与 ADR 重复的选型理由）、`references/build-and-tests.md`（端口名规则）、门禁脚本 `no-std-async` 的 `Required` 文案、`NOTICE.md`（`enkits（enkiTS）`）、`docs/file-index.md`（`vcpkg.json` 约束列补 host 声明与端口名要求）、`cmake/Shaders.cmake` 两条缺工具提示（原文让用户"安装 Vulkan SDK"，与 ADR 0002 结论冲突）、`game/CMakeLists.txt`、`engine/render/triangle_renderer.hpp`、`assets/shaders/triangle.vert`、`docs/learning-notes.md`（A 区两个名词条目 + B 区 ADR / DoD 条目 + D 区白名单条目并新增 SSOT 条目）。
+  6. 顺带修掉一处**非本次引入但同类**的隐患：`docs/file-index.md` 工作区文件是 CRLF，与本仓库"纯 LF、无 BOM"的约定（也是 Trae 预览排查时确认过的约束）不符，已归一化；现全仓库已跟踪文件与新文件均为纯 LF、无 BOM。
+- 为什么：ADR 0002 修的是"结论写错了"，但病根是**同一决策在多处重复展开、且没有同步清单**——只改结论不改机制，下次照样漂移。本次把"技术结论只在权威层展开一次，其它层只能引用"写成硬规则，并配 9 项同步清单 + 一组可执行的 Grep 自查，让"漏同步"从"靠人记住"变成"有清单可逐项核对、有命令可验证"。同时，两处"A 或 B"若不在此刻收敛，V0.3 开工时仍要停下来做选型仲裁。
+- 验证：
+  1. 门禁：`-SelfTest` → `Self-test passed: 18 case(s)`；`-RepoRoot .` → `scanned 7 file(s), 0 violation(s)`，退出码 0。
+  2. **口径漂移自查**（按 `SKILL.md` 第 6 节的 Grep 表逐条跑）：
+     - `或 \*\* | / \*\* | V 或 Vendored` → 仅命中 `SKILL.md` 自查表自身 1 处（该行就是关键词表，属预期）；
+     - `enkiTS | Taskflow` → 余 17 处**全部**为端口名对照、备选说明、ADR 历史陈述、devlog 历史与自查表自身，**无并列候选残留**；
+     - `自研稀疏集 | 自研 ECS | 预留 C++20 | 逐步试点` → 余下命中同样全部落在备选说明 / 历史修订记录 / 范围控制（"自研 ECS → 直接用 EnTT"）。
+  3. 构建：`cmake --preset debug` → `Configuring done (2.7s)`；`cmake --build --preset debug` → 6/6 目标、退出码 0、**零警告**（`/W4` + `/WX`），Shader 双格式重新产出。
+  4. 测试：`ctest --preset debug` → **6/6 passed**，0.07s。
+  5. 行尾与编码：全仓库已跟踪文件 + 3 个新文件，CR 字节 = -1、BOM = False。
+- 下一步 / 遗留：① 本轮与上一轮改动**均未提交**（累计 17 改 + 3 新）。② `NOTICE.md` 标 `*` 的许可仍未逐字核对；`LICENSE` 的 `<COPYRIGHT HOLDER>` 仍是占位符。③ CI 仍未实测。④ 待收敛项表两项（遮挡剔除、LOD 接缝）**必须在 V0.5 开工前经 ADR 收敛**，否则按违规处理。⑤ 下一阶段：开新会话进入 V0.1（单区块 + 面剔除 + 破/放方块 + 走动跳跃），施工按 `references/gameplay-v0.1.md`。

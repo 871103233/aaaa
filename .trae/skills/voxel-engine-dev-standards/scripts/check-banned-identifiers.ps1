@@ -12,6 +12,12 @@
     The rule table in $rules below is the single source of truth for banned identifiers.
     The prose guidance stays positive; only this script names the banned tokens.
 
+    Scope: only mechanically detectable prohibitions live here. Red lines that need
+    semantic judgement (blocking IO on the main thread, float world coordinates,
+    new/delete on hot paths, meshing before neighbours are lit) are NOT covered by this
+    gate; they rely on the DoD checklist and code review. The boundary is documented in
+    references/build-and-tests.md section 6.
+
     Matching is line based. When a rule genuinely must be mentioned (unit tests,
     generators, migration tools), waive it with an inline comment on the same line:
 
@@ -23,7 +29,7 @@
     looking for .git / CMakePresets.json / CMakeLists.txt / vcpkg.json.
 
 .PARAMETER IncludeDir
-    Directories to scan, relative to the repository root. Default: engine voxel game editor.
+    Directories to scan, relative to the repository root. Default: engine voxel game editor tests.
 
 .PARAMETER SelfTest
     Run the built-in fixture cases only (validates the rule regexes) and do not scan.
@@ -64,7 +70,7 @@ $rules = @(
     [pscustomobject]@{
         Name     = 'no-std-async'
         Pattern  = '\bstd::async\b'
-        Required = 'use enkiTS or Taskflow for task scheduling'
+        Required = 'use enkits (vcpkg port name: enkits) for task scheduling'
     }
     [pscustomobject]@{
         Name     = 'no-rtti'
@@ -85,6 +91,11 @@ $rules = @(
         Name     = 'no-gl-direct'
         Pattern  = '#\s*include\s*[<"](?:GL/|glad/|glew/|GLFW/|glfw3)'
         Required = 'route rendering through SDL3_gpu (GL headers belong in the platform wrapper only)'
+    }
+    [pscustomobject]@{
+        Name     = 'no-rand'
+        Pattern  = '\b(?:rand|srand)\s*\('
+        Required = 'generation must be deterministic: derive from the 64-bit seed (splitmix64 / xxhash)'
     }
 )
 
@@ -119,6 +130,10 @@ function Invoke-SelfTest {
         @{ Line = 'ChunkedJitteredGrid grid(seed);';      Rule = 'no-poisson';       Expect = $false }
         @{ Line = '#include <glad/glad.h>';               Rule = 'no-gl-direct';     Expect = $true  }
         @{ Line = '#include <SDL3/SDL_gpu.h>';            Rule = 'no-gl-direct';     Expect = $false }
+        @{ Line = 'int v = rand() % 4;';                  Rule = 'no-rand';          Expect = $true  }
+        @{ Line = 'srand(1234);';                         Rule = 'no-rand';          Expect = $true  }
+        @{ Line = 'int v = splitmix64(seed)';             Rule = 'no-rand';          Expect = $false }
+        @{ Line = 'int v = RandomRange(a, b);';           Rule = 'no-rand';          Expect = $false }
     )
 
     $failed = 0

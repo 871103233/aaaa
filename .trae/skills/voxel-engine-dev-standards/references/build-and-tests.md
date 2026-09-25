@@ -8,8 +8,23 @@
 - 一键构建：`cmake --preset debug` → `cmake --build --preset debug`。
 - Presets 覆盖 `Debug` / `Release` / `RelWithDebInfo` / ASAN / TSan。
 - 编译参数一律进 `CMakePresets.json`；不在聊天记录或手工 IDE 配置中留存。
-- 依赖策略：需要预编译的库（SDL3 / Jolt / Assimp / EnTT / enkiTS）走 vcpkg manifest；
+- 依赖策略：需要预编译的库（SDL3 / Jolt / Assimp / EnTT / enkits）走 vcpkg manifest；
   header-only 库（stb、FastNoiseLite、zstd amalgamation）可直接 vendoring 到 `third_party/`。
+- **一律用 vcpkg 端口名，不用业界通称**：`enkits`（不是 `enkiTS` / `enki-ts`）、`entt`、`sdl3`、`gtest`、`glm`。
+  通称与端口名的对照表见主文件「技术栈：单一事实来源与口径统一」第 3 节。
+- **构建期工具必须写成 host 依赖**：工具类依赖（`shaderc` 提供的 `glslc`、`sdl3-shadercross` 提供的
+  `shadercross`）要用对象形式并置 `"host": true`：
+
+  ```json
+  { "name": "shaderc", "host": true }
+  ```
+
+  原因：普通字符串写法（`"shaderc"`）会被当作**目标平台库**处理，不保证把可执行工具放进
+  CMake 的 `find_program` 搜索路径；`host: true` 用 host triplet 构建并暴露工具，
+  开发机与 CI 都不必手工配 `PATH`。缺工具时 `cmake/Shaders.cmake` 只警告、不阻断配置，
+  代价是程序在**运行期**才因缺 `.spv` / `.dxil` 失败 —— 所以 CI 必须把工具装齐。
+- **注意 host 依赖会传递性地带上其依赖的特性**：例如 `sdl3-shadercross` 会拉入 `sdl3[vulkan]`
+  与 `directx-dxc` / `spirv-cross` / `glslang`，首次 configure 时间明显变长（不是卡住）。
 
 ## 2. 编译器与警告
 
@@ -60,7 +75,7 @@
   # 显式指定仓库根
   pwsh -File .trae/skills/voxel-engine-dev-standards/scripts/check-banned-identifiers.ps1 -RepoRoot .
 
-  # 只跑内置自检，验证规则正则是否符合预期（14 例，不扫描仓库）
+  # 只跑内置自检，验证规则正则是否符合预期（18 例，不扫描仓库）
   pwsh -File .trae/skills/voxel-engine-dev-standards/scripts/check-banned-identifiers.ps1 -SelfTest
   ```
 
@@ -74,6 +89,24 @@
 
 - **接入 CI**：在构建步骤**之前**执行，非 0 即终止。
 - **扩展方式**：新增结构性规则时，只修改脚本 `$rules` 并补一条 `-SelfTest` 用例；不要在正文里堆叠禁令。
+
+### 6.1 门禁的覆盖边界（重要）
+
+门禁只覆盖**可机械识别**的禁令。红线表里的另一些条目需要语义判断，**门禁抓不到**，
+必须靠第六节 DoD 自检与代码评审兜住 —— 不要因为它们没报警就以为合规：
+
+| 已入 `$rules`，机械拦截 | 门禁**不覆盖**，靠 DoD 自检 + 评审 |
+| --- | --- |
+| C++20 Modules / `std::jthread` / `std::async` | 红线 2：主线程同步加载 / 生成 / IO |
+| RTTI（`dynamic_cast` / `typeid`） | 红线 6：用 `float` 表示世界坐标 |
+| cereal 等序列化库 | 红线 9：对区块加粗粒度锁（单写者 + 快照） |
+| Poisson / Bridson（须用网格抖动） | 红线 10：热路径 `new` / `delete`、滥用 `shared_ptr` |
+| 直接 include GL / GLFW 头文件 | 红线 11：可变 `deltaTime` 直接驱动物理与角色 |
+| `rand()` / `srand()`（生成须确定性） | 红线 12：邻居未达 `Lit` 就建网格 |
+| | 红线 14：用归一化 0~1 UV 直接采大四边形 |
+| | 红线 16：每帧全量重算光照 / 整 Chunk 重建 |
+
+新增可机械化的红线时，按上面的「扩展方式」补规则；**不可机械化的条目不再往脚本里塞**。
 
 **建议同时保留的机械门禁**（与脚本互补，均由构建保证）：
 

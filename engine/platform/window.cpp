@@ -6,9 +6,9 @@
 namespace vx {
 namespace {
 
-/// 选择可用的 Shader 字节码格式。
-/// V0.1 的构建流程只产出 SPIR-V，因此在 Windows 上优先落到 Vulkan 后端；
-/// DXIL 一并声明，便于后续接入 dxc 后自动切到 D3D12。
+/// 声明本机希望接受的 Shader 字节码格式。
+/// SDL3_gpu 会据此挑选后端：Windows 上优先 Vulkan（SPIR-V），无可用 Vulkan 时落到 D3D12（DXIL）。
+/// 构建期两种格式都会产出，故这里把两者一并声明（见 ADR 0002）。
 [[nodiscard]] SDL_GPUShaderFormat pick_shader_format() noexcept {
 #if defined(SDL_PLATFORM_WINDOWS)
     return SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_DXIL;

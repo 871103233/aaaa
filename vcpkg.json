@@ -6,7 +6,9 @@
   "dependencies": [
     "sdl3",
     "glm",
-    "gtest"
+    "gtest",
+    { "name": "shaderc", "host": true },
+    { "name": "sdl3-shadercross", "host": true }
   ],
   "builtin-baseline": "10541e317a660f4165ba4ac2851ab54a8d4577b1"
 }

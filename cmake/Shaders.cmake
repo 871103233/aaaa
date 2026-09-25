@@ -87,14 +87,15 @@ function(add_shader TARGET)
                 message(STATUS
                     "未找到 shadercross，仅产出 SPIR-V：${SHADER_NAME}"
                     "（Vulkan 后端可用，D3D12 后端不可用；"
-                    "可执行 `vcpkg install sdl3-shadercross:x64-windows`）")
+                    "该工具由 vcpkg.json 的 host 依赖 `sdl3-shadercross` 提供，请检查 VCPKG_ROOT 后重新配置）")
             endif()
 
             add_dependencies(${TARGET} ${TARGET}_shader_spirv_${SHADER_KEY})
         else()
             message(WARNING
                 "未找到 glslc，跳过 Shader 编译：${SHADER_NAME}\n"
-                "  可安装 Vulkan SDK，或执行 `vcpkg install shaderc:x64-windows` 后重新配置。")
+                "  该工具由 vcpkg.json 的 host 依赖 `shaderc` 提供，请检查 VCPKG_ROOT 后重新配置。\n"
+                "  不要依赖手工 PATH 或 Vulkan SDK（见 docs/adr/0002-shader-dual-format-pipeline.md）。")
         endif()
     endforeach()
 endfunction()

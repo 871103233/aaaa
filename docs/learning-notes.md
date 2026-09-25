@@ -126,13 +126,14 @@
 ### Job System / 依赖计数 / DAG
 
 - 一句话定义：能表达任务间依赖关系的调度器。
-- 在本项目里是什么 / 为什么需要：异步区块管线是一张**有依赖的图**（生成 → 邻居就绪 → 光照 → 网格化 → 上传），朴素线程池表达不了"等 4 个邻居都完成再网格化"。候选库：enkiTS / Taskflow。
+- 在本项目里是什么 / 为什么需要：异步区块管线是一张**有依赖的图**（生成 → 邻居就绪 → 光照 → 网格化 → 上传），朴素线程池表达不了"等 4 个邻居都完成再网格化"。**本项目已采用 enkits**（vcpkg 端口名 `enkits`，注意无连字符）；备选 Taskflow 与自研无锁池的取舍见 ADR 0003。
 
 ### ECS（Entity-Component-System）
 
 - 一句话定义：用"实体 + 组件 + 系统"组合代替继承的数据驱动架构。
 - 在本项目里是什么 / 为什么需要：**体素场景里 ECS 只服务少量动态实体**（怪物、掉落物）。方块不是 Entity，区块顶多算一个。
 - 易错点或关键取舍：别把 ECS 当性能银弹，它不是体素性能的主要杠杆。
+- 本项目实现：**EnTT**（vcpkg 端口 `entt`，起步）；自研稀疏集为备选，切换条件见 ADR 0003。
 
 ### RHI（Render Hardware Interface）
 
@@ -197,12 +198,12 @@
 ### DoD（Definition of Done，完成定义）
 
 - 一句话定义：一个任务算"做完"的检查清单。
-- 在本项目里是什么 / 为什么需要：开发规范第七节的 12 项自检。
+- 在本项目里是什么 / 为什么需要：开发规范第七节的 14 项自检。
 
 ### ADR（Architecture Decision Record，架构决策记录）
 
 - 一句话定义：一条记录 = 一个决策 + 背景 + 备选方案 + 理由 + 后果。
-- 在本项目里是什么 / 为什么需要：半年后你会忘记"当初为什么不选 X"。现有 `docs/adr/0001-render-backend-sdl3-gpu.md`。
+- 在本项目里是什么 / 为什么需要：半年后你会忘记"当初为什么不选 X"。现有 `docs/adr/0001-render-backend-sdl3-gpu.md`（渲染后端选型）、`docs/adr/0002-shader-dual-format-pipeline.md`（双格式 Shader）、`docs/adr/0003-task-scheduler-and-ecs.md`（任务调度与 ECS 选型收敛）。
 
 ### Sanitizer：ASAN / TSan / UBSAN
 
@@ -221,6 +222,13 @@
 - 一句话定义：Manifest 模式指目录里有 `vcpkg.json` 时按清单装依赖；`builtin-baseline` 是锁定的版本基准（一个 vcpkg 仓库提交 SHA）；Triplet 是目标平台组合（如 `x64-windows`）。
 - 在本项目里是什么 / 为什么需要：依赖（sdl3 / glm / gtest）走 Manifest 模式，baseline 已锁定为 `10541e31…`。
 - 易错点或关键取舍：**Manifest 模式下不接受命令行单独指定包**——要装独立工具包需换到无清单的目录用**经典模式**。
+
+### vcpkg host 依赖（`"host": true`）
+
+- 一句话定义：把某个依赖标记为"只在**构建机**上需要"，vcpkg 用 host triplet 构建它，并把它提供的可执行工具暴露给构建系统。
+- 在本项目里是什么 / 为什么需要：`glslc`（`shaderc` 端口）与 `shadercross`（`sdl3-shadercross` 端口）是**构建期工具**，不是链接进产物的库。写成 `{ "name": "shaderc", "host": true }` 后，`cmake/Shaders.cmake` 的 `find_program` 能找到它们，开发机与 CI 都不必手工配 `PATH`。
+- 易错点或关键取舍：写成普通字符串（`"shaderc"`）会被当作**目标平台库**处理，不保证工具可见。另：host 依赖会传递地带出其依赖的特性——`sdl3-shadercross` 会拉入 `sdl3[vulkan]`、`directx-dxc`、`glslang`、`spirv-cross`，首次 configure 明显变慢（不是卡住）。
+- 相关：`vcpkg.json`、`cmake/Shaders.cmake`、`references/build-and-tests.md` §1
 
 ### 警告即错误（/W4 + /WX）
 
@@ -294,9 +302,9 @@
   - 运行时用 `SDL_GetGPUShaderFormats()` 询问设备需要哪种，再决定加载 `.spv` 还是 `.dxil`。
 - **易错点或关键取舍**：
   - **`shadercross` 不认 GLSL**（输入仅支持 SPIR-V / HLSL），所以必须"先 `glslc` 再 `shadercross`"，无法一步到位。
-  - 需要 `glslc`（shaderc 端口）与 `shadercross`（sdl3-shadercross 端口）**两个**工具；缺工具时构建只警告不阻断，代价是**运行时才失败**。
+  - 需要 `glslc`（shaderc 端口）与 `shadercross`（sdl3-shadercross 端口）**两个**工具；二者已作为 **host 依赖**写入 `vcpkg.json`，随 `cmake --preset` 自动装入。缺工具时构建只警告不阻断，代价是**运行时才失败**。
   - 不要再写成"只编 SPIR-V"——这是已被实测推翻的旧结论（见 [devlog.md](devlog.md) 2026-09-25 第 4 条）。
-- **相关**：`cmake/Shaders.cmake`、`engine/render/triangle_renderer.cpp`、`references/meshing-and-render.md` §6（该处表述待同步修正）
+- **相关**：ADR [0002-shader-dual-format-pipeline.md](adr/0002-shader-dual-format-pipeline.md)、`cmake/Shaders.cmake`、`engine/render/triangle_renderer.cpp`、`references/meshing-and-render.md` §6
 
 ### 结构性禁止门禁
 
@@ -306,9 +314,16 @@
 
 ### 技术白名单 / 红线表
 
-- 白名单：默认采用的技术清单，照此执行。
+- **技术白名单**：技能规范中「唯一口径表」的旧称 —— 默认采用的技术清单，照此执行，每格只有一个值。
 - 红线表：左列"需绕开的写法"、右列"必须执行"，**执行时以右列为准**。
 - 为什么：文档里大量"禁止"容易被误当成要求项执行，正向锚点是抗取反的做法。
+
+### 技术栈单一事实来源（SSOT）与口径统一
+
+- **一句话定义**：每条技术结论只有一个"权威写处"，其它文档只能**引用**、不能改写或补细节。
+- **在本项目里是什么 / 为什么需要**：技能规范分三层——**权威层**（`tech-plan` 各章 + `docs/adr/`，写决策、理由、备选与切换条件）、**索引层**（技能里的「唯一口径表」，一格一个值、不写理由）、**执行层**（`references/*.md`，写落地约束）。起因是"Shader 只编 SPIR-V"这条结论曾同时散落在技能、方案、ADR 三处，改了一处漏了三处，最后按旧结论施工直接断言失败。
+- **易错点或关键取舍**：① 口径表里**不许出现"A 或 B"**，未决项须登记到「待收敛项」表并注明收敛时限；② **vcpkg 端口名 ≠ 业界通称**（`enkits` 不是 `enkiTS`、也不是 `enki-ts`）；③ 改选型要走「四步流程」并扫完「同步清单」9 项——最容易漏的是**源码注释**（它不是权威层，但会复述结论）。
+- **相关**：技能规范「技术栈：单一事实来源与口径统一」、`docs/adr/0001` ~ `0003`、方案文档 §3.1 / §3.2 / §5
 
 ### POST-V0.5 暂缓项
 
