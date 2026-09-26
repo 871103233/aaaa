@@ -112,7 +112,11 @@ jobs:
             echo "runner vcpkg is already at the pinned baseline"
           else
             git -C "$VCPKG_ROOT" fetch --depth=1 origin "$BASELINE" || git -C "$VCPKG_ROOT" fetch --unshallow
-            git -C "$VCPKG_ROOT" checkout --detach FETCH_HEAD
+            # The runner image's clone carries local modifications (seen on ubuntu-latest:
+            # "Your local changes to the following files would be overwritten by checkout"),
+            # so a plain checkout is refused. -f discards them (also clearing untracked files
+            # that would obstruct the switch). The runner is ephemeral, so this is safe.
+            git -C "$VCPKG_ROOT" checkout -f --detach FETCH_HEAD
           fi
           git -C "$VCPKG_ROOT" rev-parse HEAD
           git -C "$VCPKG_ROOT" cat-file -e "$BASELINE:versions/baseline.json"

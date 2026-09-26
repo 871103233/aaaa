@@ -264,3 +264,23 @@
   4. **行尾与编码**：5 个新文件 + 2 个构建脚本逐字节复核 → `CR=0`、`BOM=False`（纯 LF）。
   5. `engine/render/triangle_renderer.*` 未改动，PoC 冒烟路径仍可编译。
 - 下一步 / 遗留：① **T3 的运行期接线未做**：`MeshRenderer` 需 `<shader_dir>/mesh.vert|.frag`，而这两个 Shader 源尚未加入 `assets/shaders/`、也未在 `game/CMakeLists.txt` 注册 `add_shader`（本轮任务禁止改 `game/`）——**须在 T4/T5 接入地形网格时一并补上**，否则网格渲染路径只有静态正确性、没有运行时验证。② 剩余任务：**T4~T6**（世界层：高度场 tile / splat 材质 / 笔刷挖堆）、**T7~T9**（Jolt 角色 / 可挖体积 / ImGui 面板）、**T10** 阶段验收。③ **世界层更名待执行**（`voxel/` → `world/`，与 T4 同批）。④ 待收敛项 4（地表 LOD）与 6（遮挡剔除）仍开放。⑤ 本批改动**尚未提交**。
+
+---
+
+## 2026-09-25  修复 Linux CI：vcpkg 工作树带本地改动导致 checkout 被拒
+
+- 做了什么：把 `.github/workflows/ci.yml` 的 `Align vcpkg with pinned baseline` 步骤中
+  `git -C "$VCPKG_ROOT" checkout --detach FETCH_HEAD` 改为 `checkout -f --detach FETCH_HEAD`，并补 4 行注释说明缘由。
+- 为什么：run `36146153279` 的结论显示 **Windows 两个 job（debug / release）已首次全绿**、两个门禁也全绿，
+  仅 ubuntu 的 asan / tsan 失败，且失败点就在该步骤，原文为
+  `error: Your local changes to the following files would be overwritten by checkout:` ——
+  即 **runner 镜像预装的 `/usr/local/share/vcpkg` 工作树本身带本地改动**，普通 checkout 被 git 拒绝。
+  用 `-f` 丢弃这些改动（并清掉会阻碍切换的未跟踪文件）；runner 是一次性环境，丢弃镜像自带改动安全。
+  **注意本次与上一轮修的不是同一件事**：上轮（`bcc6008`/`a7822c9`）解决的是"锁定基线的提交对象在 shallow 克隆里取不到"，
+  本次解决的是"取到之后工作树切不过去"——两个问题在不同环节，因此 Windows 侧转绿而 Linux 侧仍红。
+- 验证：本地 —— `.github/workflows/ci.yml` 逐字节检查 → 非 ASCII 字节 **0**、CR 字节 **-1**、无 BOM
+  （该文件按仓库约定必须纯 ASCII + 纯 LF，见 `ci.yml` 顶部注释）；改动为 4 行新增注释 + 1 行命令改写。
+  CI —— 结果待本次推送触发的 run（见下方"下一步 / 遗留"）。
+- 下一步 / 遗留：① 若 `-f` 后 ubuntu 仍失败，备选方案是**在 workspace 内 depth=1 clone 一份 vcpkg 到锁定基线并 bootstrap**，
+  彻底不依赖镜像预装状态（代价是多一次 clone）；② `docs/plans/v0.1.md` 的 **I1** 与前置条件 **P7** 待 CI 结果确认后收口；
+  ③ 待收敛项 4（地表 LOD）与 6（遮挡剔除）仍开放。
