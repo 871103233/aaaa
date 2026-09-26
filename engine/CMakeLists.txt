@@ -5,13 +5,16 @@
 # Jolt 类型全部隐藏在 engine/physics/physics_world.cpp 内（pimpl）。
 
 find_package(Jolt CONFIG REQUIRED)
+find_package(tomlplusplus CONFIG REQUIRED)
 
 add_library(voxel_engine STATIC
     core/clock.cpp
     core/fixed_step.cpp
+    core/frame_limiter.cpp
     core/log.cpp
     input/input_map.cpp
     physics/physics_world.cpp
+    platform/settings.cpp
     platform/window.cpp
     render/camera.cpp
     render/mesh_renderer.cpp
@@ -22,7 +25,8 @@ target_include_directories(voxel_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_link_libraries(voxel_engine
     PUBLIC  voxel_build_options
-    PUBLIC  SDL3::SDL3          # 公共头文件暴露 SDL 类型，故为 PUBLIC
+    PUBLIC  SDL3::SDL3              # 公共头文件暴露 SDL 类型，故为 PUBLIC
     PUBLIC  glm::glm
-    PRIVATE Jolt::Jolt          # 只在 physics_world.cpp 内出现 Jolt 头，故为 PRIVATE
+    PRIVATE Jolt::Jolt              # 只在 physics_world.cpp 内出现 Jolt 头，故为 PRIVATE
+    PRIVATE tomlplusplus::tomlplusplus  # 只在 settings.cpp 内出现 toml++ 头，故为 PRIVATE
 )

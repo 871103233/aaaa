@@ -10,6 +10,7 @@ namespace {
 using vx::CameraSettings;
 using vx::CameraView;
 using vx::ITerrainQuery;
+using vx::kCameraMinDistance;
 using vx::kCameraPitchLimit;
 using vx::ThirdPersonCamera;
 
@@ -88,6 +89,35 @@ public:
     }
 };
 
+/// 退化地形桩：线段**从起点就被完全挡住**（`safeT = 0`），地表恒在 y = 0。
+///
+/// 这正是"把地表堆到注视点之上"时相机遇到的情形：避障会把跟随距离压到 0。
+class FullyBlockedAtStartGround : public ITerrainQuery {
+public:
+    [[nodiscard]] bool QueryHeight(float /*worldX*/, float /*worldZ*/, float& outHeight) const override {
+        outHeight = 0.0F;
+        return true;
+    }
+
+    [[nodiscard]] bool QueryObstruction(const glm::vec3& /*from*/, const glm::vec3& /*to*/,
+                                        float& outSafeT) const override {
+        outSafeT = 0.0F;
+        return true;
+    }
+};
+
+/// 视图矩阵是否逐元素有限（出现 NaN / Inf 即为"整帧几何失效"）。
+[[nodiscard]] bool IsFinite(const glm::mat4& matrix) {
+    for (int column = 0; column < 4; ++column) {
+        for (int row = 0; row < 4; ++row) {
+            if (!std::isfinite(matrix[column][row])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 // 俯仰角必须被钳制在 ±89°：超限值的设置与增量调整都不能突破上下限。
@@ -114,6 +144,36 @@ TEST(ThirdPersonCamera, PitchIsClampedToPlusMinusEightyNineDegrees) {
     EXPECT_FLOAT_EQ(camera.Pitch(), kCameraPitchLimit);
     camera.SetPitch(-kCameraPitchLimit);
     EXPECT_FLOAT_EQ(camera.Pitch(), -kCameraPitchLimit);
+}
+
+// T14 回归（与缺陷 B2 同源）：反复施加**极大幅度**的 AddPitch（两方向各若干次）后，俯仰必须**恰好**
+// 停在 ±89°；且两个极限处的视图矩阵（含视图投影）必须逐元素有限。
+// 这正是"±89° 必须可达、但绝不能到 90°"的门禁：到 ±90° 时视线与世界上方向平行，
+// `glm::lookAt` 归一化得 NaN，画面会只剩清屏色。
+TEST(ThirdPersonCamera, ExtremeRepeatedPitchClampsExactlyAndStaysFinite) {
+    ThirdPersonCamera camera;
+    camera.SnapTo(glm::vec3(0.0F, 0.0F, 0.0F));
+    camera.SetYaw(1.1F);
+
+    // 向上猛拉：每次都远超剩余行程，钳制必须精确停在 +kCameraPitchLimit（不是"接近"）。
+    for (int i = 0; i < 8; ++i) {
+        camera.AddPitch(glm::radians(100000.0F));
+    }
+    EXPECT_FLOAT_EQ(camera.Pitch(), kCameraPitchLimit);
+    const CameraView up = camera.Evaluate(0.0, nullptr);
+    EXPECT_TRUE(IsFinite(up.view));
+    EXPECT_TRUE(IsFinite(up.viewProjection));
+    EXPECT_TRUE(IsFinite(up.projection));
+
+    // 向下猛拉：精确停在 -kCameraPitchLimit。
+    for (int i = 0; i < 8; ++i) {
+        camera.AddPitch(glm::radians(-100000.0F));
+    }
+    EXPECT_FLOAT_EQ(camera.Pitch(), -kCameraPitchLimit);
+    const CameraView down = camera.Evaluate(0.0, nullptr);
+    EXPECT_TRUE(IsFinite(down.view));
+    EXPECT_TRUE(IsFinite(down.viewProjection));
+    EXPECT_TRUE(IsFinite(down.projection));
 }
 
 // 无遮挡时，相机必须恰好落在请求的跟随距离上（不被安全网挪动）。
@@ -235,3 +295,50 @@ TEST(ThirdPersonCamera, PivotInterpolatesBetweenLogicSteps) {
     EXPECT_NEAR(camera.Evaluate(-1.0, nullptr).target.x, 0.0F, 1e-5F);
     EXPECT_NEAR(camera.Evaluate(2.0, nullptr).target.x, 10.0F, 1e-5F);
 }
+
+// 缺陷 B2 回归：避障把跟随距离压到 0 时，相机**不得**退化出非有限视图矩阵。
+//
+// 退化路径（蓝屏根因）：`safeT = 0` ⇒ `distance = 0` ⇒ `eye == target`，`glm::lookAt` 的视线基向量成为
+// 零向量；随后"离地间隙"安全网把 `eye` 顶到 `target` 正上方 ⇒ 视线又与世界上方向平行。
+// 两者都会让视图矩阵变成 NaN，整帧几何被丢弃，画面只剩清屏色。
+TEST(ThirdPersonCamera, DegenerateViewIsAvoidedWhenFollowDistanceCollapses) {
+    CameraSettings settings;
+    settings.followDistance  = 14.0F;  // 与 game/main.cpp 一致
+    settings.pivotHeight     = 1.6F;
+    settings.groundClearance = 0.2F;
+
+    ThirdPersonCamera camera(settings);
+    camera.SnapTo(glm::vec3(0.0F, 0.0F, 0.0F));
+    camera.SetYaw(0.7F);
+    camera.SetPitch(-0.42F);
+
+    const FullyBlockedAtStartGround terrain;
+    const CameraView                view = camera.Evaluate(0.0, &terrain);
+
+    // 相机始终与注视点保持一个正的最小距离（否则视线基向量退化）。
+    EXPECT_GE(glm::length(view.eye - view.target), kCameraMinDistance - 1e-5F);
+    EXPECT_GT(view.distance, 0.0F);
+
+    // 视图与视图投影矩阵必须逐元素有限，否则整帧几何都会变成 NaN。
+    EXPECT_TRUE(IsFinite(view.view));
+    EXPECT_TRUE(IsFinite(view.viewProjection));
+}
+
+// 最小距离托底不得改变**正常（无遮挡）**情况下的跟随距离。
+TEST(ThirdPersonCamera, MinDistanceGuardKeepsRequestedDistanceWhenUnobstructed) {
+    CameraSettings settings;
+    settings.followDistance = 14.0F;
+    settings.pivotHeight    = 1.6F;
+
+    ThirdPersonCamera camera(settings);
+    camera.SnapTo(glm::vec3(0.0F, 0.0F, 0.0F));
+    camera.SetYaw(0.7F);
+    camera.SetPitch(-0.42F);
+
+    const FlatGround terrain;  // 不报告遮挡
+    const CameraView view = camera.Evaluate(0.0, &terrain);
+
+    EXPECT_NEAR(view.distance, settings.followDistance, 1e-4F);
+    EXPECT_TRUE(IsFinite(view.viewProjection));
+}
+

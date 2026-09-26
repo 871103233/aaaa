@@ -12,13 +12,16 @@ find_package(tomlplusplus CONFIG REQUIRED)
 
 add_library(voxel_world STATIC
     dig/terrain_brush.cpp
+    generation/map_preset.cpp
     generation/terrain_noise.cpp
     terrain/material_blender.cpp
     terrain/material_table.cpp
+    terrain/material_textures.cpp
     terrain/terrain_collision.cpp
     terrain/terrain_mesher.cpp
     terrain/terrain_tile.cpp
     terrain/terrain_world.cpp
+    terrain/world_bounds.cpp
 )
 
 target_include_directories(voxel_world

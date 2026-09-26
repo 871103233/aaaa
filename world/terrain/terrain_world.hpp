@@ -1,8 +1,8 @@
 #pragma once
 
+#include "generation/map_preset.hpp"
 #include "generation/terrain_noise.hpp"
 #include "render/camera.hpp"
-#include "terrain/material_blender.hpp"
 #include "terrain/material_table.hpp"
 #include "terrain/terrain_mesher.hpp"
 #include "terrain/terrain_tile.hpp"
@@ -34,6 +34,11 @@ public:
     TerrainWorld& operator=(const TerrainWorld&) = delete;
     TerrainWorld(TerrainWorld&&) = delete;
     TerrainWorld& operator=(TerrainWorld&&) = delete;
+
+    /// 设置预设地图的地形编辑（T11）。必须在 `GenerateTile` **之前**调用：
+    /// 生成固定为「噪声先行、编辑覆盖其上」，因此每个 tile 生成后都会应用同一份编辑，
+    /// 同一文件 + 同一种子 ⇒ 同一世界（红线 7）。
+    void SetMapPreset(const MapPreset& preset);
 
     // ---- 单 tile 生命周期（由流式层调用）----
 
@@ -75,11 +80,15 @@ public:
 
     [[nodiscard]] std::uint64_t Seed() const noexcept { return m_seed; }
 
+    /// 本世界所用的材质表（启动期加载的**同一份**）。
+    /// 调用方据此构建 GPU uniform 块（`BuildMaterialUniform`），保证 CPU 与 GPU 参数同源（ADR 0009）。
+    [[nodiscard]] const TerrainMaterialTable& Materials() const noexcept { return m_materials; }
+
 private:
     std::uint64_t         m_seed = 0;
     TerrainMaterialTable  m_materials;
     TerrainNoiseGenerator m_noise;
-    MaterialBlender       m_blender;
+    std::vector<MapEdit>  m_mapEdits;  ///< 预设地图的地形编辑（T11）；空表示纯噪声世界
 
     std::map<TileCoord, TerrainTile>     m_tiles;
     std::map<TileCoord, TerrainTileMesh> m_meshes;

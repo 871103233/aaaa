@@ -20,6 +20,10 @@ enum class ActionId : std::uint8_t {
     LookX,   ///< 模拟动作：本帧鼠标水平位移
     LookY,   ///< 模拟动作：本帧鼠标垂直位移
     ToggleDebugPanel,  ///< 调试面板开关（T9；只在 game/ 消费，不参与模拟）
+    ToggleFly,         ///< 飞行模式开关（T12；只在 game/ 消费，不参与模拟）
+    FlyDown,           ///< 飞行时下降（T12；只在 game/ 消费，不参与模拟）
+    ReleaseMouseCapture,  ///< 释放鼠标相对模式（T14 遗留；T15 起 `Esc` 改绑 `ToggleSystemPanel`，本动作不再绑定）
+    ToggleSystemPanel,    ///< 开关系统面板（T15；`Esc`；只在 game/ 消费，不参与模拟）
 
     Count,
 };

@@ -1,5 +1,6 @@
 #include "render/mesh_renderer.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -44,11 +45,19 @@ struct ShaderArtifact {
     throw std::runtime_error("当前 GPU 后端既不支持 DXIL 也不支持 SPIR-V，无法加载 Shader");
 }
 
+/// Shader 声明的各类资源数量（SDL3_gpu 在创建 Shader 时必须显式给出）。
+struct ShaderResourceCounts {
+    std::uint32_t samplers        = 0;
+    std::uint32_t storageTextures = 0;
+    std::uint32_t storageBuffers  = 0;
+    std::uint32_t uniformBuffers  = 0;
+};
+
 [[nodiscard]] SDL_GPUShader* create_shader_from_file(SDL_GPUDevice* device,
                                                      const std::filesystem::path& path,
                                                      SDL_GPUShaderStage stage,
                                                      SDL_GPUShaderFormat format,
-                                                     std::uint32_t numStorageBuffers) {
+                                                     const ShaderResourceCounts& counts) {
     std::vector<std::uint8_t> code = read_binary_file(path);
 
     SDL_GPUShaderCreateInfo info {};
@@ -57,10 +66,10 @@ struct ShaderArtifact {
     info.entrypoint           = "main";
     info.format               = format;
     info.stage                = stage;
-    info.num_samplers         = 0;
-    info.num_uniform_buffers  = 0;
-    info.num_storage_buffers  = numStorageBuffers;
-    info.num_storage_textures = 0;
+    info.num_samplers         = counts.samplers;
+    info.num_uniform_buffers  = counts.uniformBuffers;
+    info.num_storage_buffers  = counts.storageBuffers;
+    info.num_storage_textures = counts.storageTextures;
 
     SDL_GPUShader* shader = SDL_CreateGPUShader(device, &info);
     if (shader == nullptr) {
@@ -134,12 +143,16 @@ MeshRenderer::MeshRenderer(SDL_GPUDevice* device, SDL_Window* window, std::files
     const ShaderArtifact artifact = select_shader_artifact(m_device);
     const std::string    extension = artifact.extension;
 
+    // 顶点着色器：1 个只读 storage buffer（相机常量）。
     SDL_GPUShader* vertexShader =
         create_shader_from_file(m_device, shader_dir / (shader_name + ".vert" + extension),
-                                SDL_GPU_SHADERSTAGE_VERTEX, artifact.format, /*numStorageBuffers=*/1);
+                                SDL_GPU_SHADERSTAGE_VERTEX, artifact.format,
+                                ShaderResourceCounts { 0, 0, 1, 0 });
+    // 片元着色器：2 个采样纹理数组（albedo / 法线）+ 1 个 uniform 块（材质参数）。
     SDL_GPUShader* fragmentShader =
         create_shader_from_file(m_device, shader_dir / (shader_name + ".frag" + extension),
-                                SDL_GPU_SHADERSTAGE_FRAGMENT, artifact.format, /*numStorageBuffers=*/0);
+                                SDL_GPU_SHADERSTAGE_FRAGMENT, artifact.format,
+                                ShaderResourceCounts { /*samplers=*/2, 0, 0, /*uniformBuffers=*/1 });
 
     // 顶点布局：与 MeshVertex 一一对应（pitch = 单个顶点大小，stride 连续）。
     SDL_GPUVertexBufferDescription vertexBufferDescription {};
@@ -151,8 +164,6 @@ MeshRenderer::MeshRenderer(SDL_GPUDevice* device, SDL_Window* window, std::files
     const SDL_GPUVertexAttribute attributes[] = {
         { 0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, static_cast<Uint32>(offsetof(MeshVertex, position)) },
         { 1, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, static_cast<Uint32>(offsetof(MeshVertex, normal)) },
-        { 2, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4,
-          static_cast<Uint32>(offsetof(MeshVertex, materialWeights)) },
     };
 
     SDL_GPUVertexInputState vertexInput {};
@@ -213,6 +224,22 @@ MeshRenderer::MeshRenderer(SDL_GPUDevice* device, SDL_Window* window, std::files
     if (m_cameraTransferBuffer == nullptr) {
         throw std::runtime_error(std::string("创建相机常量上传缓冲失败：") + SDL_GetError());
     }
+
+    // 纹理数组共用的采样器：repeat 寻址（地表平铺）+ 线性过滤 + mipmap 线性。
+    // 引擎不关心纹理内容（世界层决定），只固定"平铺且带 mip"这一通用采样行为。
+    SDL_GPUSamplerCreateInfo samplerInfo {};
+    samplerInfo.min_filter     = SDL_GPU_FILTER_LINEAR;
+    samplerInfo.mag_filter     = SDL_GPU_FILTER_LINEAR;
+    samplerInfo.mipmap_mode    = SDL_GPU_SAMPLERMIPMAPMODE_LINEAR;
+    samplerInfo.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+    samplerInfo.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+    samplerInfo.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+    samplerInfo.min_lod        = 0.0F;
+    samplerInfo.max_lod        = 1000.0F;
+    m_layerSampler = SDL_CreateGPUSampler(m_device, &samplerInfo);
+    if (m_layerSampler == nullptr) {
+        throw std::runtime_error(std::string("创建纹理采样器失败：") + SDL_GetError());
+    }
 }
 
 MeshRenderer::~MeshRenderer() {
@@ -230,8 +257,19 @@ MeshRenderer::~MeshRenderer() {
     if (m_cameraTransferBuffer != nullptr) {
         SDL_ReleaseGPUTransferBuffer(m_device, m_cameraTransferBuffer);
     }
+    if (m_vertexStagingBuffer != nullptr) {
+        SDL_ReleaseGPUTransferBuffer(m_device, m_vertexStagingBuffer);
+    }
     if (m_cameraUniformBuffer != nullptr) {
         SDL_ReleaseGPUBuffer(m_device, m_cameraUniformBuffer);
+    }
+    for (SDL_GPUTexture* texture : m_textureArrays) {
+        if (texture != nullptr) {
+            SDL_ReleaseGPUTexture(m_device, texture);
+        }
+    }
+    if (m_layerSampler != nullptr) {
+        SDL_ReleaseGPUSampler(m_device, m_layerSampler);
     }
     if (m_pipeline != nullptr) {
         SDL_ReleaseGPUGraphicsPipeline(m_device, m_pipeline);
@@ -251,6 +289,7 @@ MeshHandle MeshRenderer::UploadMesh(const MeshData& mesh) {
         create_and_upload_buffer(m_device, SDL_GPU_BUFFERUSAGE_VERTEX, mesh.vertices.data(), vertexBytes);
     resources.indexBuffer =
         create_and_upload_buffer(m_device, SDL_GPU_BUFFERUSAGE_INDEX, mesh.indices.data(), indexBytes);
+    resources.vertexCount = static_cast<std::uint32_t>(mesh.vertices.size());
     resources.indexCount = static_cast<std::uint32_t>(mesh.indices.size());
 
     std::uint32_t slot = 0;
@@ -263,6 +302,58 @@ MeshHandle MeshRenderer::UploadMesh(const MeshData& mesh) {
         m_meshes.push_back(resources);
     }
     return MeshHandle { slot + 1 };
+}
+
+bool MeshRenderer::UpdateMeshVertices(MeshHandle handle, const std::vector<MeshVertex>& vertices) {
+    if (!handle.IsValid() || handle.id > m_meshes.size()) {
+        return false;
+    }
+    const MeshResources& resources = m_meshes[handle.id - 1];
+    if (resources.vertexBuffer == nullptr) {
+        return false;
+    }
+    // 顶点数必须与上传时一致，否则既有的 GPU 顶点缓冲装不下（本方法只做就地刷新）。
+    if (vertices.size() != static_cast<std::size_t>(resources.vertexCount)) {
+        return false;
+    }
+
+    const std::uint32_t vertexBytes = static_cast<std::uint32_t>(vertices.size() * sizeof(MeshVertex));
+    if (m_vertexStagingBuffer == nullptr || m_vertexStagingCapacity < vertexBytes) {
+        // 扩容只在首次或网格变大时发生，稳态（定长动态网格）下不触发，故不构成每帧分配。
+        if (m_vertexStagingBuffer != nullptr) {
+            SDL_ReleaseGPUTransferBuffer(m_device, m_vertexStagingBuffer);
+            m_vertexStagingBuffer = nullptr;
+        }
+        SDL_GPUTransferBufferCreateInfo stagingInfo {};
+        stagingInfo.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+        stagingInfo.size  = vertexBytes;
+        m_vertexStagingBuffer = SDL_CreateGPUTransferBuffer(m_device, &stagingInfo);
+        if (m_vertexStagingBuffer == nullptr) {
+            m_vertexStagingCapacity = 0;
+            return false;
+        }
+        m_vertexStagingCapacity = vertexBytes;
+    }
+
+    // cycle = true：即便该暂存缓冲仍被上一帧的命令缓冲引用，也可安全复用（SDL 内部换名）。
+    void* mapped = SDL_MapGPUTransferBuffer(m_device, m_vertexStagingBuffer, /*cycle=*/true);
+    if (mapped == nullptr) {
+        return false;
+    }
+    std::memcpy(mapped, vertices.data(), vertexBytes);
+    SDL_UnmapGPUTransferBuffer(m_device, m_vertexStagingBuffer);
+
+    SDL_GPUCommandBuffer* commandBuffer = SDL_AcquireGPUCommandBuffer(m_device);
+    if (commandBuffer == nullptr) {
+        return false;
+    }
+    SDL_GPUCopyPass* copyPass = SDL_BeginGPUCopyPass(commandBuffer);
+    SDL_GPUTransferBufferLocation source { m_vertexStagingBuffer, 0 };
+    SDL_GPUBufferRegion           destination { resources.vertexBuffer, 0, vertexBytes };
+    SDL_UploadToGPUBuffer(copyPass, &source, &destination, /*cycle=*/false);
+    SDL_EndGPUCopyPass(copyPass);
+    SDL_SubmitGPUCommandBuffer(commandBuffer);
+    return true;
 }
 
 void MeshRenderer::ReleaseMesh(MeshHandle handle) noexcept {
@@ -280,6 +371,126 @@ void MeshRenderer::ReleaseMesh(MeshHandle handle) noexcept {
     }
     resources = MeshResources {};
     m_freeSlots.push_back(slot);
+}
+
+TextureArrayHandle MeshRenderer::CreateTextureArray(const TextureArrayDesc& desc) {
+    if (desc.width == 0 || desc.height == 0 || desc.layerCount == 0 || desc.pixels == nullptr) {
+        throw std::runtime_error("TextureArrayDesc 非法（宽 / 高 / 层数须 ≥ 1 且 pixels 非空）");
+    }
+
+    // 完整 mip 链长度 = floor(log2(max(w, h))) + 1。
+    std::uint32_t levels = 1;
+    for (std::uint32_t extent = std::max(desc.width, desc.height); extent > 1; extent >>= 1) {
+        ++levels;
+    }
+
+    SDL_GPUTextureCreateInfo textureInfo {};
+    textureInfo.type                 = SDL_GPU_TEXTURETYPE_2D_ARRAY;
+    textureInfo.format               = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    // COLOR_TARGET 是 SDL_GenerateMipmapsForGPUTexture 的硬性要求（生成 mip 时把各级当作渲染目标）。
+    textureInfo.usage                = SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
+    textureInfo.width                = desc.width;
+    textureInfo.height               = desc.height;
+    textureInfo.layer_count_or_depth = desc.layerCount;
+    textureInfo.num_levels           = levels;
+    textureInfo.sample_count         = SDL_GPU_SAMPLECOUNT_1;
+
+    SDL_GPUTexture* texture = SDL_CreateGPUTexture(m_device, &textureInfo);
+    if (texture == nullptr) {
+        throw std::runtime_error(std::string("创建纹理数组失败：") + SDL_GetError());
+    }
+
+    const std::uint32_t layerBytes = desc.width * desc.height * 4U;
+    const std::uint32_t totalBytes = layerBytes * desc.layerCount;
+
+    SDL_GPUTransferBufferCreateInfo transferInfo {};
+    transferInfo.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+    transferInfo.size  = totalBytes;
+    SDL_GPUTransferBuffer* transfer = SDL_CreateGPUTransferBuffer(m_device, &transferInfo);
+    if (transfer == nullptr) {
+        SDL_ReleaseGPUTexture(m_device, texture);
+        throw std::runtime_error(std::string("创建纹理上传缓冲失败：") + SDL_GetError());
+    }
+
+    void* mapped = SDL_MapGPUTransferBuffer(m_device, transfer, /*cycle=*/false);
+    if (mapped == nullptr) {
+        SDL_ReleaseGPUTransferBuffer(m_device, transfer);
+        SDL_ReleaseGPUTexture(m_device, texture);
+        throw std::runtime_error(std::string("映射纹理上传缓冲失败：") + SDL_GetError());
+    }
+    std::memcpy(mapped, desc.pixels, totalBytes);
+    SDL_UnmapGPUTransferBuffer(m_device, transfer);
+
+    SDL_GPUCommandBuffer* commandBuffer = SDL_AcquireGPUCommandBuffer(m_device);
+    if (commandBuffer == nullptr) {
+        SDL_ReleaseGPUTransferBuffer(m_device, transfer);
+        SDL_ReleaseGPUTexture(m_device, texture);
+        throw std::runtime_error(std::string("SDL_AcquireGPUCommandBuffer 失败：") + SDL_GetError());
+    }
+
+    // 逐层上传第 0 级（显式给 layer 与 d=1，避免 2D 数组的层 / 深度歧义）。
+    SDL_GPUCopyPass* copyPass = SDL_BeginGPUCopyPass(commandBuffer);
+    for (std::uint32_t layer = 0; layer < desc.layerCount; ++layer) {
+        SDL_GPUTextureTransferInfo source { transfer, layer * layerBytes, 0, 0 };
+        SDL_GPUTextureRegion       destination { texture, /*mip_level=*/0, /*layer=*/layer, 0, 0, 0,
+                                                 desc.width, desc.height, /*d=*/1 };
+        SDL_UploadToGPUTexture(copyPass, &source, &destination, /*cycle=*/false);
+    }
+    SDL_EndGPUCopyPass(copyPass);
+
+    // mip 链由 SDL 从第 0 级生成（须在 pass 之外调用）。
+    if (levels > 1) {
+        SDL_GenerateMipmapsForGPUTexture(commandBuffer, texture);
+    }
+
+    SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(commandBuffer);
+    if (fence != nullptr) {
+        SDL_WaitForGPUFences(m_device, /*wait_all=*/true, &fence, 1);
+        SDL_ReleaseGPUFence(m_device, fence);
+    }
+    SDL_ReleaseGPUTransferBuffer(m_device, transfer);
+
+    std::uint32_t slot = 0;
+    if (!m_freeTextureSlots.empty()) {
+        slot = m_freeTextureSlots.back();
+        m_freeTextureSlots.pop_back();
+        m_textureArrays[slot] = texture;
+    } else {
+        slot = static_cast<std::uint32_t>(m_textureArrays.size());
+        m_textureArrays.push_back(texture);
+    }
+    return TextureArrayHandle { slot + 1 };
+}
+
+void MeshRenderer::ReleaseTextureArray(TextureArrayHandle handle) noexcept {
+    if (!handle.IsValid() || handle.id > m_textureArrays.size()) {
+        return;
+    }
+    const std::uint32_t slot = handle.id - 1;
+    if (m_textureArrays[slot] != nullptr) {
+        SDL_ReleaseGPUTexture(m_device, m_textureArrays[slot]);
+        m_textureArrays[slot] = nullptr;
+    }
+    if (m_albedoTexture.id == handle.id) {
+        m_albedoTexture = TextureArrayHandle {};
+    }
+    if (m_normalTexture.id == handle.id) {
+        m_normalTexture = TextureArrayHandle {};
+    }
+    m_freeTextureSlots.push_back(slot);
+}
+
+void MeshRenderer::SetSampledTextureArrays(TextureArrayHandle albedo, TextureArrayHandle normal) noexcept {
+    m_albedoTexture = albedo;
+    m_normalTexture = normal;
+}
+
+void MeshRenderer::SetMaterialUniform(const void* data, std::size_t size) noexcept {
+    if (data == nullptr || size > kMaxMaterialUniformBytes) {
+        return;
+    }
+    std::memcpy(m_materialUniform.data(), data, size);
+    m_materialUniformSize = size;
 }
 
 void MeshRenderer::SetCamera(const CameraView& camera) noexcept {
@@ -374,6 +585,22 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
 
     SDL_GPUBuffer* cameraBuffers[1] = { m_cameraUniformBuffer };
     SDL_BindGPUVertexStorageBuffers(pass, 0, cameraBuffers, 1);
+
+    // 片元资源：纹理数组（槽 0 = albedo、槽 1 = 法线）与材质 uniform（槽 0）。
+    // 两者都只在调用方设置过时才绑定 / 推送；引擎不解释其内容。
+    if (m_albedoTexture.IsValid() && m_normalTexture.IsValid() &&
+        m_albedoTexture.id <= m_textureArrays.size() && m_normalTexture.id <= m_textureArrays.size()) {
+        SDL_GPUTextureSamplerBinding bindings[2] = {};
+        bindings[0].texture = m_textureArrays[m_albedoTexture.id - 1];
+        bindings[0].sampler = m_layerSampler;
+        bindings[1].texture = m_textureArrays[m_normalTexture.id - 1];
+        bindings[1].sampler = m_layerSampler;
+        SDL_BindGPUFragmentSamplers(pass, 0, bindings, 2);
+    }
+    if (m_materialUniformSize > 0) {
+        SDL_PushGPUFragmentUniformData(commandBuffer, 0, m_materialUniform.data(),
+                                       static_cast<Uint32>(m_materialUniformSize));
+    }
 
     if (meshes != nullptr) {
         for (std::size_t i = 0; i < meshCount; ++i) {

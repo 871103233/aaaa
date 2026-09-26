@@ -38,6 +38,15 @@ public:
         double        originZ     = 0.0;      ///< 采样 `(0, 0)` 的世界 Z（`double`，红线 6）
     };
 
+    /// 通用静态盒体描述（与地形无关；任何轴对齐的静态阻挡都能使用）。
+    ///
+    /// `center` 为盒中心、`halfExtents` 为各轴半长（均须 `> 0`），均为世界空间、单位格。
+    /// 精度说明同 `HeightFieldDesc`：进入 Jolt 时显式转换为 `JPH::Real`（当前为 `float`）。
+    struct BoxDesc {
+        glm::dvec3 center { 0.0 };       ///< 盒中心（世界，格）
+        glm::dvec3 halfExtents { 0.5 };  ///< 各轴半长（格，须 `> 0`）
+    };
+
     /// 角色胶囊描述（**脚底**为原点，与 Jolt `CharacterVirtual` 约定一致）。
     struct CapsuleDesc {
         float      radius             = 0.3F;   ///< 胶囊半径（格）
@@ -75,6 +84,9 @@ public:
     /// 返回 false 表示句柄无效或重建失败；失败时保留旧形状。
     bool UpdateHeightField(BodyHandle handle, const HeightFieldDesc& desc);
 
+    /// 创建一个静态盒体碰撞体。返回无效句柄表示创建失败（半长非正等），失败原因写入日志。
+    [[nodiscard]] BodyHandle AddStaticBox(const BoxDesc& desc);
+
     /// 移除一个碰撞体；无效句柄为无操作。
     void RemoveBody(BodyHandle handle) noexcept;
 
@@ -90,6 +102,14 @@ public:
 
     /// 设置角色速度（格 / 秒）。水平分量由玩法层给出，竖直分量含跳跃冲量。
     void SetCharacterVelocity(CharacterHandle handle, const glm::vec3& velocity) noexcept;
+
+    /// 直接把角色**脚底**放到 `position` 并清零速度；无效句柄为无操作。
+    ///
+    /// 用途：地形（静态高度场）在角色脚下被抬高后，Jolt 的 `CharacterVirtual` **不会**被静态形状
+    /// 变化顶出——一旦角色被新地表埋住，支撑判定失效，它会在重力下穿过高度场。此时由玩法层把角色
+    /// 放回新地表（"地形升起时骑上去"，与放置方块把角色顶起的惯例一致）。
+    /// 该操作会瞬移角色，调用方需自行把相机吸附到新位置以避免插值拖影。
+    void SetCharacterPosition(CharacterHandle handle, const glm::dvec3& position) noexcept;
 
     /// 在固定步内推进角色：着地时清除下沉速度、空中时累加重力，再做滑动 / 贴地 / **自动上台阶**。
     /// 前置条件：`dt > 0`。

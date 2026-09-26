@@ -1,6 +1,7 @@
 #pragma once
 
 #include "render/mesh_renderer.hpp"
+#include "system_panel.hpp"
 
 #include <SDL3/SDL.h>
 
@@ -16,12 +17,15 @@ namespace vx {
 struct DebugStats {
     double      frameSeconds      = 0.0;      ///< 上一帧真实时长（秒）
     int         stepsThisFrame     = 0;       ///< 本帧执行的固定逻辑步数
+    int         frameRateCap       = 0;       ///< 当前帧率上限（Hz，T17）
     glm::dvec3  characterPosition { 0.0 };    ///< 角色脚底位置（世界格，`double`）
     bool        characterOnGround  = false;   ///< 角色是否着地
+    bool        characterFlying    = false;   ///< 角色是否处于飞行模式（T12）
     float       cameraYaw          = 0.0F;    ///< 相机 yaw（弧度）
     float       cameraPitch        = 0.0F;    ///< 相机 pitch（弧度）
     float       cameraDistance     = 0.0F;    ///< 相机实际跟随距离（格）
     float       brushRadius        = 0.0F;    ///< 笔刷半径（格）
+    bool        mouseCaptured      = false;   ///< 鼠标是否处于相对模式（捕获，T14）
     std::size_t loadedTileCount    = 0;       ///< 已加载（已网格化）的 tile 数
     std::size_t lastDirtyTileCount = 0;       ///< 最近一次笔刷弄脏的 tile 数
     std::size_t tileBodyCount      = 0;       ///< 已建立物理碰撞体的 tile 数
@@ -51,13 +55,42 @@ public:
     void Toggle() noexcept { m_visible = !m_visible; }
     [[nodiscard]] bool Visible() const noexcept { return m_visible; }
 
-    /// 开始一帧 ImGui；隐藏时为无操作（因此 `BuildUI` / `EndFrame` / `DrawOverlay` 也一并空转）。
+    /// 本机是否加载到 CJK 字体（T16）：true 时面板用中文标签，false 时整表回退纯 ASCII 英文。
+    ///
+    /// 取值在构造期由 [`ApplyUiFont`](ui_font.hpp) 决定，之后不再变化。
+    [[nodiscard]] bool UsesCjkLabels() const noexcept { return m_cjkFontLoaded; }
+
+    /// SDL 事件转发入口（T15）：安装到 `Window::SetEventCallback`，把每个事件交给 ImGui 后端。
+    ///
+    /// 这是让 ImGui 面板**可交互**的前提——此前只读正是因为事件从未转发。`userData` 为 `DebugOverlay*`。
+    static void OnSdlEvent(void* userData, const SDL_Event& event);
+
+    /// 系统面板（T15）开关 / 查询。
+    void               ToggleSystemPanel() noexcept { m_systemPanel.Toggle(); }
+    [[nodiscard]] bool SystemPanelOpen() const noexcept { return m_systemPanel.IsOpen(); }
+
+    /// 本帧 ImGui 是否想接管鼠标 / 键盘（`io.WantCaptureMouse` / `WantCaptureKeyboard`）。
+    ///
+    /// 只在**本帧已开始 ImGui 帧**时有效；未开始（面板与调试面板都隐藏）时恒为 false。
+    /// 供 `main` 的输入抑制纯函数使用（见 `gameplay_input.hpp`）。
+    [[nodiscard]] bool WantsCaptureMouse() const noexcept { return m_wantCaptureMouse; }
+    [[nodiscard]] bool WantsCaptureKeyboard() const noexcept { return m_wantCaptureKeyboard; }
+
+    /// 通知 ImGui 玩法当前是否处于**相对鼠标（捕获）**状态。
+    ///
+    /// 相对模式下 SDL 报告的鼠标绝对坐标无意义，若照常喂给 ImGui，会把"悬停"算到 UI 上，
+    /// 从而误抑制玩法视角。捕获期间据此置 `ImGuiConfigFlags_NoMouse`（面板打开时必已释放捕获，
+    /// 因此不影响面板交互）。
+    void SetGameplayMouseCaptured(bool captured) noexcept { m_gameplayMouseCaptured = captured; }
+
+    /// 开始一帧 ImGui。当调试面板与系统面板都不可见时为无操作
+    /// （因此 `BuildUI` / `EndFrame` / `DrawOverlay` 也一并空转，开销近似为零）。
     void BeginFrame();
 
-    /// 记录本帧统计并构建面板内容。前置条件：已在可见状态下调用 `BeginFrame`。
-    void BuildUI(const DebugStats& stats);
+    /// 记录本帧统计并构建面板内容（调试面板 + 系统面板）。前置条件：已调用 `BeginFrame`。
+    void BuildUI(const DebugStats& stats, SystemPanelContext& panelContext);
 
-    /// 结束 ImGui 帧（`ImGui::Render`）；隐藏时为无操作。
+    /// 结束 ImGui 帧（`ImGui::Render`）；未开始帧时为无操作。
     void EndFrame();
 
     /// IRenderOverlay：在同一命令缓冲、3D 通道之后绘制面板。
@@ -75,6 +108,19 @@ private:
 
     ImGuiContext* m_context = nullptr;
     bool          m_visible = true;
+
+    /// 构造期解析到的字体语言（T16）：是否加载到 CJK 字体，决定标签中 / 英。
+    bool m_cjkFontLoaded = false;
+
+    SystemPanel m_systemPanel;
+
+    /// 本帧是否已调用 `ImGui::NewFrame`（调试面板或系统面板可见时为 true）。
+    bool m_frameActive = false;
+    /// 本帧开始 ImGui 帧后采样的 ImGui 捕获标志（供输入抑制决策）。
+    bool m_wantCaptureMouse    = false;
+    bool m_wantCaptureKeyboard = false;
+    /// 玩法是否处于相对鼠标（捕获）状态；为 true 时对本帧 ImGui 置 `NoMouse`。
+    bool m_gameplayMouseCaptured = false;
 
     std::array<float, kHistorySize> m_history {};
     std::size_t                     m_historyCount = 0;

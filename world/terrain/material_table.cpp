@@ -56,6 +56,14 @@ void ValidateLayer(const MaterialLayer& layer, const std::filesystem::path& path
     if (layer.heightBlend < 0.0F || layer.slopeBlend < 0.0F) {
         throw std::runtime_error(Describe(path, slot, "height_blend/slope_blend") + "不能为负");
     }
+    if (!(layer.uvScale > 0.0F)) {
+        throw std::runtime_error(Describe(path, slot, "uv_scale") + "必须大于 0");
+    }
+    for (const float tint : { layer.tintR, layer.tintG, layer.tintB }) {
+        if (tint < 0.0F || tint > 1.0F) {
+            throw std::runtime_error(Describe(path, slot, "tint_r/tint_g/tint_b") + "必须落在 [0, 1]");
+        }
+    }
 }
 
 }  // namespace
@@ -104,6 +112,10 @@ TerrainMaterialTable TerrainMaterialTable::LoadFromFile(const std::filesystem::p
         parsed.slopeMin    = ReadFloat(*layer, path, slot, "slope_min");
         parsed.slopeMax    = ReadFloat(*layer, path, slot, "slope_max");
         parsed.slopeBlend  = ReadFloat(*layer, path, slot, "slope_blend");
+        parsed.uvScale     = ReadFloat(*layer, path, slot, "uv_scale");
+        parsed.tintR       = ReadFloat(*layer, path, slot, "tint_r");
+        parsed.tintG       = ReadFloat(*layer, path, slot, "tint_g");
+        parsed.tintB       = ReadFloat(*layer, path, slot, "tint_b");
 
         ValidateLayer(parsed, path, slot);
         table.m_layers[slot] = std::move(parsed);
@@ -116,12 +128,46 @@ TerrainMaterialTable TerrainMaterialTable::Default() {
     TerrainMaterialTable table;
 
     // 取值与 assets/config/materials.toml 一致，保证测试与运行期行为可比。
-    table.m_layers[0] = MaterialLayer { "grass", 1, 0.0F, 96.0F, 16.0F, 0.0F, 0.35F, 0.10F };
-    table.m_layers[1] = MaterialLayer { "dirt", 2, 0.0F, 160.0F, 24.0F, 0.20F, 0.60F, 0.15F };
-    table.m_layers[2] = MaterialLayer { "rock", 3, 40.0F, 512.0F, 24.0F, 0.45F, 1.0F, 0.15F };
-    table.m_layers[3] = MaterialLayer { "sand", 4, 0.0F, 6.0F, 3.0F, 0.0F, 0.30F, 0.10F };
+    // 字段顺序见 MaterialLayer 声明：name / textureLayer / 高度带(3) / 坡度带(3) / uvScale / tintRGB。
+    table.m_layers[0] =
+        MaterialLayer { "grass", 1, 0.0F, 96.0F, 16.0F, 0.0F, 0.35F, 0.10F, 0.12F, 0.31F, 0.55F, 0.24F };
+    table.m_layers[1] =
+        MaterialLayer { "dirt", 2, 0.0F, 160.0F, 24.0F, 0.20F, 0.60F, 0.15F, 0.10F, 0.45F, 0.33F, 0.21F };
+    table.m_layers[2] =
+        MaterialLayer { "rock", 3, 40.0F, 512.0F, 24.0F, 0.45F, 1.0F, 0.15F, 0.16F, 0.55F, 0.55F, 0.56F };
+    table.m_layers[3] =
+        MaterialLayer { "sand", 4, 0.0F, 6.0F, 3.0F, 0.0F, 0.30F, 0.10F, 0.18F, 0.83F, 0.74F, 0.48F };
 
     return table;
+}
+
+MaterialUniform BuildMaterialUniform(const TerrainMaterialTable& table, double originX, double originY,
+                                     double originZ) noexcept {
+    MaterialUniform uniform;
+    uniform.renderOriginX = static_cast<float>(originX);
+    uniform.renderOriginY = static_cast<float>(originY);
+    uniform.renderOriginZ = static_cast<float>(originZ);
+
+    for (std::size_t slot = 0; slot < static_cast<std::size_t>(kMaterialSlotCount); ++slot) {
+        const MaterialLayer& layer = table.Layer(static_cast<int>(slot));
+        MaterialLayerUniform& out  = uniform.layers[slot];
+
+        out.heightMin = layer.heightMin;
+        out.heightMax = layer.heightMax;
+        out.heightBlend = layer.heightBlend;
+        // 纹理数组层号从 0 起：表里的 1 号层 = 数组第 0 层（0 号层留给"缺失纹理"）。
+        out.textureIndex = static_cast<float>(layer.textureLayer - 1);
+        out.slopeMin = layer.slopeMin;
+        out.slopeMax = layer.slopeMax;
+        out.slopeBlend = layer.slopeBlend;
+        out.slopeUnused = 0.0F;
+        out.tintR = layer.tintR;
+        out.tintG = layer.tintG;
+        out.tintB = layer.tintB;
+        out.uvScale = layer.uvScale;
+    }
+
+    return uniform;
 }
 
 }  // namespace vx

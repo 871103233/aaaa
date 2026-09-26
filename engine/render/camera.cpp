@@ -97,6 +97,18 @@ CameraView ThirdPersonCamera::Evaluate(double alpha, const ITerrainQuery* terrai
         }
     }
 
+    // 不变量：`eye` 与 `target` 的间距恒不小于 `kCameraMinDistance`。
+    //
+    // 为什么必须在**用离地间隙抬高 eye 之前**托底：遮挡可能把 distance 压到 0，使 `eye == target`，
+    // 视线基向量退化为零；随后"离地间隙"只会抬高 `eye.y`，若此时 eye 与 target 的水平偏移也为 0，
+    // 视线方向就与世界上方向**平行**，`glm::lookAt` 归一化得到 NaN，视图矩阵失效、整帧几何被丢弃，
+    // 画面只剩清屏色（缺陷 B2）。先保证一个正的跟随距离，则 `backward` 的水平分量
+    // （`cos(pitch) >= cos(89°) > 0`）保证横向偏移恒非零，抬高纵坐标不会再造成退化。
+    if (distance < kCameraMinDistance) {
+        distance = kCameraMinDistance;
+        eye      = view.target + backward * distance;
+    }
+
     // 安全网：无论线段查询是否报告遮挡，视线都不得落在地表之下。
     if (terrain != nullptr) {
         float groundHeight = 0.0F;

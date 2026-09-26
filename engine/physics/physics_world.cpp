@@ -17,6 +17,7 @@
 #include <Jolt/Physics/Character/CharacterVirtual.h>
 #include <Jolt/Physics/Collision/BroadPhase/BroadPhaseLayer.h>
 #include <Jolt/Physics/Collision/ObjectLayer.h>
+#include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
@@ -182,6 +183,20 @@ struct PhysicsWorld::Impl {
     std::vector<JPH::BodyID>    bodies;  ///< 槽位 → BodyID；已释放槽位保存无效 ID
     std::vector<std::uint32_t>  freeBodySlots;
     std::vector<CharacterEntry> characters;
+
+    /// 把一个成功创建的静态刚体登记进槽位表，返回句柄（`slot + 1`）。
+    [[nodiscard]] PhysicsWorld::BodyHandle RegisterBody(const JPH::BodyID& bodyID) {
+        std::uint32_t slot = 0;
+        if (!freeBodySlots.empty()) {
+            slot = freeBodySlots.back();
+            freeBodySlots.pop_back();
+            bodies[slot] = bodyID;
+        } else {
+            slot = static_cast<std::uint32_t>(bodies.size());
+            bodies.push_back(bodyID);
+        }
+        return slot + 1;
+    }
 };
 
 PhysicsWorld::PhysicsWorld() : m_impl(std::make_unique<Impl>()) {
@@ -229,17 +244,31 @@ PhysicsWorld::BodyHandle PhysicsWorld::AddHeightField(const HeightFieldDesc& des
         VX_LOG_ERROR("创建高度场刚体失败");
         return 0;
     }
+    return m_impl->RegisterBody(bodyID);
+}
 
-    std::uint32_t slot = 0;
-    if (!m_impl->freeBodySlots.empty()) {
-        slot = m_impl->freeBodySlots.back();
-        m_impl->freeBodySlots.pop_back();
-        m_impl->bodies[slot] = bodyID;
-    } else {
-        slot = static_cast<std::uint32_t>(m_impl->bodies.size());
-        m_impl->bodies.push_back(bodyID);
+PhysicsWorld::BodyHandle PhysicsWorld::AddStaticBox(const BoxDesc& desc) {
+    if (desc.halfExtents.x <= 0.0 || desc.halfExtents.y <= 0.0 || desc.halfExtents.z <= 0.0) {
+        VX_LOG_ERROR("静态盒体参数非法：半长必须为正（%g, %g, %g）", desc.halfExtents.x, desc.halfExtents.y,
+                     desc.halfExtents.z);
+        return 0;
     }
-    return slot + 1;
+
+    const JPH::ShapeRefC shape =
+        new JPH::BoxShape(JPH::Vec3(static_cast<float>(desc.halfExtents.x), static_cast<float>(desc.halfExtents.y),
+                                    static_cast<float>(desc.halfExtents.z)));
+    JPH::BodyCreationSettings bodySettings(shape,
+                                           JPH::RVec3(static_cast<JPH::Real>(desc.center.x),
+                                                      static_cast<JPH::Real>(desc.center.y),
+                                                      static_cast<JPH::Real>(desc.center.z)),
+                                           JPH::Quat::sIdentity(), JPH::EMotionType::Static, kObjectLayerStatic);
+    const JPH::BodyID bodyID =
+        m_impl->system->GetBodyInterface().CreateAndAddBody(bodySettings, JPH::EActivation::DontActivate);
+    if (bodyID.IsInvalid()) {
+        VX_LOG_ERROR("创建静态盒体刚体失败");
+        return 0;
+    }
+    return m_impl->RegisterBody(bodyID);
 }
 
 bool PhysicsWorld::UpdateHeightField(BodyHandle handle, const HeightFieldDesc& desc) {
@@ -327,6 +356,19 @@ void PhysicsWorld::SetCharacterVelocity(CharacterHandle handle, const glm::vec3&
     if (JPH::CharacterVirtual* character = m_impl->characters[handle - 1].character.get(); character != nullptr) {
         character->SetLinearVelocity(JPH::Vec3(velocity.x, velocity.y, velocity.z));
     }
+}
+
+void PhysicsWorld::SetCharacterPosition(CharacterHandle handle, const glm::dvec3& position) noexcept {
+    if (handle == 0 || handle > m_impl->characters.size()) {
+        return;
+    }
+    JPH::CharacterVirtual* character = m_impl->characters[handle - 1].character.get();
+    if (character == nullptr) {
+        return;
+    }
+    character->SetPosition(JPH::RVec3(static_cast<JPH::Real>(position.x), static_cast<JPH::Real>(position.y),
+                                      static_cast<JPH::Real>(position.z)));
+    character->SetLinearVelocity(JPH::Vec3::sZero());
 }
 
 void PhysicsWorld::MoveCharacter(CharacterHandle handle, float dt, const glm::vec3& gravity) {

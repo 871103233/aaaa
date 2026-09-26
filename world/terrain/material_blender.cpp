@@ -30,15 +30,14 @@ constexpr float kWeightEpsilon = 1.0F / 1000000.0F;
     return t * t * (3.0F - 2.0F * t);
 }
 
-/// 一条「带」的隶属度：带内为 1，带外经 `blend` 宽度平滑归零。
-[[nodiscard]] float BandFactor(float value, float min, float max, float blend) noexcept {
+}  // namespace
+
+float MaterialBandFactor(float value, float min, float max, float blend) noexcept {
     if (blend <= 0.0F) {
         return (value >= min && value <= max) ? 1.0F : 0.0F;
     }
     return SmoothStep(min - blend, min, value) * (1.0F - SmoothStep(max, max + blend, value));
 }
-
-}  // namespace
 
 std::array<float, static_cast<std::size_t>(kMaterialSlotCount)> ComputeBlendWeights(const TerrainMaterialTable& table,
                                                                                     float heightBlocks,
@@ -49,8 +48,8 @@ std::array<float, static_cast<std::size_t>(kMaterialSlotCount)> ComputeBlendWeig
     float total = 0.0F;
     for (int slot = 0; slot < kMaterialSlotCount; ++slot) {
         const MaterialLayer& layer = table.Layer(slot);
-        const float weight = BandFactor(heightBlocks, layer.heightMin, layer.heightMax, layer.heightBlend) *
-                             BandFactor(clampedSlope, layer.slopeMin, layer.slopeMax, layer.slopeBlend);
+        const float weight = MaterialBandFactor(heightBlocks, layer.heightMin, layer.heightMax, layer.heightBlend) *
+                             MaterialBandFactor(clampedSlope, layer.slopeMin, layer.slopeMax, layer.slopeBlend);
         weights[static_cast<std::size_t>(slot)] = weight;
         total += weight;
     }

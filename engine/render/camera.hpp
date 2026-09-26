@@ -12,6 +12,14 @@ inline constexpr float kDegToRad = 0.01745329251994329577F;
 /// 留 1° 余量，使视线方向永不与世界上方向平行，从而避免万向节奇异。
 inline constexpr float kCameraPitchLimit = 89.0F * kDegToRad;
 
+/// 相机与注视点之间的**最小距离**（格）。
+///
+/// 不变量：`ThirdPersonCamera::Evaluate` 返回的 `eye` 与 `target` 的间距恒 `>=` 本值。
+/// 若允许间距退化到 0（避障把相机拉到注视点、或地表被抬高后由"离地间隙"安全网把相机顶到注视点正上方），
+/// `glm::lookAt` 的视线基向量要么是零向量、要么与世界上方向平行，归一化会得到 NaN；
+/// 视图矩阵随之失效、整帧几何被丢弃 —— 画面只剩清屏色（缺陷 B2）。
+inline constexpr float kCameraMinDistance = 0.5F;
+
 /// 地形查询接口：**相机避障所需的最小契约**。
 ///
 /// 为什么要放在引擎层：世界层（`world/`）尚未落地，而相机必须能在没有地形实现的情况下

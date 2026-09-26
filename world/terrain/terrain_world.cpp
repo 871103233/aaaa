@@ -14,12 +14,18 @@ constexpr float kObstructionStepBlocks = 0.25F;
 }  // namespace
 
 TerrainWorld::TerrainWorld(std::uint64_t worldSeed, TerrainMaterialTable materials)
-    : m_seed(worldSeed), m_materials(std::move(materials)), m_noise(worldSeed), m_blender(worldSeed) {}
+    : m_seed(worldSeed), m_materials(std::move(materials)), m_noise(worldSeed) {}
+
+void TerrainWorld::SetMapPreset(const MapPreset& preset) {
+    m_mapEdits = preset.edits;
+}
 
 void TerrainWorld::GenerateTile(int tileX, int tileZ) {
     TerrainTile& tile = m_tiles[TileCoord { tileX, tileZ }];
     tile.coord        = TileCoord { tileX, tileZ };
     GenerateTerrainTile(tile, m_noise);
+    // 预设地图：噪声先行，编辑按文件顺序覆盖其上（T11；纯函数，边界列逐位一致）。
+    ApplyMapEditsToTile(m_mapEdits, tile);
 }
 
 void TerrainWorld::MeshTile(int tileX, int tileZ) {
@@ -27,7 +33,7 @@ void TerrainWorld::MeshTile(int tileX, int tileZ) {
     if (tile == nullptr) {
         return;
     }
-    m_meshes[TileCoord { tileX, tileZ }] = BuildTerrainMesh(*tile, m_blender, m_materials);
+    m_meshes[TileCoord { tileX, tileZ }] = BuildTerrainMesh(*tile);
 }
 
 void TerrainWorld::LoadTile(int tileX, int tileZ) {

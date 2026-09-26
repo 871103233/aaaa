@@ -1,7 +1,6 @@
 #include "terrain/terrain_mesher.hpp"
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstdint>
 
@@ -39,8 +38,7 @@ glm::dvec3 TerrainTileMesh::WorldPosition(std::size_t vertexIndex) const noexcep
                       static_cast<double>(TileOriginColumn(coord.z)) + static_cast<double>(vertex.position[2]));
 }
 
-TerrainTileMesh BuildTerrainMesh(const TerrainTile& tile, const MaterialBlender& blender,
-                                 const TerrainMaterialTable& table) {
+TerrainTileMesh BuildTerrainMesh(const TerrainTile& tile) {
     TerrainTileMesh result;
     result.coord = tile.coord;
 
@@ -50,24 +48,16 @@ TerrainTileMesh BuildTerrainMesh(const TerrainTile& tile, const MaterialBlender&
 
     for (int j = 0; j < kTerrainTileVertexCount; ++j) {
         for (int i = 0; i < kTerrainTileVertexCount; ++i) {
-            const float heightBlocks = HeightToBlocks(tile.At(i, j));
-            const glm::vec3 normal   = ComputeNormal(tile, i, j);
-            const float slope        = std::clamp(1.0F - normal.y, 0.0F, 1.0F);
+            const float     heightBlocks = HeightToBlocks(tile.At(i, j));
+            const glm::vec3 normal       = ComputeNormal(tile, i, j);
 
-            const std::array<float, static_cast<std::size_t>(kMaterialSlotCount)> weights = blender.WeightsAt(
-                table, static_cast<float>(tile.WorldColumnX(i)), static_cast<float>(tile.WorldColumnZ(j)), heightBlocks,
-                slope);
-
-            MeshVertex& vertex  = result.mesh.vertices[TerrainTileMesh::VertexIndex(i, j)];
-            vertex.position[0]  = static_cast<float>(i);
-            vertex.position[1]  = heightBlocks;
-            vertex.position[2]  = static_cast<float>(j);
-            vertex.normal[0]    = normal.x;
-            vertex.normal[1]    = normal.y;
-            vertex.normal[2]    = normal.z;
-            for (int slot = 0; slot < kMaterialSlotCount; ++slot) {
-                vertex.materialWeights[static_cast<std::size_t>(slot)] = weights[static_cast<std::size_t>(slot)];
-            }
+            MeshVertex& vertex = result.mesh.vertices[TerrainTileMesh::VertexIndex(i, j)];
+            vertex.position[0] = static_cast<float>(i);
+            vertex.position[1] = heightBlocks;
+            vertex.position[2] = static_cast<float>(j);
+            vertex.normal[0]   = normal.x;
+            vertex.normal[1]   = normal.y;
+            vertex.normal[2]   = normal.z;
         }
     }
 

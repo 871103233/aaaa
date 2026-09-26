@@ -16,6 +16,9 @@ find_package(imgui CONFIG REQUIRED)
 add_executable(voxel_game
     main.cpp
     debug_overlay.cpp
+    system_panel.cpp
+    ui_font.cpp
+    ui_theme.cpp
 )
 
 # 让运行期能定位仓库内已提交的资产（材质表等），与 tests/CMakeLists.txt 口径一致。

@@ -4,6 +4,7 @@
 
 #include <SDL3/SDL.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -18,16 +19,17 @@ namespace vx {
 /// 顶点由世界层按**平滑曲面**产出，渲染侧只按下面的固定布局消费。
 ///
 /// 布局与 Shader 的顶点输入位置一一对应（见 mesh_renderer.cpp 的管线描述）：
-///   - location 0 `vec3 position`        —— **相机相对坐标**（红线 6：世界定位不用 `float`；
-///                                          世界层上传前做相机相对偏移）
-///   - location 1 `vec3 normal`          —— 世界空间单位法线（由高度场 / 密度场梯度算出，
-///                                          禁止用面法线近似）
-///   - location 2 `vec4 materialWeights` —— 材质混合权重（splat）；`x~w` 依次对应 4 个纹理层，
-///                                          0 号层保留给"缺失纹理"占位
+///   - location 0 `vec3 position` —— **相机相对坐标**（红线 6：世界定位不用 `float`；
+///                                  世界层上传前做相机相对偏移）
+///   - location 1 `vec3 normal`   —— 世界空间单位法线（由高度场 / 密度场梯度算出，
+///                                  禁止用面法线近似）
+///
+/// **不再承载材质权重**（ADR 0009）：权重由片元着色器按世界高度与坡度**逐像素**重算，
+/// 过渡带宽因此由几何曲率决定、不受顶点间距限制。片元用 uniform 的**渲染原点**把这里的
+/// 相机相对坐标还原为世界坐标（见 `SetMaterialUniform`）。
 struct MeshVertex {
-    float position[3]        = { 0.0F, 0.0F, 0.0F };
-    float normal[3]          = { 0.0F, 1.0F, 0.0F };
-    float materialWeights[4] = { 0.0F, 0.0F, 0.0F, 0.0F };
+    float position[3] = { 0.0F, 0.0F, 0.0F };
+    float normal[3]   = { 0.0F, 1.0F, 0.0F };
 };
 
 /// 一份待上传的网格数据（顶点 + 32 位索引）。
@@ -48,6 +50,29 @@ struct MeshHandle {
 
     [[nodiscard]] bool IsValid() const noexcept { return id != 0; }
 };
+
+/// 通用 2D 纹理数组的 GPU 句柄。`id == 0` 表示无效句柄。
+struct TextureArrayHandle {
+    std::uint32_t id = 0;
+
+    [[nodiscard]] bool IsValid() const noexcept { return id != 0; }
+};
+
+/// 通用 2D 纹理数组的创建描述。**不含任何世界 / 地形语义**：引擎只按字节上传，不解释内容。
+///
+/// 约定：像素格式固定为 `R8G8B8A8_UNORM`，数据为 layer-major 连续的第 0 级
+/// （层 L 的像素从 `L * width * height * 4` 开始）；mip 链由引擎用 SDL 生成。
+/// 前置条件：`pixels` 至少 `width * height * 4 * layerCount` 字节。
+struct TextureArrayDesc {
+    std::uint32_t       width      = 0;
+    std::uint32_t       height     = 0;
+    std::uint32_t       layerCount = 0;
+    const std::uint8_t* pixels     = nullptr;
+};
+
+/// 材质 uniform 块的最大字节数（`SetMaterialUniform` 的容量上限）。
+/// 当前片元块 = 渲染原点（`vec4`）+ 4 层 × 3 个 `vec4` = 208 字节；留余量给后续参数。
+inline constexpr std::size_t kMaxMaterialUniformBytes = 512;
 
 /// 帧末叠加层：与 3D 主通道**共用同一个命令缓冲**，在提交前绘制覆盖内容（调试面板等 UI）。
 ///
@@ -81,9 +106,10 @@ protected:
 /// 两者并存，冒烟路径保持不变。
 ///
 /// Shader 约定（由构建期两段式管线产出双格式，见 ADR 0002）：
-///   - 顶点着色器入口 `main`：消费上面 `MeshVertex` 的三个 location，
-///     并绑定一个 storage buffer（slot 0，内容为 `CameraUniform`）；
-///   - 片元着色器入口 `main`。
+///   - 顶点着色器入口 `main`：消费上面 `MeshVertex` 的两个 location，
+///     并绑定一个只读 storage buffer（slot 0，内容为 `CameraUniform`）；
+///   - 片元着色器入口 `main`：采样两个纹理数组（slot 0 / 1，见 `SetSampledTextureArrays`）
+///     并读取一个 uniform 块（slot 0，见 `SetMaterialUniform`）。
 ///   产物路径为 `<shader_dir>/<shader_name>.vert{.spv|.dxil}` 与 `<shader_name>.frag{...}`，
 ///   缺失时构造函数抛 `std::runtime_error`（与 `TriangleRenderer` 一致）。
 ///
@@ -103,8 +129,35 @@ public:
     /// 注意：上传会阻塞到 GPU 完成，只应在加载 / 生成阶段调用，**不得**放进每帧热路径。
     [[nodiscard]] MeshHandle UploadMesh(const MeshData& mesh);
 
+    /// 用一个**顶点数不变**的新顶点数组就地刷新已上传网格的顶点缓冲；索引缓冲保持不变。
+    ///
+    /// 与 `UploadMesh` 的区别：复用既有 GPU 缓冲与一个常驻暂存缓冲，**不创建 GPU 资源、不做同步等待**，
+    /// 因而可用于每帧改写"相机相对顶点"的**动态**网格（例如主角胶囊体）。
+    /// 返回 false 表示句柄无效、槽位已释放，或 `vertices.size()` 与上传时不一致。
+    [[nodiscard]] bool UpdateMeshVertices(MeshHandle handle, const std::vector<MeshVertex>& vertices);
+
     /// 释放一个网格的 GPU 资源；无效句柄为无操作。
     void ReleaseMesh(MeshHandle handle) noexcept;
+
+    /// 创建并同步上传一个 2D 纹理数组（采样用，含由 SDL 生成的完整 mip 链）。
+    ///
+    /// 前置条件：`desc.width/height/layerCount ≥ 1` 且 `desc.pixels` 非空。
+    /// 注意：会阻塞到 GPU 完成，只应在加载 / 生成阶段调用，**不得**放进每帧热路径。
+    /// 失败时抛 `std::runtime_error`（启动 / 加载期允许异常）。
+    [[nodiscard]] TextureArrayHandle CreateTextureArray(const TextureArrayDesc& desc);
+
+    /// 释放一个纹理数组的 GPU 资源；无效句柄为无操作。
+    void ReleaseTextureArray(TextureArrayHandle handle) noexcept;
+
+    /// 绑定两个纹理数组到网格着色器的采样槽 0（albedo）/ 1（normal）。
+    /// 槽序与 `assets/shaders/mesh.frag` 的 `set = 2, binding = 0/1` 一致。
+    void SetSampledTextureArrays(TextureArrayHandle albedo, TextureArrayHandle normal) noexcept;
+
+    /// 设置片元着色器的材质 uniform 块（**原样字节**，引擎不解释其语义）。
+    ///
+    /// 需与 mesh.frag 的 std140 `set = 3, binding = 0` 布局一致（块内容由世界层构建）。
+    /// 只做拷贝、不分配；`size > kMaxMaterialUniformBytes` 时忽略。
+    void SetMaterialUniform(const void* data, std::size_t size) noexcept;
 
     /// 设置本帧相机常量；下一次 `RenderFrame` 生效。
     void SetCamera(const CameraView& camera) noexcept;
@@ -120,6 +173,7 @@ private:
     struct MeshResources {
         SDL_GPUBuffer* vertexBuffer = nullptr;
         SDL_GPUBuffer* indexBuffer  = nullptr;
+        std::uint32_t  vertexCount  = 0;
         std::uint32_t  indexCount   = 0;
     };
 
@@ -143,6 +197,24 @@ private:
 
     std::vector<MeshResources> m_meshes;
     std::vector<std::uint32_t> m_freeSlots;
+
+    // ---- 纹理数组与材质 uniform（通用，引擎不解释内容）----
+
+    /// 复用的采样器：repeat 寻址 + 线性过滤 + mipmap 线性（创建一次，全体纹理数组共用）。
+    SDL_GPUSampler* m_layerSampler = nullptr;
+
+    std::vector<SDL_GPUTexture*> m_textureArrays;
+    std::vector<std::uint32_t>   m_freeTextureSlots;
+    TextureArrayHandle           m_albedoTexture;
+    TextureArrayHandle           m_normalTexture;
+
+    /// 片元 uniform 块的暂存字节（固定容量，`SetMaterialUniform` 只做 memcpy、不分配）。
+    std::array<std::uint8_t, kMaxMaterialUniformBytes> m_materialUniform {};
+    std::size_t                                        m_materialUniformSize = 0;
+
+    /// `UpdateMeshVertices` 复用的常驻暂存缓冲：容量足够时**不**重新分配（避免每帧堆分配）。
+    SDL_GPUTransferBuffer* m_vertexStagingBuffer   = nullptr;
+    std::uint32_t          m_vertexStagingCapacity = 0;
 };
 
 }  // namespace vx

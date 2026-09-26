@@ -201,3 +201,41 @@ TEST(PhysicsCharacter, SprintDoesNotPassThroughTallWall) {
     EXPECT_NEAR(state.position.y, 5.0, kRestTolerance);  // 仍站在低处
     EXPECT_GE(lowest, 5.0 - kNoFallTolerance);   // 全程不穿地形
 }
+
+// T18 新增的**通用静态盒体**（`AddStaticBox`）：20 格/秒冲刺撞上盒体不得穿过，
+// 与高度场墙同一验收口径；同时确认盒体计入碰撞体总数。
+TEST(PhysicsBody, SprintDoesNotPassThroughStaticBox) {
+    PhysicsWorld physics;
+
+    const std::vector<float> samples = MakeFlatSamples(5.0F);
+    ASSERT_NE(physics.AddHeightField(MakeDesc(samples)), 0u);
+
+    PhysicsWorld::BoxDesc box;
+    box.center      = glm::dvec3(32.0, 10.0, 32.0);  // 近端面在 x = 31
+    box.halfExtents = glm::dvec3(1.0, 15.0, 10.0);   // 覆盖 y ∈ [-5, 25]，高过角色
+    ASSERT_NE(physics.AddStaticBox(box), 0u);
+    EXPECT_EQ(physics.BodyCount(), 2u);
+
+    PhysicsWorld::CapsuleDesc capsule;
+    capsule.stepUpHeight = 1.0F;
+    capsule.position     = glm::dvec3(24.0, 5.0, 32.0);
+    const PhysicsWorld::CharacterHandle character = physics.CreateCharacter(capsule);
+    ASSERT_NE(character, 0u);
+
+    const float lowest = DriveCharacter(physics, character, 20.0F, 60);  // 1 秒，位移上限 20 格
+
+    const PhysicsWorld::CharacterState state = physics.GetCharacterState(character);
+    EXPECT_LT(state.position.x, 31.0);                       // 被盒体挡住，未穿过
+    EXPECT_NEAR(state.position.y, 5.0, kRestTolerance);      // 仍站在地面
+    EXPECT_GE(lowest, 5.0 - kNoFallTolerance);               // 全程不穿地形
+}
+
+// 非法盒体（半长非正）必须拒绝并返回无效句柄，不得静默创建退化碰撞体。
+TEST(PhysicsBody, RejectsStaticBoxWithNonPositiveHalfExtent) {
+    PhysicsWorld physics;
+
+    PhysicsWorld::BoxDesc box;
+    box.halfExtents = glm::dvec3(1.0, 0.0, 1.0);
+    EXPECT_EQ(physics.AddStaticBox(box), 0u);
+    EXPECT_EQ(physics.BodyCount(), 0u);
+}

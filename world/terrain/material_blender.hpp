@@ -8,11 +8,26 @@
 
 namespace vx {
 
-/// 按「高度 + 坡度」计算 N 个材质槽位的 splat 权重，并归一化到和为 1（ADR 0004 / 方案 §4.3）。
+/// 一条「带」的隶属度：带内为 1，带外经 `blend` 宽的**窄带**平滑阶跃归零（ADR 0009）。
+///
+/// 这是材质过渡的**唯一**曲线定义，CPU 与 GPU 共用同一公式：
+///   - 实现内 `ComputeBlendWeights` 调用本函数；
+///   - `assets/shaders/mesh.frag` 的 `bandFactor()` 逐字镜像本函数（逐像素调用）。
+///
+/// 过渡带宽由 `blend` 决定（两侧各 `blend` 宽），因此远窄于整段 [min, max]；
+/// 片元着色器逐像素求值后，边界宽度只受几何局部曲率限制，不再受 1 格顶点间距摊开。
+///
+/// 前置条件：`min ≤ max`；`blend ≤ 0` 表示硬边界。
+[[nodiscard]] float MaterialBandFactor(float value, float min, float max, float blend) noexcept;
+
+/// 按「高度 + 坡度」计算 N 个材质槽位的 splat 权重，并归一化到和为 1（ADR 0004 / 0009 / 方案 §4.3）。
 ///
 /// 纯函数：不依赖全局状态、不分配、不抛异常。
 /// 模型：每个槽位的原始权重 = `heightFactor * slopeFactor`，两个因子分别是高度带与坡度带的
-/// 平滑隶属度；若总和过小（无槽位匹配），则整体退化为「槽位 0 权重 1」，保证权重非零且和为 1。
+/// 平滑隶属度（见 `MaterialBandFactor`）；若总和过小（无槽位匹配），则整体退化为「槽位 0 权重 1」，
+/// 保证权重非零且和为 1。
+///
+/// `assets/shaders/mesh.frag` 的 `computeWeights()` 镜像本函数；两边改动必须同步。
 ///
 /// 前置条件：`slope` 应为 `1 - normal.y`；越界值会被钳制到 `[0, 1]`。
 [[nodiscard]] std::array<float, static_cast<std::size_t>(kMaterialSlotCount)>

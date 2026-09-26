@@ -1,8 +1,6 @@
 #pragma once
 
 #include "render/mesh_renderer.hpp"
-#include "terrain/material_blender.hpp"
-#include "terrain/material_table.hpp"
 #include "terrain/terrain_tile.hpp"
 #include "terrain/terrain_types.hpp"
 
@@ -34,11 +32,11 @@ struct TerrainTileMesh {
 ///
 /// - 顶点位置为块内定点坐标转 `float`；世界定位由 `TerrainTileMesh::coord` 承担；
 /// - **法线由高度场梯度计算**并写入顶点属性（禁止面法线近似）；
-/// - 材质权重由 `blender` + `table` 按高度与坡度算出，写入顶点的 splat 分量；
+/// - **不再**写入材质权重：ADR 0009 起权重由片元着色器**逐像素**按世界高度与坡度计算，
+///   因此过渡带宽只受几何曲率限制，不受 1 格顶点间距摊开（顶点格式见 `MeshVertex`）；
 /// - 三角形绕序在 +Y 视角下为逆时针（`(A,C,B)` 与 `(B,C,D)`，A/B/C/D 为每格四角）。
 ///
 /// 前置条件：`tile` 已由 `GenerateTerrainTile` 填充完毕。
-[[nodiscard]] TerrainTileMesh BuildTerrainMesh(const TerrainTile& tile, const MaterialBlender& blender,
-                                               const TerrainMaterialTable& table);
+[[nodiscard]] TerrainTileMesh BuildTerrainMesh(const TerrainTile& tile);
 
 }  // namespace vx
