@@ -177,6 +177,11 @@ LightingTable LightingTable::LoadFromFile(const std::filesystem::path& path) {
     table.m_shadow.normalOffset = ReadNonNegative(shadow, path, "shadow", "normal_offset");
     // 缺陷 1：投射体扩展下限兜底（格，≥ 0）。
     table.m_shadow.casterHeightMin = ReadNonNegative(shadow, path, "shadow", "caster_height_min");
+    // 缺陷 B8：级联过渡带宽度比例，必须 ∈ [0, 0.5]（越界即抛，不静默钳制）。
+    table.m_shadow.cascadeBlend = ReadFloat(shadow, path, "shadow", "cascade_blend");
+    if (table.m_shadow.cascadeBlend < 0.0F || table.m_shadow.cascadeBlend > 0.5F) {
+        throw std::runtime_error(Describe(path, "shadow", "cascade_blend") + "必须落在 [0, 0.5]");
+    }
 
     return table;
 }

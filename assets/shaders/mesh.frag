@@ -150,12 +150,13 @@ layout(set = 3, binding = 1, std140) uniform LightingBlock {
 } lighting;
 
 /// 级联阴影 uniform 块（T21b / ADR 0010 P1）：字段排布与 CPU 侧 engine/render/shadow_cascade.hpp 的
-/// `ShadowUniform` **逐字对应**（4×mat4 + 3 个 vec4 = 304 字节）。矩阵由 game/ 每帧按相机参数构建。
+/// `ShadowUniform` **逐字对应**（4×mat4 + 4 个 vec4 = 320 字节）。矩阵由 game/ 每帧按相机参数构建。
 layout(set = 3, binding = 2, std140) uniform ShadowBlock {
     mat4 lightMatrices[4];      // 各级光空间矩阵（**渲染原点相对坐标系**，与顶点同为相机相对坐标）
     vec4 splitDistances;        // x..w = 各级远平面（相机视距，格）
     vec4 shadowParams;          // x = 级数, y = 1/resolution（texel 尺寸，UV 单位）, z = depth_bias, w = normal_offset(格)
     vec4 cameraForwardEnabled;  // xyz = 相机世界前向（单位向量）, w = 启用(1/0)
+    vec4 cascadeBlendParams;    // x = cascade_blend（级联过渡带宽度比例）, y/z/w = 未用（填充位）
 } shadow;
 
 /// 一条「带」的隶属度：带内为 1，带外经 blend 宽的窄带平滑阶跃归零。
@@ -224,14 +225,20 @@ float valueNoise(vec2 p) {
     return mix(mix(a, b, curve.x), mix(c, d, curve.x), curve.y);
 }
 
-/// 级联阴影采样（T21b）：返回**遮蔽量** ∈ [0, 1]（0 = 全亮、1 = 全暗）。
+/// 级联阴影采样（T21b / 缺陷 B8）：返回**遮蔽量** ∈ [0, 1]（0 = 全亮、1 = 全暗）。
 ///
 /// 级联选择规则：按**沿相机视轴的线性深度** `viewDepth = dot(worldPos - cameraWorld, cameraForward)`
 /// 与 `shadow.splitDistances[i]` 比较，取第一个"深度 ≤ 该级远平面"的级联 i。
 /// 为什么不用欧氏距离 `length(worldPos - cameraWorld)`：分割距离是沿视轴量的，
 /// 视锥边缘的片元欧氏距离会大于其轴向深度，导致它提前跳到更大的级联、而该级联的包围球
 /// 可能并不包含它（采样到级联外 → 阴影错误）。轴向深度与分割口径完全一致，不会出现这种越界。
-/// 超过最远一级 → 不投影（远景融入雾，见 lighting.toml 的 max_distance）。
+///
+/// **超出最远级联 → clamp 到最远级联**（缺陷 B8 要求 3）：此前返回"受光"，会使影子尾端
+/// 随视角出现 / 消失；最远级联已覆盖到 `max_distance`，再远处由雾掩盖，故 clamp 后行为更稳定。
+///
+/// **级联边界混合**（缺陷 B8 要求 2）：在 `cascade_blend × 该级远平面` 宽的过渡带内同时采样
+/// 相邻两级，权重用 `smoothstep`（与 CPU 侧 `vx::CascadeBlendWeight` 逐字镜像），**两级权重和恒为 1**；
+/// `cascade_blend = 0` 时逐字退回"单级采样"（旧行为）。
 ///
 /// 深度比较公式（正交投影，NDC z ∈ [0, 1]，近平面 = 0，与 SDL_gpu 的深度约定一致）：
 ///   `lightDepth = projected.z`，`closest = texture(u_shadow, ...).r`；
@@ -239,44 +246,21 @@ float valueNoise(vec2 p) {
 ///
 /// 偏移量量纲与抗瑕疵：
 ///   - `shadowParams.w` = normal_offset，**世界单位（格）**：采样点沿几何法线外移，
-///     使掠射表面离开自身写入的深度 —— 这是抗 **acne（自阴影条纹）** 的主要手段
-///     （几何偏移不依赖深度分辨率，比单靠 depthBias 稳）。
-///   - `shadowParams.z` = depth_bias，**阴影图 [0,1] 深度单位**：给比较留一点常数余量，
-///     吸收投影与光栅化误差；两者用量都很小，因此 **Peter-panning（阴影与物体分离）** 仅在
-///     5cm 量级（normal_offset = 0.05 格），肉眼不可辨。
+///     使掠射表面离开自身写入的深度 —— 这是抗 **acne（自阴影条纹）** 的主要手段。
+///   - `shadowParams.z` = depth_bias，**阴影图 [0,1] 深度单位**：给比较留一点常数余量。
 ///
 /// **V 必须翻转**：SDL_gpu 的 NDC 是"左下角 (-1,-1)、+Y 向上"，而纹理坐标是"左上角 (0,0)、+Y 向下"
 /// （SDL_gpu.h §Coordinate System；后端差异由 SDL 自动转换）。因此把光空间 NDC 转纹理 UV 必须写
 /// `uv = vec2(x*0.5 + 0.5, 0.5 - y*0.5)`；照直写 `y*0.5 + 0.5` 会让阴影图相对几何**上下颠倒**
 /// （与 tonemap.vert 的 V 翻转同源，属于本项目缺陷 B5 的同类陷阱）。
-float sampleShadow(vec3 relativePosition, vec3 geometricNormal, float viewDepth) {
-    if (shadow.cameraForwardEnabled.w < 0.5) {
-        return 0.0;  // 阴影关闭：整段跳过（不采样、不比较）
-    }
 
-    const int cascadeCount = int(shadow.shadowParams.x);
-    int       cascade      = -1;
-    for (int i = 0; i < kMaxShadowCascades; ++i) {
-        if (i >= cascadeCount) {
-            break;
-        }
-        if (viewDepth <= shadow.splitDistances[i]) {
-            cascade = i;
-            break;
-        }
-    }
-    if (cascade < 0) {
-        return 0.0;  // 超出最远级联：不投影
-    }
+/// 采样**单个**级联，返回遮蔽量 ∈ [0, 1]。级联外（含深度越界）→ 视为受光（0）。
+float sampleCascadeShadow(int cascade, vec3 shadowPosition) {
+    const vec4 lightClip = shadow.lightMatrices[cascade] * vec4(shadowPosition, 1.0);
+    const vec3 projected = lightClip.xyz / lightClip.w;  // 正交投影：w 恒为 1
 
-    // 光空间矩阵作用于**相机相对坐标**（与顶点同坐标系），故用 v_relativePosition + 法线偏移。
-    const vec3 shadowPosition = relativePosition + geometricNormal * shadow.shadowParams.w;
-    const vec4 lightClip      = shadow.lightMatrices[cascade] * vec4(shadowPosition, 1.0);
-    const vec3 projected      = lightClip.xyz / lightClip.w;  // 正交投影：w 恒为 1
-
-    // 级联外（含深度越界）→ 视为受光，避免 clamp 到边缘 texel 产生假阴影。
     if (any(lessThan(projected, vec3(-1.0))) || any(greaterThan(projected, vec3(1.0)))) {
-        return 0.0;
+        return 0.0;  // 级联外 → 视为受光，避免 clamp 到边缘 texel 产生假阴影
     }
 
     const vec2  uv    = vec2(projected.x * 0.5 + 0.5, 0.5 - projected.y * 0.5);  // 见上方 V 翻转说明
@@ -294,6 +278,58 @@ float sampleShadow(vec3 relativePosition, vec3 geometricNormal, float viewDepth)
         }
     }
     return 1.0 - litSamples * (1.0 / 9.0);
+}
+
+/// 级联过渡带的**近级权重** ∈ [0, 1]（缺陷 B8）；与 CPU 侧 `vx::CascadeBlendWeight` 逐字镜像。
+/// 远级权重 = `1 - 本值`，故两侧权重和**恒为 1**；`blendBand <= 0` 时恒为 1（退回单级采样）。
+float cascadeBlendWeight(float viewDepth, float splitInner, float blendBand) {
+    if (blendBand <= 0.0) {
+        return 1.0;
+    }
+    const float bandInner = splitInner - blendBand;
+    if (viewDepth <= bandInner) {
+        return 1.0;
+    }
+    if (viewDepth >= splitInner) {
+        return 0.0;
+    }
+    const float t = (viewDepth - bandInner) / blendBand;
+    return 1.0 - t * t * (3.0 - 2.0 * t);
+}
+
+float sampleShadow(vec3 relativePosition, vec3 geometricNormal, float viewDepth) {
+    if (shadow.cameraForwardEnabled.w < 0.5) {
+        return 0.0;  // 阴影关闭：整段跳过（不采样、不比较）
+    }
+
+    const int cascadeCount = int(shadow.shadowParams.x);
+    // 缺陷 B8：默认 clamp 到最远级联（超出最远级联不再"视为受光"）。
+    int cascade = cascadeCount - 1;
+    for (int i = 0; i < kMaxShadowCascades; ++i) {
+        if (i >= cascadeCount) {
+            break;
+        }
+        if (viewDepth <= shadow.splitDistances[i]) {
+            cascade = i;
+            break;
+        }
+    }
+
+    // 光空间矩阵作用于**相机相对坐标**（与顶点同坐标系），故用 v_relativePosition + 法线偏移。
+    const vec3 shadowPosition = relativePosition + geometricNormal * shadow.shadowParams.w;
+
+    // 缺陷 B8：级联边界附近同时采样相邻两级并加权混合（近级权重 + 远级权重恒为 1）。
+    if (cascade + 1 < cascadeCount) {
+        const float splitInner = shadow.splitDistances[cascade];
+        const float blendBand  = shadow.cascadeBlendParams.x * splitInner;
+        const float nearWeight = cascadeBlendWeight(viewDepth, splitInner, blendBand);
+        if (nearWeight < 1.0) {
+            const float nearAmount = sampleCascadeShadow(cascade, shadowPosition);
+            const float farAmount  = sampleCascadeShadow(cascade + 1, shadowPosition);
+            return nearWeight * nearAmount + (1.0 - nearWeight) * farAmount;
+        }
+    }
+    return sampleCascadeShadow(cascade, shadowPosition);
 }
 
 void main() {

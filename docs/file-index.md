@@ -5,7 +5,7 @@
 
 - **粒度**：目录 + 模块入口（公共头 / `CMakeLists.txt` / 脚本）。实现文件（`.cpp`）与测试用例不逐个登记。
 - **更新时机**：任何目录或模块入口发生增删改时，与代码**同一次提交内**更新本文件。
-- **最后核对**：2026-09-25（对照 `git ls-files`）
+- **最后核对**：2026-09-27（对照 `git ls-files`）
 
 ---
 
@@ -94,7 +94,7 @@ voxel-engine/
 | `world/` | 世界层：生成、地表网格化、材质、挖掘、流式加载、可挖体积、存档 | 可依赖 `engine` | 硬件访问一律经引擎核心 / 平台抽象，**不直接调用平台 API** |
 | `world/terrain/` | 地表高度场 tile（64×64、`int16` 1/16 格）、网格化与梯度法线、材质混合、`ITerrainQuery` 实现、**碰撞体采样构建**（`terrain_collision`） | 可依赖 `engine` | tile 网格须多采样一行/列（65×65），保证相邻 tile 边界**逐位相等、无裂缝**；世界定位用整数 / `double` |
 | `world/generation/` | 确定性种子派生与噪声（FastNoiseLite 封装，pimpl 隔离）、**预设固定地图加载**（`map_preset`：种子 / 范围 / 出生点 / 地形编辑区，TOML） | 可依赖 `engine` | 生成必须是**纯函数**（种子 + 整数坐标）；预设编辑叠加在噪声之上，**同一文件必须得到同一世界**；禁止 `rand()` / 时间 / 线程顺序 |
-| `world/dig/` | 笔刷挖掘 / 堆建与脏 tile 收集 | 可依赖 `engine` | 只标脏**受影响**的 tile；重网格与 GPU 上传不得阻塞主线程 |
+| `world/dig/` | 地形笔刷：平整填平 / 削平（`Level`）、平滑爆破（`Crater`）、球笔刷挖 / 堆，与脏 tile 收集；笔刷参数表 `assets/config/brush.toml` | 可依赖 `engine` | 只标脏**受影响**的 tile；重网格与 GPU 上传不得阻塞主线程；爆破 / 平整剖面**边界一阶连续**（无硬台阶） |
 | `world/CMakeLists.txt` | 世界层构建目标 | — | 新增源文件 / 子目录须在此登记 |
 
 ---
@@ -123,7 +123,7 @@ voxel-engine/
 | 条目 | 职责 | 依赖方向 | 约束 |
 | --- | --- | --- | --- |
 | `assets/` | 运行时资源源文件 | — | 生成物放 `assets/generated/`（已忽略） |
-| `assets/config/` | 配置表：`materials.toml`（地表材质槽与权重规则）、`lighting.toml`（太阳 / 天空光 / 雾）等 | — | 带 `schema_version`；由 toml++ 在**启动期**加载，失败即明确报错（ADR 0005） |
+| `assets/config/` | 配置表：`materials.toml`（地表材质槽与权重规则）、`lighting.toml`（太阳 / 天空光 / 雾 / 阴影）、`brush.toml`（平整 / 削平 / 爆破笔刷参数）等 | — | 带 `schema_version`；由 toml++ 在**启动期**加载，失败即明确报错（ADR 0005） |
 | `assets/maps/` | 预设固定地图（TOML）：种子 / 覆盖范围 / 出生点 / 地形编辑区（flatten · raise · carve） | — | 带 `schema_version`；**非法文件必须显式报错，不得静默回退**；同一文件必须得到同一世界 |
 | `assets/shaders/` | GLSL 源（`.vert` / `.frag` / `.comp`） | — | 只放源；`.spv` / `.dxil` 由构建生成到 `<build>/assets/shaders/`；新增须在 `game/CMakeLists.txt` 里 `add_shader` |
 | `assets/textures/` | 纹理源（供地表多纹理权重混合使用） | — | 现状含 `layers.toml`（旧纹理数组层号表）——**已随 ADR 0004 作废待删除**；材质配置见 `assets/config/` |

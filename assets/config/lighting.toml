@@ -23,12 +23,14 @@
 #   - sun.direction 长度必须非零（加载后由 BuildLightingUniform 归一化）；
 #   - 所有颜色分量 ∈ [0, 1]；sun.intensity / sky.intensity / fog.density / fog.height_falloff ≥ 0；
 #   - shadow.cascade_count ∈ [1, 4]；shadow.resolution 是 2 的幂且 ≥ 256；
-#     shadow.max_distance > 0；shadow.split_lambda ∈ [0, 1]；depth_bias / normal_offset / caster_height_min ≥ 0。
+#     shadow.max_distance > 0；shadow.split_lambda ∈ [0, 1]；depth_bias / normal_offset / caster_height_min ≥ 0；
+#     shadow.cascade_blend ∈ [0, 0.5]。
 #
-# 版本历史：v1 首版（无 [shadow]）→ v2 新增 [shadow]（T21b）→ **v4 新增 shadow.caster_height_min（缺陷 1 修复）**。
-#   （v3 未使用；按缺陷修复要求直接升到 4。）
+# 版本历史：v1 首版（无 [shadow]）→ v2 新增 [shadow]（T21b）→ v4 新增 shadow.caster_height_min（缺陷 1 修复）
+#   → **v5 新增 shadow.cascade_blend（缺陷 B8 修复：级联边界混合）**。
+#   （v3 未使用；版本号按缺陷修复要求推进。）
 
-schema_version = 4
+schema_version = 5
 
 # ---------------------------------------------------------------------------
 # 太阳（方向光）
@@ -129,3 +131,11 @@ normal_offset = 0.05
 #   本值是它的下限：即使游戏侧推导为 0（空地形 / 误传）也不会漏投影。
 #   160 格足以覆盖测试地图的地标塔（塔顶 260 格 − 基底 120 格 ≈ 140 格），并留有余量。
 caster_height_min = 160.0
+
+# cascade_blend：**级联过渡带宽度比例**（缺陷 B8 修复，必须 ∈ [0, 0.5]）。缺陷 B8 新增。
+#   用途：级联选择按"沿视轴的线性深度"切换，转动相机时同一地面点会在**级联边界附近**切换级联，
+#   而两级 texel 尺寸与光空间盒不同 ⇒ 边界处被重采样、出现突跳。本值让着色器在边界附近
+#   `cascade_blend × 该级远平面` 宽的过渡带内**同时采样相邻两级并加权混合**（权重用 smoothstep，
+#   两级权重和恒为 1），消除跨级联的硬跳变。
+#   0.1 → 过渡带占该级覆盖距离的 10%（相对比例，近处不会过宽）；设 0 则逐字退回"单级采样"（旧行为）。
+cascade_blend = 0.1

@@ -28,6 +28,34 @@ inline constexpr int kMaxShadowCascades = 4;
 [[nodiscard]] std::array<float, kMaxShadowCascades> ComputeCascadeSplits(float nearPlane, float farPlane,
                                                                           int cascadeCount, float lambda) noexcept;
 
+/// 把原始 texel 世界尺寸**向上量化到 2 的幂**（缺陷 B8 修复，治机制 2："级联半径随视角连续变化"）。
+///
+/// 推导：每级 texel 世界尺寸 = `2·halfExtent / resolution`，而 `halfExtent` 取自"视锥切片 AABB 的外接球"
+/// 半径 —— 相机一转 AABB 就变 ⇒ texel 连续变化 ⇒ texel 对齐网格在变，影子随视角"爬行"。
+/// 把 texel 向上量化到 2 的幂 `q` 后，由 `q` 反推**实际使用的半径** `radiusUsed = q·resolution/2`
+/// （`halfExtent` 相应取 `max(halfExtentRaw, radiusUsed)` 以保证覆盖不缩水）。
+/// 因 `resolution` 也是 2 的幂，可证 `q·resolution/2 = nextPowerOfTwo(halfExtentRaw)`（量纲推导：
+/// `texel = halfExtent / (resolution/2)`，两边同乘 `resolution/2` 即 `nextPowerOfTwo(x/c)·c =
+/// nextPowerOfTwo(x)`，`c = resolution/2` 为 2 的幂）—— 故 `radiusUsed` 就是 halfExtent 的 2 的幂上界，
+/// **分段恒定**：相机小幅旋转（半径不跨 2 的幂边界）时 texel 与投影缩放均不变，网格不再爬行。
+///
+/// 保证：结果 `≥ rawTexelWorldSize`（覆盖不缩水）、是 2 的幂、随 `raw` 单调不减；
+/// `raw ≤ 0` 或 `resolution ≤ 0` 时原样返回（调用方不应发生，仅作兜底）。不读全局、不分配。
+[[nodiscard]] float QuantizeTexelWorldSize(float rawTexelWorldSize, int resolution) noexcept;
+
+/// 级联过渡带的混合权重（缺陷 B8 修复，治机制 1："级联选择依赖相机朝向"）。
+///
+/// `viewDepth` = 沿相机视轴的线性深度；`splitInner` = 该级远平面（级联边界）；
+/// `blendBand` = 过渡带宽度 = `cascade_blend × splitInner`（相对比例，避免固定格数在近处过宽）。
+/// 返回**近级**（`splitInner` 所属级联）的权重 ∈ `[0, 1]`，**远级**（下一级）权重 = `1 − 返回值`：
+///   - `viewDepth ≤ splitInner − blendBand`（带外近侧）→ `1`（纯近级）；
+///   - `viewDepth ≥ splitInner`（带外远侧）→ `0`（纯远级）；
+///   - 带内用 `smoothstep` 过渡 ⇒ **两侧权重和恒为 1**，跨级联处不再出现硬跳变 / 重采样突跳。
+/// `blendBand ≤ 0`（即 `cascade_blend = 0`）时恒返回 `1` ⇒ 逐字退回"单级采样"（旧行为）。
+/// 这是 CPU 侧纯函数（不读全局、不分配），与 `assets/shaders/mesh.frag` 的 `cascadeBlendWeight()`
+/// **逐字镜像**；两边改动必须同步。
+[[nodiscard]] float CascadeBlendWeight(float viewDepth, float splitInner, float blendBand) noexcept;
+
 /// 单个级联的正交光空间矩阵：**正交投影 × 视图**，把该级联包围球映射进 NDC `[-1, 1]³`。
 ///
 /// 关键约定（见 `.trae/skills/.../references/meshing-and-render.md` §4 与 SDL_gpu.h §Coordinate System）：
@@ -85,6 +113,8 @@ inline constexpr int kMaxShadowCascades = 4;
 ///   - `normalOffset`            法线偏移（世界单位 / 格）
 ///   - `cameraForwardX/Y/Z`      相机世界前向（单位向量，级联选择按"沿视轴的线性深度"）
 ///   - `enabled`                 1 = 启用、0 = 关闭（着色器据此**整段跳过**采样）
+///   - `cascadeBlend`            级联过渡带宽度比例（缺陷 B8）；过渡带宽 = 本值 × 该级远平面。
+///                               最后一个 `vec4` 只有 `x` 有效，`y/z/w` 为填充（保持 std140 对齐）。
 struct ShadowUniform {
     glm::mat4 lightMatrices[kMaxShadowCascades];
 
@@ -99,10 +129,15 @@ struct ShadowUniform {
     float cameraForwardY = 0.0F;
     float cameraForwardZ = -1.0F;
     float enabled        = 0.0F;
+
+    float cascadeBlend       = 0.0F;
+    float cascadeBlendUnused0 = 0.0F;
+    float cascadeBlendUnused1 = 0.0F;
+    float cascadeBlendUnused2 = 0.0F;
 };
 
-static_assert(sizeof(ShadowUniform) == 16 * 19,
-              "ShadowUniform 必须与 mesh.frag 的 std140 布局逐字节一致（4×mat4 + 4 个 vec4 = 304 字节）");
+static_assert(sizeof(ShadowUniform) == 16 * 20,
+              "ShadowUniform 必须与 mesh.frag 的 std140 布局逐字节一致（4×mat4 + 4 个 vec4 = 320 字节）");
 
 /// 由光照表与**渲染原点相对**的相机参数构建本帧的阴影 uniform（CPU→GPU 唯一入口）。
 ///
@@ -131,6 +166,12 @@ static_assert(sizeof(ShadowUniform) == 16 * 19,
 /// 就会与相对的 `center_i.y` 混用、整段偏移一个渲染原点 Y —— 这是本项最易写错之处。**
 /// `casterHeightMin` 取自 `table.Shadow().casterHeightMin`，是配置里的**下限兜底**：
 /// 即使地形推导为 0（或地形为空），也保证每级覆盖到中心之上该高度，避免漏投影。
+///
+/// **缺陷 B8 的两条修复（阴影不再随视角变化）**：
+///   1. texel 量化：每级 halfExtent 经 `QuantizeTexelWorldSize` 量化后**分段恒定**（见其说明），
+///      相机小幅旋转时投影缩放与 texel 网格不变（治"级联半径连续变化 ⇒ 网格爬行"）；
+///   2. 级联过渡带：`cascadeBlend` 随 `cascade_blend` 配置透传，着色器据 `CascadeBlendWeight`
+///      在边界附近混合相邻两级（治"级联选择依赖相机朝向 ⇒ 跨级联重采样"）。
 [[nodiscard]] ShadowUniform BuildShadowUniform(const LightingTable& table, const glm::mat4& viewRelative,
                                                float fieldOfViewDegrees, float aspectRatio, float nearPlane,
                                                float farPlane, float casterTopRelative) noexcept;

@@ -70,8 +70,6 @@ constexpr float kLookSensitivity    = 0.0022F;
 constexpr float kWalkSpeed          = 9.0F;                       ///< 行走速度（格/秒）
 constexpr float kSprintSpeed        = 20.0F;                      ///< 冲刺速度（格/秒）
 constexpr float kFlySpeed           = 28.0F;                      ///< 飞行速度（格/秒）；飞行中按 Shift 加倍
-constexpr float kBrushRadius        = 6.0F;                       ///< 笔刷半径（格）
-constexpr int   kBrushDeltaUnits    = vx::kHeightUnitsPerBlock;   ///< 每次点击抬升 / 下沉 1 格
 constexpr double kRebaseDistance    = 24.0;                       ///< 渲染原点重定基阈值（格）
 constexpr float kCameraFollowDistance = 14.0F;                    ///< 第三人称相机跟随距离（格）
 
@@ -257,18 +255,49 @@ void StepCharacter(vx::PhysicsWorld& physics, vx::PhysicsWorld::CharacterHandle 
                              static_cast<float>(after.position.z)));
 }
 
-/// 对当前注视点执行一次笔刷挖 / 堆，**只重网格、只重传、只重建**受影响的 tile
-/// （红线：禁止整世界重网格）。
+/// 笔刷动作（T26）：右键 = 填平、左键 = 削平、Shift + 左键 = 爆破演示。
+enum class BrushAction {
+    Fill,    ///< 平整填充：半径内向施力点高度收敛（只抬升低处）
+    Shave,   ///< 削平：半径内向施力点高度收敛（只削低高处）
+    Crater,  ///< 爆破演示：下挖 + 外环隆起（为战斗破坏地形系统做的能力入口）
+};
+
+/// 对当前施力点执行一次笔刷操作，**只重网格、只重传、只重建**受影响的 tile
+/// （红线：禁止整世界重网格）。参数全部来自 `brush.toml`（唯一事实来源）。
 /// 返回本次被弄脏的 tile 数（供调试面板显示）。
 std::size_t ApplyBrush(vx::TerrainWorld& world, vx::TerrainCollision& collision, vx::MeshRenderer& renderer,
                        const std::vector<vx::TileCoord>& tileCoords, std::vector<vx::MeshHandle>& tileHandles,
-                       const glm::vec3& focus, int deltaUnits, const glm::dvec3& renderOrigin) {
+                       const glm::vec3& focus, const vx::BrushSettings& settings, BrushAction action, float dt,
+                       const glm::dvec3& renderOrigin) {
     vx::BrushPose brush;
     brush.centerX = focus.x;
     brush.centerZ = focus.z;
-    brush.radius  = kBrushRadius;
+    brush.radius  = settings.radius;
 
-    const vx::BrushResult result = vx::ApplyTerrainBrush(world, brush, deltaUnits);
+    // 平整的目标高度 = **施力点**（脚下 / 视线落点）处的地表高度：把范围内的低处填到它、高处削到它。
+    float targetHeight = 0.0F;
+    if (!world.QueryHeight(brush.centerX, brush.centerZ, targetHeight)) {
+        return 0;
+    }
+
+    const char*     actionName = "平整填平";
+    vx::BrushResult result;
+    switch (action) {
+        case BrushAction::Fill:
+            result = vx::ApplyTerrainLevel(world, brush, targetHeight, settings.strength * dt, settings.falloff,
+                                           vx::LevelMode::Fill);
+            break;
+        case BrushAction::Shave:
+            actionName = "削平";
+            result = vx::ApplyTerrainLevel(world, brush, targetHeight, settings.strength * dt, settings.falloff,
+                                           vx::LevelMode::Shave);
+            break;
+        case BrushAction::Crater:
+            actionName = "爆破演示";
+            result = vx::ApplyTerrainCrater(world, brush, settings.craterDepth, settings.craterRim,
+                                            settings.craterRadius, settings.falloff);
+            break;
+    }
     if (result.changedColumns == 0) {
         return 0;
     }
@@ -285,9 +314,10 @@ std::size_t ApplyBrush(vx::TerrainWorld& world, vx::TerrainCollision& collision,
     // 高度变了 → 重建这些 tile 的物理碰撞体（T7：高度变化后重建 HeightFieldShape）。
     const std::size_t rebuiltBodies = collision.SyncTiles(world, result.dirtyTiles);
 
-    VX_LOG_INFO("笔刷（半径 %.1f 格）作用于 (%.1f, %.1f)：改动 %zu 列，重网格 %zu 个 tile，重建碰撞体 %zu 个",
-                static_cast<double>(kBrushRadius), static_cast<double>(brush.centerX),
-                static_cast<double>(brush.centerZ), result.changedColumns, remeshed, rebuiltBodies);
+    // 每帧持续施力 ⇒ 用 DEBUG 级别（避免刷屏），只在确实改动时记录。
+    VX_LOG_DEBUG("笔刷[%s]（半径 %.1f 格）作用于 (%.1f, %.1f)：改动 %zu 列，重网格 %zu 个 tile，重建碰撞体 %zu 个",
+                 actionName, static_cast<double>(settings.radius), static_cast<double>(brush.centerX),
+                 static_cast<double>(brush.centerZ), result.changedColumns, remeshed, rebuiltBodies);
     return result.dirtyTiles.size();
 }
 
@@ -342,12 +372,25 @@ int main(int argc, char** argv) {
                                 static_cast<double>(shadowSettings.resolution) *
                                 static_cast<double>(shadowSettings.resolution) * 4.0 / (1024.0 * 1024.0);
         VX_LOG_INFO("阴影配置：%s（级数 %d，分辨率 %d²，覆盖 %.0f 格，split_lambda %.2f，"
-                    "depth_bias %.4f，normal_offset %.3f 格，**投射体扩展下限 %.0f 格**）；"
+                    "depth_bias %.4f，normal_offset %.3f 格，**投射体扩展下限 %.0f 格**，**级联混合 %.2f**）；"
                     "阴影图预估 %.2f MB（占 VRAM 预算 300 MB 的 %.1f%%）",
                     shadowSettings.enabled ? "启用" : "关闭", shadowSettings.cascadeCount, shadowSettings.resolution,
                     static_cast<double>(shadowSettings.maxDistance), static_cast<double>(shadowSettings.splitLambda),
                     static_cast<double>(shadowSettings.depthBias), static_cast<double>(shadowSettings.normalOffset),
-                    static_cast<double>(shadowSettings.casterHeightMin), shadowMb, 100.0 * shadowMb / 300.0);
+                    static_cast<double>(shadowSettings.casterHeightMin), static_cast<double>(shadowSettings.cascadeBlend),
+                    shadowMb, 100.0 * shadowMb / 300.0);
+
+        // T26：笔刷配置（平整 / 削平 / 爆破的参数）。与材质表 / 光照表**同源解析**（同一个 SourceAssetPath，
+        // 同一个 toml++）；加载失败（缺失 / 语法错 / 校验不过 / schema_version 不符）抛异常 → 启动失败，
+        // 与其它配置表口径一致：**禁止静默回退**。
+        const vx::BrushTable      brushTable    = vx::BrushTable::LoadFromFile(SourceAssetPath("assets/config/brush.toml"));
+        const vx::BrushSettings&  brushSettings = brushTable.Settings();
+        VX_LOG_INFO("笔刷配置已加载（schema_version=%d）：半径 %.1f 格，平整速率 %.1f 格/秒，衰减带 %.2f；"
+                    "爆破 深 %.1f / 坑半径 %.1f / 外环 %.1f 格",
+                    brushTable.SchemaVersion(), static_cast<double>(brushSettings.radius),
+                    static_cast<double>(brushSettings.strength), static_cast<double>(brushSettings.falloff),
+                    static_cast<double>(brushSettings.craterDepth), static_cast<double>(brushSettings.craterRadius),
+                    static_cast<double>(brushSettings.craterRim));
 
         // T11：从预设地图构建世界（种子 / 范围 / 地形编辑全部来自文件，不再硬编码）。
         const std::filesystem::path mapPath = SourceAssetPath(kDefaultMapFile);
@@ -621,6 +664,11 @@ int main(int argc, char** argv) {
         // 飞行模式开关状态（T12）；切换时清零速度，避免残留速度把角色弹飞。
         bool flying = false;
 
+        // T26：重新捕获鼠标的那一次点击**不落到笔刷上**（直到松开按键）。笔刷改为持续输入后，
+        // 若只在按下帧抑制，按住不放会在下一帧立刻开始施力，等于把"捕获点击"变成了笔刷操作；
+        // 故用锁存：捕获点击被消费时置位，两个笔刷键都松开时清零。
+        bool brushSuppressUntilRelease = false;
+
         // 跳跃请求**帧级锁存**（缺陷 B3）：主循环在 Mailbox 下可达上千 FPS，而逻辑 / 物理是 60 Hz 固定步，
         // 多数帧的 `StepPlan::steps` 为 0。若在帧边界直接消费"本帧按下"边沿，该边沿会在没有逻辑步的帧上
         // 被静默丢弃（实测 ~1500 FPS 时只有 ~4% 的帧有逻辑步 → 96% 的空格按下丢失）。故先锁存，
@@ -629,7 +677,7 @@ int main(int argc, char** argv) {
 
         VX_LOG_INFO("地表世界就绪：种子 %llu，tile %zu 个，材质表 schema_version=%d，笔刷半径 %.1f 格",
                     static_cast<unsigned long long>(preset.seed), tileCoords.size(), materials.SchemaVersion(),
-                    static_cast<double>(kBrushRadius));
+                    static_cast<double>(brushSettings.radius));
         VX_LOG_INFO("角色物理就绪：地表碰撞体 %zu 个 tile；胶囊 半径 %.2f / 总高 %.2f 格；"
                     "重力 %.1f、跳跃初速 %.2f（由身高推导，最高点 %.2f 格 = 身高 %.0f%%）、"
                     "最大坡度 %.0f°、自动上台阶 %.1f 格（dt=1/60）",
@@ -642,9 +690,15 @@ int main(int argc, char** argv) {
                     debugOverlay.Visible() ? "显示" : "隐藏", debugOverlay.SystemPanelOpen() ? "打开" : "关闭");
         VX_LOG_INFO("控制说明：W/A/S/D = 移动；Shift = 冲刺；Space = 跳（飞行中 = 上升）；"
                     "F = 切换飞行模式；飞行中 左Ctrl = 下降（Shift 加速）；鼠标移动 = 环视（已捕获，可转满 ±89°）；"
-                    "鼠标左键 = 挖（笔刷半径 %.1f 格）；鼠标右键 = 堆；Esc = 开关系统面板（打开时释放鼠标、关闭时恢复）；"
-                    "点击窗口 = 重新捕获（该次点击不挖掘 / 堆土）；F1 = 调试面板；关闭窗口 = 退出",
-                    static_cast<double>(kBrushRadius));
+                    "**鼠标右键 = 平整填平**（把半径 %.1f 格内的低处填到脚下高度）；"
+                    "**鼠标左键 = 削平**（把高于脚下高度的部分削掉）；"
+                    "**Shift + 鼠标左键 = 爆破演示**（下挖 %.1f 格 / 坑半径 %.1f 格 / 外环 %.1f 格）；"
+                    "笔刷为按住持续施力（速率 %.1f 格/秒，参数见 brush.toml）；"
+                    "Esc = 开关系统面板（打开时释放鼠标、关闭时恢复）；"
+                    "点击窗口 = 重新捕获（该次点击不施力）；F1 = 调试面板；关闭窗口 = 退出",
+                    static_cast<double>(brushSettings.radius), static_cast<double>(brushSettings.craterDepth),
+                    static_cast<double>(brushSettings.craterRadius), static_cast<double>(brushSettings.craterRim),
+                    static_cast<double>(brushSettings.strength));
 
         std::size_t lastDirtyTiles = 0;
 
@@ -712,6 +766,7 @@ int main(int argc, char** argv) {
                     // 消费本帧的鼠标点击边沿：重新捕获的这一次点击到此为止，绝不落到笔刷上。
                     (void)input.ConsumePressed(vx::ActionId::Attack);
                     (void)input.ConsumePressed(vx::ActionId::Use);
+                    brushSuppressUntilRelease = true;  // 直到松开按键才解除（见其声明处说明）
                 }
             }
 
@@ -741,11 +796,10 @@ int main(int argc, char** argv) {
                             flying ? "开（无重力，Space 上升 / 左Ctrl 下降）" : "关（恢复重力与碰撞）");
             }
 
-            // 笔刷：本帧按下边沿消费一次（无论是否抑制都要消费，避免边沿残留）。
-            const bool digEdge  = input.ConsumePressed(vx::ActionId::Attack);
-            const bool pileEdge = input.ConsumePressed(vx::ActionId::Use);
-            const bool digRequested  = digEdge && !suppression.mouseBrush;
-            const bool pileRequested = pileEdge && !suppression.mouseBrush;
+            // 笔刷：T26 起为**持续输入**（按住即连续施力），故这里只消费点击边沿（避免残留），
+            // 实际施力放在固定步循环之后，按固定步长折算速率（红线 11）。
+            (void)input.ConsumePressed(vx::ActionId::Attack);
+            (void)input.ConsumePressed(vx::ActionId::Use);
 
             // 空格跳跃：本帧按下边沿先**锁存**，不在此帧边界丢弃（缺陷 B3，见 jumpRequested 的说明）。
             // T14/T15：未捕获、或 ImGui 接管键盘时不接受移动 / 跳跃输入；
@@ -797,26 +851,38 @@ int main(int argc, char** argv) {
             }
             const double logicMs = logicTimer.EndMs();
 
-            if (digRequested || pileRequested) {
-                lastDirtyTiles = ApplyBrush(world, terrainCollision, renderer, tileCoords, tileHandles,
-                                            camera.TargetCurrent(), digRequested ? -kBrushDeltaUnits : kBrushDeltaUnits,
-                                            renderOrigin);
+            // T26 笔刷：按住左键 = 削平；按住右键 = 平整填平；Shift + 左键 = 爆破演示。
+            // 参数全部来自 brush.toml（唯一事实来源）；速率按**固定步长**折算（红线 11：不用可变帧间隔）。
+            // 松开任一键即解除"捕获点击"抑制。
+            if (!input.Held(vx::ActionId::Attack) && !input.Held(vx::ActionId::Use)) {
+                brushSuppressUntilRelease = false;
+            }
+            const bool brushAllowed = mouseCaptured && !suppression.mouseBrush && !brushSuppressUntilRelease;
+            const bool shaveHeld    = brushAllowed && input.Held(vx::ActionId::Attack);
+            const bool fillHeld     = brushAllowed && input.Held(vx::ActionId::Use);
+            if (plan.steps > 0 && (shaveHeld || fillHeld)) {
+                const bool        shiftHeld = input.Held(vx::ActionId::Sprint);
+                const BrushAction brushAction =
+                    shaveHeld ? (shiftHeld ? BrushAction::Crater : BrushAction::Shave) : BrushAction::Fill;
+                const float brushDt = static_cast<float>(vx::kFixedDt) * static_cast<float>(plan.steps);
+                lastDirtyTiles =
+                    ApplyBrush(world, terrainCollision, renderer, tileCoords, tileHandles, camera.TargetCurrent(),
+                               brushSettings, brushAction, brushDt, renderOrigin);
 
                 // 抬升地形后把被埋住的角色**顶回新地表**（缺陷 B2 的物理侧）。
                 // Jolt 的静态高度场在 `SetShape` 之后不会把 `CharacterVirtual` 推出去：角色一旦被抬高的
                 // 地表埋住，支撑判定失效，它会在重力下穿过高度场、带着相机钻到地下（画面只剩清屏色）。
                 // 因此这里把低于地表的角色放回地表，并把相机吸附到同一位置，避免一帧的插值拖影。
-                if (pileRequested) {
-                    const vx::PhysicsWorld::CharacterState state = physics.GetCharacterState(character);
-                    float                                    surface = 0.0F;
-                    if (world.QueryHeight(static_cast<float>(state.position.x), static_cast<float>(state.position.z),
-                                          surface) &&
-                        state.position.y < static_cast<double>(surface)) {
-                        const glm::dvec3 lifted(state.position.x, static_cast<double>(surface), state.position.z);
-                        physics.SetCharacterPosition(character, lifted);
-                        camera.SnapTo(glm::vec3(static_cast<float>(lifted.x), static_cast<float>(lifted.y),
-                                                static_cast<float>(lifted.z)));
-                    }
+                // 填平 / 爆破会抬高地表；削平只降低地表，此检查幂等、无副作用。
+                const vx::PhysicsWorld::CharacterState state = physics.GetCharacterState(character);
+                float                                    surface = 0.0F;
+                if (world.QueryHeight(static_cast<float>(state.position.x), static_cast<float>(state.position.z),
+                                      surface) &&
+                    state.position.y < static_cast<double>(surface)) {
+                    const glm::dvec3 lifted(state.position.x, static_cast<double>(surface), state.position.z);
+                    physics.SetCharacterPosition(character, lifted);
+                    camera.SnapTo(glm::vec3(static_cast<float>(lifted.x), static_cast<float>(lifted.y),
+                                            static_cast<float>(lifted.z)));
                 }
             }
 
@@ -860,7 +926,7 @@ int main(int argc, char** argv) {
             stats.cameraYaw         = camera.Yaw();
             stats.cameraPitch       = camera.Pitch();
             stats.cameraDistance    = view.distance;
-            stats.brushRadius       = kBrushRadius;
+            stats.brushRadius       = brushSettings.radius;
             stats.mouseCaptured     = mouseCaptured;
             stats.loadedTileCount   = tileCoords.size();
             stats.lastDirtyTileCount = lastDirtyTiles;

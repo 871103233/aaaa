@@ -32,9 +32,11 @@ namespace {
 
 using vx::BuildCascadeLightMatrix;
 using vx::BuildShadowUniform;
+using vx::CascadeBlendWeight;
 using vx::ComputeCascadeSplits;
 using vx::kMaxShadowCascades;
 using vx::LightingTable;
+using vx::QuantizeTexelWorldSize;
 using vx::ShadowUniform;
 
 constexpr float kTolerance = 1e-4F;
@@ -42,7 +44,7 @@ constexpr float kTolerance = 1e-4F;
 /// 一份只求"能通过校验"的临时配置：阴影关闭、级数 2、分辨率取下限 256、偏移为 0、投射体下限 0。
 /// 用于覆盖 enabled = false 与边界值的解析 / 投影路径。
 constexpr const char* kDisabledShadowConfig =
-    "schema_version = 4\n"
+    "schema_version = 5\n"
     "[sun]\n"
     "direction = [0.0, 1.0, 0.0]\n"
     "color = [1.0, 1.0, 1.0]\n"
@@ -64,12 +66,13 @@ constexpr const char* kDisabledShadowConfig =
     "split_lambda = 1.0\n"
     "depth_bias = 0.0\n"
     "normal_offset = 0.0\n"
-    "caster_height_min = 0.0\n";
+    "caster_height_min = 0.0\n"
+    "cascade_blend = 0.0\n";
 
 /// 一份"阴影启用、投射体下限为 0"的临时配置：用于验证扩展量**完全由地形推导决定**
 /// （下限置 0 时不再是候选解释），从而把"扩展是否生效"钉死在 casterTopRelative 上（缺陷 1 回归）。
 constexpr const char* kZeroCasterShadowConfig =
-    "schema_version = 4\n"
+    "schema_version = 5\n"
     "[sun]\n"
     "direction = [0.5, 0.8, 0.3]\n"
     "color = [1.0, 1.0, 1.0]\n"
@@ -91,7 +94,8 @@ constexpr const char* kZeroCasterShadowConfig =
     "split_lambda = 0.75\n"
     "depth_bias = 0.0015\n"
     "normal_offset = 0.05\n"
-    "caster_height_min = 0.0\n";
+    "caster_height_min = 0.0\n"
+    "cascade_blend = 0.0\n";
 
 [[nodiscard]] std::filesystem::path WriteTempConfig(const char* name, const std::string& content) {
     const std::filesystem::path path = std::filesystem::temp_directory_path() / name;
@@ -316,9 +320,9 @@ TEST(ShadowCascade, DisabledShadowFlagsUniform) {
     RemoveTempConfig(path);
 }
 
-// uniform 字节数必须与 mesh.frag 的 ShadowBlock（4×mat4 + 3×vec4）逐字节一致。
+// uniform 字节数必须与 mesh.frag 的 ShadowBlock（4×mat4 + 4×vec4）逐字节一致。
 TEST(ShadowCascade, UniformLayoutMatchesGlslBlock) {
-    EXPECT_EQ(sizeof(ShadowUniform), static_cast<std::size_t>(4 * 64 + 3 * 16));
+    EXPECT_EQ(sizeof(ShadowUniform), static_cast<std::size_t>(4 * 64 + 4 * 16));
 }
 
 // ---- 缺陷 1 回归：高大投射体的阴影盒扩展（shadow caster extension）----
@@ -408,4 +412,140 @@ TEST(ShadowCascade, UniformExtendsCascadeForTallTerrainCaster) {
     EXPECT_LE(flooredClip.z, 1.0F + kTolerance);
 
     RemoveTempConfig(path);
+}
+
+// ---- 缺陷 B8 回归：阴影随视角变化（机制 2 —— 级联半径随视角连续变化）----
+//
+// 契约：阴影是几何与光照的函数，不应随相机朝向变化。
+// 机制：每级正交盒尺寸取自"视锥切片 AABB 的外接球"，相机转动 ⇒ AABB 变 ⇒ 半径变 ⇒
+//       `texelWorldSize = 2·halfExtent/resolution` 与投影缩放（1/halfExtent）随之连续变化 ⇒
+//       texel 对齐网格在变，影子随视角"爬行"。
+// 修复：把每级 halfExtent 经 texel 量化后**分段恒定**（见 QuantizeTexelWorldSize）。
+// 本测以 fov ±3%（级联半径随之 ±3%）检验：每级矩阵的缩放分量（3×3）与 texel 网格必须**逐元素不变**。
+// 修前：texel 与投影缩放随半径连续变化 ⇒ 缩放分量必然不同 ⇒ 本测失败（缺陷可复现）。
+TEST(ShadowCascade, CascadeScaleStaysConstantUnderSmallRadiusChange) {
+    const LightingTable table = LightingTable::Default();
+    ASSERT_TRUE(table.Shadow().enabled);
+
+    const float fieldOfViewDegrees = 60.0F;
+    const float aspectRatio        = 1.0F;
+    const float nearPlane          = 0.1F;
+    const float farPlane           = 100.0F;
+
+    const ShadowUniform base =
+        BuildShadowUniform(table, glm::mat4(1.0F), fieldOfViewDegrees, aspectRatio, nearPlane, farPlane, 0.0F);
+    const ShadowUniform plus =
+        BuildShadowUniform(table, glm::mat4(1.0F), fieldOfViewDegrees * 1.03F, aspectRatio, nearPlane, farPlane, 0.0F);
+    const ShadowUniform minus =
+        BuildShadowUniform(table, glm::mat4(1.0F), fieldOfViewDegrees * 0.97F, aspectRatio, nearPlane, farPlane, 0.0F);
+
+    const int count = table.Shadow().cascadeCount;
+    for (int i = 0; i < count; ++i) {
+        for (int column = 0; column < 3; ++column) {
+            for (int row = 0; row < 3; ++row) {
+                EXPECT_NEAR(plus.lightMatrices[static_cast<std::size_t>(i)][column][row],
+                            base.lightMatrices[static_cast<std::size_t>(i)][column][row], 1e-5F)
+                    << "级联 " << i << " 半径 +3% 后缩放分量变了";
+                EXPECT_NEAR(minus.lightMatrices[static_cast<std::size_t>(i)][column][row],
+                            base.lightMatrices[static_cast<std::size_t>(i)][column][row], 1e-5F)
+                    << "级联 " << i << " 半径 -3% 后缩放分量变了";
+            }
+        }
+        // texel 网格（= 2·halfExtent/resolution）也必须不变：由正交矩阵的缩放分量反推 halfExtent。
+        // 正交矩阵第 0 列为 (1/halfExtent)·V[0]，而 V[0] 是单位向量 ⇒ |m[0][0]| = 1/halfExtent。
+        const float halfExtentBase = 1.0F / std::abs(base.lightMatrices[static_cast<std::size_t>(i)][0][0]);
+        const float halfExtentPlus = 1.0F / std::abs(plus.lightMatrices[static_cast<std::size_t>(i)][0][0]);
+        const float texelBase = 2.0F * halfExtentBase / static_cast<float>(table.Shadow().resolution);
+        const float texelPlus = 2.0F * halfExtentPlus / static_cast<float>(table.Shadow().resolution);
+        EXPECT_NEAR(texelPlus, texelBase, 1e-6F) << "级联 " << i << " 半径 +3% 后 texel 网格变了";
+    }
+
+    // cascade_blend 如实透传（着色器据 shadow.cascadeBlendParams.x 执行边界混合）。
+    EXPECT_FLOAT_EQ(base.cascadeBlend, table.Shadow().cascadeBlend);
+    EXPECT_FLOAT_EQ(base.cascadeBlend, 0.1F) << "提交配置的 cascade_blend 默认值";
+}
+
+// ---- 缺陷 B8 修复的纯函数：QuantizeTexelWorldSize ----
+//
+// 契约：结果 ≥ 输入（覆盖不缩水）、结果是 2 的幂、随输入单调不减、
+//       且**输入小幅扰动（±3%）不改变结果**（texel 网格分段恒定 ⇒ 不再随视角"爬行"）。
+
+/// 浮点数是否为 2 的幂（`2^k`）：frexp 的尾数须恰为 0.5。
+[[nodiscard]] bool IsPowerOfTwo(float value) {
+    if (!(value > 0.0F)) {
+        return false;
+    }
+    int exponent = 0;
+    const float mantissa = std::frexp(value, &exponent);
+    return mantissa == 0.5F;
+}
+
+TEST(ShadowCascade, QuantizeTexelWorldSizeIsUpperPowerOfTwo) {
+    const int resolution = 2048;
+
+    // 结果 ≥ 输入、且为 2 的幂；恰为 2 的幂时保持不变。
+    const float samples[] = { 0.001F, 0.003F, 0.01F, 0.0234F, 0.03125F, 0.05F, 0.12F, 0.3F, 1.7F, 12.0F };
+    for (const float raw : samples) {
+        const float quantized = QuantizeTexelWorldSize(raw, resolution);
+        EXPECT_GE(quantized, raw) << "raw=" << raw;
+        EXPECT_TRUE(IsPowerOfTwo(quantized)) << "raw=" << raw << " → " << quantized;
+    }
+    EXPECT_FLOAT_EQ(QuantizeTexelWorldSize(0.03125F, resolution), 0.03125F) << "已是 2 的幂时不变";
+}
+
+TEST(ShadowCascade, QuantizeTexelWorldSizeIsMonotonicAndStableUnderSmallPerturbation) {
+    const int resolution = 2048;
+
+    // 单调不减：输入递增序列的输出不得回落。
+    float previous = 0.0F;
+    for (int i = 1; i <= 200; ++i) {
+        const float raw = static_cast<float>(i) * 0.001F;
+        const float quantized = QuantizeTexelWorldSize(raw, resolution);
+        EXPECT_GE(quantized, previous) << "raw=" << raw;
+        previous = quantized;
+    }
+
+    // 输入小幅扰动（±3%）不改变结果（除恰好跨越 2 的幂边界的极端取值外，常规取径必须稳定）。
+    const float baseValues[] = { 0.02F, 0.05F, 0.12F, 0.2F, 0.37F };
+    for (const float raw : baseValues) {
+        const float center = QuantizeTexelWorldSize(raw, resolution);
+        EXPECT_FLOAT_EQ(QuantizeTexelWorldSize(raw * 1.03F, resolution), center) << "raw=" << raw;
+        EXPECT_FLOAT_EQ(QuantizeTexelWorldSize(raw * 0.97F, resolution), center) << "raw=" << raw;
+    }
+}
+
+// ---- 缺陷 B8 修复的纯函数：CascadeBlendWeight ----
+//
+// 契约：带外近侧 → 1、带外远侧 → 0、带内用 smoothstep 过渡（单调不增）；
+//       **近级 + 远级权重和恒为 1**；`blendBand = 0` 时退化为单级（恒 1）。
+
+TEST(ShadowCascade, CascadeBlendWeightTransitionsSmoothly) {
+    const float splitInner = 20.0F;
+    const float blendBand  = 0.1F * splitInner;  // 与 cascade_blend × 远平面 同口径
+
+    // 带外近侧 → 1；带外远侧 → 0；边界处 → 0（远级接管）。
+    EXPECT_FLOAT_EQ(CascadeBlendWeight(splitInner - blendBand - 1.0F, splitInner, blendBand), 1.0F);
+    EXPECT_FLOAT_EQ(CascadeBlendWeight(splitInner, splitInner, blendBand), 0.0F);
+    EXPECT_FLOAT_EQ(CascadeBlendWeight(splitInner + 1.0F, splitInner, blendBand), 0.0F);
+    EXPECT_FLOAT_EQ(CascadeBlendWeight(0.0F, splitInner, blendBand), 1.0F);
+
+    // 带内单调不增，且与远级权重（1 − w）之和恒为 1。
+    float previous = 1.0F;
+    for (int i = 0; i <= 100; ++i) {
+        const float t          = static_cast<float>(i) / 100.0F;
+        const float viewDepth  = (splitInner - blendBand) + t * blendBand;
+        const float nearWeight = CascadeBlendWeight(viewDepth, splitInner, blendBand);
+        EXPECT_LE(nearWeight, previous + 1e-6F) << "i=" << i;
+        EXPECT_GE(nearWeight, 0.0F);
+        EXPECT_LE(nearWeight, 1.0F);
+        EXPECT_FLOAT_EQ(nearWeight + (1.0F - nearWeight), 1.0F) << "两侧权重和必须恒为 1";
+        previous = nearWeight;
+    }
+
+    // 带中点 = smoothstep(0.5) = 0.5。
+    EXPECT_NEAR(CascadeBlendWeight(splitInner - 0.5F * blendBand, splitInner, blendBand), 0.5F, 1e-5F);
+
+    // cascade_blend = 0（blendBand = 0）→ 逐字退回单级：任意深度恒为 1。
+    EXPECT_FLOAT_EQ(CascadeBlendWeight(splitInner - 1.0F, splitInner, 0.0F), 1.0F);
+    EXPECT_FLOAT_EQ(CascadeBlendWeight(splitInner + 5.0F, splitInner, 0.0F), 1.0F);
 }

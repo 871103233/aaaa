@@ -1,0 +1,45 @@
+# 笔刷与地形破坏参数表（T26：平整填充 / 削平破坏 / 平滑爆破）
+#
+# 依据：docs/game-design.md（玩家能力：破坏地形）与 ADR 0005（TOML + toml++，启动期一次性加载，
+#       非法即抛异常、不静默回退）。本表是 game/ 侧笔刷行为的**唯一事实来源**：
+#       game/main.cpp 据本表构造笔刷姿态与模式参数，**禁止**在别处另写一份常量。
+#
+# 权威解释在代码：字段语义、单位与衰减公式见 world/dig/terrain_brush.hpp。
+#
+# 单位与口径：
+#   - radius / crater_depth / crater_rim / crater_radius 单位 = 格；
+#   - strength 单位 = 格 / 秒（平整的**收敛速率**），game/ 按固定步长 dt 折算为每步最大改动；
+#   - falloff 是无量纲的**过渡带占比** ∈ (0, 1]，用于 smoothstep 收口（越大越平缓）。
+#
+# 约束（加载时校验，违反即中止启动）：
+#   - schema_version 必须等于 BrushTable::kSchemaVersion；
+#   - radius / strength / crater_depth / crater_radius 必须 > 0；crater_rim ≥ 0；
+#   - falloff ∈ (0, 1]。
+#
+# 版本历史：v1 首版（T26）。
+
+schema_version = 1
+
+# radius：通用笔刷半径（格），平整 / 削平的作用半径。
+#   6 格与旧版写死的 kBrushRadius 一致，保证手感连续。
+radius = 6.0
+
+# strength：平整的收敛速率（格/秒）。半径内每列高度向目标高度收敛时的最大变化速率，
+#   实际每步改动 = clamp(target − h, ±strength·dt) × BrushFalloff(d/r)。
+#   6 格/秒 → 60 Hz 下每步最多 0.1 格，填平一处数格深的坑约需 1~2 秒，手感平滑、不突兀。
+strength = 6.0
+
+# falloff：smoothstep 过渡带占半径的**比例** ∈ (0, 1]。
+#   BrushFalloff(d) = 1 − smoothstep(r·(1−falloff), r, d)：d ≤ r·(1−falloff) 处为 1，到 d = r 平滑归零。
+#   0.6 → 中心 40% 半径内满强度、外侧 60% 半径平滑衰减到 0（避免边缘出现硬台阶）。
+falloff = 0.6
+
+# crater_depth：爆破坑中心的**下挖深度**（格）。剖面上按 BrushFalloff 收口到边缘归零。
+crater_depth = 6.0
+
+# crater_rim：爆破坑**外环隆起**高度（格，≥ 0，模拟抛土堆）。峰值位于 d ≈ crater_radius 附近，
+#   边界处值与一阶导均归零（无硬台阶）；设 0 则无外环。
+crater_rim = 2.0
+
+# crater_radius：爆破坑半径（格）。与通用 radius 分开：爆破是一次性的大范围破坏，半径通常更大。
+crater_radius = 8.0

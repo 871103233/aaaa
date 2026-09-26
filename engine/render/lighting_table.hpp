@@ -69,6 +69,10 @@ struct ShadowSettings {
     /// （空地形 / 误传），也保证每级阴影盒覆盖到级联中心之上该高度，避免高大投射体被裁掉（缺陷 1）。
     /// 默认 160 格足以覆盖测试地图的地标塔顶端（塔顶 260 格 − 基底 120 格 ≈ 140 格）。
     float casterHeightMin = 160.0F;
+
+    /// 级联过渡带宽度比例（缺陷 B8，必须 ∈ [0, 0.5]）：过渡带宽 = 本值 × 该级远平面（相对比例，
+    /// 避免固定格数在近处过宽）。`0` = 关闭混合，逐字退回"单级采样"（旧行为）。
+    float cascadeBlend = 0.1F;
 };
 
 /// 指数高度雾配置（T21c）。
@@ -172,8 +176,9 @@ public:
     /// 当前表格式版本；写入配置文件的 `schema_version` 必须与之相等。
     /// v2（T21b）：新增 `[shadow]` 段（级联阴影参数）——缺失即报错，**不**按 v1 兼容读取。
     /// v4（缺陷 1 修复）：`[shadow]` 新增 `caster_height_min`（投射体扩展下限兜底）——缺失即报错。
-    ///   （v3 未使用；版本号按缺陷修复要求直接升到 4。）
-    static constexpr int kSchemaVersion = 4;
+    /// v5（缺陷 B8 修复）：`[shadow]` 新增 `cascade_blend`（级联过渡带宽度比例）——缺失即报错。
+    ///   （v3 未使用；版本号按缺陷修复要求推进。）
+    static constexpr int kSchemaVersion = 5;
 
     /// 从 TOML 文件加载并校验；失败抛 `std::runtime_error`（启动期允许异常，ADR 0005）。
     /// 前置条件：`path` 指向待加载的光照表文件。

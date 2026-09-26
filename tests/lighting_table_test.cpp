@@ -32,7 +32,7 @@ using vx::SrgbToLinear;
 /// fog.color **刻意缺失**，用于同时覆盖"默认取 sky.horizon_color"这条路径；
 /// [shadow] 段位于最末，便于用字符串替换逐项制造非法值（T21b）。
 constexpr const char* kValidConfig =
-    "schema_version = 4\n"
+    "schema_version = 5\n"
     "[sun]\n"
     "direction = [0.0, 1.0, 0.0]\n"
     "color = [1.0, 1.0, 1.0]\n"
@@ -54,7 +54,8 @@ constexpr const char* kValidConfig =
     "split_lambda = 0.75\n"
     "depth_bias = 0.0015\n"
     "normal_offset = 0.05\n"
-    "caster_height_min = 80.0\n";
+    "caster_height_min = 80.0\n"
+    "cascade_blend = 0.3\n";
 
 [[nodiscard]] std::filesystem::path WriteTempConfig(const char* name, const std::string& content) {
     const std::filesystem::path path = std::filesystem::temp_directory_path() / name;
@@ -103,6 +104,8 @@ TEST(LightingTable, LoadsCommittedConfig) {
     EXPECT_FLOAT_EQ(table.Shadow().normalOffset, 0.05F);
     // 缺陷 1：提交配置的投射体扩展下限（覆盖测试地图地标塔）。
     EXPECT_FLOAT_EQ(table.Shadow().casterHeightMin, 160.0F);
+    // 缺陷 B8：提交配置的级联过渡带宽度比例。
+    EXPECT_FLOAT_EQ(table.Shadow().cascadeBlend, 0.1F);
 }
 
 // 内置默认表与提交的配置一致：保证测试与运行期行为可比（口径同材质表）。
@@ -131,11 +134,12 @@ TEST(LightingTable, DefaultMatchesCommittedConfig) {
     EXPECT_FLOAT_EQ(loaded.Shadow().depthBias, builtin.Shadow().depthBias);
     EXPECT_FLOAT_EQ(loaded.Shadow().normalOffset, builtin.Shadow().normalOffset);
     EXPECT_FLOAT_EQ(loaded.Shadow().casterHeightMin, builtin.Shadow().casterHeightMin);
+    EXPECT_FLOAT_EQ(loaded.Shadow().cascadeBlend, builtin.Shadow().cascadeBlend);
 }
 
-// T21b / 缺陷 1：表格式版本已升到 4（新增 [shadow].caster_height_min）——防止旧版文件被静默接受。
-TEST(LightingTable, SchemaVersionIsFour) {
-    EXPECT_EQ(LightingTable::kSchemaVersion, 4);
+// T21b / 缺陷 1 / 缺陷 B8：表格式版本已升到 5（新增 [shadow].cascade_blend）——防止旧版文件被静默接受。
+TEST(LightingTable, SchemaVersionIsFive) {
+    EXPECT_EQ(LightingTable::kSchemaVersion, 5);
 }
 
 // 缺失配置必须显式报错，禁止静默回退。
@@ -146,7 +150,7 @@ TEST(LightingTable, MissingConfigThrows) {
 // schema_version 不符必须报错。
 TEST(LightingTable, InvalidSchemaThrows) {
     std::string content = kValidConfig;
-    const std::string from = "schema_version = 4";
+    const std::string from = "schema_version = 5";
     content.replace(content.find(from), from.size(), "schema_version = 99");
     const std::filesystem::path path = WriteTempConfig("vx_invalid_lighting_schema.toml", content);
     EXPECT_THROW((void)LightingTable::LoadFromFile(path), std::runtime_error);
@@ -308,6 +312,7 @@ TEST(LightingTable, ShadowValidConfigParses) {
     EXPECT_FLOAT_EQ(table.Shadow().depthBias, 0.0015F);
     EXPECT_FLOAT_EQ(table.Shadow().normalOffset, 0.05F);
     EXPECT_FLOAT_EQ(table.Shadow().casterHeightMin, 80.0F);
+    EXPECT_FLOAT_EQ(table.Shadow().cascadeBlend, 0.3F);
     RemoveTempConfig(path);
 }
 
@@ -323,6 +328,7 @@ TEST(LightingTable, ShadowSettingsDefaultsMatchCommittedConfig) {
     EXPECT_FLOAT_EQ(defaults.depthBias, 0.0015F);
     EXPECT_FLOAT_EQ(defaults.normalOffset, 0.05F);
     EXPECT_FLOAT_EQ(defaults.casterHeightMin, 160.0F);
+    EXPECT_FLOAT_EQ(defaults.cascadeBlend, 0.1F);
 }
 
 // [shadow] 段整段缺失必须报错。
@@ -441,6 +447,36 @@ TEST(LightingTable, ShadowCasterHeightMinNegativeThrows) {
     const std::string from = "caster_height_min = 80.0";
     content.replace(content.find(from), from.size(), "caster_height_min = -1.0");
     const std::filesystem::path path = WriteTempConfig("vx_lighting_shadow_caster_neg.toml", content);
+    EXPECT_THROW((void)LightingTable::LoadFromFile(path), std::runtime_error);
+    RemoveTempConfig(path);
+}
+
+// 缺陷 B8：缺 cascade_blend 必须报错（结构变更，旧文件不得被静默接受）。
+TEST(LightingTable, ShadowMissingCascadeBlendThrows) {
+    std::string content = kValidConfig;
+    const std::string from = "cascade_blend = 0.3\n";
+    content.erase(content.find(from), from.size());
+    const std::filesystem::path path = WriteTempConfig("vx_lighting_shadow_no_blend.toml", content);
+    EXPECT_THROW((void)LightingTable::LoadFromFile(path), std::runtime_error);
+    RemoveTempConfig(path);
+}
+
+// 缺陷 B8：cascade_blend 越界（> 0.5）必须报错，禁止静默钳制。
+TEST(LightingTable, ShadowCascadeBlendTooLargeThrows) {
+    std::string content = kValidConfig;
+    const std::string from = "cascade_blend = 0.3";
+    content.replace(content.find(from), from.size(), "cascade_blend = 0.6");
+    const std::filesystem::path path = WriteTempConfig("vx_lighting_shadow_blend_high.toml", content);
+    EXPECT_THROW((void)LightingTable::LoadFromFile(path), std::runtime_error);
+    RemoveTempConfig(path);
+}
+
+// 缺陷 B8：负的 cascade_blend 必须报错。
+TEST(LightingTable, ShadowCascadeBlendNegativeThrows) {
+    std::string content = kValidConfig;
+    const std::string from = "cascade_blend = 0.3";
+    content.replace(content.find(from), from.size(), "cascade_blend = -0.1");
+    const std::filesystem::path path = WriteTempConfig("vx_lighting_shadow_blend_neg.toml", content);
     EXPECT_THROW((void)LightingTable::LoadFromFile(path), std::runtime_error);
     RemoveTempConfig(path);
 }

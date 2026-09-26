@@ -84,6 +84,30 @@ std::array<float, kMaxShadowCascades> ComputeCascadeSplits(float nearPlane, floa
     return splits;
 }
 
+float QuantizeTexelWorldSize(float rawTexelWorldSize, int resolution) noexcept {
+    // 兜底：非正输入或非法分辨率不量化（调用方不应发生）。
+    if (!(rawTexelWorldSize > 0.0F) || resolution <= 0) {
+        return rawTexelWorldSize;
+    }
+    // 向上取整到 2 的幂：2^ceil(log2(raw))。raw 本身是 2 的幂时结果不变。
+    return std::exp2(std::ceil(std::log2(rawTexelWorldSize)));
+}
+
+float CascadeBlendWeight(float viewDepth, float splitInner, float blendBand) noexcept {
+    if (!(blendBand > 0.0F)) {
+        return 1.0F;  // cascade_blend = 0：逐字退回单级采样（近级权重恒为 1）
+    }
+    const float bandInner = splitInner - blendBand;
+    if (viewDepth <= bandInner) {
+        return 1.0F;  // 带外近侧：纯近级
+    }
+    if (viewDepth >= splitInner) {
+        return 0.0F;  // 带外远侧：纯远级
+    }
+    const float t = (viewDepth - bandInner) / blendBand;
+    return 1.0F - t * t * (3.0F - 2.0F * t);  // smoothstep；与远级权重之和恒为 1
+}
+
 glm::mat4 BuildCascadeLightMatrix(const glm::vec3& sunDirection, const glm::vec3& cascadeCenter, float cascadeRadius,
                                   float cascadeTexelSize, float casterHeight) noexcept {
     const LightBasis basis = MakeLightBasis(sunDirection);
@@ -146,6 +170,7 @@ ShadowUniform BuildShadowUniform(const LightingTable& table, const glm::mat4& vi
     uniform.texelSize    = 1.0F / static_cast<float>(settings.resolution);
     uniform.depthBias    = settings.depthBias;
     uniform.normalOffset = settings.normalOffset;
+    uniform.cascadeBlend = settings.cascadeBlend;  // 缺陷 B8：级联过渡带宽度比例（透传给着色器）
 
     if (!settings.enabled) {
         // 显式关闭：着色器按 enabled 整段跳过，级数置 0 以免遍历到无意义的矩阵。
@@ -193,11 +218,22 @@ ShadowUniform BuildShadowUniform(const LightingTable& table, const glm::mat4& vi
         // （渲染原点 Y 抵消），因此扩展量不随渲染原点重定基而漂移（见头文件对该坐标系的强调）。
         const float casterHeight = std::max(settings.casterHeightMin, casterTopRelative - center.y);
 
-        // 覆盖 texel 的世界尺寸按扩展后的正交盒宽度算：texel 对齐轴与实际盒一致，否则量化步长与盒不匹配。
-        const float halfExtent     = radius + CasterHorizontalExtension(sunDirection, casterHeight);
-        const float texelWorldSize = 2.0F * halfExtent / static_cast<float>(settings.resolution);
+        // 缺陷 B8（机制 2）：把 texel 世界尺寸向上量化到 2 的幂，并据量化后的 texel 反推**实际使用的
+        // 半宽** `halfExtentUsed = quantizedTexel · resolution / 2`（= `nextPowerOfTwo(halfExtentRaw)`，
+        // 因 resolution 也是 2 的幂）。投影缩放（1/halfExtentUsed）与 texel 网格因此**分段恒定**：
+        // 相机小幅旋转（半径不跨 2 的幂边界）时二者都不变，texel 对齐网格不再随视角爬行。
+        // 覆盖不缩水：`halfExtentUsed ≥ halfExtentRaw = radius + 水平扩展`。
+        const float horizontalExtension = CasterHorizontalExtension(sunDirection, casterHeight);
+        const float halfExtentRaw       = radius + horizontalExtension;
+        const float rawTexelWorldSize   = 2.0F * halfExtentRaw / static_cast<float>(settings.resolution);
+        const float quantizedTexel      = QuantizeTexelWorldSize(rawTexelWorldSize, settings.resolution);
+        const float halfExtentUsed      = std::max(halfExtentRaw,
+                                                   quantizedTexel * static_cast<float>(settings.resolution) * 0.5F);
+        // BuildCascadeLightMatrix 内部还会叠加 caster 水平扩展，故传入的"半径"取 halfExtentUsed − 水平扩展，
+        // 使函数内部正交半宽恰为 halfExtentUsed、texel 恰为 quantizedTexel（两者一致，对齐网格与盒匹配）。
+        const float cascadeRadiusArg = std::max(0.0F, halfExtentUsed - horizontalExtension);
         uniform.lightMatrices[static_cast<std::size_t>(i)] =
-            BuildCascadeLightMatrix(sunDirection, center, radius, texelWorldSize, casterHeight);
+            BuildCascadeLightMatrix(sunDirection, center, cascadeRadiusArg, quantizedTexel, casterHeight);
         uniform.splitDistances[static_cast<std::size_t>(i)] = splitFar;
 
         previousSplit = splitFar;

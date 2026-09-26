@@ -44,16 +44,16 @@
 | 通用网格渲染路径（顶点/索引缓冲、相机 UBO、索引绘制） | **已实现** | `engine/render/mesh_renderer.hpp` |
 | 纹理数组（多层 `SDL_GPUTexture`，每层独立 mipmap；`sampler2DArray` 采样） | **已实现** | 同上；地表材质按 ADR 0009 使用（**禁止**改用纹理图集，见 `references/meshing-and-render.md` §3） |
 | 片元 uniform 块（材质参数，std140；CPU→GPU **唯一投影入口**） | **已实现** | `world/terrain/material_table.hpp`（`MaterialUniform` / `BuildMaterialUniform`，`static_assert` 钉死布局）+ `engine/render/mesh_renderer.hpp`（上传） |
-| 程序生成占位材质贴图（albedo + 法线，确定性、可平铺） | **已实现** | `world/terrain/material_textures.*`（ADR 0009）；4 层 × 256² × `R8G8B8A8_UNORM`，albedo + 法线各一张，含 mip 约 **2.67 MB** 显存（第 0 级 1.00 MB/张） |
+| 程序生成占位材质贴图（**材质四件套 albedo / normal / roughness / AO + 宏观变化**，确定性、可平铺） | **已实现** | `world/terrain/material_textures.*`（ADR 0009 / ADR 0010 P2）；5 张 `R8G8B8A8_UNORM` 纹理数组（四件套各 4 层 + macro **1 层**）× 256²，含 mip 约 **5.67 MB** 显存。多尺度（双频段）且**逐字节确定性** |
 | 叠加层接口（`IRenderOverlay`，用于调试 UI） | **已实现** | 同上 |
 | 动态网格顶点刷新（就地更新定长网格顶点；稳态**零堆分配**、不建 GPU 资源） | **已实现** | `engine/render/mesh_renderer.hpp`（`UpdateMeshVertices`）；供每帧移动的网格（角色代理体）使用 |
 | 第三人称相机（跟随 + 沿视线避障 + **最小跟随距离托底防退化视图矩阵**） | **已实现** | `engine/render/camera.hpp`；避障经 `ITerrainQuery` 契约（由世界层实现）；`kCameraMinDistance` 保证 `eye≠target`，避免 `lookAt` 归一化得 NaN |
 | 相机相对渲染（浮点原点重定基） | **已实现** | 世界定位保持整数 / `double`，上传 GPU 前转相机相对 `float` |
 | 视锥体裁剪 | **未开始** | 目前全部网格随手提交 |
-| **HDR 离屏渲染 + 后处理通道**（曝光 / ACES 近似色调映射 / sRGB 编码） | **已实现** | [ADR 0010](adr/0010-render-quality-pipeline.md)；`engine/render/mesh_renderer.*`（主通道渲到 `R16G16B16A16_FLOAT` 离屏目标）+ `assets/shaders/tonemap.vert|.frag`（全屏三角形）；曝光经 `SetExposure` 来自 `engine/platform/settings.*`（`[0.1, 8.0]` 钳制）。**记账**：HDR 目标 8 B/px、深度 4 B/px，纹理总量计入 `RenderStats::textureBytes` 并**在启动日志按项打印**（实测 1280×720：材质 2.67 + 深度 3.52 + HDR 7.03 = **13.21 MB**）；预算表见方案 §7.2.1 |
+| **HDR 离屏渲染 + 后处理通道**（曝光 / ACES 近似色调映射 / sRGB 编码） | **已实现** | [ADR 0010](adr/0010-render-quality-pipeline.md)；`engine/render/mesh_renderer.*`（主通道渲到 `R16G16B16A16_FLOAT` 离屏目标）+ `assets/shaders/tonemap.vert|.frag`（全屏三角形）；曝光经 `SetExposure` 来自 `engine/platform/settings.*`（`[0.1, 8.0]` 钳制）。**记账**：HDR 目标 8 B/px、深度 4 B/px，纹理总量计入 `RenderStats::textureBytes` 并**在启动日志按项打印**（实测 1280×720 全项：材质 5.67 + 深度 3.52 + HDR 7.03 + 阴影 48.00 + MSAA 38.67 = **102.89 MB**）；预算表见方案 §7.2.1 |
 | **PBR 着色模型**（Cook-Torrance：GGX + Smith + Schlick，电介质 `F0 = 0.04`） | **已实现** | [ADR 0010](adr/0010-render-quality-pipeline.md) P2；`assets/shaders/mesh.frag`；粗糙度来自 roughness 贴图，**AO 只作用环境项**；参数经 `BuildMaterialUniform` 单入口投影 |
 | 方向光 + **半球天空光**（参数全部来自配置，含颜色在 CPU 侧转线性） | **已实现** | [ADR 0010](adr/0010-render-quality-pipeline.md)；`engine/render/lighting_table.*`（`LightingUniform` 128 字节 + `BuildLightingUniform` 单入口投影）+ `assets/config/lighting.toml`；经**片元 uniform 槽 1** 上传（槽 0 为材质）。**暗部因此呈天空色而非死黑** |
-| 阴影 / 级联阴影（CSM，3 级 2048² `D32_FLOAT` 深度数组 + texel 对齐 + 3×3 PCF + **投射体扩展**） | **已实现** | [ADR 0010](adr/0010-render-quality-pipeline.md)；纯函数 `engine/render/shadow_cascade.*`（分割 / 光空间矩阵 / **caster extension** / `ShadowUniform` 304 B）+ `mesh_renderer`（深度数组与深度通道）+ `assets/shaders/shadow.vert|.frag`；参数来自 `lighting.toml [shadow]`。**记账：48.00 MB**（已计入 `RenderStats::textureBytes`）。**投射体扩展**让高于视锥切片的高大投射体（塔）仍能投影 —— 修复"阴影随视角变化"。**注意**：SDL3_gpu 不允许 `fragment_shader == nullptr`，深度通道仍需一个空入口的片元着色器 |
+| 阴影 / 级联阴影（CSM，3 级 2048² `D32_FLOAT` 深度数组 + **texel 2 的幂量化** + 3×3 PCF + **投射体扩展** + **级联过渡带混合**） | **已实现** | [ADR 0010](adr/0010-render-quality-pipeline.md)；纯函数 `engine/render/shadow_cascade.*`（分割 / 光空间矩阵 / **caster extension** / **`QuantizeTexelWorldSize`** / **`CascadeBlendWeight`** / `ShadowUniform` **320 B**）+ `mesh_renderer`（深度数组与深度通道）+ `assets/shaders/shadow.vert` / `shadow.frag`；参数来自 `lighting.toml [shadow]`（含 `caster_height_min`、`cascade_blend`）。**记账：48.00 MB**（已计入 `RenderStats::textureBytes`）。**投射体扩展**让高于视锥切片的高大投射体（塔）仍能投影；**texel 量化为 2 的幂 + 级联间平滑混合**消除"阴影随视角变化 / 边界突跳"（B6 / B8）。**注意**：SDL3_gpu 不允许 `fragment_shader == nullptr`，深度通道仍需一个空入口的片元着色器 |
 | 指数高度雾（雾色默认取天空地平色） | **已实现** | `assets/shaders/mesh.frag`（光照之后、写 HDR 之前于**线性空间**施加；参数来自 `lighting.toml`，`enabled=false` 时整体跳过）。**大气散射 / 体积雾仍未开始** |
 | 抗锯齿（MSAA 1× / 2× / 4× / 8×，档位可配；`R16G16B16A16_FLOAT` 多采样 + `SDL_GPU_STOREOP_RESOLVE`） | **已实现** | [ADR 0010](adr/0010-render-quality-pipeline.md) P3；`engine/render/mesh_renderer.*`（档位经 `SetMsaaSampleCount` 来自 `engine/platform/settings.*`，按硬件能力取不高于请求的受支持档；**档位 = 1 时不建多采样纹理，零额外开销**）+ `game/debug_overlay.hpp` 的多频细节法线（`mesh.frag`：第二频段 UV ×4、RNM、仅最高权重层）。**记账**：1080p 4× ≈ 95 MB（1280×720 实测 +38.67 MB） |
 | 渲染开销统计（Draw Call / 三角形 / 纹理显存 / CPU 帧时间分解） | **已实现** | `engine/render/mesh_renderer.hpp`（通用 `RenderStats` + 纯函数 `EstimateTextureArrayBytes`，显存随纹理 / 目标创建释放增减，**含阴影深度数组**）+ `game/debug_overlay.*`（F1 面板展示；**Draw Call / 三角形已含阴影通道的绘制**）；**GPU pass 时间不可用**——SDL3_gpu 无时间戳查询 API，面板显式标注而非编造 |
@@ -69,8 +69,8 @@
 | **预设地图**（TOML：种子 / 范围 / 出生点 / 地形编辑区 flatten·raise·carve） | **已实现** | `world/generation/map_preset.*`；示例 `assets/maps/test_range.toml` |
 | 高度场地表 tile（64×64 列、`int16` 1/16 格、65×65 采样） | **已实现** | `world/terrain/`；相邻 tile 边界**逐位相等无裂缝** |
 | 地表网格化 + 梯度法线 | **已实现** | 同上 |
-| 材质权重混合（按高度 + 坡度算 splat 权重，4 槽位）+ **四件套贴图**（albedo / normal / roughness / AO）+ **宏观变化** + **陡壁三平面投影** | **部分实现** | 权重**逐像素**重算（窄带 `smoothstep`，ADR 0009）；PBR 与四件套已落地（ADR 0010 P2），程序生成为**多尺度**（双频段）且**逐字节确定性**；**坡度驱动的三平面混合**（平坦处单次采样、陡面按 `|N|` 混合三轴投影）已落地，**随笔刷挖 / 堆自动跟随**；**仍无真实美术 PBR 资源**（程序生成占位），故为"部分实现"。材质显存 **5.67 MB**。**材质带的不变量已单测钉死**（任意 `(高度, 坡度)` 至少一层非零） |
-| 球笔刷挖 / 堆 + 脏 tile 局部重网格 | **已实现** | `world/dig/terrain_brush.*` |
+| 材质权重混合（按高度 + 坡度算 splat 权重，4 槽位）+ **四件套贴图**（albedo / normal / roughness / AO）+ **宏观变化** + **陡壁三平面投影** | **部分实现** | 权重**逐像素**重算（窄带 `smoothstep`，ADR 0009）；PBR 与四件套已落地（ADR 0010 P2），程序生成为**多尺度**（双频段）且**逐字节确定性**；**坡度驱动的三平面混合**（平坦处单次采样、陡面按 `|N|` 混合三轴投影）已落地，参数来自 `materials.toml [triplanar]`（`slope_min` / `slope_max` / `sharpness`），**随笔刷挖 / 堆自动跟随**；**仍无真实美术 PBR 资源**（程序生成占位），故为"部分实现"。材质显存 **5.67 MB**。**材质带的不变量已单测钉死**（任意 `(高度, 坡度)` 至少一层非零） |
+| 地形笔刷：**平整填平 / 削平**（`Level`，向目标高度平滑收敛）+ **平滑爆破**（`Crater`，坑体 + 外环隆起，边界一阶连续）+ 球笔刷挖 / 堆；脏 tile 局部重网格 | **已实现** | `world/dig/terrain_brush.*`（`ApplyTerrainLevel` / `ApplyTerrainCrater` / `BrushFalloff` 纯函数）；参数表 `assets/config/brush.toml`（T26） |
 | 可挖标记区域（程序化规则 + 数据文件叠加） | **未开始** | 规则已定（ADR 0006）；代码未实现 |
 | 可挖体积（局部 SDF + 等值面网格化，洞穴） | **未开始** | 方案见 ADR 0007 |
 | 物件层（地表元素 / 建筑 / 建造） | **未开始** | 分层定义见 ADR 0004 |
@@ -96,7 +96,7 @@
 | --- | --- | --- |
 | ECS（EnTT） | **已引入未使用** | 依赖已在 `vcpkg.json`，代码尚未使用 |
 | 任务系统 / 后台线程（enkits） | **已引入未使用** | 同上；当前生成与网格化仍在主线程 |
-| 配置表加载（TOML + toml++，启动期校验、非法即报错） | **已实现** | `world/terrain/material_table.*`、`world/generation/map_preset.*`、**`engine/render/lighting_table.*`**、`engine/platform/settings.*` |
+| 配置表加载（TOML + toml++，启动期校验、非法即报错） | **已实现** | `world/terrain/material_table.*`、`world/generation/map_preset.*`、**`engine/render/lighting_table.*`**、**`world/dig/terrain_brush.*`（`brush.toml`）**、`engine/platform/settings.*` |
 | 音频（播放 / 混音 / 音源） | **未开始** | 仅保留**唯一增益入口** `engine/platform/settings.hpp::ApplyMasterVolumeGain`（设置值已接通，**当前无声源 ⇒ 听不到**）；要能听到还需音频流 + 混音器 + 音源 |
 | 存档 / 读档（只存脏数据，自定义二进制 + zstd） | **未开始** | 内容模型见 ADR 0006 / `references/save-and-serialization.md` |
 | 资源管理（纹理 / 模型加载） | **未开始** | `stb_image` 已引入未使用；模型导入（Assimp）未引入 |
@@ -108,7 +108,7 @@
 | UI 可交互（ImGui + SDL3/SDL3_gpu 后端，事件转发已接） | **已实现** | `game/debug_overlay.*`、`game/system_panel.*`；面板交互与游戏输入抑制分离（`game/gameplay_input.hpp`） |
 | UI 字体解析与标签缝（命中 CJK 字体用中文，否则**整表英文、绝不缺字**） | **已实现** | `game/ui_font.*`（三级解析：仓库 `assets/fonts/` → 系统 CJK → 无）、`game/ui_text.hpp`（唯一取词缝；有单测 + 源码扫描防绕过） |
 | UI 主题（统一暗色样式，单一样式入口） | **已实现** | `game/ui_theme.*`（`ApplyUiTheme`） |
-| 单元测试 | **已实现** | `tests/`，**176 项**（`ctest --preset debug`） |
+| 单元测试 | **已实现** | `tests/`，**200 项**（`ctest --preset debug`） |
 | 结构门禁（禁止标识符扫描） | **已实现** | `scripts/check-banned-identifiers.ps1`（扫 **88** 文件） |
 | CI（Windows debug/release 全绿） | **部分实现** | Linux 作业受 runner 系统依赖影响，见阶段计划 I1 |
 
