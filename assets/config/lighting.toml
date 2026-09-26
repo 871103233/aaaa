@@ -23,9 +23,12 @@
 #   - sun.direction 长度必须非零（加载后由 BuildLightingUniform 归一化）；
 #   - 所有颜色分量 ∈ [0, 1]；sun.intensity / sky.intensity / fog.density / fog.height_falloff ≥ 0；
 #   - shadow.cascade_count ∈ [1, 4]；shadow.resolution 是 2 的幂且 ≥ 256；
-#     shadow.max_distance > 0；shadow.split_lambda ∈ [0, 1]；depth_bias / normal_offset ≥ 0。
+#     shadow.max_distance > 0；shadow.split_lambda ∈ [0, 1]；depth_bias / normal_offset / caster_height_min ≥ 0。
+#
+# 版本历史：v1 首版（无 [shadow]）→ v2 新增 [shadow]（T21b）→ **v4 新增 shadow.caster_height_min（缺陷 1 修复）**。
+#   （v3 未使用；按缺陷修复要求直接升到 4。）
 
-schema_version = 2
+schema_version = 4
 
 # ---------------------------------------------------------------------------
 # 太阳（方向光）
@@ -118,3 +121,11 @@ depth_bias = 0.0015
 # normal_offset：法线偏移（世界单位 / 格），必须 ≥ 0。
 #   采样点沿几何法线外移 0.05 格，使掠射表面离开自身深度（Peter-panning 因此极小：仅 5cm 量级）。
 normal_offset = 0.05
+
+# caster_height_min：**投射体扩展的下限兜底**（单位：格，必须 ≥ 0）。缺陷 1 修复新增。
+#   用途：影子盒原本只包住"视锥切片外接球"，高于该球的高大投射体（地标塔）会被裁掉、导致阴影随视角变化。
+#   修复后每级阴影盒沿光照方向按"投射体高出该级中心的高度"向前 / 向外扩展；
+#   该高度 = max(本值, 最高地形高度 − 该级中心高度)（后者由 game/ 从已加载地形推导后传入）。
+#   本值是它的下限：即使游戏侧推导为 0（空地形 / 误传）也不会漏投影。
+#   160 格足以覆盖测试地图的地标塔（塔顶 260 格 − 基底 120 格 ≈ 140 格），并留有余量。
+caster_height_min = 160.0

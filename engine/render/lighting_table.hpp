@@ -64,6 +64,11 @@ struct ShadowSettings {
 
     /// 法线偏移（世界单位 / 格），必须 ≥ 0：沿几何法线偏移采样点，抗 acne。
     float normalOffset = 0.05F;
+
+    /// 投射体扩展的**下限兜底**（格，必须 ≥ 0）：即使 `game/` 从地形推导出的"最高投射体高度"为 0
+    /// （空地形 / 误传），也保证每级阴影盒覆盖到级联中心之上该高度，避免高大投射体被裁掉（缺陷 1）。
+    /// 默认 160 格足以覆盖测试地图的地标塔顶端（塔顶 260 格 − 基底 120 格 ≈ 140 格）。
+    float casterHeightMin = 160.0F;
 };
 
 /// 指数高度雾配置（T21c）。
@@ -166,7 +171,9 @@ class LightingTable {
 public:
     /// 当前表格式版本；写入配置文件的 `schema_version` 必须与之相等。
     /// v2（T21b）：新增 `[shadow]` 段（级联阴影参数）——缺失即报错，**不**按 v1 兼容读取。
-    static constexpr int kSchemaVersion = 2;
+    /// v4（缺陷 1 修复）：`[shadow]` 新增 `caster_height_min`（投射体扩展下限兜底）——缺失即报错。
+    ///   （v3 未使用；版本号按缺陷修复要求直接升到 4。）
+    static constexpr int kSchemaVersion = 4;
 
     /// 从 TOML 文件加载并校验；失败抛 `std::runtime_error`（启动期允许异常，ADR 0005）。
     /// 前置条件：`path` 指向待加载的光照表文件。

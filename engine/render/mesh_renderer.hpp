@@ -72,8 +72,8 @@ struct TextureArrayDesc {
 };
 
 /// 材质 uniform 块的最大字节数（`SetMaterialUniform` 的容量上限）。
-/// 当前片元块 = 渲染原点（`vec4`）+ 4 层 × 4 个 `vec4` = 272 字节（ADR 0010 P2 起每层含
-/// roughness / ao / 宏观参数）；留余量给后续参数。
+/// 当前片元块 = 渲染原点（`vec4`）+ 三平面参数（`vec4`，C 项）+ 4 层 × 4 个 `vec4` = 288 字节
+/// （ADR 0010 P2 起每层含 roughness / ao / 宏观参数）；留余量给后续参数。
 inline constexpr std::size_t kMaxMaterialUniformBytes = 512;
 
 /// 光照 uniform 块的最大字节数（`SetLightingUniform` 的容量上限）。

@@ -33,6 +33,20 @@ namespace vx {
 [[nodiscard]] std::array<float, static_cast<std::size_t>(kMaterialSlotCount)>
 ComputeBlendWeights(const TerrainMaterialTable& table, float heightBlocks, float slope) noexcept;
 
+/// 平面 ↔ 三平面的**自动混合权重**（C 项 / 陡壁 UV 拉伸修复）。
+///
+/// 输入 `slope = 1 - |N.y|`（0 = 水平面、1 = 竖直面，由**世界空间几何法线**逐像素得出）。
+/// 返回 `smoothstep(slopeMin, slopeMax, slope)`，并受 `settings.enabled` 门控（false → 恒为 0）。
+///   0   → 纯平面投影（平地路径，采样次数与旧版完全相同）；
+///   1   → 完全三平面；中间为平滑过渡。
+///
+/// **为什么必须逐像素由法线算**：地形会被笔刷挖与堆。只有"权重随几何法线实时变化"才能做到
+/// **法线一变、混合自动跟随**，无需任何 CPU 侧预烘焙 / 按 tile 分支 / 重建网格等额外动作。
+///
+/// 这是 CPU 侧纯函数（不读全局、不分配），与 `assets/shaders/mesh.frag` 的 `triplanarWeight()` 逐字镜像；
+/// 两边改动必须同步。前置条件：`settings` 已通过校验（`0 ≤ slopeMin < slopeMax ≤ 1`、`sharpness > 0`）。
+[[nodiscard]] float TriplanarBlendWeight(float slope, const TriplanarSettings& settings) noexcept;
+
 /// 材质混合器：在纯函数之上叠加**确定性噪声抖动**，让材质过渡带不是一条完美直线。
 ///
 /// 抖动只扰动参与高度带判断的高度值，不改变世界几何；噪声种子由全局种子派生（`SplitMix64`），

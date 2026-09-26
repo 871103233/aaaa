@@ -342,11 +342,12 @@ int main(int argc, char** argv) {
                                 static_cast<double>(shadowSettings.resolution) *
                                 static_cast<double>(shadowSettings.resolution) * 4.0 / (1024.0 * 1024.0);
         VX_LOG_INFO("阴影配置：%s（级数 %d，分辨率 %d²，覆盖 %.0f 格，split_lambda %.2f，"
-                    "depth_bias %.4f，normal_offset %.3f 格）；阴影图预估 %.2f MB（占 VRAM 预算 300 MB 的 %.1f%%）",
+                    "depth_bias %.4f，normal_offset %.3f 格，**投射体扩展下限 %.0f 格**）；"
+                    "阴影图预估 %.2f MB（占 VRAM 预算 300 MB 的 %.1f%%）",
                     shadowSettings.enabled ? "启用" : "关闭", shadowSettings.cascadeCount, shadowSettings.resolution,
                     static_cast<double>(shadowSettings.maxDistance), static_cast<double>(shadowSettings.splitLambda),
                     static_cast<double>(shadowSettings.depthBias), static_cast<double>(shadowSettings.normalOffset),
-                    shadowMb, 100.0 * shadowMb / 300.0);
+                    static_cast<double>(shadowSettings.casterHeightMin), shadowMb, 100.0 * shadowMb / 300.0);
 
         // T11：从预设地图构建世界（种子 / 范围 / 地形编辑全部来自文件，不再硬编码）。
         const std::filesystem::path mapPath = SourceAssetPath(kDefaultMapFile);
@@ -942,10 +943,17 @@ int main(int argc, char** argv) {
 
             // T21b：级联分割与各级光空间矩阵由 game 每帧按相机参数算出（engine 不认识相机设置），
             // 经 BuildShadowUniform 单入口投影成片元 uniform 槽 2 的参数块；级数 / 分辨率来自配置。
+            // 缺陷 1：投射体扩展需要"最高投射体相对渲染原点的高度"——由已加载地形推导：
+            //   casterTopRelative = 最高地表高度（世界 Y，格）− 渲染原点 Y
+            // 与级联中心同坐标系（都是渲染原点相对），故引擎侧 `casterTopRelative − center.y` 即
+            // "最高地形高度 − 该级切片中心高度"。地形可被笔刷挖/堆，故每帧重算（仅遍历已加载 tile）。
             const vx::CameraSettings& cameraSettings = camera.Settings();
+            const float               maxSurfaceBlocks = world.MaxSurfaceHeightBlocks();
+            const float               casterTopRelative =
+                std::max(0.0F, maxSurfaceBlocks - static_cast<float>(renderOrigin.y));
             const vx::ShadowUniform   shadowUniform  = vx::BuildShadowUniform(
                 lighting, relativeView.view, cameraSettings.fieldOfViewDegrees, cameraSettings.aspectRatio,
-                cameraSettings.nearPlane, cameraSettings.farPlane);
+                cameraSettings.nearPlane, cameraSettings.farPlane, casterTopRelative);
             renderer.SetShadowCascades(shadowUniform, static_cast<std::uint32_t>(lighting.Shadow().cascadeCount),
                                        static_cast<std::uint32_t>(lighting.Shadow().resolution));
             // T24：渲染提交相位（RenderFrame 内含相机常量与动态顶点等内部上传）。

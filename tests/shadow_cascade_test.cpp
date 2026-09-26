@@ -39,10 +39,10 @@ using vx::ShadowUniform;
 
 constexpr float kTolerance = 1e-4F;
 
-/// 一份只求"能通过校验"的临时配置：阴影关闭、级数 2、分辨率取下限 256、偏移为 0。
+/// 一份只求"能通过校验"的临时配置：阴影关闭、级数 2、分辨率取下限 256、偏移为 0、投射体下限 0。
 /// 用于覆盖 enabled = false 与边界值的解析 / 投影路径。
 constexpr const char* kDisabledShadowConfig =
-    "schema_version = 2\n"
+    "schema_version = 4\n"
     "[sun]\n"
     "direction = [0.0, 1.0, 0.0]\n"
     "color = [1.0, 1.0, 1.0]\n"
@@ -63,7 +63,35 @@ constexpr const char* kDisabledShadowConfig =
     "max_distance = 64.0\n"
     "split_lambda = 1.0\n"
     "depth_bias = 0.0\n"
-    "normal_offset = 0.0\n";
+    "normal_offset = 0.0\n"
+    "caster_height_min = 0.0\n";
+
+/// 一份"阴影启用、投射体下限为 0"的临时配置：用于验证扩展量**完全由地形推导决定**
+/// （下限置 0 时不再是候选解释），从而把"扩展是否生效"钉死在 casterTopRelative 上（缺陷 1 回归）。
+constexpr const char* kZeroCasterShadowConfig =
+    "schema_version = 4\n"
+    "[sun]\n"
+    "direction = [0.5, 0.8, 0.3]\n"
+    "color = [1.0, 1.0, 1.0]\n"
+    "intensity = 1.0\n"
+    "[sky]\n"
+    "zenith_color = [0.5, 0.5, 0.5]\n"
+    "horizon_color = [0.5, 0.5, 0.5]\n"
+    "ground_color = [0.1, 0.1, 0.1]\n"
+    "intensity = 1.0\n"
+    "[fog]\n"
+    "enabled = false\n"
+    "density = 0.001\n"
+    "height_falloff = 0.01\n"
+    "[shadow]\n"
+    "enabled = true\n"
+    "cascade_count = 3\n"
+    "resolution = 1024\n"
+    "max_distance = 180.0\n"
+    "split_lambda = 0.75\n"
+    "depth_bias = 0.0015\n"
+    "normal_offset = 0.05\n"
+    "caster_height_min = 0.0\n";
 
 [[nodiscard]] std::filesystem::path WriteTempConfig(const char* name, const std::string& content) {
     const std::filesystem::path path = std::filesystem::temp_directory_path() / name;
@@ -212,7 +240,7 @@ TEST(ShadowCascade, UniformCoversEachCascadeFrustumSlice) {
     ASSERT_EQ(cascadeCount, 3);
 
     const ShadowUniform uniform =
-        BuildShadowUniform(table, glm::mat4(1.0F), fieldOfViewDegrees, aspectRatio, nearPlane, farPlane);
+        BuildShadowUniform(table, glm::mat4(1.0F), fieldOfViewDegrees, aspectRatio, nearPlane, farPlane, 0.0F);
 
     EXPECT_FLOAT_EQ(uniform.enabled, 1.0F);
     EXPECT_FLOAT_EQ(uniform.cascadeCount, static_cast<float>(cascadeCount));
@@ -265,7 +293,7 @@ TEST(ShadowCascade, UniformClampsCoverageToMaxDistance) {
     const LightingTable table = LightingTable::Default();
 
     const ShadowUniform uniform =
-        BuildShadowUniform(table, glm::mat4(1.0F), 70.0F, 16.0F / 9.0F, 0.05F, 1000.0F);
+        BuildShadowUniform(table, glm::mat4(1.0F), 70.0F, 16.0F / 9.0F, 0.05F, 1000.0F, 0.0F);
 
     const int lastIndex = table.Shadow().cascadeCount - 1;
     EXPECT_NEAR(uniform.splitDistances[static_cast<std::size_t>(lastIndex)], table.Shadow().maxDistance, kTolerance);
@@ -277,7 +305,7 @@ TEST(ShadowCascade, DisabledShadowFlagsUniform) {
     const LightingTable         table = LightingTable::LoadFromFile(path);
 
     const ShadowUniform uniform =
-        BuildShadowUniform(table, glm::mat4(1.0F), 70.0F, 16.0F / 9.0F, 0.05F, 500.0F);
+        BuildShadowUniform(table, glm::mat4(1.0F), 70.0F, 16.0F / 9.0F, 0.05F, 500.0F, 0.0F);
 
     EXPECT_FLOAT_EQ(uniform.enabled, 0.0F);
     EXPECT_FLOAT_EQ(uniform.cascadeCount, 0.0F);
@@ -291,4 +319,93 @@ TEST(ShadowCascade, DisabledShadowFlagsUniform) {
 // uniform 字节数必须与 mesh.frag 的 ShadowBlock（4×mat4 + 3×vec4）逐字节一致。
 TEST(ShadowCascade, UniformLayoutMatchesGlslBlock) {
     EXPECT_EQ(sizeof(ShadowUniform), static_cast<std::size_t>(4 * 64 + 3 * 16));
+}
+
+// ---- 缺陷 1 回归：高大投射体的阴影盒扩展（shadow caster extension）----
+//
+// 契约（docs/plans/v0.1.md T21b："可见且**不抖动**"）：阴影是几何与光照的函数，不应随相机朝向变化。
+// 机制：只包"切片外接球"时，高出该球的高大投射体在阴影通道被裁掉 ⇒ 只有落在盒内的塔身参与投射 ⇒
+//       相机转动 ⇒ 切片变 ⇒ 盒变 ⇒ 参与投射的塔段变 ⇒ 阴影随视角变化。
+// 本测用"切片中心上方 60 格、半径 1 格"的投射体（高于半径 10 的盒数倍），断言：
+//   ① 未扩展（casterHeight = 0）时该点**确实越界**——证明这条测试真的在测缺陷，而不是恒真；
+//   ② 扩展（casterHeight = 60）后该点映射进 NDC [-1, 1]³——证明修复生效。
+
+// ① 矩阵级：BuildCascadeLightMatrix 的投射体扩展。
+TEST(ShadowCascade, LightMatrixCoversTallCasterWithExtension) {
+    const glm::vec3 sunDirection = glm::normalize(glm::vec3(0.5F, 0.8F, 0.3F));
+    const glm::vec3 center(3.0F, 4.0F, 5.0F);
+    const float     radius      = 10.0F;
+    const float     texel       = 2.0F * radius / 1024.0F;
+    const float     casterHeight = 60.0F;
+    const glm::vec3 casterTop    = center + glm::vec3(0.0F, casterHeight, 0.0F);  // 中心上方 60 格
+
+    const glm::mat4 extended  = BuildCascadeLightMatrix(sunDirection, center, radius, texel, casterHeight);
+    const glm::vec4 extendedClip = extended * glm::vec4(casterTop, 1.0F);
+    EXPECT_GE(extendedClip.x, -1.0F - kTolerance);
+    EXPECT_LE(extendedClip.x, 1.0F + kTolerance);
+    EXPECT_GE(extendedClip.y, -1.0F - kTolerance);
+    EXPECT_LE(extendedClip.y, 1.0F + kTolerance);
+    EXPECT_GE(extendedClip.z, -1.0F - kTolerance);
+    EXPECT_LE(extendedClip.z, 1.0F + kTolerance);
+
+    // 反证：casterHeight = 0（旧行为）时该点必须**越界**，否则测试是恒真的。
+    const glm::mat4   legacy       = BuildCascadeLightMatrix(sunDirection, center, radius, texel, 0.0F);
+    const glm::vec4   legacyClip   = legacy * glm::vec4(casterTop, 1.0F);
+    const bool        legacyOutside = legacyClip.x < -1.0F || legacyClip.x > 1.0F || legacyClip.y < -1.0F ||
+                                      legacyClip.y > 1.0F || legacyClip.z < -1.0F || legacyClip.z > 1.0F;
+    EXPECT_TRUE(legacyOutside) << "casterHeight=0 时 60 格高的投射体必须落在盒外（缺陷机制的可复现证据）";
+}
+
+// ② uniform 级：BuildShadowUniform 依据传入的"最高投射体相对原点高度"逐级扩展。
+// 这里把 caster_height_min 置 0，使扩展量**完全**由 casterTopRelative 决定；identity 视图的视锥关于
+// 视轴对称 ⇒ 各级切片中心 y = 0，故"中心上方 H"的投射体正好检验 casterTopRelative 的接线是否正确。
+TEST(ShadowCascade, UniformExtendsCascadeForTallTerrainCaster) {
+    const std::filesystem::path path = WriteTempConfig("vx_shadow_zero_caster.toml", kZeroCasterShadowConfig);
+    const LightingTable         table = LightingTable::LoadFromFile(path);
+    ASSERT_FLOAT_EQ(table.Shadow().casterHeightMin, 0.0F);
+
+    const float fieldOfViewDegrees = 60.0F;
+    const float aspectRatio        = 1.0F;
+    const float nearPlane          = 0.1F;
+    const float farPlane           = 100.0F;  // < max_distance(180)，各级覆盖到 farPlane
+
+    const std::array<float, kMaxShadowCascades> splits = ComputeCascadeSplits(
+        nearPlane, farPlane, table.Shadow().cascadeCount, table.Shadow().splitLambda);
+    const float sliceNear = nearPlane;
+    const float sliceFar  = splits[0];
+    const glm::vec3 sliceCenter(0.0F, 0.0F, -(sliceNear + sliceFar) * 0.5F);  // identity 视图：中心 x=y=0
+    const float     casterTopHeight = 60.0F;
+    const glm::vec3 casterTop       = sliceCenter + glm::vec3(0.0F, casterTopHeight, 0.0F);
+
+    // casterTopRelative 覆盖该投射体 → 第 0 级矩阵必须把它映射进 NDC。
+    const ShadowUniform covered =
+        BuildShadowUniform(table, glm::mat4(1.0F), fieldOfViewDegrees, aspectRatio, nearPlane, farPlane,
+                           casterTopHeight);
+    const glm::vec4 coveredClip = covered.lightMatrices[0] * glm::vec4(casterTop, 1.0F);
+    EXPECT_GE(coveredClip.x, -1.0F - kTolerance);
+    EXPECT_LE(coveredClip.x, 1.0F + kTolerance);
+    EXPECT_GE(coveredClip.y, -1.0F - kTolerance);
+    EXPECT_LE(coveredClip.y, 1.0F + kTolerance);
+    EXPECT_GE(coveredClip.z, -1.0F - kTolerance);
+    EXPECT_LE(coveredClip.z, 1.0F + kTolerance);
+
+    // casterTopRelative = 0（等价旧行为）→ 该投射体越界（缺陷在 uniform 级同样可复现）。
+    const ShadowUniform legacy =
+        BuildShadowUniform(table, glm::mat4(1.0F), fieldOfViewDegrees, aspectRatio, nearPlane, farPlane, 0.0F);
+    const glm::vec4 legacyClip = legacy.lightMatrices[0] * glm::vec4(casterTop, 1.0F);
+    const bool      legacyOutside = legacyClip.x < -1.0F || legacyClip.x > 1.0F || legacyClip.y < -1.0F ||
+                                    legacyClip.y > 1.0F || legacyClip.z < -1.0F || legacyClip.z > 1.0F;
+    EXPECT_TRUE(legacyOutside) << "casterTopRelative=0 时该投射体必须落在盒外";
+
+    // 配置下限兜底独立生效：Default() 的 caster_height_min = 160 → 即使 casterTopRelative = 0，
+    // 150 格高的投射体仍被覆盖（证明 game 侧推导为 0 时也不会漏投影）。
+    const LightingTable builtin = LightingTable::Default();
+    const ShadowUniform floored =
+        BuildShadowUniform(builtin, glm::mat4(1.0F), fieldOfViewDegrees, aspectRatio, nearPlane, farPlane, 0.0F);
+    const glm::vec3 flooredTop = sliceCenter + glm::vec3(0.0F, 150.0F, 0.0F);
+    const glm::vec4 flooredClip = floored.lightMatrices[0] * glm::vec4(flooredTop, 1.0F);
+    EXPECT_GE(flooredClip.z, -1.0F - kTolerance) << "配置下限 160 应覆盖 150 格高的投射体";
+    EXPECT_LE(flooredClip.z, 1.0F + kTolerance);
+
+    RemoveTempConfig(path);
 }

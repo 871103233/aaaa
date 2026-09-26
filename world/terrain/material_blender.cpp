@@ -39,6 +39,14 @@ float MaterialBandFactor(float value, float min, float max, float blend) noexcep
     return SmoothStep(min - blend, min, value) * (1.0F - SmoothStep(max, max + blend, value));
 }
 
+float TriplanarBlendWeight(float slope, const TriplanarSettings& settings) noexcept {
+    if (!settings.enabled) {
+        return 0.0F;  // 关闭：恒为 0 → 着色器整段走平面路径（零额外采样）
+    }
+    // 与着色器 triplanarWeight 逐字镜像：clamp 到 [0,1] 后走同一 smoothstep。
+    return SmoothStep(settings.slopeMin, settings.slopeMax, std::clamp(slope, 0.0F, 1.0F));
+}
+
 std::array<float, static_cast<std::size_t>(kMaterialSlotCount)> ComputeBlendWeights(const TerrainMaterialTable& table,
                                                                                     float heightBlocks,
                                                                                     float slope) noexcept {
@@ -56,6 +64,12 @@ std::array<float, static_cast<std::size_t>(kMaterialSlotCount)> ComputeBlendWeig
 
     if (total <= kWeightEpsilon) {
         // 无槽位匹配：退化为槽位 0，仍满足"权重非负且和为 1"。
+        //
+        // ⚠ 警示：这是**给异常输入的兜底**，不应在正常地形上大面积触发（ADR 0009 / 缺陷 2）。
+        // 触发它意味着 `assets/config/materials.toml` 的高度 / 坡度带出现**覆盖空洞**——某 (高度, 坡度)
+        // 处四层隶属度全为 0，于是整片区域被强制涂成槽位 0（草）的颜色。近期就发生过一次（高度 >112 的
+        // 平地全落此分支）。排查方法：在材料高度 × 坡度网格上核对各层带的并集是否覆盖全域
+        // （见 tests/terrain_material_test.cpp 的不变量测试）。此处是热路径，不打印日志，只在源头留警示。
         weights.fill(0.0F);
         weights[0] = 1.0F;
         return weights;

@@ -42,12 +42,37 @@ inline constexpr int kMaxShadowCascades = 4;
 ///   - **texel 对齐**：把中心在光空间右 / 上轴上的投影量化到 `cascadeTexelSize` 的整数倍，再据量化后的
 ///     中心重建视图矩阵。相机移动不足一个 texel 时矩阵**不变**，因此阴影不会随相机亚 texel 抖动。
 ///
-/// 视图与正交参数：眼睛位于 `snappedCenter + sunDirection · cascadeRadius`，看向中心，正交范围
-/// `±cascadeRadius`、深度 `[0, 2·cascadeRadius]` —— 正好包住该包围球。
+/// 视图与正交参数：眼睛位于 `snappedCenter + sunDirection · (cascadeRadius + axisExtension)`，看向中心，
+/// 正交范围见下、深度 `[0, 2·cascadeRadius + axisExtension]` —— 包住该包围球**并向前覆盖投射体**。
 ///
-/// 前置条件：`sunDirection` 长度非零；`cascadeRadius > 0`；`cascadeTexelSize > 0`。不读全局、不分配。
+/// **投射体扩展（shadow caster extension，缺陷 1 修复）**：
+/// 只用"视锥切片外接球"时，正交盒只有 `±cascadeRadius`（X/Y）与 `0~2·cascadeRadius`（沿光轴）——
+/// 高于该球的高大投射体（地标塔）在阴影通道被裁剪，只有落在盒内的那段塔身参与投射，
+/// 相机转动 ⇒ 视锥切片变 ⇒ 盒变 ⇒ 参与投射的塔身段变，阴影因此**随视角变化**（违反"阴影是几何与光照的
+/// 函数"这一契约）。故按下述方式把盒**朝太阳一侧**扩展 `casterHeight`（投射体高出**级联中心**的高度，格）：
+///   - 沿光轴延伸 `axisExtension = casterHeight / max(|dir.y|, eps)`；
+///   - X/Y 各扩 `horizontalExtension = casterHeight · tan(θ)`，其中
+///     `tanθ = sqrt(1 - dir.y²) / max(|dir.y|, eps)`，`θ` = 光照方向与竖直方向的夹角。
+///
+/// 推导（保守上界，保证覆盖；两种等价写法取"扩盒"一种）：
+///   取光空间正交基 `(right, up, dir)`。投射体竖直向上高出中心 `h`，其顶端相对中心的光空间坐标为
+///   `(h·(right·Y), h·(up·Y), h·(dir·Y)) = (·, ·, h·cosθ)`：
+///     - 沿光轴：竖直位移在光轴上的投影为 `h·cosθ`（`dir.y = cosθ`）。本实现取更大的保守量
+///       `h / max(|dir.y|, eps) ≥ h·cosθ`（`cosθ ≤ 1`；太阳接近竖直时二者相等），
+///       即"把竖直高度按光轴斜率折算"，绝不会欠覆盖；
+///     - X/Y：`|right·Y| ≤ sinθ`、`|up·Y| ≤ sinθ`，取更大的保守量 `h·tanθ ≥ h·sinθ`（`θ ∈ [0, 90°)`）。
+///   扩展后：眼睛沿 `sunDirection` 再外移 `axisExtension`，深度上限 += `axisExtension`；
+///   原切片角点仍满足 `|x'|,|y'| ≤ cascadeRadius ≤ halfExtent`、深度落在 `[0, 2r + axisExtension]`，
+///   故**旧覆盖不丢**，只是盒变大、分辨率摊薄一点。
+///
+/// `casterHeight = 0`（默认）⇒ `axisExtension = horizontalExtension = 0`，逐字退回旧行为
+/// （既有"包围球 8 点在内""亚 texel 平移矩阵不变"等断言不受影响）。
+///
+/// 前置条件：`sunDirection` 长度非零；`cascadeRadius > 0`；`cascadeTexelSize > 0`；`casterHeight ≥ 0`。
+/// 不读全局、不分配。
 [[nodiscard]] glm::mat4 BuildCascadeLightMatrix(const glm::vec3& sunDirection, const glm::vec3& cascadeCenter,
-                                                float cascadeRadius, float cascadeTexelSize) noexcept;
+                                                float cascadeRadius, float cascadeTexelSize,
+                                                float casterHeight = 0.0F) noexcept;
 
 /// 片元槽 2（`set = 3, binding = 2`）的阴影 uniform 块，std140 布局。
 ///
@@ -94,8 +119,20 @@ static_assert(sizeof(ShadowUniform) == 16 * 19,
 ///
 /// `enabled = false` 时返回一个显式关闭的块（`enabled = 0`、`cascadeCount = 0`），
 /// 着色器据 `enabled` 整段跳过；此时不保证矩阵有意义。
+///
+/// **`casterTopRelative`（缺陷 1 的新参数，坐标系一致是关键）**：
+/// 传入的是**地形中最高投射体相对渲染原点的高度**（格，≥ 0），即
+/// `最高地形高度（世界 Y）− 渲染原点 Y`；`game/` 从已加载地形推导（`engine/` 不读配置、不认识世界类型）。
+/// 本函数对**每一级**算出该级真正需要覆盖的高度：
+///   `casterHeight_i = max(casterHeightMin, casterTopRelative − center_i.y)`
+/// 其中 `center_i` 是级联中心，**已是渲染原点相对的坐标**（由 `viewRelative` 的逆矩阵得到）。
+/// 因 `casterTopRelative − center_i.y = 最高地形高度 − center_i 的世界 Y`（渲染原点 Y 在相减中抵消），
+/// 该值与"最高地形高度 − 当前切片中心高度"逐字等价。**若把 `casterTopRelative` 误当成世界坐标，
+/// 就会与相对的 `center_i.y` 混用、整段偏移一个渲染原点 Y —— 这是本项最易写错之处。**
+/// `casterHeightMin` 取自 `table.Shadow().casterHeightMin`，是配置里的**下限兜底**：
+/// 即使地形推导为 0（或地形为空），也保证每级覆盖到中心之上该高度，避免漏投影。
 [[nodiscard]] ShadowUniform BuildShadowUniform(const LightingTable& table, const glm::mat4& viewRelative,
                                                float fieldOfViewDegrees, float aspectRatio, float nearPlane,
-                                               float farPlane) noexcept;
+                                               float farPlane, float casterTopRelative) noexcept;
 
 }  // namespace vx

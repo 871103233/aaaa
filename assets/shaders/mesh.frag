@@ -3,7 +3,7 @@
 // 地表 / 体积网格的片元着色器。
 //
 // 演进：ADR 0009（权重逐像素算 + 分层 albedo/法线，T19）→ ADR 0010 P1（方向光 + CSM + 半球天空光 + 雾，T21）
-//       → **ADR 0010 P2（PBR Cook-Torrance + 材质四件套 + 宏观变化，T22）**。
+//       → ADR 0010 P2（PBR Cook-Torrance + 材质四件套 + 宏观变化，T22）→ **C 项（陡壁三平面混合投影）**。
 //
 // 本版做什么：
 //   1. **权重逐像素重算**（不变）：按世界高度与坡度求各层权重，过渡带是**窄带** smoothstep。
@@ -17,6 +17,10 @@
 //   5. **多频细节法线**（T23 / ADR 0010 P3）：在既有 normal 贴图之上再叠**第二频段**——同一张 normal 图
 //      取**另一个（更高频的）UV 尺度**；合成方式为 RNM（见下）。**只对权重最高的层**做这一次额外采样，
 //      不为每层都加采样（带宽硬约束：材质采样是最大的一笔带宽，见 tech-plan §7.2.2）。
+//   6. **三平面混合投影（C 项）**：陡壁上的平面（+Y 轴）投影会把纹理拉长。这里对**权重最高的那一层**、
+//      按**逐像素由世界空间几何法线**算出的混合权重，在三个轴投影之间混合（见 triplanarWeight / 采样段）。
+//      平地路径（混合权重 ≈ 0）**早退**为单次平面投影，采样次数与旧版完全相同；参数全部来自材质表的
+//      `[triplanar]` 段（经 BuildMaterialUniform 投影），此处不留第二份常量。
 //
 // PBR 公式（每片元；`N` 为几何 + 法线贴图后的世界法线，`L` 由地表指向太阳，`V` 由地表指向相机，
 // `H = normalize(L + V)`，`α = roughness²`）：
@@ -79,6 +83,10 @@ const int kMaxSampledLayers = 4;
 /// 近似零权重：低于此值直接跳过采样（不改变结果，只省带宽）。**四件套与宏观都受同一守卫保护。**
 const float kWeightEpsilon = 1.0 / 1000000.0;
 
+/// 三平面混合权重的"视为平地"阈值（C 项）：低于它**不进入三平面分支**，只做单次平面采样。
+/// 与 CPU 侧口径一致（平地路径零额外开销）。
+const float kTriWeightEpsilon = 1.0 / 1000.0;
+
 /// 级联数上限：与 engine/render/shadow_cascade.hpp 的 `kMaxShadowCascades` 一致。
 const int kMaxShadowCascades = 4;
 
@@ -123,6 +131,7 @@ struct MaterialLayerParams {
 
 layout(set = 3, binding = 0, std140) uniform MaterialBlock {
     vec4 renderOrigin;  // xyz = 渲染原点（世界坐标），片元用它把相机相对位置还原为世界坐标
+    vec4 triplanar;     // C 项：x = 启用(1/0), y = slope_min, z = slope_max, w = sharpness（来自材质表 [triplanar]）
     MaterialLayerParams layers[kMaterialLayerCount];
 } material;
 
@@ -159,6 +168,10 @@ float bandFactor(float value, float lo, float hi, float blend) {
 }
 
 /// 全部槽位的归一化权重；镜像 CPU 侧 ComputeBlendWeights（含"无匹配 → 槽位 0"的退化）。
+///
+/// ⚠ 警示：下面的兜底分支（total ≈ 0 → 槽位 0 权重 1）是**给异常输入的兜底**，不应在正常地形上触发
+///   （ADR 0009 / 缺陷 2）。它被触发意味着 materials.toml 的带出现**覆盖空洞**，整片区域会被强制涂成
+///   槽位 0（草）的颜色。这里与 CPU 侧逐字镜像；改动必须同步（见 world/terrain/material_blender.cpp）。
 vec4 computeWeights(float height, float slope) {
     vec4  weights = vec4(0.0);
     float total   = 0.0;
@@ -177,6 +190,20 @@ vec4 computeWeights(float height, float slope) {
         return weights;
     }
     return weights / total;
+}
+
+/// 平面 ↔ 三平面的**自动混合权重**（C 项）；逐字镜像 world/terrain/material_blender.cpp 的 TriplanarBlendWeight。
+///
+/// 输入 `slope = 1 - |N.y|`（由**世界空间几何法线**逐像素算出：0 = 水平面、1 = 竖直面）。
+/// 返回 smoothstep(slope_min, slope_max, slope)，并受 uniform 的启用位门控（false → 0）。
+///   ≈ 0 → 纯平面（平地路径，单次采样）；= 1 → 完全三平面；中间为平滑过渡。
+///
+/// **自动切换的根据**：地形会被笔刷挖 / 堆，法线一变这里就变，**无需任何 CPU 侧预烘焙 / 重建网格**。
+float triplanarWeight(float slope) {
+    if (material.triplanar.x < 0.5) {
+        return 0.0;  // 关闭：整段走平面路径
+    }
+    return smoothstep(material.triplanar.y, material.triplanar.z, clamp(slope, 0.0, 1.0));
 }
 
 float hash21(vec2 p) {
@@ -299,11 +326,41 @@ void main() {
             continue;
         }
         const MaterialLayerParams layer = material.layers[i];
-        const vec2 uv = worldPosition.xz * layer.tintUv.a + detail * kDetailStrength;
-
         const float textureLayer = layer.height.w;
-        const vec3  layerAlbedo  = texture(u_albedo, vec3(uv, textureLayer)).rgb;
-        vec3        layerNormal  = texture(u_normal, vec3(uv, textureLayer)).rgb * 2.0 - 1.0;
+
+        // 平面（+Y 轴）投影 UV —— 即原路径；roughness / AO / macro / 细节法线仍用它。
+        const vec2 planarUv = worldPosition.xz * layer.tintUv.a + detail * kDetailStrength;
+
+        // ---- C 项：陡壁三平面混合投影（**自动、逐像素、仅最高权重层**）----
+        // 混合权重 triplanarWeight 由**世界空间几何法线**逐像素算出：地形被笔刷挖 / 堆后，受影响 tile
+        // 重网格 → 顶点法线更新 → 这里自动跟随，**无需任何额外动作**（不重建材质、不重编 Shader）。
+        // 平地路径（triWeight ≈ 0）**早退**为单次平面采样，采样次数与旧版完全相同（零额外开销）。
+        // 取舍：三平面只作用于 albedo 与 normal（陡壁拉伸最明显的是颜色）；roughness / AO / macro / 细节
+        //   法线保持平面投影（陡壁上的视觉影响小），以免每层采样次数翻三倍。
+        const float triWeight = (i == maxWeightIndex) ? triplanarWeight(1.0 - abs(geometricNormal.y)) : 0.0;
+
+        vec3 layerAlbedo = vec3(0.0);
+        vec3 layerNormal = vec3(0.0, 0.0, 1.0);
+        if (triWeight > kTriWeightEpsilon) {
+            // 三轴权重：以 triWeight 在"纯 +Y（平面）"与"|N|^sharpness"之间插值——
+            //   triWeight = 0 时退化为纯 +Y（与平面路径逐点一致，切换无跳变）；
+            //   triWeight = 1 时按 |N| 的幂在三个轴投影间混合（sharpness 越大越只取最贴合的轴）。
+            const vec3 axisRaw = mix(vec3(0.0, 1.0, 0.0),
+                                     pow(abs(geometricNormal), vec3(material.triplanar.w)), triWeight);
+            const vec3 axisWeight = axisRaw / max(axisRaw.x + axisRaw.y + axisRaw.z, 1e-5);
+
+            const vec2 uvX = worldPosition.zy * layer.tintUv.a + detail * kDetailStrength;
+            const vec2 uvZ = worldPosition.xy * layer.tintUv.a + detail * kDetailStrength;
+            layerAlbedo = axisWeight.x * texture(u_albedo, vec3(uvX, textureLayer)).rgb +
+                          axisWeight.y * texture(u_albedo, vec3(planarUv, textureLayer)).rgb +
+                          axisWeight.z * texture(u_albedo, vec3(uvZ, textureLayer)).rgb;
+            layerNormal = axisWeight.x * (texture(u_normal, vec3(uvX, textureLayer)).rgb * 2.0 - 1.0) +
+                          axisWeight.y * (texture(u_normal, vec3(planarUv, textureLayer)).rgb * 2.0 - 1.0) +
+                          axisWeight.z * (texture(u_normal, vec3(uvZ, textureLayer)).rgb * 2.0 - 1.0);
+        } else {
+            layerAlbedo = texture(u_albedo, vec3(planarUv, textureLayer)).rgb;
+            layerNormal = texture(u_normal, vec3(planarUv, textureLayer)).rgb * 2.0 - 1.0;
+        }
         // 多频细节法线（T23 / ADR 0010 P3）：**仅权重最高的层**再采一次同一张 normal 图，UV 尺度 ×4（高频）。
         // 合成方式 = RNM（Reoriented Normal Mapping，Whiteout 变体）：
         //   result = normalize(vec3(base.xy + highFreq.xy, base.z))
@@ -311,14 +368,14 @@ void main() {
         // 基础法线的朝向；不引入新采样器 / 纹理，只多一次采样。
         // **带宽取舍**：只对 `i == maxWeightIndex` 采样一次；若每层都加一次，则每片元会多出最高 4 次采样
         // （材质采样已是最大的一笔带宽，见 tech-plan §7.2.2）。代价是层权重交接处高频细节会瞬间切换，
-        // 因幅度有限、且处于窄带过渡内，肉眼不可辨。
+        // 因幅度有限、且处于窄带过渡内，肉眼不可辨。细节法线保持平面 UV（见上方取舍）。
         if (i == maxWeightIndex) {
             const vec3 highFrequencyNormal =
-                texture(u_normal, vec3(uv * kDetailNormalUvRatio, textureLayer)).rgb * 2.0 - 1.0;
+                texture(u_normal, vec3(planarUv * kDetailNormalUvRatio, textureLayer)).rgb * 2.0 - 1.0;
             layerNormal = normalize(vec3(layerNormal.xy + highFrequencyNormal.xy, layerNormal.z));
         }
-        const float layerRough   = texture(u_roughness, vec3(uv, textureLayer)).r;
-        const float layerAo      = texture(u_ao, vec3(uv, textureLayer)).r;
+        const float layerRough   = texture(u_roughness, vec3(planarUv, textureLayer)).r;
+        const float layerAo      = texture(u_ao, vec3(planarUv, textureLayer)).r;
 
         // 宏观变化：独立 UV 尺度（显著小于基础 UV 尺度），采样单层 macro 图的 R 通道。
         // 乘子围绕 1 上下浮动（±macro_strength），同时调制 albedo 与 roughness（ADR 0010 P2）。

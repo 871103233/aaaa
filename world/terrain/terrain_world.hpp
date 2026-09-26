@@ -78,6 +78,11 @@ public:
     [[nodiscard]] bool QueryHeight(float worldX, float worldZ, float& outHeight) const override;
     [[nodiscard]] bool QueryObstruction(const glm::vec3& from, const glm::vec3& to, float& outSafeT) const override;
 
+    /// 已加载 tile 中的**最高地表高度**（格）。无 tile 时返回 0。
+    /// 供上层推导阴影投射体高度（缺陷 1）：`最高地表高度 − 渲染原点高度` 即最高投射体相对原点的高度。
+    /// 遍历已加载 tile 的顶点行（仅 9 个 tile 量级），可在每帧调用；不分配、不读全局。
+    [[nodiscard]] float MaxSurfaceHeightBlocks() const noexcept;
+
     [[nodiscard]] std::uint64_t Seed() const noexcept { return m_seed; }
 
     /// 本世界所用的材质表（启动期加载的**同一份**）。

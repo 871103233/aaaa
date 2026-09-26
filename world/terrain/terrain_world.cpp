@@ -97,6 +97,18 @@ std::size_t TerrainWorld::RemeshDirtyTiles(const std::vector<TileCoord>& dirty) 
     return remeshed;
 }
 
+float TerrainWorld::MaxSurfaceHeightBlocks() const noexcept {
+    float maximum = 0.0F;
+    for (const auto& entry : m_tiles) {
+        const TerrainTile& tile = entry.second;
+        for (const Height height : tile.heights) {
+            const float blocks = HeightToBlocks(height);
+            maximum            = (blocks > maximum) ? blocks : maximum;
+        }
+    }
+    return maximum;
+}
+
 bool TerrainWorld::QueryHeight(float worldX, float worldZ, float& outHeight) const {
     const int columnX = static_cast<int>(std::floor(worldX));
     const int columnZ = static_cast<int>(std::floor(worldZ));

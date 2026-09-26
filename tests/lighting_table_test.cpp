@@ -32,7 +32,7 @@ using vx::SrgbToLinear;
 /// fog.color **刻意缺失**，用于同时覆盖"默认取 sky.horizon_color"这条路径；
 /// [shadow] 段位于最末，便于用字符串替换逐项制造非法值（T21b）。
 constexpr const char* kValidConfig =
-    "schema_version = 2\n"
+    "schema_version = 4\n"
     "[sun]\n"
     "direction = [0.0, 1.0, 0.0]\n"
     "color = [1.0, 1.0, 1.0]\n"
@@ -53,7 +53,8 @@ constexpr const char* kValidConfig =
     "max_distance = 180.0\n"
     "split_lambda = 0.75\n"
     "depth_bias = 0.0015\n"
-    "normal_offset = 0.05\n";
+    "normal_offset = 0.05\n"
+    "caster_height_min = 80.0\n";
 
 [[nodiscard]] std::filesystem::path WriteTempConfig(const char* name, const std::string& content) {
     const std::filesystem::path path = std::filesystem::temp_directory_path() / name;
@@ -100,6 +101,8 @@ TEST(LightingTable, LoadsCommittedConfig) {
     EXPECT_FLOAT_EQ(table.Shadow().splitLambda, 0.75F);
     EXPECT_FLOAT_EQ(table.Shadow().depthBias, 0.0015F);
     EXPECT_FLOAT_EQ(table.Shadow().normalOffset, 0.05F);
+    // 缺陷 1：提交配置的投射体扩展下限（覆盖测试地图地标塔）。
+    EXPECT_FLOAT_EQ(table.Shadow().casterHeightMin, 160.0F);
 }
 
 // 内置默认表与提交的配置一致：保证测试与运行期行为可比（口径同材质表）。
@@ -127,11 +130,12 @@ TEST(LightingTable, DefaultMatchesCommittedConfig) {
     EXPECT_FLOAT_EQ(loaded.Shadow().splitLambda, builtin.Shadow().splitLambda);
     EXPECT_FLOAT_EQ(loaded.Shadow().depthBias, builtin.Shadow().depthBias);
     EXPECT_FLOAT_EQ(loaded.Shadow().normalOffset, builtin.Shadow().normalOffset);
+    EXPECT_FLOAT_EQ(loaded.Shadow().casterHeightMin, builtin.Shadow().casterHeightMin);
 }
 
-// T21b：表格式版本已升到 2（新增 [shadow]）——防止旧版文件被静默接受。
-TEST(LightingTable, SchemaVersionIsTwo) {
-    EXPECT_EQ(LightingTable::kSchemaVersion, 2);
+// T21b / 缺陷 1：表格式版本已升到 4（新增 [shadow].caster_height_min）——防止旧版文件被静默接受。
+TEST(LightingTable, SchemaVersionIsFour) {
+    EXPECT_EQ(LightingTable::kSchemaVersion, 4);
 }
 
 // 缺失配置必须显式报错，禁止静默回退。
@@ -142,7 +146,7 @@ TEST(LightingTable, MissingConfigThrows) {
 // schema_version 不符必须报错。
 TEST(LightingTable, InvalidSchemaThrows) {
     std::string content = kValidConfig;
-    const std::string from = "schema_version = 2";
+    const std::string from = "schema_version = 4";
     content.replace(content.find(from), from.size(), "schema_version = 99");
     const std::filesystem::path path = WriteTempConfig("vx_invalid_lighting_schema.toml", content);
     EXPECT_THROW((void)LightingTable::LoadFromFile(path), std::runtime_error);
@@ -303,6 +307,7 @@ TEST(LightingTable, ShadowValidConfigParses) {
     EXPECT_FLOAT_EQ(table.Shadow().splitLambda, 0.75F);
     EXPECT_FLOAT_EQ(table.Shadow().depthBias, 0.0015F);
     EXPECT_FLOAT_EQ(table.Shadow().normalOffset, 0.05F);
+    EXPECT_FLOAT_EQ(table.Shadow().casterHeightMin, 80.0F);
     RemoveTempConfig(path);
 }
 
@@ -317,6 +322,7 @@ TEST(LightingTable, ShadowSettingsDefaultsMatchCommittedConfig) {
     EXPECT_FLOAT_EQ(defaults.splitLambda, 0.75F);
     EXPECT_FLOAT_EQ(defaults.depthBias, 0.0015F);
     EXPECT_FLOAT_EQ(defaults.normalOffset, 0.05F);
+    EXPECT_FLOAT_EQ(defaults.casterHeightMin, 160.0F);
 }
 
 // [shadow] 段整段缺失必须报错。
@@ -415,6 +421,26 @@ TEST(LightingTable, ShadowNormalOffsetNegativeThrows) {
     const std::string from = "normal_offset = 0.05";
     content.replace(content.find(from), from.size(), "normal_offset = -0.05");
     const std::filesystem::path path = WriteTempConfig("vx_lighting_shadow_normal.toml", content);
+    EXPECT_THROW((void)LightingTable::LoadFromFile(path), std::runtime_error);
+    RemoveTempConfig(path);
+}
+
+// 缺陷 1：缺 caster_height_min 必须报错（结构变更，旧文件不得被静默接受）。
+TEST(LightingTable, ShadowMissingCasterHeightMinThrows) {
+    std::string content = kValidConfig;
+    const std::string from = "caster_height_min = 80.0\n";
+    content.erase(content.find(from), from.size());
+    const std::filesystem::path path = WriteTempConfig("vx_lighting_shadow_no_caster.toml", content);
+    EXPECT_THROW((void)LightingTable::LoadFromFile(path), std::runtime_error);
+    RemoveTempConfig(path);
+}
+
+// 缺陷 1：负的 caster_height_min 必须报错。
+TEST(LightingTable, ShadowCasterHeightMinNegativeThrows) {
+    std::string content = kValidConfig;
+    const std::string from = "caster_height_min = 80.0";
+    content.replace(content.find(from), from.size(), "caster_height_min = -1.0");
+    const std::filesystem::path path = WriteTempConfig("vx_lighting_shadow_caster_neg.toml", content);
     EXPECT_THROW((void)LightingTable::LoadFromFile(path), std::runtime_error);
     RemoveTempConfig(path);
 }

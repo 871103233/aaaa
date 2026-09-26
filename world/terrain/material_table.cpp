@@ -16,6 +16,28 @@ namespace {
     return path.string() + ": [[layer]] #" + std::to_string(slot) + " 字段 [" + field + "] ";
 }
 
+[[nodiscard]] std::string Describe(const std::filesystem::path& path, const char* section, const char* field) {
+    return path.string() + ": 段 [" + section + "] 字段 [" + field + "] ";
+}
+
+[[nodiscard]] bool ReadBool(const toml::table& section, const std::filesystem::path& path, const char* sectionName,
+                            const char* field) {
+    const std::optional<bool> value = section[field].value<bool>();
+    if (!value.has_value()) {
+        throw std::runtime_error(Describe(path, sectionName, field) + "缺失或不是布尔值");
+    }
+    return *value;
+}
+
+[[nodiscard]] float ReadSectionFloat(const toml::table& section, const std::filesystem::path& path,
+                                     const char* sectionName, const char* field) {
+    const std::optional<double> value = section[field].value<double>();
+    if (!value.has_value()) {
+        throw std::runtime_error(Describe(path, sectionName, field) + "缺失或不是数值");
+    }
+    return static_cast<float>(*value);
+}
+
 [[nodiscard]] float ReadFloat(const toml::table& layer, const std::filesystem::path& path, std::size_t slot,
                               const char* field) {
     const std::optional<double> value = layer[field].value<double>();
@@ -137,6 +159,26 @@ TerrainMaterialTable TerrainMaterialTable::LoadFromFile(const std::filesystem::p
         table.m_layers[slot] = std::move(parsed);
     }
 
+    // C 项：全局三平面（triplanar）参数。必填；缺失 / 越界一律抛异常（与其它段同口径，不静默回退）。
+    const toml::table* triplanar = document["triplanar"].as_table();
+    if (triplanar == nullptr) {
+        throw std::runtime_error(path.string() + ": 缺少 [triplanar] 段");
+    }
+    TriplanarSettings parsedTriplanar;
+    parsedTriplanar.enabled   = ReadBool(*triplanar, path, "triplanar", "enabled");
+    parsedTriplanar.slopeMin  = ReadSectionFloat(*triplanar, path, "triplanar", "slope_min");
+    parsedTriplanar.slopeMax  = ReadSectionFloat(*triplanar, path, "triplanar", "slope_max");
+    parsedTriplanar.sharpness = ReadSectionFloat(*triplanar, path, "triplanar", "sharpness");
+    if (parsedTriplanar.slopeMin < 0.0F || parsedTriplanar.slopeMax > 1.0F ||
+        parsedTriplanar.slopeMin >= parsedTriplanar.slopeMax) {
+        throw std::runtime_error(Describe(path, "triplanar", "slope_min/slope_max") +
+                                 "必须满足 0 ≤ slope_min < slope_max ≤ 1（否则 smoothstep 退化）");
+    }
+    if (!(parsedTriplanar.sharpness > 0.0F)) {
+        throw std::runtime_error(Describe(path, "triplanar", "sharpness") + "必须大于 0");
+    }
+    table.m_triplanar = parsedTriplanar;
+
     return table;
 }
 
@@ -146,14 +188,18 @@ TerrainMaterialTable TerrainMaterialTable::Default() {
     // 取值与 assets/config/materials.toml 一致，保证测试与运行期行为可比。
     // 字段顺序见 MaterialLayer 声明：name / textureLayer / 高度带(3) / 坡度带(3) / uvScale /
     // tintRGB / roughness / ao / macroUvScale / macroStrength。
-    table.m_layers[0] = MaterialLayer { "grass", 1, 0.0F, 96.0F, 16.0F, 0.0F, 0.35F, 0.10F, 0.12F, 0.31F, 0.55F,
+    // 带参数（缺陷 2 修复）：使 (高度 ∈ [0,512], 坡度 ∈ [0,1]) 全域至少一层非零，见 TOML 头部论证。
+    table.m_layers[0] = MaterialLayer { "grass", 1, 0.0F, 320.0F, 60.0F, 0.0F, 0.45F, 0.10F, 0.12F, 0.31F, 0.55F,
                                         0.24F, 0.90F, 0.85F, 0.020F, 0.35F };
-    table.m_layers[1] = MaterialLayer { "dirt", 2, 0.0F, 160.0F, 24.0F, 0.20F, 0.60F, 0.15F, 0.10F, 0.45F, 0.33F,
+    table.m_layers[1] = MaterialLayer { "dirt", 2, 300.0F, 512.0F, 60.0F, 0.0F, 0.55F, 0.10F, 0.10F, 0.45F, 0.33F,
                                         0.21F, 0.88F, 0.75F, 0.015F, 0.40F };
-    table.m_layers[2] = MaterialLayer { "rock", 3, 40.0F, 512.0F, 24.0F, 0.45F, 1.0F, 0.15F, 0.16F, 0.55F, 0.55F,
+    table.m_layers[2] = MaterialLayer { "rock", 3, 0.0F, 512.0F, 0.0F, 0.55F, 1.0F, 0.10F, 0.16F, 0.55F, 0.55F,
                                         0.56F, 0.40F, 0.70F, 0.030F, 0.30F };
     table.m_layers[3] = MaterialLayer { "sand", 4, 0.0F, 6.0F, 3.0F, 0.0F, 0.30F, 0.10F, 0.18F, 0.83F, 0.74F,
                                         0.48F, 0.95F, 0.90F, 0.025F, 0.25F };
+
+    // C 项：三平面参数（默认值即 TriplanarSettings 的成员初值，与 assets/config/materials.toml 的 [triplanar] 一致）。
+    table.m_triplanar = TriplanarSettings {};
 
     return table;
 }
@@ -164,6 +210,13 @@ MaterialUniform BuildMaterialUniform(const TerrainMaterialTable& table, double o
     uniform.renderOriginX = static_cast<float>(originX);
     uniform.renderOriginY = static_cast<float>(originY);
     uniform.renderOriginZ = static_cast<float>(originZ);
+
+    // C 项：全局三平面参数（单入口投影；与各层字段同源，禁止在着色器另写一份）。
+    const TriplanarSettings& triplanar = table.Triplanar();
+    uniform.triplanarEnabled   = triplanar.enabled ? 1.0F : 0.0F;
+    uniform.triplanarSlopeMin  = triplanar.slopeMin;
+    uniform.triplanarSlopeMax  = triplanar.slopeMax;
+    uniform.triplanarSharpness = triplanar.sharpness;
 
     for (std::size_t slot = 0; slot < static_cast<std::size_t>(kMaterialSlotCount); ++slot) {
         const MaterialLayer& layer = table.Layer(static_cast<int>(slot));

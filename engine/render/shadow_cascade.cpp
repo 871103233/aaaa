@@ -22,6 +22,18 @@ struct LightBasis {
     glm::vec3 up;
 };
 
+/// 光方向的竖直分量下限：既避免 `1 / |dir.y|` 除零，也把"太阳贴地平线"时爆炸的投射体扩展量钳成有限值。
+constexpr float kCasterMinVerticalComponent = 0.05F;
+
+/// 投射体扩展的水平量：`casterHeight · tanθ`（`tanθ = sqrt(1 - dir.y²) / max(|dir.y|, eps)`）。
+/// 与 `BuildCascadeLightMatrix` 内部同一公式；`BuildShadowUniform` 需要它来算覆盖 texel 的尺寸。
+[[nodiscard]] float CasterHorizontalExtension(const glm::vec3& sunDirection, float casterHeight) noexcept {
+    const float absDirectionY = std::max(std::abs(sunDirection.y), kCasterMinVerticalComponent);
+    const float tanTheta =
+        std::sqrt(std::max(0.0F, 1.0F - sunDirection.y * sunDirection.y)) / absDirectionY;
+    return std::max(casterHeight, 0.0F) * tanTheta;
+}
+
 [[nodiscard]] LightBasis MakeLightBasis(const glm::vec3& sunDirection) noexcept {
     LightBasis basis;
     basis.direction = glm::normalize(sunDirection);
@@ -73,12 +85,23 @@ std::array<float, kMaxShadowCascades> ComputeCascadeSplits(float nearPlane, floa
 }
 
 glm::mat4 BuildCascadeLightMatrix(const glm::vec3& sunDirection, const glm::vec3& cascadeCenter, float cascadeRadius,
-                                  float cascadeTexelSize) noexcept {
+                                  float cascadeTexelSize, float casterHeight) noexcept {
     const LightBasis basis = MakeLightBasis(sunDirection);
+
+    // ---- 投射体扩展（见头文件推导）----
+    // 以 |dir.y| 为竖直分量；eps 既避免除零，也把"太阳贴地平线"时爆炸的扩展量钳成有限值（|dir.y| ≥ eps）。
+    const float absDirectionY = std::max(std::abs(basis.direction.y), kCasterMinVerticalComponent);
+    const float vertical      = std::max(casterHeight, 0.0F);
+    // 沿光轴向前延伸量：把"竖直高度 h"按光轴斜率折算（h / cosθ ≥ h·cosθ，保守覆盖）。
+    const float axisExtension = vertical / absDirectionY;
+    // X/Y 各扩量：竖直位移在光平面内的最大投影 = h·sinθ，这里取更大的保守量 h·tanθ（见 CasterHorizontalExtension）。
+    const float halfExtent    = cascadeRadius + CasterHorizontalExtension(basis.direction, vertical);
+    const float farDepth      = 2.0F * cascadeRadius + axisExtension;
 
     // ---- texel 对齐：把中心在光空间 x / y 轴上的投影量化到 texel 网格 ----
     // 量化是"单位对齐"的关键：相机连续移动时，只有跨过 texel 边界才会改变矩阵的平移分量，
     // 否则阴影图会随相机做亚 texel 的斜移，表现为阴影边缘持续抖动（shimmering）。
+    // 量化轴（right / up）与扩展无关（扩展只沿光轴与光平面各向同性放大），故仍按原轴量化。
     const float centerX = glm::dot(cascadeCenter, basis.right);
     const float centerY = glm::dot(cascadeCenter, basis.up);
     const float snappedX = std::round(centerX / cascadeTexelSize) * cascadeTexelSize;
@@ -86,21 +109,22 @@ glm::mat4 BuildCascadeLightMatrix(const glm::vec3& sunDirection, const glm::vec3
     const glm::vec3 snappedCenter =
         cascadeCenter + basis.right * (snappedX - centerX) + basis.up * (snappedY - centerY);
 
-    // ---- 视图：眼睛在量化后的中心沿太阳方向外移一个半径，看向中心 ----
+    // ---- 视图：眼睛在量化后的中心沿太阳方向外移（半径 + 轴向扩展量），看向中心 ----
     // 用 basis.up 作为 lookAt 的上向：它与视线方向严格正交，不会像世界上向那样在太阳接近垂直时退化。
-    const glm::vec3 eye = snappedCenter + basis.direction * cascadeRadius;
+    const glm::vec3 eye = snappedCenter + basis.direction * (cascadeRadius + axisExtension);
     const glm::mat4 view = glm::lookAt(eye, snappedCenter, basis.up);
 
-    // ---- 正交投影：±radius 的正方形，深度 [0, 2·radius]（右手系 + 0~1 深度）----
-    // 包围球以 snappedCenter 为心、radius 为半径，在视图空间的 z ∈ [-2·radius, 0]，xy ∈ [-radius, radius]，
-    // 因此 8 个角点全部落在 NDC [-1, 1]³ 内。
-    const glm::mat4 projection = glm::orthoRH_ZO(-cascadeRadius, cascadeRadius, -cascadeRadius, cascadeRadius, 0.0F,
-                                                 2.0F * cascadeRadius);
+    // ---- 正交投影：±halfExtent 的正方形，深度 [0, 2·radius + axisExtension]（右手系 + 0~1 深度）----
+    // 扩展量为 0 时逐字退回旧行为：包围球在视图空间的 xy ∈ [-radius, radius]、z ∈ [-2·radius, 0]，
+    // 8 个角点全部落在 NDC [-1, 1]³ 内；扩展后盒只变大，原切片角点仍在盒内（覆盖不丢）。
+    const glm::mat4 projection =
+        glm::orthoRH_ZO(-halfExtent, halfExtent, -halfExtent, halfExtent, 0.0F, farDepth);
     return projection * view;
 }
 
 ShadowUniform BuildShadowUniform(const LightingTable& table, const glm::mat4& viewRelative, float fieldOfViewDegrees,
-                                 float aspectRatio, float nearPlane, float farPlane) noexcept {
+                                 float aspectRatio, float nearPlane, float farPlane,
+                                 float casterTopRelative) noexcept {
     const ShadowSettings& settings = table.Shadow();
 
     ShadowUniform uniform {};
@@ -164,9 +188,16 @@ ShadowUniform BuildShadowUniform(const LightingTable& table, const glm::mat4& vi
         const glm::vec3 center = (minimum + maximum) * 0.5F;
         const float     radius = glm::length((maximum - minimum) * 0.5F);
 
-        const float texelWorldSize = 2.0F * radius / static_cast<float>(settings.resolution);
+        // 投射体扩展：该级中心之上必须覆盖的高度 = max(配置下限, 地形最高点相对原点高度 − 中心相对高度)。
+        // `casterTopRelative` 与 `center.y` **同为渲染原点相对坐标**，相减即"最高地形高度 − 该级中心高度"
+        // （渲染原点 Y 抵消），因此扩展量不随渲染原点重定基而漂移（见头文件对该坐标系的强调）。
+        const float casterHeight = std::max(settings.casterHeightMin, casterTopRelative - center.y);
+
+        // 覆盖 texel 的世界尺寸按扩展后的正交盒宽度算：texel 对齐轴与实际盒一致，否则量化步长与盒不匹配。
+        const float halfExtent     = radius + CasterHorizontalExtension(sunDirection, casterHeight);
+        const float texelWorldSize = 2.0F * halfExtent / static_cast<float>(settings.resolution);
         uniform.lightMatrices[static_cast<std::size_t>(i)] =
-            BuildCascadeLightMatrix(sunDirection, center, radius, texelWorldSize);
+            BuildCascadeLightMatrix(sunDirection, center, radius, texelWorldSize, casterHeight);
         uniform.splitDistances[static_cast<std::size_t>(i)] = splitFar;
 
         previousSplit = splitFar;

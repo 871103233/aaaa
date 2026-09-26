@@ -8,6 +8,25 @@
 
 namespace vx {
 
+/// 全局三平面（triplanar）混合配置（C 项 / 陡壁 UV 拉伸修复）。
+///
+/// **为什么"自动切换"是硬要求**：地形会被笔刷挖与堆，混合权重若在 CPU 侧按坡度预烘焙、或按 tile 分支、
+/// 或需要重建网格，则地形一变就得重做——本项目**不允许**该路径。故混合权重**逐像素由世界空间法线**算出
+/// （见 `TriplanarBlendWeight` 与 `assets/shaders/mesh.frag` 的 `triplanarWeight`）：法线一变混合即自动跟随。
+struct TriplanarSettings {
+    /// false 时着色器整段跳过三平面（混合权重恒为 0，退回纯平面投影）。
+    bool enabled = true;
+
+    /// 自动切换下界：坡度 `slope = 1 - |N.y|`（0 = 水平面、1 = 竖直面）低于它 → 纯平面路径（零额外采样）。
+    float slopeMin = 0.45F;
+
+    /// 自动切换上界：坡度达到它 → 完全三平面（按 |N| 的幂在三个轴投影间混合）。必须 > `slopeMin`。
+    float slopeMax = 0.70F;
+
+    /// 三轴投影的锐化指数（必须 > 0）：越大越"只取最贴合的那一两个轴"，过渡越干脆。
+    float sharpness = 4.0F;
+};
+
 /// splat 槽位数量：等于纹理数组的层数，并与 `render/mesh_renderer.hpp` 的纹理采样约定一致。
 ///
 /// ADR 0009 起权重在**片元着色器**逐像素计算，不再写入顶点属性；本常量只约束
@@ -94,16 +113,26 @@ struct MaterialLayerUniform {
 ///
 /// `renderOrigin` 是相机相对渲染的**渲染原点**：顶点上传前已减去它，片元用它把相机相对坐标
 /// 还原成世界坐标，才能按世界高度算权重（红线 6：世界定位不用 `float` 存储，仅上传时转换）。
+///
+/// `triplanar` 是全局三平面参数（C 项）：`x = enabled(1/0)`、`y = slope_min`、`z = slope_max`、
+/// `w = sharpness`。与 mesh.frag 的 `MaterialBlock.triplanar` 逐字对应。
 struct MaterialUniform {
     float renderOriginX = 0.0F;
     float renderOriginY = 0.0F;
     float renderOriginZ = 0.0F;
     float renderOriginUnused = 0.0F;
+
+    float triplanarEnabled  = 1.0F;  ///< 1 = 启用三平面、0 = 关闭（着色器据此整段跳过）
+    float triplanarSlopeMin = 0.45F;
+    float triplanarSlopeMax = 0.70F;
+    float triplanarSharpness = 4.0F;
+
     std::array<MaterialLayerUniform, static_cast<std::size_t>(kMaterialSlotCount)> layers {};
 };
 
-static_assert(sizeof(MaterialUniform) == 16 + 64 * static_cast<std::size_t>(kMaterialSlotCount),
-              "MaterialUniform 必须与 mesh.frag 的 std140 布局逐字节一致");
+static_assert(sizeof(MaterialUniform) == 16 * (2 + 4 * static_cast<std::size_t>(kMaterialSlotCount)),
+              "MaterialUniform 必须与 mesh.frag 的 std140 布局逐字节一致"
+              "（渲染原点 + 三平面参数 + 4 层 × 4 个 vec4 = 288 字节）");
 
 class TerrainMaterialTable;
 
@@ -125,7 +154,9 @@ public:
     /// 当前表格式版本；写入配置文件的 `schema_version` 必须与之相等。
     /// 2：新增 `uv_scale` 与 `tint_r/g/b`（ADR 0009）。
     /// 3：新增 `roughness` / `ao` / `macro_uv_scale` / `macro_strength`（ADR 0010 P2）。
-    static constexpr int kSchemaVersion = 3;
+    /// 4：调整高度 / 坡度带使 (高度 × 坡度) 全域被覆盖（缺陷 2 修复）；并新增全局 `[triplanar]` 段（C 项，
+    ///    同一版本内落地，不重复升版）。
+    static constexpr int kSchemaVersion = 4;
 
     /// 从 TOML 文件加载并校验；失败抛 `std::runtime_error`（启动期允许异常，ADR 0005）。
     /// 前置条件：`path` 指向待加载的材质表文件。
@@ -142,8 +173,12 @@ public:
 
     [[nodiscard]] int SchemaVersion() const noexcept { return m_schemaVersion; }
 
+    /// 全局三平面（triplanar）参数（C 项）。供 `BuildMaterialUniform` 与着色器使用。
+    [[nodiscard]] const TriplanarSettings& Triplanar() const noexcept { return m_triplanar; }
+
 private:
     std::array<MaterialLayer, static_cast<std::size_t>(kMaterialSlotCount)> m_layers {};
+    TriplanarSettings                                                       m_triplanar;
     int                                                                     m_schemaVersion = kSchemaVersion;
 };
 

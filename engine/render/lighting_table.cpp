@@ -175,6 +175,8 @@ LightingTable LightingTable::LoadFromFile(const std::filesystem::path& path) {
 
     table.m_shadow.depthBias    = ReadNonNegative(shadow, path, "shadow", "depth_bias");
     table.m_shadow.normalOffset = ReadNonNegative(shadow, path, "shadow", "normal_offset");
+    // 缺陷 1：投射体扩展下限兜底（格，≥ 0）。
+    table.m_shadow.casterHeightMin = ReadNonNegative(shadow, path, "shadow", "caster_height_min");
 
     return table;
 }
