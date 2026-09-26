@@ -74,6 +74,11 @@ struct MaterialLayer {
 
     /// 宏观调制强度；取值 [0, 1]。乘在 albedo 与 roughness 上（围绕 1 上下浮动）。
     float macroStrength = 0.0F;
+
+    /// **在可挖体积中替代本层的槽位**（[ADR 0014](../../docs/adr/0014-voxel-material-index.md)）；
+    /// `-1` = 用本层自身。用于「表层 → 次表层」映射：`grass` / `sand` 这类只该出现在地表薄层的层，
+    /// 在体积内映射为 `dirt` ⇒ **在草地上挖坑看到土、在山体（陡坡 ⇒ 岩）里挖洞看到岩**。
+    int subsurfaceSlot = -1;
 };
 
 /// GPU 侧的一个材质层参数块；字段排布与 `assets/shaders/mesh.frag` 的 std140 块逐字对应。
@@ -155,7 +160,8 @@ public:
     /// 2：新增 `uv_scale` 与 `tint_r/g/b`（ADR 0009）。
     /// 3：新增 `roughness` / `ao` / `macro_uv_scale` / `macro_strength`（ADR 0010 P2）。
     /// 4：调整高度 / 坡度带使 (高度 × 坡度) 全域被覆盖（缺陷 2 修复）；并新增全局 `[triplanar]` 段（C 项，
-    ///    同一版本内落地，不重复升版）。
+    ///    同一版本内落地，不重复升版）、每层可选的 `subsurface`（ADR 0014 的表层 → 次表层映射）。
+    ///    `subsurface` **缺省 = 自身**，旧文件无需改动即可加载 ⇒ **不构成破坏性变更，故不升版**。
     static constexpr int kSchemaVersion = 4;
 
     /// 从 TOML 文件加载并校验；失败抛 `std::runtime_error`（启动期允许异常，ADR 0005）。

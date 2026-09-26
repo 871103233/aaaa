@@ -173,17 +173,24 @@ void DebugOverlay::BuildUI(const DebugStats& stats, SystemPanelContext& panelCon
             UiText(stats.physicsReady ? UiLabel::ValueReady : UiLabel::ValueNotReady, cjk),
             UiText(stats.characterFlying ? UiLabel::ValueYes : UiLabel::ValueNo, cjk));
 
-    ImGui::SeparatorText(UiText(UiLabel::SectionCameraBrush, cjk));
+    ImGui::SeparatorText(UiText(UiLabel::SectionCameraOrb, cjk));
     StatRow(UiText(UiLabel::CameraOrientation, cjk), UiText(UiLabel::CameraOrientationFormat, cjk),
             stats.cameraYaw * 57.2957795F, stats.cameraPitch * 57.2957795F, stats.cameraDistance);
     ValueRow(UiText(UiLabel::MouseCapture, cjk),
              UiText(stats.mouseCaptured ? UiLabel::MouseCaptureOn : UiLabel::MouseCaptureOff, cjk));
-    StatRow(UiText(UiLabel::BrushRadius, cjk), UiText(UiLabel::BrushRadiusFormat, cjk), stats.brushRadius);
+    StatRow(UiText(UiLabel::ExplosionRadius, cjk), UiText(UiLabel::ExplosionRadiusFormat, cjk),
+            stats.explosionRadius);
+    StatRow(UiText(UiLabel::Orbs, cjk), UiText(UiLabel::OrbCountFormat, cjk), stats.orbActiveCount,
+            stats.orbCapacity);
 
     ImGui::SeparatorText(UiText(UiLabel::SectionWorldPhysics, cjk));
     StatRow(UiText(UiLabel::LoadedTiles, cjk), UiText(UiLabel::CountFormat, cjk), stats.loadedTileCount);
     StatRow(UiText(UiLabel::DirtyTiles, cjk), UiText(UiLabel::CountFormat, cjk), stats.lastDirtyTileCount);
     StatRow(UiText(UiLabel::TileBodies, cjk), UiText(UiLabel::CountFormat, cjk), stats.tileBodyCount);
+    StatRow(UiText(UiLabel::VolumeBlocks, cjk), UiText(UiLabel::VolumeBlocksFormat, cjk), stats.volumeBlockCount,
+            stats.carvedBlockCount);
+    StatRow(UiText(UiLabel::VolumeBodies, cjk), UiText(UiLabel::CountFormat, cjk), stats.volumeBodyCount);
+    StatRow(UiText(UiLabel::CollapseMoved, cjk), UiText(UiLabel::CountFormat, cjk), stats.collapseMovedVoxels);
 
     // T24：渲染开销（实测自 MeshRenderer）+ 纹理显存记账（ADR 0010）；纯展示，不回写任何状态。
     ImGui::SeparatorText(UiText(UiLabel::SectionRenderCost, cjk));

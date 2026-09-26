@@ -9,11 +9,11 @@ namespace vx {
 /// "拖音量滑块"会带着相机转。分类与来源：
 ///   - `keyboardGameplay`：键盘玩法动作（移动 / 冲刺 / 跳跃 / 飞行开关与升降）—— 由 `WantCaptureKeyboard` 决定；
 ///   - `cameraLook`：鼠标相对位移驱动的视角旋转 —— 由 `WantCaptureMouse` 决定；
-///   - `mouseBrush`：鼠标左右键的挖 / 堆 —— 由 `WantCaptureMouse` 决定。
+///   - `mouseAction`：鼠标左右键的玩法动作（T27 起 = 发射光球）—— 由 `WantCaptureMouse` 决定。
 struct InputSuppression {
     bool keyboardGameplay = false;  ///< 键盘玩法动作是否被抑制
     bool cameraLook       = false;  ///< 鼠标视角旋转是否被抑制
-    bool mouseBrush       = false;  ///< 鼠标挖 / 堆是否被抑制
+    bool mouseAction      = false;  ///< 鼠标玩法动作（发射）是否被抑制
 };
 
 /// 纯函数：由「系统面板是否打开」「ImGui 是否想接管鼠标 / 键盘」决定各类玩法输入是否抑制。
@@ -30,7 +30,7 @@ struct InputSuppression {
     InputSuppression suppression;
     suppression.keyboardGameplay = blockKeyboard;
     suppression.cameraLook       = blockMouse;
-    suppression.mouseBrush       = blockMouse;
+    suppression.mouseAction      = blockMouse;
     return suppression;
 }
 

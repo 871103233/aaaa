@@ -16,6 +16,7 @@ find_package(GTest CONFIG REQUIRED)
 add_executable(voxel_tests
     character_jump_test.cpp
     character_test.cpp
+    dig_volume_test.cpp
     fixed_step_test.cpp
     frame_limiter_test.cpp
     gameplay_input_test.cpp
@@ -23,6 +24,7 @@ add_executable(voxel_tests
     lighting_table_test.cpp
     map_preset_test.cpp
     mouse_capture_test.cpp
+    orb_test.cpp
     system_settings_test.cpp
     physics_test.cpp
     render_camera_test.cpp
@@ -35,6 +37,9 @@ add_executable(voxel_tests
     terrain_tile_test.cpp
     ui_font_test.cpp
     ui_text_test.cpp
+    volume_collapse_test.cpp
+    volume_collision_test.cpp
+    volume_mesher_test.cpp
     world_bounds_test.cpp
 )
 

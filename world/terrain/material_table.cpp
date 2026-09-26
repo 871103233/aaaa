@@ -131,6 +131,10 @@ TerrainMaterialTable TerrainMaterialTable::LoadFromFile(const std::filesystem::p
     TerrainMaterialTable table;
     table.m_schemaVersion = static_cast<int>(*schemaVersion);
 
+    // ADR 0014：每层的 `subsurface` 用**材质名**引用（可读、与层顺序无关），故先收集名字、
+    // 等所有层都解析完再映射成槽位号（见紧随其后的循环）。
+    std::array<std::string, static_cast<std::size_t>(kMaterialSlotCount)> subsurfaceNames {};
+
     for (std::size_t slot = 0; slot < layers->size(); ++slot) {
         const toml::table* layer = (*layers)[slot].as_table();
         if (layer == nullptr) {
@@ -154,9 +158,28 @@ TerrainMaterialTable TerrainMaterialTable::LoadFromFile(const std::filesystem::p
         parsed.ao            = ReadFloat(*layer, path, slot, "ao");
         parsed.macroUvScale  = ReadFloat(*layer, path, slot, "macro_uv_scale");
         parsed.macroStrength = ReadFloat(*layer, path, slot, "macro_strength");
+        // `subsurface` 可缺省（缺省 = 自身，兼容旧文件）；一旦写了就参与下面的名字校验。
+        subsurfaceNames[slot] = layer->contains("subsurface") ? ReadString(*layer, path, slot, "subsurface")
+                                                             : parsed.name;
 
         ValidateLayer(parsed, path, slot);
         table.m_layers[slot] = std::move(parsed);
+    }
+
+    // 名字 → 槽位号（ADR 0014）。必须等所有层解析完才能解析引用；未知名字抛异常（不静默回退）。
+    for (std::size_t slot = 0; slot < static_cast<std::size_t>(kMaterialSlotCount); ++slot) {
+        int found = -1;
+        for (std::size_t other = 0; other < static_cast<std::size_t>(kMaterialSlotCount); ++other) {
+            if (table.m_layers[other].name == subsurfaceNames[slot]) {
+                found = static_cast<int>(other);
+                break;
+            }
+        }
+        if (found < 0) {
+            throw std::runtime_error(path.string() + ": layer[" + std::to_string(slot) +
+                                     "].subsurface 指向未知材质 \"" + subsurfaceNames[slot] + "\"");
+        }
+        table.m_layers[slot].subsurfaceSlot = found;
     }
 
     // C 项：全局三平面（triplanar）参数。必填；缺失 / 越界一律抛异常（与其它段同口径，不静默回退）。
@@ -197,6 +220,13 @@ TerrainMaterialTable TerrainMaterialTable::Default() {
                                         0.56F, 0.40F, 0.70F, 0.030F, 0.30F };
     table.m_layers[3] = MaterialLayer { "sand", 4, 0.0F, 6.0F, 3.0F, 0.0F, 0.30F, 0.10F, 0.18F, 0.83F, 0.74F,
                                         0.48F, 0.95F, 0.90F, 0.025F, 0.25F };
+
+    // ADR 0014：表层 → 次表层映射，与 assets/config/materials.toml 的 `subsurface` 一致。
+    // 草 / 沙只该出现在地表薄层，在体积内映射为土；岩 / 土保持自身。
+    table.m_layers[0].subsurfaceSlot = 1;  // grass → dirt
+    table.m_layers[1].subsurfaceSlot = 1;  // dirt  → dirt
+    table.m_layers[2].subsurfaceSlot = 2;  // rock  → rock
+    table.m_layers[3].subsurfaceSlot = 1;  // sand  → dirt
 
     // C 项：三平面参数（默认值即 TriplanarSettings 的成员初值，与 assets/config/materials.toml 的 [triplanar] 一致）。
     table.m_triplanar = TriplanarSettings {};

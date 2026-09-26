@@ -1,5 +1,7 @@
 #include "terrain/terrain_world.hpp"
 
+#include "terrain/material_blender.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <set>
@@ -33,7 +35,7 @@ void TerrainWorld::MeshTile(int tileX, int tileZ) {
     if (tile == nullptr) {
         return;
     }
-    m_meshes[TileCoord { tileX, tileZ }] = BuildTerrainMesh(*tile);
+    m_meshes[TileCoord { tileX, tileZ }] = BuildTerrainMesh(*tile, m_quadFilter);
 }
 
 void TerrainWorld::LoadTile(int tileX, int tileZ) {
@@ -118,6 +120,48 @@ bool TerrainWorld::QueryHeight(float worldX, float worldZ, float& outHeight) con
         return false;
     }
     outHeight = HeightToBlocks(height);
+    return true;
+}
+
+bool TerrainWorld::IsSolid(const glm::vec3& point) const {
+    float height = 0.0F;
+    if (!QueryHeight(point.x, point.z, height)) {
+        return false;  // 未加载 / 无数据：不阻挡（口径与 QueryObstruction 一致）
+    }
+    return point.y <= height;
+}
+
+bool TerrainWorld::QueryDigMaterialSlot(float worldX, float worldZ, std::uint8_t& outSlot) const {
+    float height = 0.0F;
+    if (!QueryHeight(worldX, worldZ, height)) {
+        return false;
+    }
+
+    // 坡度 = 1 - normal.y（与地表着色同口径）：用高度场中心差分求切线，再算法线的 y 分量。
+    constexpr float kStep = 1.0F;
+    float           hx0   = 0.0F;
+    float           hx1   = 0.0F;
+    float           hz0   = 0.0F;
+    float           hz1   = 0.0F;
+    const bool      okX   = QueryHeight(worldX - kStep, worldZ, hx0) && QueryHeight(worldX + kStep, worldZ, hx1);
+    const bool      okZ   = QueryHeight(worldX, worldZ - kStep, hz0) && QueryHeight(worldX, worldZ + kStep, hz1);
+    const float     dx    = okX ? (hx1 - hx0) / (2.0F * kStep) : 0.0F;
+    const float     dz    = okZ ? (hz1 - hz0) / (2.0F * kStep) : 0.0F;
+    const float     normalY = 1.0F / std::sqrt(1.0F + dx * dx + dz * dz);
+    const float     slope   = std::clamp(1.0F - normalY, 0.0F, 1.0F);
+
+    const std::array<float, static_cast<std::size_t>(kMaterialSlotCount)> weights =
+        ComputeBlendWeights(m_materials, height, slope);
+    std::size_t best = 0;
+    for (std::size_t i = 1; i < weights.size(); ++i) {
+        if (weights[i] > weights[best]) {
+            best = i;
+        }
+    }
+
+    // 表层 → 次表层映射（ADR 0014）：`-1` = 用自身（未配置映射的层，以及 Default 表以外的调用方）。
+    const int subsurface = m_materials.Layer(static_cast<int>(best)).subsurfaceSlot;
+    outSlot = static_cast<std::uint8_t>(subsurface >= 0 ? subsurface : static_cast<int>(best));
     return true;
 }
 

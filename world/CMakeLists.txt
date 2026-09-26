@@ -3,7 +3,7 @@
 # 目录职责（见 docs/tech-plan-v2.0.md §9.1）：
 #   terrain/    地表高度场 tile：数据布局、生成、网格化、法线、材质 splat 混合、物理碰撞体提供者
 #   generation/ 多层噪声、子系统种子派生、分块确定性
-#   dig/        笔刷挖掘 / 堆建与局部重网格调度（可挖体积块于 T8 加入）
+#   dig/        笔刷挖掘 / 堆建与局部重网格调度、可挖区域标记与可挖体积（SDF + Surface Nets）
 #
 # 依赖方向：只依赖 engine（platform → engine → world → game），不直接调用平台 API。
 # 第三方：FastNoiseLite（vendored，生成用，PRIVATE）；toml++（配置表，PRIVATE）。
@@ -11,7 +11,14 @@
 find_package(tomlplusplus CONFIG REQUIRED)
 
 add_library(voxel_world STATIC
+    dig/collapse_table.cpp
+    dig/dig_region.cpp
+    dig/dig_volume.cpp
+    dig/projectile_table.cpp
     dig/terrain_brush.cpp
+    dig/volume_collapse.cpp
+    dig/volume_collision.cpp
+    dig/volume_mesher.cpp
     generation/map_preset.cpp
     generation/terrain_noise.cpp
     terrain/material_blender.cpp

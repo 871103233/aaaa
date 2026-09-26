@@ -188,12 +188,14 @@ MeshRenderer::MeshRenderer(SDL_GPUDevice* device, SDL_Window* window, std::files
                                 SDL_GPU_SHADERSTAGE_VERTEX, artifact.format,
                                 ShaderResourceCounts { 0, 0, 1, 0 });
     // 片元着色器：6 个采样纹理（slot 0..4 = albedo / normal / roughness / AO / macro，slot 5 = 阴影深度数组）
-    //              + 3 个 uniform 块（slot 0 材质、slot 1 光照、slot 2 阴影）。
-    // SDL_gpu 每阶段采样器上限为 16（MAX_TEXTURE_SAMPLERS_PER_STAGE），6 个无需把 roughness/AO 打包进通道。
+    //              + 4 个 uniform 块（slot 0 材质、slot 1 光照、slot 2 阴影、**slot 3 自发光**，T27）。
+    // SDL_gpu 每阶段采样器上限为 16（MAX_TEXTURE_SAMPLERS_PER_STAGE），6 个无需把 roughness/AO 打包进通道；
+    // uniform 槽上限为 4（`MAX_UNIFORM_BUFFERS_PER_STAGE`）——**声明的个数必须与着色器里 `set = 3` 的
+    // binding 数一致**，否则 `SDL_CreateGPUGraphicsPipeline` 会以 E_INVALIDARG 失败（T27 实测踩到）。
     m_meshFragmentShader =
         create_shader_from_file(m_device, shader_dir / (shader_name + ".frag" + extension),
                                 SDL_GPU_SHADERSTAGE_FRAGMENT, artifact.format,
-                                ShaderResourceCounts { /*samplers=*/6, 0, 0, /*uniformBuffers=*/3 });
+                                ShaderResourceCounts { /*samplers=*/6, 0, 0, /*uniformBuffers=*/4 });
 
     // 主通道管线：先按单采样创建（`SetMsaaSampleCount` 通常在构造之后调用；档位变化时
     // `EnsureMainPipeline` 用同一批 Shader 重建），保证构造期即验证"设备 + 管线 + Shader"链路。
@@ -405,6 +407,8 @@ void MeshRenderer::CreateMainPipeline(std::uint32_t sampleCount) {
     const SDL_GPUVertexAttribute attributes[] = {
         { 0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, static_cast<Uint32>(offsetof(MeshVertex, position)) },
         { 1, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, static_cast<Uint32>(offsetof(MeshVertex, normal)) },
+        // location 2：材质槽位覆盖（ADR 0014）。地表网格填 kNoMaterialOverride（由片元按高度/坡度算权重）。
+        { 2, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT, static_cast<Uint32>(offsetof(MeshVertex, material)) },
     };
 
     SDL_GPUVertexInputState vertexInput {};
@@ -532,7 +536,7 @@ MeshRenderer::~MeshRenderer() {
     }
 }
 
-MeshHandle MeshRenderer::UploadMesh(const MeshData& mesh) {
+MeshHandle MeshRenderer::UploadMesh(const MeshData& mesh, bool emissive) {
     if (mesh.vertices.empty() || mesh.indices.empty()) {
         return MeshHandle {};
     }
@@ -547,6 +551,7 @@ MeshHandle MeshRenderer::UploadMesh(const MeshData& mesh) {
         create_and_upload_buffer(m_device, SDL_GPU_BUFFERUSAGE_INDEX, mesh.indices.data(), indexBytes);
     resources.vertexCount = static_cast<std::uint32_t>(mesh.vertices.size());
     resources.indexCount = static_cast<std::uint32_t>(mesh.indices.size());
+    resources.emissive  = emissive;
 
     std::uint32_t slot = 0;
     if (!m_freeSlots.empty()) {
@@ -1026,10 +1031,12 @@ void MeshRenderer::LogTextureAccounting(std::uint32_t width, std::uint32_t heigh
                 static_cast<double>(msaaTotalBytes) / kBytesPerMb, totalMb, width, height);
 }
 
-void MeshRenderer::DrawMeshes(SDL_GPURenderPass* pass, const MeshHandle* meshes, std::size_t meshCount) {
+void MeshRenderer::DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURenderPass* pass, const MeshHandle* meshes,
+                              std::size_t meshCount, bool pushEmissive) {
     if (meshes == nullptr) {
         return;
     }
+
     for (std::size_t i = 0; i < meshCount; ++i) {
         const MeshHandle handle = meshes[i];
         if (!handle.IsValid() || handle.id > m_meshes.size()) {
@@ -1040,6 +1047,22 @@ void MeshRenderer::DrawMeshes(SDL_GPURenderPass* pass, const MeshHandle* meshes,
             continue;
         }
 
+        // 自发光（T27，片元 uniform 槽 3）：只对 `emissive = true` 的网格叠加，其余推送零值。
+        // 逐网格推送：`SDL_gpu.h` 明说 push 数据对**后续**绘制生效，故每次绘制前都要推。
+        if (pushEmissive) {
+            struct EmissiveParams {
+                float emissive[4];  ///< rgb = 自发光颜色（线性光），a = 强度（0 = 普通地表网格）
+            };
+            EmissiveParams emissiveParams {};
+            if (resources.emissive) {
+                emissiveParams.emissive[0] = m_emissiveColor[0];
+                emissiveParams.emissive[1] = m_emissiveColor[1];
+                emissiveParams.emissive[2] = m_emissiveColor[2];
+                emissiveParams.emissive[3] = 1.0F;
+            }
+            SDL_PushGPUFragmentUniformData(commandBuffer, 3, &emissiveParams,
+                                           static_cast<Uint32>(sizeof(emissiveParams)));
+        }
         SDL_GPUBufferBinding vertexBinding { resources.vertexBuffer, 0 };
         SDL_BindGPUVertexBuffers(pass, 0, &vertexBinding, 1);
 
@@ -1142,7 +1165,7 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
             SDL_GPUBuffer* matrixBuffers[1] = { m_shadowMatrixBuffers[cascade] };
             SDL_BindGPUVertexStorageBuffers(shadowPass, 0, matrixBuffers, 1);
 
-            DrawMeshes(shadowPass, meshes, meshCount);
+            DrawMeshes(commandBuffer, shadowPass, meshes, meshCount, /*pushEmissive=*/false);
             SDL_EndGPURenderPass(shadowPass);
         }
     }
@@ -1188,7 +1211,7 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
     SDL_BindGPUVertexStorageBuffers(pass, 0, cameraBuffers, 1);
 
     // 片元资源：采样器槽 0..4 = albedo / normal / roughness / AO / macro（材质四件套 + 宏观变化），
-    // 槽 5 = 阴影深度数组；uniform 槽 0 = 材质、槽 1 = 光照、槽 2 = 阴影。
+    // 槽 5 = 阴影深度数组；uniform 槽 0 = 材质、槽 1 = 光照、槽 2 = 阴影（槽 3 = 自发光，逐网格推送）。
     // 都在调用方设置过时才绑定 / 推送；引擎不解释其内容。
     const bool materialArraysReady =
         m_albedoTexture.IsValid() && m_normalTexture.IsValid() && m_roughnessTexture.IsValid() &&
@@ -1221,13 +1244,13 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
         SDL_PushGPUFragmentUniformData(commandBuffer, 1, m_lightingUniform.data(),
                                        static_cast<Uint32>(m_lightingUniformSize));
     }
-    // 阴影（T21b）：片元 uniform 槽 2。
+    // 阴影（T21b）：片元 uniform 槽 2。槽 3（自发光）由 `DrawMeshes` **逐网格**推送。
     if (m_shadowUniformValid) {
         SDL_PushGPUFragmentUniformData(commandBuffer, 2, &m_shadowUniform,
                                        static_cast<Uint32>(sizeof(ShadowUniform)));
     }
 
-    DrawMeshes(pass, meshes, meshCount);
+    DrawMeshes(commandBuffer, pass, meshes, meshCount, /*pushEmissive=*/true);
 
     SDL_EndGPURenderPass(pass);
 

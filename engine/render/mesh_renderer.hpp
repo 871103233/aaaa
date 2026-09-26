@@ -14,6 +14,13 @@
 
 namespace vx {
 
+/// 材质槽位**覆盖**的"未指定"值（[ADR 0014](../../docs/adr/0014-voxel-material-index.md)）。
+///
+/// 片元遇到它时才按世界高度与坡度**逐像素**算权重（ADR 0009 的地表路径）；
+/// 可挖体积的内表面则携带**具体槽位**，直接用它切开的那种材质 —— 否则洞底（位于地下、坡度 0）
+/// 会被材质规则判成"草"，出现"地下草地"。
+inline constexpr float kNoMaterialOverride = -1.0F;
+
 /// 地表 / 体积网格的**通用**顶点格式。
 ///
 /// 刻意不含任何方块 / 体素语义：没有面朝向枚举、没有方块 ID、没有 UV 层号。
@@ -24,13 +31,16 @@ namespace vx {
 ///                                  世界层上传前做相机相对偏移）
 ///   - location 1 `vec3 normal`   —— 世界空间单位法线（由高度场 / 密度场梯度算出，
 ///                                  禁止用面法线近似）
+///   - location 2 `float material` —— **材质槽位覆盖**（ADR 0014）：`kNoMaterialOverride` = 由片元
+///                                  按高度 / 坡度算（地表）；否则直接取该槽位（可挖体积的内表面）
 ///
-/// **不再承载材质权重**（ADR 0009）：权重由片元着色器按世界高度与坡度**逐像素**重算，
+/// **不承载材质权重**（ADR 0009）：权重由片元着色器按世界高度与坡度**逐像素**重算，
 /// 过渡带宽因此由几何曲率决定、不受顶点间距限制。片元用 uniform 的**渲染原点**把这里的
 /// 相机相对坐标还原为世界坐标（见 `SetMaterialUniform`）。
 struct MeshVertex {
     float position[3] = { 0.0F, 0.0F, 0.0F };
     float normal[3]   = { 0.0F, 1.0F, 0.0F };
+    float material    = kNoMaterialOverride;
 };
 
 /// 一份待上传的网格数据（顶点 + 32 位索引）。
@@ -139,7 +149,9 @@ protected:
 ///     并绑定一个只读 storage buffer（slot 0，内容为 `CameraUniform`）；
 ///   - 片元着色器入口 `main`：采样六个纹理数组（slot 0..4 = albedo / normal / roughness / AO / macro
 ///     材质四件套与宏观变化，slot 5 = 阴影深度数组）
-///     并读取三个 uniform 块（slot 0 = 材质，slot 1 = 光照；slot 2 = 阴影，见 `SetShadowCascades`）。
+///     并读取四个 uniform 块（slot 0 = 材质，slot 1 = 光照；slot 2 = 阴影，槽 3 = **自发光**，见下）。
+///   - **自发光**（T27）：`UploadMesh(..., true)` 的网格在**同一条管线**里由槽 3 给出发光颜色
+///     （`DrawMeshes` 逐网格推送；普通网格推零值）——不加开关分支、不加第二条管线。
 ///   - 阴影通道另用 `shadow.vert` + 空入口 `shadow.frag`：无颜色目标、只写深度，
 ///     顶点 slot 0 绑定该级的光空间矩阵（与相机矩阵**同类**机制：`SDL_BindGPUVertexStorageBuffers`）。
 ///   产物路径为 `<shader_dir>/<shader_name>.vert{.spv|.dxil}` 与 `<shader_name>.frag{...}`，
@@ -158,8 +170,10 @@ public:
     /// 创建并同步上传一个网格。空网格（顶点或索引为空）返回无效句柄。
     ///
     /// 前置条件：`mesh` 的索引为 32 位且都在顶点范围内。
+    /// `emissive = true` 时该网格的主通道绘制会带上 `SetEmissiveColor` 的自发光项（**在雾之后**叠加），
+    /// 用于光球之类的自发光体；阴影通道不受影响（只写深度）。
     /// 注意：上传会阻塞到 GPU 完成，只应在加载 / 生成阶段调用，**不得**放进每帧热路径。
-    [[nodiscard]] MeshHandle UploadMesh(const MeshData& mesh);
+    [[nodiscard]] MeshHandle UploadMesh(const MeshData& mesh, bool emissive = false);
 
     /// 用一个**顶点数不变**的新顶点数组就地刷新已上传网格的顶点缓冲；索引缓冲保持不变。
     ///
@@ -211,6 +225,14 @@ public:
     void SetShadowCascades(const ShadowUniform& uniform, std::uint32_t cascadeCount,
                            std::uint32_t resolution) noexcept;
 
+    /// 设置**自发光网格**的颜色（线性光；ADR 0010 的 HDR 通路会把它推过 1.0，从而在色调映射后发白发光）。
+    /// 只影响以 `emissive = true` 上传的网格；下一次 `RenderFrame` 生效。
+    void SetEmissiveColor(float red, float green, float blue) noexcept {
+        m_emissiveColor[0] = red;
+        m_emissiveColor[1] = green;
+        m_emissiveColor[2] = blue;
+    }
+
     /// 设置本帧相机常量；下一次 `RenderFrame` 生效。
     void SetCamera(const CameraView& camera) noexcept;
 
@@ -256,6 +278,7 @@ private:
         SDL_GPUBuffer* indexBuffer  = nullptr;
         std::uint32_t  vertexCount  = 0;
         std::uint32_t  indexCount   = 0;
+        bool           emissive     = false;  ///< 主通道是否叠加自发光项（见 `UploadMesh`）
     };
 
     /// 保证主通道图形管线与请求的 MSAA 档位一致（档位变化时用常驻 Shader 重建）。
@@ -284,7 +307,12 @@ private:
 
     /// 绑定并绘制一批网格（主通道与阴影通道共用同一实现）；同时累加本帧绘制统计。
     /// 前置条件：调用方已绑定图形管线（两通道的顶点输入布局一致，均为 `MeshVertex`）。
-    void DrawMeshes(SDL_GPURenderPass* pass, const MeshHandle* meshes, std::size_t meshCount);
+    ///
+    /// `pushEmissive` 为 true 时（仅主通道）在**每次绘制前**把该网格的自发光参数推到片元 uniform 槽 3：
+    /// 自发光网格用 `m_emissiveColor`，其余网格用零（`SDL_gpu.h` §SDL_PushGPUFragmentUniformData：
+    /// "Subsequent draw calls in this command buffer will use this uniform data" ⇒ 逐网格推送即可）。
+    void DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURenderPass* pass, const MeshHandle* meshes,
+                    std::size_t meshCount, bool pushEmissive);
 
     /// 把纹理显存**按项**打到日志（材质数组 / 深度 / HDR / 阴影），供预算核对（ADR 0010 记账义务）。
     void LogTextureAccounting(std::uint32_t width, std::uint32_t height) const;
@@ -351,6 +379,10 @@ private:
 
     /// 曝光系数（由 `SetExposure` 写入，随色调映射 uniform 上传）。
     float m_exposure = 1.0F;
+
+    /// 自发光网格的颜色（线性光；由 `SetEmissiveColor` 写入，逐网格推送到片元槽 3）。
+    /// 默认值 = 暖白，供"光球"这类自发光体在未显式设置时也有确定外观。
+    float m_emissiveColor[3] = { 1.60F, 1.25F, 0.65F };
 
     // ---- 阴影（T21b / ADR 0010 P1）：深度数组 + 每级矩阵缓冲 + 片元槽 2 的参数块 ----
 

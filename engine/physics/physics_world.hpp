@@ -47,6 +47,23 @@ public:
         glm::dvec3 halfExtents { 0.5 };  ///< 各轴半长（格，须 `> 0`）
     };
 
+    /// 通用**三角网**静态碰撞体描述（与地形无关；等值面网格、任何静态三角几何都能使用）。
+    ///
+    /// 顶点按**局部坐标**给出（网格自身的坐标原点），世界定位由 `origin*` 承担 ——
+    /// 与渲染网格的约定一致（红线 6：世界定位留给 `double`，顶点保持小数值以保证 `float` 精度）。
+    /// 顶点 / 索引数据只需在调用期间有效（构造时被复制）。
+    ///
+    /// 前置条件：`triangleCount >= 1`，且每个索引 `< vertexCount`（否则构造失败并返回 0）。
+    struct MeshDesc {
+        const float*      positions     = nullptr;  ///< `3 * vertexCount` 个局部坐标（x, y, z 依次）
+        std::size_t       vertexCount   = 0;
+        const std::uint32_t* indices    = nullptr;  ///< `3 * triangleCount` 个顶点索引
+        std::size_t       triangleCount = 0;
+        double            originX       = 0.0;      ///< 局部原点的世界 X（`double`，红线 6）
+        double            originY       = 0.0;      ///< 局部原点的世界 Y
+        double            originZ       = 0.0;      ///< 局部原点的世界 Z
+    };
+
     /// 角色胶囊描述（**脚底**为原点，与 Jolt `CharacterVirtual` 约定一致）。
     struct CapsuleDesc {
         float      radius             = 0.3F;   ///< 胶囊半径（格）
@@ -83,6 +100,15 @@ public:
     /// 用新的采样**重建同一碰撞体**的形状（例如地形被笔刷改动后）。
     /// 返回 false 表示句柄无效或重建失败；失败时保留旧形状。
     bool UpdateHeightField(BodyHandle handle, const HeightFieldDesc& desc);
+
+    /// 创建一个静态三角网碰撞体（例如可挖体积的等值面网格，ADR 0012）。
+    /// 返回无效句柄表示创建失败（参数非法等），失败原因写入日志。
+    [[nodiscard]] BodyHandle AddMesh(const MeshDesc& desc);
+
+    /// 用新的三角网**重建同一碰撞体**的形状（挖除 / 塌落之后）。
+    /// 网格为空（`triangleCount == 0`）返回 false —— 调用方应先 `RemoveBody`。
+    /// 返回 false 表示句柄无效、网格为空或重建失败；失败时保留旧形状。
+    bool UpdateMesh(BodyHandle handle, const MeshDesc& desc);
 
     /// 创建一个静态盒体碰撞体。返回无效句柄表示创建失败（半长非正等），失败原因写入日志。
     [[nodiscard]] BodyHandle AddStaticBox(const BoxDesc& desc);

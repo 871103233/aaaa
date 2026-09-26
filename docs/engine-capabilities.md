@@ -47,7 +47,8 @@
 | 程序生成占位材质贴图（**材质四件套 albedo / normal / roughness / AO + 宏观变化**，确定性、可平铺） | **已实现** | `world/terrain/material_textures.*`（ADR 0009 / ADR 0010 P2）；5 张 `R8G8B8A8_UNORM` 纹理数组（四件套各 4 层 + macro **1 层**）× 256²，含 mip 约 **5.67 MB** 显存。多尺度（双频段）且**逐字节确定性** |
 | 叠加层接口（`IRenderOverlay`，用于调试 UI） | **已实现** | 同上 |
 | 动态网格顶点刷新（就地更新定长网格顶点；稳态**零堆分配**、不建 GPU 资源） | **已实现** | `engine/render/mesh_renderer.hpp`（`UpdateMeshVertices`）；供每帧移动的网格（角色代理体）使用 |
-| 第三人称相机（跟随 + 沿视线避障 + **最小跟随距离托底防退化视图矩阵**） | **已实现** | `engine/render/camera.hpp`；避障经 `ITerrainQuery` 契约（由世界层实现）；`kCameraMinDistance` 保证 `eye≠target`，避免 `lookAt` 归一化得 NaN |
+| **自发光网格**（片元 uniform **槽 3**：`rgb` = 自发光颜色、`a` = 强度；`0` = 普通地表网格） | **已实现** | `engine/render/mesh_renderer.hpp`（`UploadMesh(..., bool emissive)` + `SetEmissiveColor`，`DrawMeshes` **逐网格**推送）+ `assets/shaders/mesh.frag`（在**雾之后**叠加，使远处光球不被雾洗掉）。用途：光球弹丸。**踩坑**：SDL_gpu 的 `set = 3` uniform 绑定必须**从 0 连续编号**、且个数与创建 Shader 时声明的 `num_uniform_buffers` 一致（每阶段上限 4）；不一致时 `SDL_CreateGPUGraphicsPipeline` 直接以 E_INVALIDARG 失败 |
+| 第三人称相机（跟随 + 沿视线避障 + **最小跟随距离托底防退化视图矩阵** + **"不得埋在实心内"安全网**） | **已实现** | `engine/render/camera.hpp`；避障经 `ITerrainQuery` 契约（`QueryObstruction` + **`IsSolid`**），由世界层实现；`kCameraMinDistance` 保证 `eye≠target`，避免 `lookAt` 归一化得 NaN。**`IsSolid` 必须包含可挖体积** ⇒ 游戏层用组合查询 `GameCameraQuery`（区域内以体积为准）；否则站在挖出的洞里的角色会把相机顶到旧地表之上 ⇒ 视角退化为俯视（人工实测第 7 轮 / T32） |
 | 相机相对渲染（浮点原点重定基） | **已实现** | 世界定位保持整数 / `double`，上传 GPU 前转相机相对 `float` |
 | 视锥体裁剪 | **未开始** | 目前全部网格随手提交 |
 | **HDR 离屏渲染 + 后处理通道**（曝光 / ACES 近似色调映射 / sRGB 编码） | **已实现** | [ADR 0010](adr/0010-render-quality-pipeline.md)；`engine/render/mesh_renderer.*`（主通道渲到 `R16G16B16A16_FLOAT` 离屏目标）+ `assets/shaders/tonemap.vert|.frag`（全屏三角形）；曝光经 `SetExposure` 来自 `engine/platform/settings.*`（`[0.1, 8.0]` 钳制）。**记账**：HDR 目标 8 B/px、深度 4 B/px，纹理总量计入 `RenderStats::textureBytes` 并**在启动日志按项打印**（实测 1280×720 全项：材质 5.67 + 深度 3.52 + HDR 7.03 + 阴影 48.00 + MSAA 38.67 = **102.89 MB**）；预算表见方案 §7.2.1 |
@@ -70,10 +71,13 @@
 | 高度场地表 tile（64×64 列、`int16` 1/16 格、65×65 采样） | **已实现** | `world/terrain/`；相邻 tile 边界**逐位相等无裂缝** |
 | 地表网格化 + 梯度法线 | **已实现** | 同上 |
 | 材质权重混合（按高度 + 坡度算 splat 权重，4 槽位）+ **四件套贴图**（albedo / normal / roughness / AO）+ **宏观变化** + **陡壁三平面投影** | **部分实现** | 权重**逐像素**重算（窄带 `smoothstep`，ADR 0009）；PBR 与四件套已落地（ADR 0010 P2），程序生成为**多尺度**（双频段）且**逐字节确定性**；**坡度驱动的三平面混合**（平坦处单次采样、陡面按 `|N|` 混合三轴投影）已落地，参数来自 `materials.toml [triplanar]`（`slope_min` / `slope_max` / `sharpness`），**随笔刷挖 / 堆自动跟随**；**仍无真实美术 PBR 资源**（程序生成占位），故为"部分实现"。材质显存 **5.67 MB**。**材质带的不变量已单测钉死**（任意 `(高度, 坡度)` 至少一层非零） |
-| 地形笔刷：**平整填平 / 削平**（`Level`，向目标高度平滑收敛）+ **平滑爆破**（`Crater`，坑体 + 外环隆起，边界一阶连续）+ 球笔刷挖 / 堆；脏 tile 局部重网格 | **已实现** | `world/dig/terrain_brush.*`（`ApplyTerrainLevel` / `ApplyTerrainCrater` / `BrushFalloff` 纯函数）；参数表 `assets/config/brush.toml`（T26） |
-| 可挖标记区域（程序化规则 + 数据文件叠加） | **未开始** | 规则已定（ADR 0006）；代码未实现 |
-| 可挖体积（局部 SDF + 等值面网格化，洞穴） | **未开始** | 方案见 ADR 0007 |
-| 物件层（地表元素 / 建筑 / 建造） | **未开始** | 分层定义见 ADR 0004 |
+| 地形笔刷：**平整填平 / 削平**（`Level`，向目标高度平滑收敛）+ **平滑爆破**（`Crater`，坑体 + 外环隆起，边界一阶连续）+ 球笔刷挖 / 堆；脏 tile 局部重网格 | **已实现** | `world/dig/terrain_brush.*`（`ApplyTerrainLevel` / `ApplyTerrainCrater` / `BrushFalloff` 纯函数）；参数表 `assets/config/brush.toml`（T26）。**T27 起不再绑定鼠标按键**（地形破坏改由光球爆炸触发，见下） |
+| 可挖标记区域 | **部分实现** | **数据文件部分已实现**：`world/dig/dig_region.*`（`DigRegionTable`，含**包围盒向外吸附到 32 的整数倍**与包含判定）+ `assets/config/dig_regions.toml`（`mode` / `priority` / `min` / `max`，同 ADR 0006 的字段规格）；**程序化规则部分未开始**（ADR 0006 的噪声阈值 / 连通性约束） |
+| 可挖体积（局部 SDF + 等值面网格化，洞穴） | **部分实现** | `world/dig/dig_volume.*`（33³ `int8` 密度块，**由高度场初始化**，球体平滑挖除，脏块重网格）+ `world/dig/volume_mesher.*`（**Naive Surface Nets**，顶点位置随密度连续变化、法线由密度梯度给出，ADR 0007/0008）。**物理碰撞已落地**（三角网静态体，[ADR 0012](adr/0012-collision-takeover-by-volumes.md)）；**仍缺**：流式加载与存档；`int8` 精度下的陡壁台阶感见 ADR 0008 的重审条件 |
+| **破坏后的塌落**（支撑缺失 ⇒ 悬空实心体下落并堆成碎石） | **已实现（首期）** | `world/dig/volume_collapse.*` + `assets/config/collapse.toml`（[ADR 0012](adr/0012-collision-takeover-by-volumes.md) 第二节）：按**载荷通路（纵向接地）+ 悬挑跨度**判支撑、**质量守恒地按连续段逐列下落**、堆面确定性摊开。**未做**：连锁复核（不迭代）、安息角 / 碎块刚体、材质强度差异 —— 见 ADR 0012「后果」 |
+| **可破坏性判定**（材质坚固度 × 伤害预算的**逐格结算**；固定器物的破坏状态） | **未开始**（规范已落盘） | [ADR 0013](adr/0013-destructible-elements.md)：地形体量按「材质 `toughness` × 弹丸 `damage` × 换算系数」**自爆心向外逐格³ 扣减**（⇒ 混合材质时软的先被挖掉；不可破坏材质零改动）；固定器物 = **几何不可变** + 状态 `Intact → Broken`（本阶段仅"变黑"占位表现）。配置落点：`materials.toml`(+`toughness`) / `projectiles.toml`(+`damage`) / `destruction.toml`(新)；落地硬约束见 `references/destructible-elements.md`。**数值（换算系数、器物阈值）待确认** |
+| **体积内表面材质**（挖出的洞按"被切开的是什么材质"着色） | **已实现**（2026-09-27） | [ADR 0014](adr/0014-voxel-material-index.md)：材质 = 该列地表 splat 主槽位经「表层 → 次表层」映射（`subsurface`）后的结果 —— **纯函数派生、零额外存储**；`MeshVertex::material` 携带**槽位覆盖**（顶点属性 `location 2`、片元 `flat in`），片元遇覆盖时直接令该槽位权重为 1 ⇒ 挖开草地看到**土**、挖开山体（陡坡 ⇒ 岩）看到**岩**。**未做**：深度分层（浅土深岩）、矿脉等可编辑体素材质 —— 见 ADR 0014 的切换条件 |
+| 物件层（地表元素 / 建筑 / 建造） | **未开始** | 分层定义见 ADR 0004；**可破坏器物的状态模型已由 [ADR 0013](adr/0013-destructible-elements.md) 定义**（几何不可变 + `Intact` / `Broken`），实现未开始 |
 | 流式加载 / 卸载（按距离） | **未开始** | 当前固定 3×3 tile |
 | LOD 与接缝缝合 | **未开始** | 待收敛项 4 |
 
@@ -82,7 +86,9 @@
 | 能力 | 状态 | 说明 / 落点 |
 | --- | --- | --- |
 | 物理引擎薄封装（Jolt，固定步长推进） | **已实现** | `engine/physics/`；公共头不含 Jolt 类型 |
-| 地表高度场碰撞体（逐 tile，挖掘后按脏 tile 重建） | **已实现** | `world/terrain/terrain_collision.*` |
+| 地表高度场碰撞体（逐 tile，挖掘后按脏 tile 重建） | **已实现** | `world/terrain/terrain_collision.*`。**被体积接管的 tile 不再建此碰撞体**（[ADR 0012](adr/0012-collision-takeover-by-volumes.md)）：否则隐形高度场会把角色挡在洞口外 |
+| **通用三角网静态碰撞体**（任意顶点 / 索引，用于可挖体积的等值面网格） | **已实现** | `engine/physics/physics_world.hpp`（`MeshDesc` / `AddMesh` / `UpdateMesh`，Jolt `MeshShape`；公共头不含 Jolt 类型） |
+| **碰撞接管**（体积绘制的地表由体积提供碰撞；挖除后按脏块重建） | **已实现** | [ADR 0012](adr/0012-collision-takeover-by-volumes.md)；`world/dig/volume_collision.*` + `game/main.cpp`。判据与 ADR 0011 同源（同一份 `DigRegionTable`），粒度 = tile。**已知限制**：部分覆盖的 tile 仍保留高度场（该 tile 内的洞进不去）；体积无存档 ⇒ 重进游戏洞与碰撞体一起消失 |
 | 通用静态盒体（供世界边界等使用；公共头不含 Jolt 类型） | **已实现** | `engine/physics/physics_world.hpp`（`AddStaticBox`）；由上层按地图范围推导放置 |
 | 角色胶囊控制器（走 / 冲刺 / 跳 / 上坡 / 自动上台阶） | **已实现** | `CharacterVirtual`；重力 24 / **跳跃初速 7.20（由身高推导，最高点 = 身高 60% = 1.08 格）** / 最大坡度 50° / 上台阶 1.0 格 |
 | 角色位置纠正（被地形埋住时顶回地表并清零速度） | **已实现** | `engine/physics/physics_world.hpp`（`SetCharacterPosition`）；静态高度场不会把角色顶出，须由上层在改地形后纠正 |

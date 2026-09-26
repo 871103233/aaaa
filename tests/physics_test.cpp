@@ -239,3 +239,80 @@ TEST(PhysicsBody, RejectsStaticBoxWithNonPositiveHalfExtent) {
     EXPECT_EQ(physics.AddStaticBox(box), 0u);
     EXPECT_EQ(physics.BodyCount(), 0u);
 }
+
+// 通用三角网静态碰撞体（T28 / ADR 0012）：非法几何必须拒绝，合法几何可建、可重建、可移除。
+TEST(PhysicsBody, MeshBodyValidatesGeometryAndSupportsRebuild) {
+    PhysicsWorld physics;
+
+    const float         positions[] = { 0.0F, 0.0F, 0.0F, 4.0F, 0.0F, 0.0F, 0.0F, 0.0F, 4.0F };
+    const std::uint32_t indices[]   = { 0, 1, 2 };
+
+    PhysicsWorld::MeshDesc mesh;
+    mesh.positions     = positions;
+    mesh.vertexCount   = 3;
+    mesh.indices       = indices;
+    mesh.triangleCount = 1;
+
+    // 非法：空指针 / 三角形数为 0。
+    PhysicsWorld::MeshDesc empty;
+    EXPECT_EQ(physics.AddMesh(empty), 0u);
+    EXPECT_EQ(physics.BodyCount(), 0u);
+
+    PhysicsWorld::MeshDesc noTriangles = mesh;
+    noTriangles.triangleCount          = 0;
+    EXPECT_EQ(physics.AddMesh(noTriangles), 0u);
+    EXPECT_EQ(physics.BodyCount(), 0u);
+
+    // 非法：索引越界。
+    const std::uint32_t badIndices[] = { 0, 1, 3 };
+    PhysicsWorld::MeshDesc outOfRange = mesh;
+    outOfRange.indices                = badIndices;
+    EXPECT_EQ(physics.AddMesh(outOfRange), 0u);
+    EXPECT_EQ(physics.BodyCount(), 0u);
+
+    // 合法：建得出，且可原地重建形状。
+    const PhysicsWorld::BodyHandle body = physics.AddMesh(mesh);
+    ASSERT_NE(body, 0u);
+    EXPECT_EQ(physics.BodyCount(), 1u);
+    EXPECT_TRUE(physics.UpdateMesh(body, mesh));
+    EXPECT_FALSE(physics.UpdateMesh(0u, mesh));
+    EXPECT_FALSE(physics.UpdateMesh(body, noTriangles)) << "空网格必须拒绝，且保留旧形状";
+
+    physics.RemoveBody(body);
+    EXPECT_EQ(physics.BodyCount(), 0u);
+}
+
+// 角色站在**三角网碰撞体**上：这就是"洞能走进去、能站在腔底"的物理前提
+// （体积网格由 Surface Nets 产出，走的正是这条路径）。
+TEST(PhysicsBody, CharacterRestsOnMeshBodySurface) {
+    PhysicsWorld physics;
+
+    // 32×32 格的平面（两个三角形），局部 y = 0、原点抬到世界高度 100。
+    const float positions[] = { -16.0F, 0.0F, -16.0F, 16.0F, 0.0F, -16.0F, 16.0F, 0.0F, 16.0F, -16.0F, 0.0F, 16.0F };
+    const std::uint32_t indices[] = { 0, 1, 2, 0, 2, 3 };
+
+    PhysicsWorld::MeshDesc mesh;
+    mesh.positions     = positions;
+    mesh.vertexCount   = 4;
+    mesh.indices       = indices;
+    mesh.triangleCount = 2;
+    mesh.originY       = 100.0;
+    ASSERT_NE(physics.AddMesh(mesh), 0u);
+
+    PhysicsWorld::CapsuleDesc capsule;
+    capsule.position = glm::dvec3(0.0, 104.0, 0.0);
+    const PhysicsWorld::CharacterHandle character = physics.CreateCharacter(capsule);
+    ASSERT_NE(character, 0u);
+
+    const glm::vec3 gravity(0.0F, -kGravity, 0.0F);
+    float           lowest = 104.0F;
+    for (int i = 0; i < 240; ++i) {  // 4 秒
+        physics.MoveCharacter(character, kFixedDt, gravity);
+        lowest = std::min(lowest, static_cast<float>(physics.GetCharacterState(character).position.y));
+    }
+
+    const PhysicsWorld::CharacterState state = physics.GetCharacterState(character);
+    EXPECT_TRUE(state.onGround) << "三角网面必须能支撑角色";
+    EXPECT_NEAR(state.position.y, 100.0, kRestTolerance);
+    EXPECT_GE(lowest, 100.0 - kNoFallTolerance) << "不得穿过三角网面";
+}

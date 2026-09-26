@@ -15,7 +15,7 @@ inline constexpr float kCameraPitchLimit = 89.0F * kDegToRad;
 /// 相机与注视点之间的**最小距离**（格）。
 ///
 /// 不变量：`ThirdPersonCamera::Evaluate` 返回的 `eye` 与 `target` 的间距恒 `>=` 本值。
-/// 若允许间距退化到 0（避障把相机拉到注视点、或地表被抬高后由"离地间隙"安全网把相机顶到注视点正上方），
+/// 若允许间距退化到 0（避障把相机拉到注视点、或相机被埋在实心体内后由"顶出实心"的安全网顶到注视点正上方），
 /// `glm::lookAt` 的视线基向量要么是零向量、要么与世界上方向平行，归一化会得到 NaN；
 /// 视图矩阵随之失效、整帧几何被丢弃 —— 画面只剩清屏色（缺陷 B2）。
 inline constexpr float kCameraMinDistance = 0.5F;
@@ -51,6 +51,13 @@ public:
     [[nodiscard]] virtual bool QueryObstruction(const glm::vec3& from, const glm::vec3& to,
                                                 float& outSafeT) const = 0;
 
+    /// 该点是否**在实心体内**（地表之下的地形，或被可挖体积填充的实体）。
+    ///
+    /// 用途：相机的"不得埋在实心里"安全网。实现**必须包含可挖体积**（ADR 0011 / 0012 的
+    /// 「谁来画 / 谁来挡必须同源」原则）：体积挖出的洞在**地表高度场里仍显示为实心**，
+    /// 若只用高度场判定，站进洞里的角色会把相机顶到旧地表之上 ⇒ 视角退化为俯视。
+    [[nodiscard]] virtual bool IsSolid(const glm::vec3& point) const = 0;
+
 protected:
     ITerrainQuery() = default;
 };
@@ -64,7 +71,7 @@ struct CameraSettings {
     float farPlane           = 1000.0F;      ///< 远裁剪面（格）
     float aspectRatio        = 16.0F / 9.0F; ///< 视口宽高比
     float collisionMargin    = 0.2F;         ///< 避障时沿视线预留的安全余量（格）
-    float groundClearance    = 0.2F;         ///< 视线相对地表的**最小离地间隙**（格）
+    float groundClearance    = 0.2F;         ///< 相机被顶出实心体后**额外**保留的间隙（格）
 };
 
 /// 相机在某一渲染帧的求值结果。
@@ -133,7 +140,7 @@ public:
     /// - `alpha` 被钳制到 `[0, 1]`（非值按 0 处理），因此**不会外插**。
     /// - `terrain` 可为空：为空时跳过避障（地形未就绪或纯几何测试）。
     /// - 避障顺序：先沿视线做线段遮挡查询并把相机**拉近**（预留 `collisionMargin` 余量），
-    ///   再用地表高度做**安全网**（视线绝不低于地表 + `groundClearance`）。
+    ///   再用 `ITerrainQuery::IsSolid` 做**安全网**（相机绝不停留在实心体内，顶出后额外留 `groundClearance`）。
     /// - 本方法 `const`：**绝不回写模拟状态**（红线 11）。
     [[nodiscard]] CameraView Evaluate(double alpha, const ITerrainQuery* terrain = nullptr) const noexcept;
 

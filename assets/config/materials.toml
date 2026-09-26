@@ -90,6 +90,9 @@ roughness    = 0.90
 ao           = 0.85
 macro_uv_scale = 0.020
 macro_strength = 0.35
+# ADR 0014：在**可挖体积**里替代本层的材质（"表层 → 次表层"）。
+# 草只该出现在地表薄层，故挖开草地看到的应是土；岩 / 土的 subsurface 写自身名。
+subsurface     = "dirt"
 
 # 槽位 1：土 —— **高海拔缓坡（碎石土）**。低中海拔不再有"中坡过渡带"（见文件头覆盖论证第 3 点：
 #   那条中坡带正是平台边缘"一圈土色"的来源）
@@ -110,6 +113,7 @@ roughness    = 0.88
 ao           = 0.75
 macro_uv_scale = 0.015
 macro_strength = 0.40
+subsurface     = "dirt"
 
 # 槽位 2：岩 —— **陡坡一律露岩（与高度无关）**；粗糙开裂。
 #   **关键**：坡度带下界为 0.55（**不含 0**），所以平台平地（坡度 0）上岩的权重严格为 0；否则平台会变成
@@ -132,6 +136,7 @@ roughness    = 0.40
 ao           = 0.70
 macro_uv_scale = 0.030
 macro_strength = 0.30
+subsurface     = "rock"
 
 # 槽位 3：沙 —— 低洼滩地；细颗粒
 [[layer]]
@@ -151,6 +156,7 @@ roughness    = 0.95
 ao           = 0.90
 macro_uv_scale = 0.025
 macro_strength = 0.25
+subsurface     = "dirt"
 
 # ---------------------------------------------------------------------------
 # 全局三平面（triplanar）：陡壁 UV 拉伸 —— 按坡度自动切换的混合投影（C 项）

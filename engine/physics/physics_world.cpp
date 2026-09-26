@@ -20,6 +20,7 @@
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
+#include <Jolt/Physics/Collision/Shape/MeshShape.h>
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Collision/ShapeFilter.h>
 #include <Jolt/Physics/EActivation.h>
@@ -162,6 +163,53 @@ void release_jolt() {
     return result.Get();
 }
 
+/// 从三角网描述构造一个 `MeshShape`；失败返回空 `RefConst`。
+///
+/// 用于可挖体积的等值面网格（ADR 0012）：顶点是**块内局部坐标**，世界定位由静态刚体的位置承担。
+[[nodiscard]] JPH::ShapeRefC build_mesh_shape(const PhysicsWorld::MeshDesc& desc) {
+    if (desc.positions == nullptr || desc.indices == nullptr || desc.vertexCount == 0 || desc.triangleCount == 0) {
+        VX_LOG_ERROR("三角网参数非法：顶点 %zu、三角形 %zu，positions=%s，indices=%s", desc.vertexCount,
+                     desc.triangleCount, (desc.positions != nullptr) ? "非空" : "空",
+                     (desc.indices != nullptr) ? "非空" : "空");
+        return {};
+    }
+
+    JPH::VertexList vertices;
+    vertices.reserve(desc.vertexCount);
+    for (std::size_t i = 0; i < desc.vertexCount; ++i) {
+        vertices.push_back(JPH::Float3(desc.positions[i * 3 + 0], desc.positions[i * 3 + 1],
+                                       desc.positions[i * 3 + 2]));
+    }
+
+    JPH::IndexedTriangleList triangles;
+    triangles.reserve(desc.triangleCount);
+    for (std::size_t t = 0; t < desc.triangleCount; ++t) {
+        const std::uint32_t i0 = desc.indices[t * 3 + 0];
+        const std::uint32_t i1 = desc.indices[t * 3 + 1];
+        const std::uint32_t i2 = desc.indices[t * 3 + 2];
+        if (i0 >= desc.vertexCount || i1 >= desc.vertexCount || i2 >= desc.vertexCount) {
+            VX_LOG_ERROR("三角网索引越界：三角形 %zu 的索引 (%u, %u, %u)，顶点数 %zu", t, i0, i1, i2,
+                         desc.vertexCount);
+            return {};
+        }
+        triangles.push_back(JPH::IndexedTriangle(i0, i1, i2, /*inMaterialIndex=*/0));
+    }
+
+    // 构造时 Jolt 会自动 `Sanitize`（去掉退化 / 重复三角形）；返回空列表时视为失败。
+    //
+    // T30：可挖体积的块**每次挖除 / 塌落都要整块重建形状**（Jolt 的 `MeshShape` 不可变），
+    // 故用 `FavorBuildSpeed` 换构建速度 —— 代价是该形状的运行期查询稍慢，而这里是静态地形，
+    // 查询余量很大（实测本工程单块重建 16 ms → 见 `tests/volume_collision_test.cpp` 的 T30 基准）。
+    JPH::MeshShapeSettings settings(std::move(vertices), std::move(triangles));
+    settings.mBuildQuality = JPH::MeshShapeSettings::EBuildQuality::FavorBuildSpeed;
+    JPH::ShapeSettings::ShapeResult result = settings.Create();
+    if (result.HasError()) {
+        VX_LOG_ERROR("构造 MeshShape 失败：%s", result.GetError().c_str());
+        return {};
+    }
+    return result.Get();
+}
+
 }  // namespace
 
 struct PhysicsWorld::Impl {
@@ -281,6 +329,44 @@ bool PhysicsWorld::UpdateHeightField(BodyHandle handle, const HeightFieldDesc& d
     }
 
     const JPH::ShapeRefC shape = build_height_field_shape(desc);
+    if (shape == nullptr) {
+        return false;  // 保留旧形状
+    }
+
+    m_impl->system->GetBodyInterface().SetShape(bodyID, shape, /*inUpdateMassProperties=*/false,
+                                                JPH::EActivation::DontActivate);
+    return true;
+}
+
+PhysicsWorld::BodyHandle PhysicsWorld::AddMesh(const MeshDesc& desc) {
+    const JPH::ShapeRefC shape = build_mesh_shape(desc);
+    if (shape == nullptr) {
+        return 0;
+    }
+
+    JPH::BodyCreationSettings bodySettings(
+        shape, JPH::RVec3(static_cast<JPH::Real>(desc.originX), static_cast<JPH::Real>(desc.originY),
+                          static_cast<JPH::Real>(desc.originZ)),
+        JPH::Quat::sIdentity(), JPH::EMotionType::Static, kObjectLayerStatic);
+    const JPH::BodyID bodyID =
+        m_impl->system->GetBodyInterface().CreateAndAddBody(bodySettings, JPH::EActivation::DontActivate);
+    if (bodyID.IsInvalid()) {
+        VX_LOG_ERROR("创建三角网刚体失败");
+        return 0;
+    }
+    return m_impl->RegisterBody(bodyID);
+}
+
+bool PhysicsWorld::UpdateMesh(BodyHandle handle, const MeshDesc& desc) {
+    if (handle == 0 || handle > m_impl->bodies.size()) {
+        return false;
+    }
+    const JPH::BodyID bodyID = m_impl->bodies[handle - 1];
+    if (bodyID.IsInvalid()) {
+        return false;
+    }
+
+    const JPH::ShapeRefC shape = build_mesh_shape(desc);
     if (shape == nullptr) {
         return false;  // 保留旧形状
     }

@@ -25,6 +25,15 @@ namespace {
     return glm::vec3(0.0F, 1.0F, 0.0F);
 }
 
+/// 相机被埋在实心体内时，沿 +Y "顶出实心"的步长（格）。
+///
+/// 用固定步长的离散顶出而不是解析求交：只依赖 `ITerrainQuery::IsSolid` 这一个点查询
+/// （无需世界层再暴露"该列实心顶面"），且步长固定 ⇒ 结果确定（红线 7）。
+constexpr float kSolidLiftStepBlocks = 0.25F;
+
+/// 顶出的最大步数（0.25 × 64 = 16 格）：防止异常数据下无限循环。
+constexpr int kMaxSolidLiftSteps = 64;
+
 }  // namespace
 
 ThirdPersonCamera::ThirdPersonCamera(CameraSettings settings) noexcept : m_settings(settings) {}
@@ -109,13 +118,18 @@ CameraView ThirdPersonCamera::Evaluate(double alpha, const ITerrainQuery* terrai
         eye      = view.target + backward * distance;
     }
 
-    // 安全网：无论线段查询是否报告遮挡，视线都不得落在地表之下。
-    if (terrain != nullptr) {
-        float groundHeight = 0.0F;
-        if (terrain->QueryHeight(eye.x, eye.z, groundHeight)) {
-            const float minY = groundHeight + m_settings.groundClearance;
-            eye.y            = std::max(eye.y, minY);
+    // 安全网：相机不得停留在**实心**体内。
+    //
+    // 判据必须是"该点是否实心"（`ITerrainQuery::IsSolid`），**不能**用"该列地表高度"：
+    // 可挖体积挖出的洞在地表高度场里**仍然显示为实心**（爆炸只改体积密度、不改高度场），
+    // 拿高度场当"无限地板"会把站在洞里的角色的相机顶到旧地表之上 ⇒ 视角退化为俯视
+    //（人工实测第 7 轮）。这条与 ADR 0011 / 0012 的「谁来画 / 谁来挡必须同源」是同一个原则：
+    // 能挖出洞的地方，相机也不能被"已经不存在的旧地表"顶出来。
+    if (terrain != nullptr && terrain->IsSolid(eye)) {
+        for (int step = 0; step < kMaxSolidLiftSteps && terrain->IsSolid(eye); ++step) {
+            eye.y += kSolidLiftStepBlocks;
         }
+        eye.y += m_settings.groundClearance;
     }
 
     view.eye      = eye;

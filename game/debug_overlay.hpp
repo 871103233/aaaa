@@ -24,11 +24,17 @@ struct DebugStats {
     float       cameraYaw          = 0.0F;    ///< 相机 yaw（弧度）
     float       cameraPitch        = 0.0F;    ///< 相机 pitch（弧度）
     float       cameraDistance     = 0.0F;    ///< 相机实际跟随距离（格）
-    float       brushRadius        = 0.0F;    ///< 笔刷半径（格）
+    float       explosionRadius    = 0.0F;    ///< 当前弹丸的爆炸半径（格，T27）
     bool        mouseCaptured      = false;   ///< 鼠标是否处于相对模式（捕获，T14）
+    std::size_t orbActiveCount     = 0;       ///< 活动光球数（T27）
+    std::size_t orbCapacity        = 0;       ///< 光球池容量（= `projectiles.toml` 的 `max_active`）
     std::size_t loadedTileCount    = 0;       ///< 已加载（已网格化）的 tile 数
-    std::size_t lastDirtyTileCount = 0;       ///< 最近一次笔刷弄脏的 tile 数
+    std::size_t lastDirtyTileCount = 0;       ///< 最近一帧因爆炸而重网格的单元数（地表 tile 或体积块）
     std::size_t tileBodyCount      = 0;       ///< 已建立物理碰撞体的 tile 数
+    std::size_t volumeBlockCount   = 0;       ///< 可挖体积块总数（T8）
+    std::size_t carvedBlockCount   = 0;       ///< 其中被挖过 / 塌落改过的体积块数（T8 / T27 / T29）
+    std::size_t volumeBodyCount    = 0;       ///< 可挖体积的三角网碰撞体数（T28）
+    std::size_t collapseMovedVoxels = 0;      ///< 累计塌落移动的实心体素数（T29）
     bool        physicsReady       = false;   ///< 角色物理是否已就绪
 
     // ---- 渲染开销与 CPU 帧时间分解（T24；取自 engine/render 的通用统计）----

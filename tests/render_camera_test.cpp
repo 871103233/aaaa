@@ -65,6 +65,8 @@ public:
         return true;
     }
 
+    [[nodiscard]] bool IsSolid(const glm::vec3& point) const override { return IsInside(point); }
+
     [[nodiscard]] bool IsInside(const glm::vec3& point) const {
         return glm::length(point - m_center) < m_radius;
     }
@@ -87,6 +89,8 @@ public:
         outSafeT = 1.0F;
         return false;
     }
+
+    [[nodiscard]] bool IsSolid(const glm::vec3& point) const override { return point.y <= 0.0F; }
 };
 
 /// 退化地形桩：线段**从起点就被完全挡住**（`safeT = 0`），地表恒在 y = 0。
@@ -103,6 +107,34 @@ public:
                                         float& outSafeT) const override {
         outSafeT = 0.0F;
         return true;
+    }
+
+    [[nodiscard]] bool IsSolid(const glm::vec3& point) const override { return point.y <= 0.0F; }
+};
+
+/// 洞穴地形桩（人工实测第 7 轮）：**地表高度恒为 0**（= 高度场"不知道洞的存在"），
+/// 但其下一处 8×8×6 的立方空腔（模拟可挖体积挖出的洞）在 `IsSolid` 里报告为**空**。
+///
+/// 这正是修复前"相机被顶出洞外 ⇒ 视角退化为俯视"的数据条件。
+class CaveTerrain : public ITerrainQuery {
+public:
+    [[nodiscard]] bool QueryHeight(float /*worldX*/, float /*worldZ*/, float& outHeight) const override {
+        outHeight = 0.0F;  // 旧地表：被挖掉却仍报出高度的那份数据
+        return true;
+    }
+
+    [[nodiscard]] bool QueryObstruction(const glm::vec3& /*from*/, const glm::vec3& /*to*/,
+                                        float& outSafeT) const override {
+        outSafeT = 1.0F;
+        return false;  // 洞内畅通：体积接管后不再有"假遮挡"
+    }
+
+    [[nodiscard]] bool IsSolid(const glm::vec3& point) const override {
+        if (point.y > 0.0F) {
+            return false;  // 地表之上是空气
+        }
+        const bool insideCave = point.y >= -6.0F && std::abs(point.x) <= 8.0F && std::abs(point.z) <= 8.0F;
+        return !insideCave;
     }
 };
 
@@ -231,7 +263,7 @@ TEST(ThirdPersonCamera, IsPulledCloserAndStaysOutsideTerrainWhenObstructed) {
     EXPECT_GT(view.eye.z, 3.0F);
 }
 
-// 即便线段查询没报告遮挡，视线也不得低于地表 + 离地间隙。
+// 即便线段查询没报告遮挡，相机也不得停留在**实心体**内（地表 0 以下即实心）。
 TEST(ThirdPersonCamera, NeverDropsBelowGroundClearance) {
     CameraSettings settings;
     settings.followDistance  = 5.0F;
@@ -246,8 +278,33 @@ TEST(ThirdPersonCamera, NeverDropsBelowGroundClearance) {
     const FlatGround terrain;
     const CameraView view = camera.Evaluate(0.0, &terrain);
 
-    EXPECT_GE(view.eye.y, settings.groundClearance - 1e-5F);
-    EXPECT_NEAR(view.eye.y, settings.groundClearance, 1e-4F);
+    // 相机被顶出实心体（地表 0）之后再额外留出 groundClearance 的间隙。
+    EXPECT_FALSE(terrain.IsSolid(view.eye));
+    EXPECT_GT(view.eye.y, 0.0F);
+}
+
+// 人工实测第 7 轮回归：角色站在**体积挖出的洞**里时，相机不得被"旧地表"顶到洞顶之上。
+//
+// 契约：相机的避障与安全网只关心"哪里是实心"（`ITerrainQuery::IsSolid`，且**必须包含可挖体积**），
+//   而不是"该列地表高度"。修复前安全网用 `QueryHeight`（旧地表 = 0）把 eye 强抬到 0.2 格
+//   ⇒ 相机跑到洞顶之上、且避障把跟随距离压到最小 ⇒ 视角退化为**俯视**。
+// 本桩正是那个数据条件：`QueryHeight` 恒报 0（高度场不知道洞存在），而 `IsSolid` 在洞内报"空"。
+TEST(ThirdPersonCamera, DoesNotLiftCameraOutOfExcavatedCave) {
+    CameraSettings settings;
+    settings.followDistance = 5.0F;
+    settings.pivotHeight    = 0.0F;
+
+    ThirdPersonCamera camera(settings);
+    camera.SnapTo(glm::vec3(0.0F, -4.0F, 0.0F));  // 角色站在洞里（该列地表高度是 0）
+    camera.SetYaw(0.0F);
+    camera.SetPitch(0.0F);  // 水平视角：相机应停在角色正后方、**同一高度**
+
+    const CaveTerrain terrain;
+    const CameraView  view = camera.Evaluate(0.0, &terrain);
+
+    EXPECT_NEAR(view.eye.y, -4.0F, 1e-4F) << "洞内相机必须与角色同高，不得被地表高度顶出洞外";
+    EXPECT_FALSE(terrain.IsSolid(view.eye)) << "相机不得落在实心体内";
+    EXPECT_NEAR(view.distance, settings.followDistance, 1e-4F) << "洞内无遮挡，跟随距离应保持";
 }
 
 // 应用渲染插值系数只影响渲染输出，绝不回写模拟状态（红线 11）。

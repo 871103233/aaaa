@@ -52,19 +52,25 @@ enum class UiLabel : int {
     ValueNo,                      ///< 取值：否
     ValueReady,                   ///< 取值：就绪
     ValueNotReady,                ///< 取值：未就绪
-    SectionCameraBrush,           ///< 分区：相机 / 笔刷
+    SectionCameraOrb,             ///< 分区：相机 / 光球（T27 起替代"相机 / 笔刷"）
     CameraOrientation,            ///< 行标签：朝向
     CameraOrientationFormat,      ///< 朝向数值格式
     MouseCapture,                 ///< 行标签：鼠标捕获
     MouseCaptureOn,               ///< 取值：捕获开
     MouseCaptureOff,              ///< 取值：捕获关
-    BrushRadius,                  ///< 行标签：笔刷半径
-    BrushRadiusFormat,            ///< 笔刷半径数值格式
+    ExplosionRadius,              ///< 行标签：爆炸半径（T27：光球的破坏半径）
+    ExplosionRadiusFormat,        ///< 爆炸半径数值格式
     SectionWorldPhysics,          ///< 分区：世界 / 物理
     LoadedTiles,                  ///< 行标签：已加载 tile
-    DirtyTiles,                   ///< 行标签：上次弄脏 tile
+    DirtyTiles,                   ///< 行标签：本帧重网格单元数（爆炸造成的）
     TileBodies,                   ///< 行标签：地表碰撞体 tile
     CountFormat,                  ///< 计数数值格式（`%zu`）
+    Orbs,                         ///< 行标签：光球（活动 / 上限）
+    OrbCountFormat,               ///< 光球计数格式（`%zu / %zu`）
+    VolumeBlocks,                 ///< 行标签：可挖体积块
+    VolumeBlocksFormat,           ///< 可挖体积块格式（`%zu（已挖 %zu）`）
+    VolumeBodies,                 ///< 行标签：体积碰撞体（T28）
+    CollapseMoved,                ///< 行标签：累计塌落体素（T29）
 
     // ---- 调试面板：渲染开销与帧时间分解（T24）----
     SectionRenderCost,            ///< 分区：渲染开销
@@ -126,19 +132,25 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsEnglish = {
     "no",
     "ready",
     "not ready",
-    "Camera / Brush",
+    "Camera / Orb",
     "Orientation",
     "yaw %.1f deg  pitch %.1f deg  dist %.2f blocks",
     "Mouse capture",
     "on (relative mode; Esc release / click recapture)",
     "off (cursor visible)",
-    "Brush radius",
+    "Explosion radius",
     "%.1f blocks",
     "World / Physics",
     "Loaded tiles",
-    "Dirty tiles (last)",
+    "Re-meshed (frame)",
     "Terrain colliders",
     "%zu",
+    "Orbs",
+    "%zu / %zu",
+    "Diggable volume blocks",
+    "%zu (carved %zu)",
+    "Volume colliders",
+    "Collapsed voxels (total)",
     "Render Cost",
     "Draw calls",
     "Triangles",
@@ -193,19 +205,25 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsChinese = {
     "否",
     "就绪",
     "未就绪",
-    "相机 / 笔刷",
+    "相机 / 光球",
     "朝向",
     "yaw %.1f°  pitch %.1f°  距离 %.2f 格",
     "鼠标捕获",
     "开（相对模式，Esc 释放 / 点击重捕获）",
     "关（光标可见）",
-    "笔刷半径",
+    "爆炸半径",
     "%.1f 格",
     "世界 / 物理",
     "已加载 tile",
-    "上次弄脏 tile",
+    "本帧重网格单元",
     "地表碰撞体 tile",
     "%zu",
+    "光球（活动 / 上限）",
+    "%zu / %zu",
+    "可挖体积块",
+    "%zu（已挖 %zu）",
+    "体积碰撞体",
+    "累计塌落体素",
     "渲染开销",
     "Draw Call 数",
     "三角形数",

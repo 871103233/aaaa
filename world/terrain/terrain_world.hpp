@@ -40,6 +40,13 @@ public:
     /// 同一文件 + 同一种子 ⇒ 同一世界（红线 7）。
     void SetMapPreset(const MapPreset& preset);
 
+    /// 设置**层间交接过滤器**（T8 / ADR 0011）：命中该过滤器的地表四边形不发射，改由可挖体积网格绘制。
+    ///
+    /// 必须在 `LoadTile` / `MeshTile` **之前**调用（只影响后续网格化；已网格化的 tile 需重新 `MeshTile`）。
+    /// 过滤器由调用方持有，其**生命周期必须覆盖本对象**；传 `nullptr` 恢复"地表网格全覆盖"的旧行为。
+    /// 之所以用接口而非直接持有可挖区域表：保持依赖方向 `dig → terrain`（地表网格化不反向依赖挖掘模块）。
+    void SetQuadFilter(const ITerrainQuadFilter* filter) noexcept { m_quadFilter = filter; }
+
     // ---- 单 tile 生命周期（由流式层调用）----
 
     /// 生成一个 tile 的高度数据（纯函数）。该 tile 已存在时按生成结果覆盖。
@@ -76,7 +83,20 @@ public:
     // ---- ITerrainQuery ----
 
     [[nodiscard]] bool QueryHeight(float worldX, float worldZ, float& outHeight) const override;
+
+    /// 该列在**可挖体积**中使用的材质槽位（[ADR 0014](../../docs/adr/0014-voxel-material-index.md)）。
+    ///
+    /// 取该列地表 splat 的**主槽位**（权重最大者），再按材质表的 `subsurfaceSlot` 做
+    /// **表层 → 次表层**映射（草 / 沙 ⇒ 土；岩 / 土保持自身）⇒ "在草地上挖坑看到土、在山体里挖洞看到岩"。
+    /// 坡度用中心差分求（与地表着色同一口径）。返回 `false` 表示该列没有地形（未加载）。
+    [[nodiscard]] bool QueryDigMaterialSlot(float worldX, float worldZ, std::uint8_t& outSlot) const;
     [[nodiscard]] bool QueryObstruction(const glm::vec3& from, const glm::vec3& to, float& outSafeT) const override;
+
+    /// `ITerrainQuery::IsSolid`：**只按地表高度场**判定（`y <= 地表高度` 即为实心）。
+    ///
+    /// 注意：本类**不知道可挖体积**（分层边界）。相机实际使用的是游戏层的组合查询
+    /// （`game/main.cpp` 的 `GameCameraQuery`：区域内以体积为准）—— 只用地表会把相机顶出洞外。
+    [[nodiscard]] bool IsSolid(const glm::vec3& point) const override;
 
     /// 已加载 tile 中的**最高地表高度**（格）。无 tile 时返回 0。
     /// 供上层推导阴影投射体高度（缺陷 1）：`最高地表高度 − 渲染原点高度` 即最高投射体相对原点的高度。
@@ -94,6 +114,9 @@ private:
     TerrainMaterialTable  m_materials;
     TerrainNoiseGenerator m_noise;
     std::vector<MapEdit>  m_mapEdits;  ///< 预设地图的地形编辑（T11）；空表示纯噪声世界
+
+    /// 层间交接过滤器（T8，非拥有；`nullptr` = 地表网格全覆盖）。
+    const ITerrainQuadFilter* m_quadFilter = nullptr;
 
     std::map<TileCoord, TerrainTile>     m_tiles;
     std::map<TileCoord, TerrainTileMesh> m_meshes;

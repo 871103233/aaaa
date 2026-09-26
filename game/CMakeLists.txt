@@ -9,6 +9,7 @@
 #   mesh.*     —— 真正的网格渲染路径（MeshRenderer）用；
 #   shadow.vert/.frag —— 阴影深度通道（T21b / ADR 0010 P1）用（纯深度写入，片元为空入口）；
 #   tonemap.*  —— HDR 色调映射通道（T20 / ADR 0010 P0）用。
+#   （T27 的光球自发光走 `mesh.frag` 的片元 uniform 槽 3，不新增着色器文件。）
 
 # ImGui：vcpkg 端口已把 SDL3 / SDLGPU3 后端的 .cpp 编进 imgui 库本体，
 # 因此这里只需链接 imgui::imgui（头文件 imgui_impl_sdl3.h / imgui_impl_sdlgpu3.h 由端口提供），

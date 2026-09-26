@@ -38,7 +38,7 @@ glm::dvec3 TerrainTileMesh::WorldPosition(std::size_t vertexIndex) const noexcep
                       static_cast<double>(TileOriginColumn(coord.z)) + static_cast<double>(vertex.position[2]));
 }
 
-TerrainTileMesh BuildTerrainMesh(const TerrainTile& tile) {
+TerrainTileMesh BuildTerrainMesh(const TerrainTile& tile, const ITerrainQuadFilter* quadFilter) {
     TerrainTileMesh result;
     result.coord = tile.coord;
 
@@ -62,10 +62,32 @@ TerrainTileMesh BuildTerrainMesh(const TerrainTile& tile) {
     }
 
     // 索引：每格两个三角形，绕序保证正面朝上。
+    // T8 层间交接：`quadFilter` 命中（四角全部落在可挖区域内）的四边形**不发射**，改由体积网格绘制。
     const std::size_t quadCount = static_cast<std::size_t>(kTerrainTileSize) * static_cast<std::size_t>(kTerrainTileSize);
     result.mesh.indices.reserve(quadCount * 6);
+    const int originColumnX = TileOriginColumn(tile.coord.x);
+    const int originColumnZ = TileOriginColumn(tile.coord.z);
     for (int j = 0; j < kTerrainTileSize; ++j) {
         for (int i = 0; i < kTerrainTileSize; ++i) {
+            if (quadFilter != nullptr) {
+                TerrainQuad quad;
+                quad.columnX[0] = originColumnX + i;      // A = (i, j)
+                quad.columnZ[0] = originColumnZ + j;
+                quad.columnX[1] = originColumnX + i + 1;  // B = (i + 1, j)
+                quad.columnZ[1] = originColumnZ + j;
+                quad.columnX[2] = originColumnX + i;      // C = (i, j + 1)
+                quad.columnZ[2] = originColumnZ + j + 1;
+                quad.columnX[3] = originColumnX + i + 1;  // D = (i + 1, j + 1)
+                quad.columnZ[3] = originColumnZ + j + 1;
+                quad.height[0]  = HeightAtBlocks(tile, i, j);
+                quad.height[1]  = HeightAtBlocks(tile, i + 1, j);
+                quad.height[2]  = HeightAtBlocks(tile, i, j + 1);
+                quad.height[3]  = HeightAtBlocks(tile, i + 1, j + 1);
+                if (quadFilter->SkipQuad(quad)) {
+                    continue;
+                }
+            }
+
             const std::uint32_t a = static_cast<std::uint32_t>(TerrainTileMesh::VertexIndex(i, j));
             const std::uint32_t b = static_cast<std::uint32_t>(TerrainTileMesh::VertexIndex(i + 1, j));
             const std::uint32_t c = static_cast<std::uint32_t>(TerrainTileMesh::VertexIndex(i, j + 1));

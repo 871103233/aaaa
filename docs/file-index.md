@@ -94,7 +94,7 @@ voxel-engine/
 | `world/` | 世界层：生成、地表网格化、材质、挖掘、流式加载、可挖体积、存档 | 可依赖 `engine` | 硬件访问一律经引擎核心 / 平台抽象，**不直接调用平台 API** |
 | `world/terrain/` | 地表高度场 tile（64×64、`int16` 1/16 格）、网格化与梯度法线、材质混合、`ITerrainQuery` 实现、**碰撞体采样构建**（`terrain_collision`） | 可依赖 `engine` | tile 网格须多采样一行/列（65×65），保证相邻 tile 边界**逐位相等、无裂缝**；世界定位用整数 / `double` |
 | `world/generation/` | 确定性种子派生与噪声（FastNoiseLite 封装，pimpl 隔离）、**预设固定地图加载**（`map_preset`：种子 / 范围 / 出生点 / 地形编辑区，TOML） | 可依赖 `engine` | 生成必须是**纯函数**（种子 + 整数坐标）；预设编辑叠加在噪声之上，**同一文件必须得到同一世界**；禁止 `rand()` / 时间 / 线程顺序 |
-| `world/dig/` | 地形笔刷：平整填平 / 削平（`Level`）、平滑爆破（`Crater`）、球笔刷挖 / 堆，与脏 tile 收集；笔刷参数表 `assets/config/brush.toml` | 可依赖 `engine` | 只标脏**受影响**的 tile；重网格与 GPU 上传不得阻塞主线程；爆破 / 平整剖面**边界一阶连续**（无硬台阶） |
+| `world/dig/` | 地形笔刷：平整填平 / 削平（`Level`）、平滑爆破（`Crater`）、球笔刷挖 / 堆，与脏 tile 收集；**可挖区域标记表**（`dig_region`：ADR 0006 的数据文件部分 + 层间交接过滤器）与**可挖体积**（`dig_volume` + `volume_mesher`：33³ `int8` 密度、Surface Nets 等值面）；**弹丸规格表**（`projectile_table`：弹道 + 爆炸破坏 + 自发光，`[[projectile]]` 数组留多类型扩展） | 可依赖 `engine` | 只标脏**受影响**的 tile / 体积块；重网格与 GPU 上传不得阻塞主线程；爆破 / 平整剖面**边界一阶连续**；**体积只在标记区域内存在**（ADR 0004 硬约束 2）；体积块与地表网格的交接口径见 ADR 0011 |
 | `world/CMakeLists.txt` | 世界层构建目标 | — | 新增源文件 / 子目录须在此登记 |
 
 ---
@@ -103,7 +103,7 @@ voxel-engine/
 
 | 条目 | 职责 | 依赖方向 | 约束 |
 | --- | --- | --- | --- |
-| `game/` | 玩法、数值、关卡、UI、AI | 可依赖 `voxel` / `engine` | 不放通用能力；不被下层引用 |
+| `game/` | 玩法、数值、关卡、UI、AI | 可依赖 `world` / `engine` | 不放通用能力；不被下层引用 |
 | `game/main.cpp` | 程序入口：初始化、主循环、组装各层 | — | — |
 | `game/CMakeLists.txt` | 游戏可执行目标 + Shader 构建钩子 | — | 新增 Shader 须在此 `add_shader(...)` |
 
@@ -123,7 +123,7 @@ voxel-engine/
 | 条目 | 职责 | 依赖方向 | 约束 |
 | --- | --- | --- | --- |
 | `assets/` | 运行时资源源文件 | — | 生成物放 `assets/generated/`（已忽略） |
-| `assets/config/` | 配置表：`materials.toml`（地表材质槽与权重规则）、`lighting.toml`（太阳 / 天空光 / 雾 / 阴影）、`brush.toml`（平整 / 削平 / 爆破笔刷参数）等 | — | 带 `schema_version`；由 toml++ 在**启动期**加载，失败即明确报错（ADR 0005） |
+| `assets/config/` | 配置表：`materials.toml`（地表材质槽与权重规则）、`lighting.toml`（太阳 / 天空光 / 雾 / 阴影）、`brush.toml`（平整 / 削平 / 爆破笔刷参数；**T27 起未绑定按键**）、`dig_regions.toml`（可挖区域标记，ADR 0006）、`projectiles.toml`（弹丸：弹道 + 爆炸破坏 + 自发光，T27）等 | — | 带 `schema_version`；由 toml++ 在**启动期**加载，失败即明确报错（ADR 0005）。**唯一例外**：`dig_regions.toml` 缺失按 ADR 0006 返回空表（不报错） |
 | `assets/maps/` | 预设固定地图（TOML）：种子 / 覆盖范围 / 出生点 / 地形编辑区（flatten · raise · carve） | — | 带 `schema_version`；**非法文件必须显式报错，不得静默回退**；同一文件必须得到同一世界 |
 | `assets/shaders/` | GLSL 源（`.vert` / `.frag` / `.comp`） | — | 只放源；`.spv` / `.dxil` 由构建生成到 `<build>/assets/shaders/`；新增须在 `game/CMakeLists.txt` 里 `add_shader` |
 | `assets/textures/` | 纹理源（供地表多纹理权重混合使用） | — | 现状含 `layers.toml`（旧纹理数组层号表）——**已随 ADR 0004 作废待删除**；材质配置见 `assets/config/` |
@@ -160,7 +160,7 @@ voxel-engine/
 | `engine/input/input_map.hpp` | 输入动作状态层（上层只消费动作；鼠标按键与键盘对称） |
 | `engine/platform/window.hpp` | 窗口与事件循环；**唯一**把 SDL 事件翻译进 `InputMap` 的地方；相对鼠标模式（捕获 / 释放）在此封装 |
 | `engine/render/triangle_renderer.hpp` | PoC 冒烟测试路径（保留可编译，未接线） |
-| `engine/render/mesh_renderer.hpp` | 通用网格渲染路径（顶点/索引缓冲、相机 UBO、索引绘制、纹理数组、HDR 目标 + 色调映射通道、渲染开销记账） |
+| `engine/render/mesh_renderer.hpp` | 通用网格渲染路径（顶点/索引缓冲、相机 UBO、索引绘制、纹理数组、HDR 目标 + 色调映射通道、渲染开销记账、**自发光网格**：片元 uniform 槽 3 逐网格推送） |
 | `engine/render/lighting_table.hpp` | `assets/config/lighting.toml` 的加载与校验；**光照 → GPU 的唯一投影入口**（`LightingUniform` / `BuildLightingUniform`） |
 | `engine/render/shadow_cascade.hpp` | CSM **纯函数**：级联分割、texel 对齐的光空间矩阵、`ShadowUniform`（无世界 / 游戏专有类型） |
 | `engine/render/camera.hpp` | 第三人称相机 + 避障；`ITerrainQuery` 查询契约（由 `world/` 实现） |
@@ -168,6 +168,14 @@ voxel-engine/
 | `world/terrain/material_table.hpp` | `assets/config/materials.toml` 的加载与校验；**CPU→GPU 材质参数唯一投影入口**（`MaterialUniform` / `BuildMaterialUniform`） |
 | `world/terrain/material_textures.hpp` | 程序生成占位材质贴图（albedo + 法线，确定性、可平铺；ADR 0009） |
 | `world/terrain/world_bounds.hpp` | 世界边界盒与四周**空气墙**放置（**纯函数**，由 tile 范围推导；对任意地图尺寸生效） |
+| `world/dig/dig_region.hpp` | 可挖区域标记表（`assets/config/dig_regions.toml`，ADR 0006 的**数据文件**部分；含包围盒**向外吸附**、优先级 / sealed 合并、块数上限校验），并实现**层间交接过滤器** `ITerrainQuadFilter`（ADR 0011） |
+| `world/dig/dig_volume.hpp` | 可挖体积世界（ADR 0004 层 ②）：33³ `int8` 密度块（由高度场初始化）、球体挖除、脏块重网格、区域外密度回退；**只在标记区域内存在** |
+| `world/dig/volume_mesher.hpp` | Surface Nets 等值面网格化（ADR 0007）：块内局部顶点 + 密度梯度法线 + 块间共享边界采样；纯函数（只依赖采样器接口） |
+| `world/dig/volume_collision.hpp` | 可挖体积 → 物理层的**三角网静态碰撞体**提供者（T28 / ADR 0012）：每个有网格的块一个 Jolt `MeshShape`，挖除 / 塌落后按脏块重建 |
+| `world/dig/volume_collapse.hpp` | 破坏后的**塌落**（T29 / ADR 0012 第二节）：按「载荷通路（纵向接地）+ 悬挑跨度」判支撑、失去支撑的实心体按连续段**质量守恒地**逐列下落并堆成碎石；单次判定、不迭代 |
+| `world/dig/collapse_table.hpp` | 塌落规则表（`assets/config/collapse.toml`）：`enabled` / `max_cantilever_blocks` / `pile_spread_blocks` / `neighborhood_margin_blocks`，逐项校验、非法即抛 |
+| `world/dig/projectile_table.hpp` | 弹丸规格表（`assets/config/projectiles.toml`）：弹道 / 爆炸破坏 / 自发光；`[[projectile]]` 数组留出多类型扩展 |
+| `game/orb.hpp` | 光球（T27）：弹道推进与命中检测（**纯函数**，只依赖 `IOrbWorldQuery`）、程序化球网格、固定容量弹丸池 |
 | `game/out_of_bounds.hpp` | 出界判定（**纯函数**）+ 救援余量；越界/坠落时送回出生点 |
 | `game/character_movement.hpp` | 主角移动基向量（**纯函数**：由相机 yaw 得前向 / 右向；方向语义有单测钉死） |
 | `game/character_mesh.hpp` | 主角**程序化胶囊代理网格**（可见占位体，尺寸同碰撞胶囊） |

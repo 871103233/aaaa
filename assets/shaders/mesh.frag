@@ -62,13 +62,20 @@
 //            binding 3 = ao        （4 层数组）
 //            binding 4 = macro     （**1 层**数组）
 //            binding 5 = shadow    （阴影深度数组，层 i = 级联 i）
-//   set 3 = 片元 uniform 块（binding 0 = 材质 / 槽 0；binding 1 = 光照与雾 / 槽 1；binding 2 = 阴影 / 槽 2）。
+//   set 3 = 片元 uniform 块（binding 0 = 材质 / 槽 0；binding 1 = 光照与雾 / 槽 1；binding 2 = 阴影 / 槽 2；
+//           binding 3 = **自发光** / 槽 3，逐网格推送：`rgb` = 颜色（线性光）、`a` = 强度；0 = 普通网格）。
+//           ⚠ binding 必须**从 0 连续编号**，且个数要与创建 Shader 时声明的 `num_uniform_buffers` 一致
+//             （本文件 = 4）；SDL_gpu 每阶段最多 4 个 uniform 槽。
 // 材质数值来自 assets/config/materials.toml（经 BuildMaterialUniform 投影）；
 // 光照 / 雾 / 阴影数值来自 assets/config/lighting.toml（经 BuildLightingUniform / BuildShadowUniform 投影）。
 // **三处都不在此另写一份**。
 
 layout(location = 0) in vec3 v_relativePosition;
 layout(location = 1) in vec3 v_normal;
+// location 2：材质槽位**覆盖**（ADR 0014）；`flat` 与顶点着色器一致，不做插值。
+//   < 0 = 未指定（地表网格：按世界高度与坡度逐像素算权重）
+//   >= 0 = 直接用该槽位（可挖体积的内表面：洞里看到的应是"被切开的那种材质"）
+layout(location = 2) flat in float v_material;
 
 layout(location = 0) out vec4 o_color;
 
@@ -158,6 +165,13 @@ layout(set = 3, binding = 2, std140) uniform ShadowBlock {
     vec4 cameraForwardEnabled;  // xyz = 相机世界前向（单位向量）, w = 启用(1/0)
     vec4 cascadeBlendParams;    // x = cascade_blend（级联过渡带宽度比例）, y/z/w = 未用（填充位）
 } shadow;
+
+/// 自发光 uniform 块（T27 / 光球）：片元 uniform **槽 3**，由 `MeshRenderer::DrawMeshes` **逐网格**推送
+/// （`SDL_gpu.h`：push 数据对后续绘制生效 ⇒ 普通网格推零值、自发光网格推 `SetEmissiveColor` 的颜色）。
+/// 颜色是**线性光**且刻意大于 1（HDR 通路），经色调映射后呈"发白发光"。
+layout(set = 3, binding = 3, std140) uniform EmissiveBlock {
+    vec4 emissive;  // rgb = 自发光颜色（线性光）, a = 强度（0 = 关）
+} emissiveParams;
 
 /// 一条「带」的隶属度：带内为 1，带外经 blend 宽的窄带平滑阶跃归零。
 /// 逐字镜像 world/terrain/material_blender.cpp 的 MaterialBandFactor（两边改动必须同步）。
@@ -336,7 +350,17 @@ void main() {
     const vec3  worldPosition   = v_relativePosition + material.renderOrigin.xyz;
     const vec3  geometricNormal = normalize(v_normal);
     const float slope           = clamp(1.0 - geometricNormal.y, 0.0, 1.0);
-    const vec4  weights         = computeWeights(worldPosition.y, slope);
+    // 材质权重：体积网格带**槽位覆盖**时直接用它（ADR 0014），否则按世界高度与坡度逐像素算。
+    // 为什么必须有覆盖：洞底位于地下、坡度 0 ⇒ 按高度/坡度会被判成"草"（"地下草地"）；
+    // 而现实里挖开岩体看到的就是岩、挖开土层看到的就是土。
+    vec4 weights;
+    const int materialOverride = int(v_material + 0.5);
+    if (materialOverride >= 0 && materialOverride < kMaterialLayerCount) {
+        weights                   = vec4(0.0);
+        weights[materialOverride] = 1.0;
+    } else {
+        weights = computeWeights(worldPosition.y, slope);
+    }
 
     const vec2 detail = vec2(valueNoise(worldPosition.xz * kDetailFrequency),
                              valueNoise(worldPosition.xz * kDetailFrequency + vec2(13.7, 71.3))) - 0.5;
@@ -503,5 +527,11 @@ void main() {
             clamp(1.0 - exp(-lighting.fogColorDensity.a * viewDistance * heightAmount), 0.0, 1.0);
         finalColor = mix(litColor, lighting.fogColorDensity.rgb, fogAmount);
     }
+
+    // ---- 自发光（T27 / 光球）：在**雾之后**叠加 ----
+    // 放在雾之后是刻意的：光球是光源，不该被大气雾按距离洗掉（否则远距离射击时看不见弹丸）。
+    // 强度 0（普通地表 / 角色网格）时这一项严格加 0，不影响任何既有观感。
+    finalColor += emissiveParams.emissive.rgb * emissiveParams.emissive.a;
+
     o_color = vec4(finalColor, 1.0);
 }
