@@ -66,6 +66,22 @@ enum class UiLabel : int {
     TileBodies,                   ///< 行标签：地表碰撞体 tile
     CountFormat,                  ///< 计数数值格式（`%zu`）
 
+    // ---- 调试面板：渲染开销与帧时间分解（T24）----
+    SectionRenderCost,            ///< 分区：渲染开销
+    DrawCalls,                    ///< 行标签：Draw Call 数
+    Triangles,                    ///< 行标签：三角形数
+    Vertices,                     ///< 行标签：顶点数
+    TextureVram,                  ///< 行标签：纹理显存
+    TextureVramFormat,            ///< 纹理显存数值格式（`%.2f MB`）
+    SectionCpuFrameTime,          ///< 分区：CPU 帧时间分解
+    CpuLogicStep,                 ///< 行标签：逻辑步（物理 + 相机）
+    CpuUiBuild,                   ///< 行标签：UI 构建
+    CpuRenderSubmit,              ///< 行标签：渲染提交
+    MillisecondsFormat,           ///< 毫秒数值格式（`%.2f ms`）
+    SectionGpuPassTime,           ///< 分区：各 pass GPU 时间
+    GpuPassTime,                  ///< 行标签：各 pass GPU 时间
+    GpuTimeUnavailable,           ///< 取值：GPU 时间不可用（SDL3_gpu 无时间戳查询）
+
     kCount  ///< 标签总数（必须保持在最后）
 };
 
@@ -123,6 +139,20 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsEnglish = {
     "Dirty tiles (last)",
     "Terrain colliders",
     "%zu",
+    "Render Cost",
+    "Draw calls",
+    "Triangles",
+    "Vertices",
+    "Texture VRAM",
+    "%.2f MB",
+    "CPU frame time",
+    "Logic (physics + camera)",
+    "UI build",
+    "Render submit",
+    "%.2f ms",
+    "GPU passes",
+    "Pass GPU time",
+    "unavailable (SDL3_gpu has no timestamp queries)",
 };
 
 /// 中文标签表：仅当**成功加载 CJK 字体**时启用（此时不可能缺字）。
@@ -176,6 +206,20 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsChinese = {
     "上次弄脏 tile",
     "地表碰撞体 tile",
     "%zu",
+    "渲染开销",
+    "Draw Call 数",
+    "三角形数",
+    "顶点数",
+    "纹理显存",
+    "%.2f MB",
+    "CPU 帧时间分解",
+    "逻辑步（物理 + 相机）",
+    "UI 构建",
+    "渲染提交",
+    "%.2f ms",
+    "各 pass GPU 时间",
+    "各 pass GPU 时间",
+    "不可用（SDL3_gpu 无时间戳查询）",
 };
 
 /// 纯函数：判断字符串是否**只含 ASCII 字节**（`cjkFontAvailable = false` 时的硬约束）。

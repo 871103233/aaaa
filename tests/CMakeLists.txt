@@ -25,6 +25,7 @@ add_executable(voxel_tests
     system_settings_test.cpp
     physics_test.cpp
     render_camera_test.cpp
+    render_stats_test.cpp
     terrain_brush_hold_test.cpp
     terrain_brush_test.cpp
     terrain_material_test.cpp

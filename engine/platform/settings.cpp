@@ -44,6 +44,14 @@ constexpr const char* kPrefApp = "voxel_game";
     return *value;
 }
 
+[[nodiscard]] double ReadDouble(const toml::table& document, const std::filesystem::path& path, const char* field) {
+    const std::optional<double> value = document[field].value<double>();
+    if (!value.has_value()) {
+        throw std::runtime_error(Describe(path, field) + "缺失或不是浮点数");
+    }
+    return *value;
+}
+
 [[nodiscard]] DisplayMode ParseDisplayMode(const std::string& text, const std::filesystem::path& path) {
     if (text == "windowed") {
         return DisplayMode::Windowed;
@@ -98,6 +106,11 @@ SystemSettings LoadSystemSettings(const std::filesystem::path& path) {
     if (document.contains("frame_rate_cap")) {
         settings.frameRateCap = static_cast<int>(ReadInt(document, path, "frame_rate_cap"));
     }
+    // 曝光（T20）：**可选字段**——旧版设置文件没有它，缺失即保持默认 1.0；存在但不是浮点数则报错；
+    // 数值越界按 `ClampExposure` 钳制到 [0.1, 8.0]（见头文件契约）。
+    if (document.contains("exposure")) {
+        settings.exposure = ClampExposure(static_cast<float>(ReadDouble(document, path, "exposure")));
+    }
     return settings;
 }
 
@@ -111,6 +124,8 @@ void SaveSystemSettings(const std::filesystem::path& path, const SystemSettings&
                                     static_cast<std::int64_t>(ClampMasterVolume(settings.masterVolume)));
     // 帧率上限始终写**解析后的绝对值**（哨兵 0 在启动时已由 `ResolveFrameRateCap` 落成实际 Hz）。
     (void)document.insert_or_assign("frame_rate_cap", static_cast<std::int64_t>(settings.frameRateCap));
+    // 曝光同样写钳制后的值（T20；改值不需重编 Shader）。
+    (void)document.insert_or_assign("exposure", static_cast<double>(ClampExposure(settings.exposure)));
 
     // binary 模式：禁止运行库做 CRLF 转换，保证落盘为纯 LF（仓库行尾约定）。
     std::ofstream out(path, std::ios::binary | std::ios::trunc);

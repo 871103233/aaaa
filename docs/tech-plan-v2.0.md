@@ -172,16 +172,26 @@
 
 - 地表材质 = **多纹理权重混合**，权重由**高度与坡度**决定；材质表为 TOML（[ADR 0005](adr/0005-config-parsing.md)）。
 - 纹理采样**必须**使用纹理数组（多层 GPU 纹理）；**禁止**使用纹理图集（低 mip 层会渗色）。
+- 材质参数口径见 [ADR 0009](adr/0009-terrain-material-pipeline.md)：权重**逐像素**在片元着色器重算（窄带 `smoothstep`），层贴图为 albedo + 法线，参数经 `BuildMaterialUniform` 单入口投影。
+- PBR 四件套（albedo / normal / roughness / AO）与宏观变化见 [ADR 0010](adr/0010-render-quality-pipeline.md) P2（**未开始**）。
 - 物件层材质 = 模型自带材质，**不参与**地表 splat。
 
-### 4.4 光照
+### 4.4 光照与色彩
 
-- 光照 = **方向光 + 级联阴影（CSM）**。
-- **禁止**引入逐方块光照与光照 BFS：本方向下不存在逐方块光照数据（[ADR 0008](adr/0008-sizes-precision-budget.md) §4）。
+**实施顺序固定为四步且不得跳步**（[ADR 0010](adr/0010-render-quality-pipeline.md)）：
+
+1. **P0**：HDR 离屏目标 + 曝光 + ACES 近似色调映射 + sRGB 编码；
+2. **P1**：方向光（可配）+ **级联阴影（CSM）** + 半球天空光 + 指数高度雾；
+3. **P2**：PBR（GGX / Smith / Schlick）+ roughness / AO；
+4. **P3**：MSAA 4× 与多频细节法线。
+
+**禁止**在未接入 HDR 与色调映射的情况下先做 P2 / P3：亮部截断会吃掉全部增益。
+**禁止**引入逐方块光照与光照 BFS：本方向下不存在逐方块光照数据（[ADR 0008](adr/0008-sizes-precision-budget.md) §4）。
 
 ### 4.5 渲染通道与坐标精度
 
 - 不透明通道为主通道；alpha cutout 与半透明各自独立通道，半透明**必须按距离排序**。
+- **主通道渲染到 HDR 离屏目标**，再经后处理通道（色调映射 + 编码）写入交换链（ADR 0010 P0）。
 - 世界坐标定位用整数与 `double`；上传 GPU 前做**相机相对偏移**转 `float`。
 - 遮挡剔除方案**尚未收敛**（§0.3 / SKILL 待收敛项 #6）。
 
@@ -264,6 +274,8 @@
 | CPU 常驻内存 | **≤ 150 MB** | Tracy 内存面板 |
 | VRAM 常驻 | **≤ 300 MB** | RenderDoc 资源统计 |
 | Draw Call | **只记录、不验收** | 见 §7.3 |
+
+> **渲染质量线（ADR 0010）的显存增量**：HDR 离屏目标、MSAA 目标、阴影级联、多通道材质贴图**必须单独记账**；上表 VRAM 口径在 ADR 0010 各阶段落地后**重新核算**（SKILL 待收敛项 #10）。
 
 ### 7.3 只记录、不验收的项
 

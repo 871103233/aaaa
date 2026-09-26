@@ -30,6 +30,15 @@ struct DebugStats {
     std::size_t lastDirtyTileCount = 0;       ///< 最近一次笔刷弄脏的 tile 数
     std::size_t tileBodyCount      = 0;       ///< 已建立物理碰撞体的 tile 数
     bool        physicsReady       = false;   ///< 角色物理是否已就绪
+
+    // ---- 渲染开销与 CPU 帧时间分解（T24；取自 engine/render 的通用统计）----
+    std::uint32_t drawCalls     = 0;    ///< 最近一帧实际执行的 Draw Call 数
+    std::uint64_t triangleCount = 0;    ///< 最近一帧实际绘制的三角形数
+    std::uint64_t vertexCount   = 0;    ///< 最近一帧实际绘制的顶点数
+    std::uint64_t textureBytes  = 0;    ///< 当前纹理显存字节总量（含 mip 链）
+    double        cpuLogicMs    = 0.0;  ///< 最近一帧逻辑步耗时（固定步循环：物理 + 相机，毫秒）
+    double        cpuUiMs       = 0.0;  ///< 最近一帧 UI 构建耗时（毫秒）
+    double        cpuRenderMs   = 0.0;  ///< 最近一帧渲染提交耗时（`RenderFrame` 及其内部上传，毫秒）
 };
 
 /// 极简 ImGui 调试面板（T9）。基于 imgui 的 **SDL3 平台后端 + SDL3_gpu 渲染后端**。

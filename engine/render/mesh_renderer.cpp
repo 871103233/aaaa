@@ -173,7 +173,9 @@ MeshRenderer::MeshRenderer(SDL_GPUDevice* device, SDL_Window* window, std::files
     vertexInput.num_vertex_attributes      = static_cast<Uint32>(std::size(attributes));
 
     SDL_GPUColorTargetDescription colorTargetDescription {};
-    colorTargetDescription.format = SDL_GetGPUSwapchainTextureFormat(m_device, m_window);
+    // T20 / ADR 0010：主通道写**离屏 HDR 目标**（`R16G16B16A16_FLOAT`），不再直接写交换链；
+    // 亮度超过 1.0 的高光因此得以保留，交由 tonemap.* 通道做曝光 + 色调映射 + sRGB 编码。
+    colorTargetDescription.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
 
     SDL_GPUGraphicsPipelineCreateInfo info {};
     info.vertex_shader   = vertexShader;
@@ -206,6 +208,61 @@ MeshRenderer::MeshRenderer(SDL_GPUDevice* device, SDL_Window* window, std::files
 
     if (m_pipeline == nullptr) {
         throw std::runtime_error(std::string("SDL_CreateGPUGraphicsPipeline 失败：") + SDL_GetError());
+    }
+
+    // ---- 色调映射管线（T20 / ADR 0010 P0）：HDR 目标 → 交换链 ----
+    // 全屏三角形（顶点缓冲为空，位置由 gl_VertexIndex 生成）；无深度目标、sample_count = 1、不剔除。
+    {
+        SDL_GPUShader* tonemapVertex =
+            create_shader_from_file(m_device, shader_dir / ("tonemap.vert" + extension),
+                                    SDL_GPU_SHADERSTAGE_VERTEX, artifact.format, ShaderResourceCounts {});
+        SDL_GPUShader* tonemapFragment =
+            create_shader_from_file(m_device, shader_dir / ("tonemap.frag" + extension),
+                                    SDL_GPU_SHADERSTAGE_FRAGMENT, artifact.format,
+                                    ShaderResourceCounts { /*samplers=*/1, 0, 0, /*uniformBuffers=*/1 });
+
+        SDL_GPUColorTargetDescription tonemapColorTarget {};
+        tonemapColorTarget.format = SDL_GetGPUSwapchainTextureFormat(m_device, m_window);
+
+        SDL_GPUGraphicsPipelineCreateInfo tonemapInfo {};
+        tonemapInfo.vertex_shader   = tonemapVertex;
+        tonemapInfo.fragment_shader = tonemapFragment;
+        // 无顶点输入（顶点缓冲与属性均为空）。
+        tonemapInfo.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+
+        tonemapInfo.rasterizer_state.fill_mode         = SDL_GPU_FILLMODE_FILL;
+        tonemapInfo.rasterizer_state.cull_mode         = SDL_GPU_CULLMODE_NONE;
+        tonemapInfo.rasterizer_state.front_face        = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
+        tonemapInfo.rasterizer_state.enable_depth_clip = false;
+
+        tonemapInfo.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
+
+        tonemapInfo.target_info.color_target_descriptions = &tonemapColorTarget;
+        tonemapInfo.target_info.num_color_targets         = 1;
+        tonemapInfo.target_info.has_depth_stencil_target  = false;
+
+        m_tonemapPipeline = SDL_CreateGPUGraphicsPipeline(m_device, &tonemapInfo);
+        SDL_ReleaseGPUShader(m_device, tonemapVertex);
+        SDL_ReleaseGPUShader(m_device, tonemapFragment);
+
+        if (m_tonemapPipeline == nullptr) {
+            throw std::runtime_error(std::string("创建色调映射管线失败：") + SDL_GetError());
+        }
+    }
+
+    // 色调映射采样 HDR 目标：clamp 寻址（屏幕空间后处理不留接缝）+ 线性过滤，单级纹理。
+    SDL_GPUSamplerCreateInfo hdrSamplerInfo {};
+    hdrSamplerInfo.min_filter     = SDL_GPU_FILTER_LINEAR;
+    hdrSamplerInfo.mag_filter     = SDL_GPU_FILTER_LINEAR;
+    hdrSamplerInfo.mipmap_mode    = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
+    hdrSamplerInfo.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    hdrSamplerInfo.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    hdrSamplerInfo.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    hdrSamplerInfo.min_lod        = 0.0F;
+    hdrSamplerInfo.max_lod        = 0.0F;
+    m_hdrSampler = SDL_CreateGPUSampler(m_device, &hdrSamplerInfo);
+    if (m_hdrSampler == nullptr) {
+        throw std::runtime_error(std::string("创建 HDR 采样器失败：") + SDL_GetError());
     }
 
     // 每帧相机常量：一个能被顶点着色器读取的 GPU 缓冲 + 一个复用的上传缓冲。
@@ -254,6 +311,9 @@ MeshRenderer::~MeshRenderer() {
     if (m_depthTexture != nullptr) {
         SDL_ReleaseGPUTexture(m_device, m_depthTexture);
     }
+    if (m_hdrTexture != nullptr) {
+        SDL_ReleaseGPUTexture(m_device, m_hdrTexture);
+    }
     if (m_cameraTransferBuffer != nullptr) {
         SDL_ReleaseGPUTransferBuffer(m_device, m_cameraTransferBuffer);
     }
@@ -271,8 +331,14 @@ MeshRenderer::~MeshRenderer() {
     if (m_layerSampler != nullptr) {
         SDL_ReleaseGPUSampler(m_device, m_layerSampler);
     }
+    if (m_hdrSampler != nullptr) {
+        SDL_ReleaseGPUSampler(m_device, m_hdrSampler);
+    }
     if (m_pipeline != nullptr) {
         SDL_ReleaseGPUGraphicsPipeline(m_device, m_pipeline);
+    }
+    if (m_tonemapPipeline != nullptr) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_tonemapPipeline);
     }
 }
 
@@ -451,14 +517,19 @@ TextureArrayHandle MeshRenderer::CreateTextureArray(const TextureArrayDesc& desc
     SDL_ReleaseGPUTransferBuffer(m_device, transfer);
 
     std::uint32_t slot = 0;
+    // 显存记账（ADR 0010）：按**含 mip 链**的估算累加（纯函数 `EstimateTextureArrayBytes`，可单测）。
+    const std::uint64_t bytes = EstimateTextureArrayBytes(desc.width, desc.height, desc.layerCount);
     if (!m_freeTextureSlots.empty()) {
-        slot = m_freeTextureSlots.back();
+        slot                       = m_freeTextureSlots.back();
         m_freeTextureSlots.pop_back();
-        m_textureArrays[slot] = texture;
+        m_textureArrays[slot]      = texture;
+        m_textureArrayBytes[slot]  = bytes;
     } else {
         slot = static_cast<std::uint32_t>(m_textureArrays.size());
         m_textureArrays.push_back(texture);
+        m_textureArrayBytes.push_back(bytes);
     }
+    m_stats.textureBytes += bytes;
     return TextureArrayHandle { slot + 1 };
 }
 
@@ -471,6 +542,9 @@ void MeshRenderer::ReleaseTextureArray(TextureArrayHandle handle) noexcept {
         SDL_ReleaseGPUTexture(m_device, m_textureArrays[slot]);
         m_textureArrays[slot] = nullptr;
     }
+    // 显存记账同步扣减（重复释放时记账字节已为 0，扣 0 无副作用）。
+    m_stats.textureBytes -= m_textureArrayBytes[slot];
+    m_textureArrayBytes[slot] = 0;
     if (m_albedoTexture.id == handle.id) {
         m_albedoTexture = TextureArrayHandle {};
     }
@@ -504,6 +578,8 @@ void MeshRenderer::EnsureDepthTarget(std::uint32_t width, std::uint32_t height) 
     if (m_depthTexture != nullptr) {
         SDL_ReleaseGPUTexture(m_device, m_depthTexture);
         m_depthTexture = nullptr;
+        m_stats.textureBytes -= m_depthBytes;
+        m_depthBytes = 0;
     }
 
     SDL_GPUTextureCreateInfo info {};
@@ -522,6 +598,42 @@ void MeshRenderer::EnsureDepthTarget(std::uint32_t width, std::uint32_t height) 
     }
     m_depthWidth  = width;
     m_depthHeight = height;
+    // 显存记账：D32_FLOAT 按 4 字节 / 像素（ADR 0010 的记账义务）。
+    m_depthBytes = static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height) * 4ULL;
+    m_stats.textureBytes += m_depthBytes;
+}
+
+void MeshRenderer::EnsureHdrTarget(std::uint32_t width, std::uint32_t height) {
+    if (m_hdrTexture != nullptr && m_hdrWidth == width && m_hdrHeight == height) {
+        return;
+    }
+    if (m_hdrTexture != nullptr) {
+        SDL_ReleaseGPUTexture(m_device, m_hdrTexture);
+        m_hdrTexture = nullptr;
+        m_stats.textureBytes -= m_hdrBytes;
+        m_hdrBytes = 0;
+    }
+
+    SDL_GPUTextureCreateInfo info {};
+    info.type   = SDL_GPU_TEXTURETYPE_2D;
+    info.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+    // COLOR_TARGET：主通道写入；SAMPLER：色调映射通道读取。
+    info.usage                = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    info.width                = width;
+    info.height               = height;
+    info.layer_count_or_depth = 1;
+    info.num_levels           = 1;
+    info.sample_count         = SDL_GPU_SAMPLECOUNT_1;
+
+    m_hdrTexture = SDL_CreateGPUTexture(m_device, &info);
+    if (m_hdrTexture == nullptr) {
+        throw std::runtime_error(std::string("创建 HDR 颜色目标失败：") + SDL_GetError());
+    }
+    m_hdrWidth  = width;
+    m_hdrHeight = height;
+    // 显存记账：R16G16B16A16_FLOAT 按 8 字节 / 像素（ADR 0010 的记账义务）。
+    m_hdrBytes = static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height) * 8ULL;
+    m_stats.textureBytes += m_hdrBytes;
 }
 
 void MeshRenderer::UploadCameraUniform(SDL_GPUCommandBuffer* commandBuffer) {
@@ -561,10 +673,17 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
     }
 
     EnsureDepthTarget(width, height);
+    EnsureHdrTarget(width, height);
     UploadCameraUniform(commandBuffer);
 
+    // 本帧绘制统计清零（纹理显存记账是持久的，不在此列）。
+    m_stats.drawCalls     = 0;
+    m_stats.triangleCount = 0;
+    m_stats.vertexCount   = 0;
+
+    // 主通道渲到**离屏 HDR 目标**（T20）：亮度不被交换链的 8 位范围截断。
     SDL_GPUColorTargetInfo colorTarget {};
-    colorTarget.texture     = swapchain;
+    colorTarget.texture     = m_hdrTexture;
     colorTarget.load_op     = SDL_GPU_LOADOP_CLEAR;
     colorTarget.store_op    = SDL_GPU_STOREOP_STORE;
     colorTarget.clear_color = clearColor;
@@ -621,10 +740,42 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
 
             SDL_DrawGPUIndexedPrimitives(pass, resources.indexCount, /*num_instances=*/1, /*first_index=*/0,
                                          /*vertex_offset=*/0, /*first_instance=*/0);
+
+            // 统计**实际执行**的绘制（T24）：Draw Call 数与本帧三角形 / 顶点总量。
+            ++m_stats.drawCalls;
+            m_stats.triangleCount += resources.indexCount / 3U;
+            m_stats.vertexCount += resources.vertexCount;
         }
     }
 
     SDL_EndGPURenderPass(pass);
+
+    // ---- 色调映射通道（T20 / ADR 0010 P0）：HDR 目标 → 交换链 ----
+    // 全屏三角形覆盖整个交换链，因此无需保留上一帧内容（DONT_CARE 加载）。
+    SDL_GPUColorTargetInfo tonemapTarget {};
+    tonemapTarget.texture  = swapchain;
+    tonemapTarget.load_op  = SDL_GPU_LOADOP_DONT_CARE;
+    tonemapTarget.store_op = SDL_GPU_STOREOP_STORE;  // 叠加层稍后以 LOAD 追加，故必须存储
+
+    // 色调映射片元 uniform（std140：单个 vec4，x = 曝光）；在开渲染通道前推送。
+    struct TonemapUniform {
+        float exposureParams[4];
+    };
+    TonemapUniform tonemapUniform {};
+    tonemapUniform.exposureParams[0] = m_exposure;
+    SDL_PushGPUFragmentUniformData(commandBuffer, 0, &tonemapUniform, static_cast<Uint32>(sizeof(tonemapUniform)));
+
+    SDL_GPURenderPass* tonemapPass = SDL_BeginGPURenderPass(commandBuffer, &tonemapTarget, 1, nullptr);
+    if (tonemapPass != nullptr) {
+        SDL_BindGPUGraphicsPipeline(tonemapPass, m_tonemapPipeline);
+
+        SDL_GPUTextureSamplerBinding hdrBinding { m_hdrTexture, m_hdrSampler };
+        SDL_BindGPUFragmentSamplers(tonemapPass, 0, &hdrBinding, 1);
+
+        // 顶点缓冲为空：3 个顶点由 gl_VertexIndex 直接生成。
+        SDL_DrawGPUPrimitives(tonemapPass, 3, /*num_instances=*/1, /*first_vertex=*/0, /*first_instance=*/0);
+        SDL_EndGPURenderPass(tonemapPass);
+    }
 
     // 叠加层：与 3D 通道共用本命令缓冲（交换链纹理只在获取它的命令缓冲里有效）。
     if (overlay != nullptr) {

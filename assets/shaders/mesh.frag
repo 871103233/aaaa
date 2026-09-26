@@ -37,6 +37,19 @@ const float kWeightEpsilon = 1.0 / 1000000.0;
 /// 方向光：固定一束斜向下的日光（单位向量），只为让起伏与坡度可见（方案 §4.4 的方向光项）。
 const vec3 kLightDirection = normalize(vec3(0.45, 0.80, 0.30));
 
+/// 光照常量（T20 起为**线性空间**口径）：环境项 + 漫反射项。
+/// 旧的 `0.35 + 0.65·diffuse` 是"直接写交换链"的 sRGB 口径；现在颜色先转线性、光照在线性空间完成，
+/// 再交给 tonemap.frag 统一做曝光 + ACES 色调映射 + sRGB 编码。
+///
+/// 按本组常量与 assets/config/materials.toml 的作者色（贴图与 tint 各按 `pow(c, 2.2)` 转线性），
+/// 漫反射约 0.8 的典型受光面经 ACES + sRGB 编码后的落点（0 = 黑，1 = 白）：
+///   草地（tint 0.31/0.55/0.24，贴图亮度 ≈ 0.72）→ 约 (0.16, 0.43, 0.10)
+///   沙地（tint 0.83/0.74/0.48，贴图亮度 ≈ 0.78）→ 约 (0.72, 0.66, 0.39)
+/// 均落在 0.1~0.75 区间内；即使贴图与朝向都取最亮也仅约 0.87，**不会出现整屏死白**；
+/// 暗部由环境项托底（P1 的天空光会进一步给暗部颜色，见 ADR 0010）。
+const float kAmbientLight = 0.10;
+const float kDiffuseLight = 1.00;
+
 /// 高频细节：扰动 UV，打散平铺重复与"机器般等距"的纹理边界。
 const float kDetailFrequency = 0.35;
 const float kDetailStrength  = 0.06;
@@ -140,7 +153,11 @@ void main() {
     const vec3 mappedNormal = normalize(tangent * safeTangentNormal.x + bitangent * safeTangentNormal.y +
                                         geometricNormal * safeTangentNormal.z);
 
-    // 环境项 + 漫反射项：避免背光面纯黑，同时保留坡度与法线细节的明暗。
+    // T20 / ADR 0010：albedo（贴图）与材质 tint 都按 sRGB 观感给出，先转到**线性空间**，
+    // 光照在线性空间完成，最后输出**线性 HDR** 颜色（色调映射 + sRGB 编码在 tonemap.frag）。
+    const vec3 albedoLinear = pow(max(albedo, vec3(0.0)), vec3(2.2));
+
+    // 环境项 + 漫反射项（线性口径）：避免背光面纯黑，同时保留坡度与法线细节的明暗。
     const float diffuse = max(dot(mappedNormal, kLightDirection), 0.0);
-    o_color = vec4(albedo * (0.35 + 0.65 * diffuse), 1.0);
+    o_color = vec4(albedoLinear * (kAmbientLight + kDiffuseLight * diffuse), 1.0);
 }

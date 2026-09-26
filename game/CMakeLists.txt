@@ -6,7 +6,8 @@
 #
 # Shader 在构建期编译为 SPIR-V 与 DXIL **双格式**（见 ADR 0002 与 cmake/Shaders.cmake）：
 #   triangle.* —— 冒烟路径（TriangleRenderer）用；
-#   mesh.*     —— 真正的网格渲染路径（MeshRenderer）用。
+#   mesh.*     —— 真正的网格渲染路径（MeshRenderer）用；
+#   tonemap.*  —— HDR 色调映射通道（T20 / ADR 0010 P0）用。
 
 # ImGui：vcpkg 端口已把 SDL3 / SDLGPU3 后端的 .cpp 编进 imgui 库本体，
 # 因此这里只需链接 imgui::imgui（头文件 imgui_impl_sdl3.h / imgui_impl_sdlgpu3.h 由端口提供），
@@ -35,3 +36,5 @@ add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/triangle.vert)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/triangle.frag)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/mesh.vert)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/mesh.frag)
+add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/tonemap.vert)
+add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/tonemap.frag)

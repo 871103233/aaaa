@@ -185,6 +185,27 @@ void DebugOverlay::BuildUI(const DebugStats& stats, SystemPanelContext& panelCon
     StatRow(UiText(UiLabel::DirtyTiles, cjk), UiText(UiLabel::CountFormat, cjk), stats.lastDirtyTileCount);
     StatRow(UiText(UiLabel::TileBodies, cjk), UiText(UiLabel::CountFormat, cjk), stats.tileBodyCount);
 
+    // T24：渲染开销（实测自 MeshRenderer）+ 纹理显存记账（ADR 0010）；纯展示，不回写任何状态。
+    ImGui::SeparatorText(UiText(UiLabel::SectionRenderCost, cjk));
+    StatRow(UiText(UiLabel::DrawCalls, cjk), UiText(UiLabel::CountFormat, cjk),
+            static_cast<std::size_t>(stats.drawCalls));
+    StatRow(UiText(UiLabel::Triangles, cjk), UiText(UiLabel::CountFormat, cjk),
+            static_cast<std::size_t>(stats.triangleCount));
+    StatRow(UiText(UiLabel::Vertices, cjk), UiText(UiLabel::CountFormat, cjk),
+            static_cast<std::size_t>(stats.vertexCount));
+    StatRow(UiText(UiLabel::TextureVram, cjk), UiText(UiLabel::TextureVramFormat, cjk),
+            static_cast<double>(stats.textureBytes) / (1024.0 * 1024.0));
+
+    // T24：CPU 帧时间分解（毫秒，显示到 0.01 ms）——由 main 用单调计时分别测量。
+    ImGui::SeparatorText(UiText(UiLabel::SectionCpuFrameTime, cjk));
+    StatRow(UiText(UiLabel::CpuLogicStep, cjk), UiText(UiLabel::MillisecondsFormat, cjk), stats.cpuLogicMs);
+    StatRow(UiText(UiLabel::CpuUiBuild, cjk), UiText(UiLabel::MillisecondsFormat, cjk), stats.cpuUiMs);
+    StatRow(UiText(UiLabel::CpuRenderSubmit, cjk), UiText(UiLabel::MillisecondsFormat, cjk), stats.cpuRenderMs);
+
+    // T24：各 pass GPU 时间。SDL3_gpu **没有时间戳查询 API**，故如实标注"不可用"——绝不编造数字。
+    ImGui::SeparatorText(UiText(UiLabel::SectionGpuPassTime, cjk));
+    ValueRow(UiText(UiLabel::GpuPassTime, cjk), UiText(UiLabel::GpuTimeUnavailable, cjk));
+
     ImGui::End();
 }
 

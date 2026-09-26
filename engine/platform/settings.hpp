@@ -19,13 +19,15 @@ inline constexpr int kFrameRateCapMin     = 60;  ///< 滑块下限（Hz）
 inline constexpr int kFrameRateCapUnset   = 0;   ///< 存储哨兵：未设置 → 取当前显示器刷新率
 inline constexpr int kFallbackRefreshRate = 60;  ///< 刷新率未知 / 非正时的回退刷新率（Hz）
 
-/// 系统设置（T15 / T17）：显示模式、窗口分辨率、主音量、帧率上限。随程序退出落盘、下次启动读回。
+/// 系统设置（T15 / T17 / T20）：显示模式、窗口分辨率、主音量、帧率上限、曝光。
+/// 随程序退出落盘、下次启动读回。
 struct SystemSettings {
     DisplayMode displayMode  = DisplayMode::Windowed;          ///< 显示模式
     int         windowWidth  = 1280;                           ///< 窗口模式下的客户区宽度（像素）
     int         windowHeight = 720;                            ///< 窗口模式下的客户区高度（像素）
     int         masterVolume = 80;                             ///< 主音量（0–100）
     int         frameRateCap = kFrameRateCapUnset;             ///< 帧率上限（Hz）；哨兵 0 = 取刷新率
+    float       exposure     = 1.0F;                           ///< HDR 色调映射曝光（T20 / ADR 0010）
 };
 
 /// 设置文件格式版本；不匹配即报错（不做静默迁移）。
@@ -35,6 +37,22 @@ inline constexpr int kSettingsSchemaVersion = 1;
 inline constexpr int kMasterVolumeMin     = 0;
 inline constexpr int kMasterVolumeMax     = 100;
 inline constexpr int kMasterVolumeDefault = 80;
+
+/// 曝光取值范围与默认值（T20 / ADR 0010 P0：色调映射的参数进配置，改值不需重编 Shader）。
+inline constexpr float kExposureMin     = 0.1F;
+inline constexpr float kExposureMax     = 8.0F;
+inline constexpr float kExposureDefault = 1.0F;
+
+/// 纯函数：把曝光钳制到 `[kExposureMin, kExposureMax]`（越界即钳制，不报错）。
+[[nodiscard]] inline float ClampExposure(float exposure) noexcept {
+    if (exposure < kExposureMin) {
+        return kExposureMin;
+    }
+    if (exposure > kExposureMax) {
+        return kExposureMax;
+    }
+    return exposure;
+}
 
 /// 纯函数：把音量钳制到 `[0, 100]`。
 [[nodiscard]] inline int ClampMasterVolume(int volume) noexcept {
@@ -96,6 +114,8 @@ inline constexpr int kMasterVolumeDefault = 80;
 ///   - `master_volume` 类型正确但越界：钳制到 `[0, 100]`（纯函数 `ClampMasterVolume`）。
 ///   - `frame_rate_cap`（T17）：**可选字段**——缺失按 `kFrameRateCapUnset`（取刷新率）处理，
 ///     以保证旧版设置文件仍能载入；存在但类型错误则报错；越界由 `ResolveFrameRateCap` 后续钳制。
+///   - `exposure`（T20）：**可选字段**——缺失按 `kExposureDefault` 处理（旧版设置文件仍能载入）；
+///     存在但类型错误则报错；越界由 `ClampExposure` 钳制到 `[kExposureMin, kExposureMax]`。
 [[nodiscard]] SystemSettings LoadSystemSettings(const std::filesystem::path& path);
 
 /// 把设置写为 TOML（UTF-8、LF）。前置条件：父目录已存在，否则抛 `std::runtime_error`。

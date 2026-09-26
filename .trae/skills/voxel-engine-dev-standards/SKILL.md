@@ -133,7 +133,7 @@ description: Enforces this voxel engine repo's architecture and coding standards
 | **可挖范围** | 由**标记区域**决定（程序化规则 + 数据文件两者结合）；区域外不可三维挖掘 | ADR 0004 |
 | **浮空与建造** | 归**物件/建造层**（EnTT 实体 + Jolt 碰撞体），**绝不写入地形场** | ADR 0004 |
 | **地形网格化** | 地表：高度场网格（LOD 方案待收敛）；可挖区域：局部等值面网格（算法待收敛） | ADR 0004 + 待收敛项 3、4 |
-| **材质与光照** | 地表**多纹理权重混合（splat）** + 方向光 + **级联阴影（CSM）**；物件用模型材质 | ADR 0004 |
+| **材质与光照** | 地表**多纹理权重混合（splat）**（权重**逐像素**算 + 分层 albedo / 法线，见 ADR 0009）；**渲染质量线按 ADR 0010 的四步顺序**：HDR + 色调映射 → 方向光 + CSM + 天空光 + 雾 → PBR + roughness/AO → MSAA 与细节法线 | ADR 0004 + ADR 0009 + ADR 0010 |
 | **物理与角色** | **Jolt**：地表 `HeightFieldShape`（分块）+ 可挖体积 `MeshShape`（分块）+ 角色 `CharacterVirtual`（胶囊） | ADR 0004 |
 | 存档 | **自定义二进制 + zstd**；只存脏数据（高度场脏列 / 脏体积 / 物件与建造 / 实体状态） | ADR 0004 |
 | 程序化生成 | **FastNoiseLite** + **分块确定性**（元素放置为纯函数，沿用网格抖动思路） | 方案 §4.2 |
@@ -220,9 +220,11 @@ description: Enforces this voxel engine repo's architecture and coding standards
 | 7 | **物理层的世界坐标精度方案**：vcpkg 的 `joltphysics` 5.6.0 未开 `JPH_DOUBLE_PRECISION`（`RVec3` = `Vec3`，单精度），与"世界定位用 `int` / `double`"的红线 6 在大坐标上冲突 | **流式加载 / 大世界任务开工前**经 ADR 收敛 | **开放**（候选：切双精度构建 / 物理本体做局部原点重定基 / 仅近场用物理） |
 | 8 | **NPC 决策模型与感知方案**（状态机 / 行为树 / 效用 / GOAP 等） | **NPC 任务开工前**经 ADR 收敛 | **开放**（占位文档：[`docs/npc-behavior.md`](../../../docs/npc-behavior.md) §2.3） |
 | 9 | **NPC 寻路与导航表示**（导航网格 / 高度场图 / 体积体素图），以及地形被挖掘后导航如何失效与重建 | **NPC 任务开工前**经 ADR 收敛 | **开放**（占位文档：同上 §2.4） |
+| 10 | **渲染质量线（[ADR 0010](../../../docs/adr/0010-render-quality-pipeline.md)）的预算重算**：HDR 离屏目标、MSAA 目标、阴影级联、多通道材质贴图的**显存与带宽** | **P0 落地后、P1 开工前**经核算并回填 §7.2 | **开放**（该项也要求在 `docs/engine-capabilities.md` 单独记账） |
 
 > 收敛范围：1~3、5 已由 ADR 0005~0008 关闭；**4 决定大视距的全部预算数字**，
-> 在它收敛前，Draw Call 与视距内存**只记录、不验收**（ADR 0008 §2）；6 属 V0.5 才落地的细节。
+> 在它收敛前，Draw Call 与视距内存**只记录、不验收**（ADR 0008 §2）；6 属 V0.5 才落地的细节；
+> 10 是 [ADR 0010](../../../docs/adr/0010-render-quality-pipeline.md) 引入质量线后**新增的记账义务**，未完成前不得宣称 VRAM 达标。
 > **到各自时限仍未收敛，即视为违规。**
 
 ### 8. 方案与方向的留档义务（缺一即未完成）

@@ -625,3 +625,33 @@
   3. **门禁**：`check-banned-identifiers.ps1 -RepoRoot .` → `scanned 81 file(s), 0 violation(s)`、`PASS`、退出码 0。
   4. **运行期冒烟**（在**前台终端**启动 `build\debug\bin\voxel_game.exe`，持续 > 11 秒仍在运行）：日志 `材质贴图已生成并上传：256×256 × 4 层，R8G8B8A8_UNORM；albedo + 法线两张，含 mip 约 2.67 MB 显存（第 0 级 1.00 MB/张）`、`地表世界就绪：… 材质表 schema_version=2 …` ⇒ 生成 → 上传 → 材质表加载 → uniform 投影全链路走通。（首轮曾触发 SDL 断言 `GenerateMipmaps texture must be created with SAMPLER and COLOR_TARGET usage flags`，给纹理补 `COLOR_TARGET` 用途位后通过；另：用 `Start-Process` 分离方式启动时进程约 3 秒后自行退出、且无任何日志输出，属该启动方式下的环境现象，前台终端启动无此问题。）
 - 下一步 / 遗留：① **目视未验收**：本环境无截图能力，"棱角色带是否真的收窄、法线立体感是否可见"须**人工目视**（看测试地图的陡坡与地标塔一带）。② **主角外观变化**：顶点不再有材质通道，主角与地表共用同一片元材质，**不再是固定沙色**；若要恢复固定外观须另开"每 draw 材质覆盖"（超出本任务范围）。③ **纹理层号口径未对齐**：`materials.toml` 注释与 `references/meshing-and-render.md` §3 都声明"`index = 0` 保留给缺失纹理"，但实现是 `textureIndex = texture_layer - 1` 落在 **4 层**数组上（0 号层实际是草）——要么数组补 1 层占位、要么改口径，**须经确认后再动**。④ 真美术 PBR 贴图替换占位图、triplanar / RVT 均未做（ADR 0009 已列切换条件）。⑤ 本批改动**尚未提交**。
+
+## 2026-09-26  渲染质量线立项 + P0 落地：HDR / 色调映射 / sRGB 编码；F1 面板补性能开销
+
+- 做了什么：
+  1. **新增 [ADR 0010](adr/0010-render-quality-pipeline.md)**：人工反馈"地表材质像 20 年前的游戏"，诊断后定案「**HDR + 色调映射 → 光照与阴影 → PBR → MSAA 与细节**」四阶段质量线（P0~P3），并明确**顺序不得跳步**。该线属 SKILL 第五节"纯增强"范畴，**由项目所有者于本日明确追加授权**，已在 ADR、阶段计划与 `docs/game-design.md`（G11）三处留档。
+  2. **T24 · F1 面板性能开销数据**：`engine/render/mesh_renderer.hpp` 新增通用 `RenderStats`（`drawCalls` / `triangleCount` / `vertexCount` / `textureBytes`）与纯函数 `EstimateTextureArrayBytes`（含完整 mip 链的 4/3 估算），显存在纹理 / 目标创建与释放时增减；`game/debug_overlay.*` 与 `game/ui_text.hpp` 新增展示行（14 个中英标签，仍全部经标签缝）；`game/main.cpp` 用核心单调时钟分相测**逻辑步 / UI 构建 / 渲染提交**三段 CPU 耗时。**GPU pass 时间不做假**：SDL3_gpu 无时间戳查询 API，面板显式显示"不可用（SDL3_gpu 无时间戳查询）"。
+  3. **T20 · P0 HDR 管线**：主通道颜色目标由交换链格式改为 **`R16G16B16A16_FLOAT` 离屏目标**（`COLOR_TARGET | SAMPLER`，随窗口尺寸重建，深度目标沿用）；新增全屏三角形 `assets/shaders/tonemap.vert|.frag`（**曝光 → ACES 近似（Narkowicz）→ 分段精确 sRGB 编码**）写入交换链；`assets/shaders/mesh.frag` 改为**线性空间**着色（albedo 与 `tint` 均转线性、光照常量从 sRGB 口径的 `0.35 + 0.65·diffuse` 改为线性口径的 `0.10 + 1.00·diffuse`）；曝光进 `engine/platform/settings.*`（**可选字段**，缺失取默认 1.0、类型错误报错、越界钳制 `[0.1, 8.0]`，`schema_version` 保持 1 以免破坏既有设置文件）；`game/CMakeLists.txt` 注册 `add_shader`。**叠加层（ImGui）仍在色调映射之后写交换链**，面板不被色调映射处理。
+  4. **文档同步**（按 SKILL 同步清单）：ADR 索引、`tech-plan-v2.0.md` §4.3/§4.4/§4.5/§7.2、`references/meshing-and-render.md` §3/§4、SKILL 唯一口径表"材质与光照"行、`engine-capabilities.md`（先登记后实现）、`ui-inventory.md`（§2.2 展示项 + §3 设置项）、`game-design.md` G11、阶段计划 T20~T24；并**新增待收敛项 10**（质量线的显存与带宽重算）。
+- 为什么：诊断表明差距主体**不在贴图分辨率，而在光照、色彩与抗锯齿**——全仓库检索 `sRGB` / `gamma` / `tonemap` / `exposure` 曾**零命中**，即完全没有 HDR 与色调映射环节，亮部一过 1.0 就死白截断、暗部没有环境色；叠加只有 Lambert 漫反射、单频程序贴图与 `sample_count = 1`（无抗锯齿）。因此**先把 P0 做掉**：没有 HDR 与色调映射，后续阴影与 PBR 的高光收益会被亮部截断直接吃掉。同时按 ADR 0010 的要求**先补可观测性（T24）**——每一步都在"变好看"的同时增加开销，没有开销数字就无法判断收益与代价，也无法履行 §7.2 的预算记账义务。**明确否定一条错路**：单纯加密网格（1 格 → 1/4 格）只会把色带变窄并抬高开销，不会产生"圆润"。
+- 验证：
+  1. **构建**：`cmake --build --preset debug` → 退出码 0，**零错误零警告**（`/W4` + 警告即错误）。
+  2. **双格式 Shader 产物**：`build\debug\assets\shaders\` 下 `mesh.*`（4）、`tonemap.vert/.frag`（4）、`triangle.*`（4）齐全 —— 新增的 tonemap **SPIR-V 与 DXIL 都有**（ADR 0002）。
+  3. **测试**：`ctest --preset debug` → **116/116 passed**（原 113 + 新增 3：`RenderStats.MipChainEstimateFollowsFourThirdsRule`、`SystemSettings.ClampExposurePureFunction`、`SystemSettings.ExposureClampedOnLoadAndRoundTrips`）。
+  4. **门禁**：`check-banned-identifiers.ps1 -RepoRoot .` → `scanned 82 file(s), 0 violation(s)`、`PASS`、退出码 0。
+  5. **运行期冒烟**：前台启动 `build\debug\bin\voxel_game.exe`，持续 **> 12 秒仍在运行**；日志 `已加载设置：… 帧率上限=360 Hz，曝光=1.00`、`材质贴图已生成并上传…`、`地表世界就绪：… 材质表 schema_version=2 …`；**无 SDL 断言、无 ERROR / WARN 行**（纹理用途位、采样器绑定、管线格式一次性通过）。
+  6. 本批改动文件逐字节校验：**纯 LF、无 BOM**。
+- 下一步 / 遗留：① **观感待人工目视验收**（SKILL 第七节）：本环境无截图能力，须人看**测试地图的陡坡与地标塔一带**——期望"无死白截断、暗部有层次、颜色不发灰"，以及 F1 面板的新数字（Draw Call 应约等于 tile 数、纹理显存应约 2.67 MB + HDR 目标 + 深度）。**色调映射落地后既有颜色常量需要重新校准**（`tint` / 清屏色 / UI 主题对比度），本轮只做了必要的线性化，**最终校准留到 P1 有天空光之后**。② **待收敛项 10 已转为"必须核算"**：P0 已落地，核清显存与带宽并回填方案 §7.2 前**不得开工 P1**。③ 后续阶段：**P1**（方向光 + CSM + 半球天空光 + 指数高度雾）→ **P2**（PBR 四件套 + 多尺度贴图）→ **P3**（MSAA + 多频细节法线）。④ 本轮已知未做：**光照参数仍未进配置文件**（方向光仍写死在 `mesh.frag`，P1 随 `assets/config/lighting.toml` 一并处理）；ESC 面板暂无曝光控件（已登记在 `ui-inventory.md` §3）。⑤ 本批改动**尚未提交**。
+
+## 2026-09-26  P0 缺陷 B5：色调映射通道把画面上下翻转 —— 根因是 SDL_gpu 的两套 Y 方向
+
+- 做了什么：修 `assets/shaders/tonemap.vert` 的全屏三角形 UV ⇒ `v_uv = vec2(position.x * 0.5 + 0.5, 0.5 - position.y * 0.5)`；在**三处**留档防复发：着色器注释、`references/meshing-and-render.md` §4 新增硬规则（"全屏后处理通道的 UV 必须翻转 V"）、`docs/learning-notes.md` 新增「SDL_gpu 的坐标约定」条；阶段计划登记为 **B5**。
+- 为什么：人工实测第 4 轮报"**视角不对，之前是对的**"。定位过程与结论：
+  1. **先排除相机路径**：`git diff` 显示本轮 `game/main.cpp` 只加了相位计时器与清屏色线性化，**没有触碰**相机 / 投影 / 视口 / 输入的任何代码；`engine/render/camera.*` 本轮零改动。⇒ 不是"相机算错了"。
+  2. 本轮唯一新增的**全屏几何**是 P0 的色调映射通道，其 `tonemap.vert` 的 `v_uv = position * 0.5 + 0.5` 是**凭直觉**写的（未查约定）。
+  3. 查本机权威依据 —— `build/debug/vcpkg_installed/x64-windows/include/SDL3/SDL_gpu.h` §Coordinate System：
+     **NDC** = "左下角 `(-1,-1)`、右上角 `(1,1)`"（**+Y 向上**）；**纹理坐标** = "左上角 `(0,0)`、右下角 `(1,1)`"（**+Y 向下**）；后端差异（如 Vulkan 的 NDC 是 +Y 向下）**由 SDL 自动转换**，明令不要自行翻转。
+     ⇒ 屏幕**上方**（NDC `y=+1`）映射到 `v_uv.y = 1`，而 `v=1` 是图像的**底部** ⇒ **整帧垂直翻转**。
+  4. **症状为何是"UI 正常、世界倒置"**：ImGui 叠加层是在色调映射**之后**、直接以交换链为目标的，不受该 UV 影响 —— 这正好解释了"面板看着正常、世界却不对"的不对称现象。
+- 验证：`cmake --build --preset debug` → 退出码 0，`tonemap.vert` 重新产出 **SPIR-V 与 DXIL 两份**产物；前台启动冒烟 **> 9 秒**运行正常、无 SDL 断言、无 ERROR / WARN；`ctest --preset debug` → **116/116**（本缺陷属着色器 UV 约定，**无法用单测覆盖**，故改为"规则 + 注释"防复发，并把目视确认列为下一步）。
+- 下一步 / 遗留：① **待人工目视确认**：世界不再上下倒置（看**天际线与地标塔/深坑的相对上下位置**：天空应在上方、坑应在下方）。② 本次教训已固化为 `references/meshing-and-render.md` §4 的硬规则（全屏后处理必须翻转 V），后续 P1 的阴影、P3 的 MSAA resolve 等任何新通道**都必须照此写**。③ B5 是 P0 的连带缺陷，**T20 的观感验收仍待人工完成**。④ 本批改动**尚未提交**。

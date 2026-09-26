@@ -74,6 +74,29 @@ struct TextureArrayDesc {
 /// 当前片元块 = 渲染原点（`vec4`）+ 4 层 × 3 个 `vec4` = 208 字节；留余量给后续参数。
 inline constexpr std::size_t kMaxMaterialUniformBytes = 512;
 
+/// 一帧渲染的开销统计（**通用**：不含任何世界 / 地形语义，供调试设施只读展示）。
+///
+/// 每帧 `RenderFrame` 开始时把 `drawCalls` / `triangleCount` / `vertexCount` 清零，
+/// 并按**实际执行**的索引绘制调用累加。`textureBytes` 是引擎当前持有的 GPU 纹理字节总量
+/// （显存记账，ADR 0010 的强制义务）：随纹理 / 目标的创建与释放增减，不随帧变化。
+struct RenderStats {
+    std::uint32_t drawCalls     = 0;  ///< 本帧实际执行的索引绘制调用次数
+    std::uint64_t triangleCount = 0;  ///< 本帧实际绘制的三角形数（Σ `indexCount / 3`）
+    std::uint64_t vertexCount   = 0;  ///< 本帧实际绘制的顶点数（Σ `vertexCount`）
+    std::uint64_t textureBytes  = 0;  ///< 当前持有的纹理显存字节总量（含 mip 链）
+};
+
+/// 纯函数：纹理数组（`R8G8B8A8_UNORM`，4 字节 / 像素）的显存估算，**含完整 mip 链**。
+///
+/// mip 链各级面积之和收敛到第 0 级的 4/3（几何级数），故取
+/// `4/3 × width × height × 4 × layerCount`。独立成纯函数以便单测：不读全局、不分配。
+[[nodiscard]] inline std::uint64_t EstimateTextureArrayBytes(std::uint32_t width, std::uint32_t height,
+                                                             std::uint32_t layerCount) noexcept {
+    const std::uint64_t base = static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height) * 4ULL *
+                               static_cast<std::uint64_t>(layerCount);
+    return base * 4ULL / 3ULL;
+}
+
 /// 帧末叠加层：与 3D 主通道**共用同一个命令缓冲**，在提交前绘制覆盖内容（调试面板等 UI）。
 ///
 /// 为什么需要这个钩子：交换链纹理只能在**获取它的那个命令缓冲**里引用，跨命令缓冲再获取一次会重复呈现；
@@ -162,7 +185,22 @@ public:
     /// 设置本帧相机常量；下一次 `RenderFrame` 生效。
     void SetCamera(const CameraView& camera) noexcept;
 
-    /// 渲染一帧：清屏（颜色 + 深度）→ 绑定相机常量 → 依次索引绘制 → 可选的叠加层。
+    /// 设置色调映射的曝光系数；下一次 `RenderFrame` 生效。
+    ///
+    /// 取值来自配置文件（`platform/settings.hpp` 的 `exposure`，已在载入时钳制），
+    /// 引擎不在此解释语义（ADR 0010：参数进配置，改值不需重编 Shader）。
+    void SetExposure(float exposure) noexcept { m_exposure = exposure; }
+
+    /// 只读：渲染开销统计与纹理显存记账（见 `RenderStats`）。
+    ///
+    /// 其中绘制统计为**最近一次** `RenderFrame` 的实测值；纹理字节为当前总量。
+    [[nodiscard]] const RenderStats& Stats() const noexcept { return m_stats; }
+
+    /// 渲染一帧：网格渲到离屏 HDR 目标 → 色调映射到交换链 → 可选的叠加层。
+    ///
+    /// 顺序（ADR 0010 的 P0）：主通道写 `R16G16B16A16_FLOAT` HDR 颜色目标（+ 深度），
+    /// 随后全屏三角形做「曝光 + ACES 近似 + sRGB 编码」输出到交换链；叠加层最后以交换链为目标绘制，
+    /// **不**被色调映射处理。
     ///
     /// `meshes` 中被跳过的情况：指针为空、句柄无效、或该槽位已释放。
     /// 返回 false 表示本帧拿不到交换链纹理（如窗口最小化），调用方可直接跳过。
@@ -180,12 +218,18 @@ private:
     /// 保证深度目标与当前交换链尺寸一致（尺寸变化时重建）。
     void EnsureDepthTarget(std::uint32_t width, std::uint32_t height);
 
+    /// 保证离屏 HDR 颜色目标（`R16G16B16A16_FLOAT`）与当前交换链尺寸一致（尺寸变化时重建）。
+    void EnsureHdrTarget(std::uint32_t width, std::uint32_t height);
+
     /// 把 `m_cameraUniform` 传到相机常量的 GPU 缓冲。
     void UploadCameraUniform(SDL_GPUCommandBuffer* commandBuffer);
 
     SDL_GPUDevice*           m_device   = nullptr;
     SDL_Window*              m_window   = nullptr;
     SDL_GPUGraphicsPipeline* m_pipeline = nullptr;
+
+    /// 色调映射管线：全屏三角形，HDR 颜色目标 → 交换链（无深度、不剔除）。
+    SDL_GPUGraphicsPipeline* m_tonemapPipeline = nullptr;
 
     SDL_GPUBuffer*         m_cameraUniformBuffer  = nullptr;
     SDL_GPUTransferBuffer* m_cameraTransferBuffer = nullptr;
@@ -194,6 +238,22 @@ private:
     SDL_GPUTexture* m_depthTexture = nullptr;
     std::uint32_t   m_depthWidth   = 0;
     std::uint32_t   m_depthHeight  = 0;
+    std::uint64_t   m_depthBytes   = 0;  ///< 深度目标的显存记账（字节）
+
+    /// 离屏 HDR 颜色目标（主通道写入、色调映射通道采样）。
+    SDL_GPUTexture* m_hdrTexture = nullptr;
+    std::uint32_t   m_hdrWidth   = 0;
+    std::uint32_t   m_hdrHeight  = 0;
+    std::uint64_t   m_hdrBytes   = 0;  ///< HDR 目标的显存记账（字节）
+
+    /// 色调映射采样 HDR 目标用的采样器（clamp 寻址 + 线性过滤，单级）。
+    SDL_GPUSampler* m_hdrSampler = nullptr;
+
+    /// 曝光系数（由 `SetExposure` 写入，随色调映射 uniform 上传）。
+    float m_exposure = 1.0F;
+
+    /// 渲染开销统计与显存记账（`Stats()` 暴露）。
+    RenderStats m_stats {};
 
     std::vector<MeshResources> m_meshes;
     std::vector<std::uint32_t> m_freeSlots;
@@ -204,6 +264,7 @@ private:
     SDL_GPUSampler* m_layerSampler = nullptr;
 
     std::vector<SDL_GPUTexture*> m_textureArrays;
+    std::vector<std::uint64_t>   m_textureArrayBytes;  ///< 与 `m_textureArrays` 同槽位：每张纹理的记账字节
     std::vector<std::uint32_t>   m_freeTextureSlots;
     TextureArrayHandle           m_albedoTexture;
     TextureArrayHandle           m_normalTexture;

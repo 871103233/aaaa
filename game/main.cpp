@@ -103,6 +103,24 @@ struct MoveCommand {
     bool  jump     = false; ///< 本帧是否请求起跳
 };
 
+/// T24：CPU 相位计时器（复用核心层单调时钟，红线：不用 `system_clock`）。
+/// 用法：`Begin()` → 相位工作 → `EndMs()` 得到本相位毫秒数；内部两次 `Tick()`，首值丢弃。
+class PhaseTimer {
+public:
+    void Begin() noexcept { (void)m_clock.Tick(); }
+    [[nodiscard]] double EndMs() noexcept { return m_clock.Tick() * 1000.0; }
+
+private:
+    vx::Clock m_clock;
+};
+
+/// T24：上一帧的 CPU 时间分解（毫秒），供 F1 面板显示。
+struct CpuFrameCost {
+    double logicMs  = 0.0;  ///< 固定步循环（物理 + 相机）
+    double uiMs     = 0.0;  ///< ImGui 帧开始 + 面板构建
+    double renderMs = 0.0;  ///< 渲染提交（`RenderFrame` 及其内部上传）
+};
+
 /// 定位构建期产出的 Shader 目录：可执行文件在 <build>/bin/，Shader 在 <build>/assets/shaders/。
 [[nodiscard]] std::filesystem::path ResolveShaderDir(const char* argv0) {
     const std::filesystem::path exeDir = std::filesystem::path(argv0).parent_path();
@@ -319,10 +337,10 @@ int main(int argc, char** argv) {
         const int displayRefreshRate = window.DisplayRefreshRate();
         systemSettings.frameRateCap = vx::ResolveFrameRateCap(systemSettings.frameRateCap, displayRefreshRate);
 
-        VX_LOG_INFO("已加载设置：显示模式=%s，分辨率=%d x %d，主音量=%d，帧率上限=%d Hz",
+        VX_LOG_INFO("已加载设置：显示模式=%s，分辨率=%d x %d，主音量=%d，帧率上限=%d Hz，曝光=%.2f",
                     (systemSettings.displayMode == vx::DisplayMode::Fullscreen) ? "fullscreen" : "windowed",
                     systemSettings.windowWidth, systemSettings.windowHeight, systemSettings.masterVolume,
-                    systemSettings.frameRateCap);
+                    systemSettings.frameRateCap, static_cast<double>(systemSettings.exposure));
         VX_LOG_INFO("显示器刷新率：%d Hz（未知时回退 %d Hz）", displayRefreshRate, vx::kFallbackRefreshRate);
 
         // 应用设置：窗口模式恢复客户区尺寸；全屏走桌面无边框全屏。
@@ -390,6 +408,9 @@ int main(int argc, char** argv) {
                     vx::kOutOfBoundsMargin);
 
         vx::MeshRenderer renderer(window.device(), window.handle(), shaderDir);
+
+        // T20 / ADR 0010：把配置里的曝光交给色调映射通道（参数进配置，改值不需重编 Shader）。
+        renderer.SetExposure(systemSettings.exposure);
 
         // T19 / ADR 0009：程序生成的占位材质贴图（albedo 细节 + 由高度噪声梯度得到的法线），
         // 上传为两个 2D 纹理数组（各 4 层），供片元着色器逐像素混合。无二进制资产、种子确定性。
@@ -527,7 +548,18 @@ int main(int argc, char** argv) {
 
         vx::Clock                clock;
         vx::FixedStepAccumulator accumulator(vx::kFixedDt);
-        const SDL_FColor         clearColor { 0.45F, 0.62F, 0.85F, 1.0F };
+
+        // T20 / ADR 0010：主通道写 HDR 目标，清屏色须按**线性光**给出（色调映射通道最后编码到 sRGB）。
+        // 作者色 (0.45, 0.62, 0.85) 按 sRGB 观感给出，转线性用 pow(c, 2.2)；渲染层不解释颜色语义。
+        const SDL_FColor clearColor { static_cast<float>(std::pow(0.45, 2.2)),
+                                      static_cast<float>(std::pow(0.62, 2.2)),
+                                      static_cast<float>(std::pow(0.85, 2.2)), 1.0F };
+
+        // T24：CPU 帧时间分解的相位计时器（逻辑步 / UI 构建 / 渲染提交）。
+        PhaseTimer   logicTimer;
+        PhaseTimer   uiTimer;
+        PhaseTimer   renderTimer;
+        CpuFrameCost cpuCost;  // 上一帧的值（面板早于本帧渲染构建，与 frameSeconds 同源）
 
         // T14：鼠标捕获（相对模式）状态。game 只持有**意图**，SDL 的真实状态由平台层维护
         // （窗口失焦时平台层会自动释放，见 `Window::pump_events`）。启动即捕获，玩家一进游戏就能转视角。
@@ -604,8 +636,11 @@ int main(int argc, char** argv) {
 
             // 起 ImGui 帧（任一面板可见时）：必须先于读取捕获标志，且早于玩法输入处理。
             // 捕获期间让 ImGui 忽略鼠标（相对模式坐标无意义），避免误判悬停而抑制视角。
+            // T24：ImGui 帧开销计入 UI 构建耗时（NewFrame 与面板构建是两段，累加）。
+            uiTimer.Begin();
             debugOverlay.SetGameplayMouseCaptured(mouseCaptured);
             debugOverlay.BeginFrame();
+            double uiMs = uiTimer.EndMs();
 
             // T15：玩法输入抑制——面板打开或 ImGui 想接管鼠标 / 键盘时，吞掉对应类别，
             // 使"点按钮"不会挖地、"拖音量"不会转相机。决策为纯函数（见 `gameplay_input.hpp`）。
@@ -688,6 +723,8 @@ int main(int argc, char** argv) {
                 command.flySpeed = input.Held(vx::ActionId::Sprint) ? (kFlySpeed * 2.0F) : kFlySpeed;
             }
 
+            // T24：逻辑步相位（固定步循环：物理 + 相机 + 出界检查）。
+            logicTimer.Begin();
             const vx::StepPlan plan = accumulator.Advance(clock.Tick());
             for (int step = 0; step < plan.steps; ++step) {
                 StepCharacter(physics, character, camera, command, flying);
@@ -711,6 +748,7 @@ int main(int argc, char** argv) {
             if (plan.steps > 0) {
                 jumpRequested = false;
             }
+            const double logicMs = logicTimer.EndMs();
 
             if (digRequested || pileRequested) {
                 lastDirtyTiles = ApplyBrush(world, terrainCollision, renderer, tileCoords, tileHandles,
@@ -781,8 +819,23 @@ int main(int argc, char** argv) {
             stats.lastDirtyTileCount = lastDirtyTiles;
             stats.tileBodyCount     = terrainCollision.TileBodyCount();
             stats.physicsReady      = true;
+
+            // T24：渲染开销取自引擎的通用统计；绘制数为**最近一次** RenderFrame（面板早于本帧渲染）。
+            const vx::RenderStats& renderStats = renderer.Stats();
+            stats.drawCalls     = renderStats.drawCalls;
+            stats.triangleCount = renderStats.triangleCount;
+            stats.vertexCount   = renderStats.vertexCount;
+            stats.textureBytes  = renderStats.textureBytes;
+            // T24：CPU 分解用**上一帧**的实测值（本帧渲染尚未提交，与 frameSeconds 同源）。
+            stats.cpuLogicMs  = cpuCost.logicMs;
+            stats.cpuUiMs     = cpuCost.uiMs;
+            stats.cpuRenderMs = cpuCost.renderMs;
+
+            // T24：面板构建（含 ImGui::Render）计入 UI 构建耗时。
+            uiTimer.Begin();
             debugOverlay.BuildUI(stats, panelContext);
             debugOverlay.EndFrame();
+            uiMs += uiTimer.EndMs();
 
             // T15：把系统面板的改动落到平台层（"控件标签即行为契约"：全屏真的切、分辨率真的改、音量真的接增益路径）。
             bool windowGeometryChanged = false;
@@ -831,9 +884,13 @@ int main(int argc, char** argv) {
             renderer.SetMaterialUniform(&materialUniform, sizeof(materialUniform));
 
             renderer.SetCamera(RelativeCameraView(view, renderOrigin));
+            // T24：渲染提交相位（RenderFrame 内含相机常量与动态顶点等内部上传）。
+            renderTimer.Begin();
             if (!renderer.RenderFrame(tileHandles.data(), tileHandles.size(), clearColor, &debugOverlay)) {
                 VX_LOG_DEBUG("本帧未取得交换链纹理（窗口最小化？），跳过渲染");
             }
+            const double renderMs = renderTimer.EndMs();
+            cpuCost = CpuFrameCost { logicMs, uiMs, renderMs };  // 供下一帧面板显示
 
             // T17：帧末补睡到目标间隔，限制帧率。垂直同步档 `TargetFps() == 0`，本调用立即返回。
             // 只用睡眠、绝不忙等（见 FrameLimiter 注释）。

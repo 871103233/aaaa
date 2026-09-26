@@ -9,6 +9,7 @@
 
 namespace {
 
+using vx::ClampExposure;
 using vx::ClampFrameRateCap;
 using vx::ClampMasterVolume;
 using vx::DisplayMode;
@@ -211,4 +212,48 @@ TEST(SystemSettings, ResolveFrameRateCapClampsStoredValue) {
     EXPECT_EQ(ResolveFrameRateCap(240, 144), 144);  // 换到低刷新率显示器 → 重新钳制
     EXPECT_EQ(ResolveFrameRateCap(30, 144), 60);
     EXPECT_EQ(ResolveFrameRateCap(90, 144), 90);  // 合法值保持
+}
+
+// T20 ①（纯函数）：曝光钳制到 [0.1, 8.0]。
+TEST(SystemSettings, ClampExposurePureFunction) {
+    EXPECT_FLOAT_EQ(ClampExposure(0.0F), vx::kExposureMin);
+    EXPECT_FLOAT_EQ(ClampExposure(-3.0F), vx::kExposureMin);
+    EXPECT_FLOAT_EQ(ClampExposure(vx::kExposureMin), vx::kExposureMin);
+    EXPECT_FLOAT_EQ(ClampExposure(1.0F), 1.0F);
+    EXPECT_FLOAT_EQ(ClampExposure(2.5F), 2.5F);
+    EXPECT_FLOAT_EQ(ClampExposure(vx::kExposureMax), vx::kExposureMax);
+    EXPECT_FLOAT_EQ(ClampExposure(100.0F), vx::kExposureMax);
+}
+
+// T20 ②：曝光——越界载入钳制、字段缺失用默认（旧设置文件兼容）、写入后往返一致。
+TEST(SystemSettings, ExposureClampedOnLoadAndRoundTrips) {
+    const std::filesystem::path path = TempPath("vx_settings_exposure.toml");
+
+    // 越界 → 载入时钳制到上界（不因用户手改出界而拒绝启动）。
+    WriteText(path,
+              "schema_version = 1\n"
+              "display_mode = \"windowed\"\n"
+              "window_width = 1280\n"
+              "window_height = 720\n"
+              "master_volume = 80\n"
+              "exposure = 20.0\n");
+    EXPECT_FLOAT_EQ(LoadSystemSettings(path).exposure, vx::kExposureMax);
+
+    // 字段缺失 → 默认值（旧版设置文件仍能载入）。
+    RemoveQuietly(path);
+    WriteText(path,
+              "schema_version = 1\n"
+              "display_mode = \"windowed\"\n"
+              "window_width = 1280\n"
+              "window_height = 720\n"
+              "master_volume = 80\n");
+    EXPECT_FLOAT_EQ(LoadSystemSettings(path).exposure, vx::kExposureDefault);
+
+    // 往返：写 2.5 → 读 2.5。
+    SystemSettings written;
+    written.exposure = 2.5F;
+    SaveSystemSettings(path, written);
+    EXPECT_FLOAT_EQ(LoadSystemSettings(path).exposure, 2.5F);
+
+    RemoveQuietly(path);
 }
