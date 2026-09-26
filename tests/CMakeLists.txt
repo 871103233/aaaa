@@ -20,12 +20,14 @@ add_executable(voxel_tests
     frame_limiter_test.cpp
     gameplay_input_test.cpp
     input_map_test.cpp
+    lighting_table_test.cpp
     map_preset_test.cpp
     mouse_capture_test.cpp
     system_settings_test.cpp
     physics_test.cpp
     render_camera_test.cpp
     render_stats_test.cpp
+    shadow_cascade_test.cpp
     terrain_brush_hold_test.cpp
     terrain_brush_test.cpp
     terrain_material_test.cpp

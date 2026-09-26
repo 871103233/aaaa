@@ -111,6 +111,11 @@ SystemSettings LoadSystemSettings(const std::filesystem::path& path) {
     if (document.contains("exposure")) {
         settings.exposure = ClampExposure(static_cast<float>(ReadDouble(document, path, "exposure")));
     }
+    // MSAA 档位（T23）：**可选字段**——旧版设置文件没有它，缺失即保持默认 4×；存在但不是整数则报错；
+    // 数值越界按 `ClampMsaaSampleCount` 钳制到最近的合法档 {1, 2, 4, 8}（见头文件契约）。
+    if (document.contains("msaa_samples")) {
+        settings.msaaSamples = ClampMsaaSampleCount(static_cast<int>(ReadInt(document, path, "msaa_samples")));
+    }
     return settings;
 }
 
@@ -126,6 +131,9 @@ void SaveSystemSettings(const std::filesystem::path& path, const SystemSettings&
     (void)document.insert_or_assign("frame_rate_cap", static_cast<std::int64_t>(settings.frameRateCap));
     // 曝光同样写钳制后的值（T20；改值不需重编 Shader）。
     (void)document.insert_or_assign("exposure", static_cast<double>(ClampExposure(settings.exposure)));
+    // MSAA 档位写钳制后的合法档（T23）。
+    (void)document.insert_or_assign("msaa_samples",
+                                    static_cast<std::int64_t>(ClampMsaaSampleCount(settings.msaaSamples)));
 
     // binary 模式：禁止运行库做 CRLF 转换，保证落盘为纯 LF（仓库行尾约定）。
     std::ofstream out(path, std::ios::binary | std::ios::trunc);

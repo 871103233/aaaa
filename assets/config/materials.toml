@@ -1,9 +1,10 @@
-# 地表材质表（splat 权重混合 + 分层贴图）
+# 地表材质表（splat 权重混合 + 分层贴图 + PBR 四件套）
 #
 # 依据：docs/adr/0004-hybrid-layered-world-representation.md（地表材质 = 多纹理权重混合）、
 #       docs/adr/0005-config-parsing.md（TOML + toml++，启动期一次性加载）、
 #       docs/adr/0008-sizes-precision-budget.md（高度范围 0~512 格）、
-#       docs/adr/0009-terrain-material-pipeline.md（权重逐像素算 + 分层 albedo/法线贴图）。
+#       docs/adr/0009-terrain-material-pipeline.md（权重逐像素算 + 分层 albedo/法线贴图）、
+#       docs/adr/0010-render-quality-pipeline.md（P2：PBR + 材质四件套 albedo/normal/roughness/AO + 宏观变化）。
 #
 # 权威解释在代码：字段语义与权重模型见 world/terrain/material_table.hpp 与
 # world/terrain/material_blender.hpp。本文件只提供数值。
@@ -17,17 +18,26 @@
 #   因此不再受 1 格顶点间距限制（ADR 0009：边界窄带化）。
 #
 # 本表是 CPU 与 GPU 的**唯一事实来源**：这些数值由 BuildMaterialUniform 打包成
-# 片元着色器的 std140 uniform 块（高度带 / 坡度带 / uv_scale / tint 全部来自这里），
-# 禁止在着色器里另写一份。
+# 片元着色器的 std140 uniform 块（高度带 / 坡度带 / uv_scale / tint / roughness / ao /
+# 宏观变化参数全部来自这里），禁止在着色器里另写一份。
 #
 # 约束（加载时校验，违反即中止启动）：
 #   - 槽位数量必须等于纹理数组层数（4）；
 #   - texture_layer ∈ [1, 255]：0 号层保留给"缺失纹理"占位；
 #   - 0 ≤ slope_min ≤ slope_max ≤ 1（坡度为 1 - normal.y）；
 #   - *_blend ≥ 0；height_min ≤ height_max；
-#   - uv_scale > 0；tint_r/tint_g/tint_b ∈ [0, 1]。
+#   - uv_scale > 0；tint_r/tint_g/tint_b ∈ [0, 1]；
+#   - roughness ∈ [0, 1]：PBR 粗糙度（0 = 镜面、1 = 完全漫反射）。地表为**电介质**，不引入
+#     metallic（保持范围最小化）；最终粗糙度 = 本值 × 粗糙度贴图的 ±20% 逐像素变化，
+#     并在着色器中钳到下限 0.045（避免 GGX 的 alpha → 0 除零）；
+#   - ao ∈ [0, 1]：环境光遮蔽系数，**只作用于天空光 / 半球光**（不作用于直接光，避免压黑受光面）；
+#     最终环境项系数 = 本值 × AO 贴图（逐像素）；
+#   - macro_uv_scale > 0：宏观变化贴图的 UV 尺度（世界格 → 贴图 UV 的重复次数）。
+#     必须**显著小于** uv_scale（约 1/5 ~ 1/6），使宏观变化以远大于基础贴图的尺度起伏，
+#     用于打破 10 格量级的平铺重复感；
+#   - macro_strength ∈ [0, 1]：宏观调制强度（乘在 albedo 与 roughness 上，围绕 1 上下浮动）。
 
-schema_version = 2
+schema_version = 3
 
 # 槽位 0：草 —— 低海拔、缓坡；细密叶丛
 [[layer]]
@@ -43,6 +53,10 @@ uv_scale     = 0.12
 tint_r       = 0.31
 tint_g       = 0.55
 tint_b       = 0.24
+roughness    = 0.90
+ao           = 0.85
+macro_uv_scale = 0.020
+macro_strength = 0.35
 
 # 槽位 1：土 —— 中低海拔、中坡的过渡材质
 [[layer]]
@@ -58,8 +72,12 @@ uv_scale     = 0.10
 tint_r       = 0.45
 tint_g       = 0.33
 tint_b       = 0.21
+roughness    = 0.88
+ao           = 0.75
+macro_uv_scale = 0.015
+macro_strength = 0.40
 
-# 槽位 2：岩 —— 高海拔或陡坡；粗糙开裂
+# 槽位 2：岩 —— 高海拔或陡坡；粗糙开裂。粗糙度最低 ⇒ 在镜面方向产生**可分辨的方向性高光**
 [[layer]]
 name         = "rock"
 texture_layer = 3
@@ -73,6 +91,10 @@ uv_scale     = 0.16
 tint_r       = 0.55
 tint_g       = 0.55
 tint_b       = 0.56
+roughness    = 0.40
+ao           = 0.70
+macro_uv_scale = 0.030
+macro_strength = 0.30
 
 # 槽位 3：沙 —— 低洼滩地；细颗粒
 [[layer]]
@@ -88,3 +110,7 @@ uv_scale     = 0.18
 tint_r       = 0.83
 tint_g       = 0.74
 tint_b       = 0.48
+roughness    = 0.95
+ao           = 0.90
+macro_uv_scale = 0.025
+macro_strength = 0.25

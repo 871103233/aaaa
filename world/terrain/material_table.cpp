@@ -64,6 +64,18 @@ void ValidateLayer(const MaterialLayer& layer, const std::filesystem::path& path
             throw std::runtime_error(Describe(path, slot, "tint_r/tint_g/tint_b") + "必须落在 [0, 1]");
         }
     }
+    if (layer.roughness < 0.0F || layer.roughness > 1.0F) {
+        throw std::runtime_error(Describe(path, slot, "roughness") + "必须落在 [0, 1]");
+    }
+    if (layer.ao < 0.0F || layer.ao > 1.0F) {
+        throw std::runtime_error(Describe(path, slot, "ao") + "必须落在 [0, 1]");
+    }
+    if (!(layer.macroUvScale > 0.0F)) {
+        throw std::runtime_error(Describe(path, slot, "macro_uv_scale") + "必须大于 0");
+    }
+    if (layer.macroStrength < 0.0F || layer.macroStrength > 1.0F) {
+        throw std::runtime_error(Describe(path, slot, "macro_strength") + "必须落在 [0, 1]");
+    }
 }
 
 }  // namespace
@@ -116,6 +128,10 @@ TerrainMaterialTable TerrainMaterialTable::LoadFromFile(const std::filesystem::p
         parsed.tintR       = ReadFloat(*layer, path, slot, "tint_r");
         parsed.tintG       = ReadFloat(*layer, path, slot, "tint_g");
         parsed.tintB       = ReadFloat(*layer, path, slot, "tint_b");
+        parsed.roughness     = ReadFloat(*layer, path, slot, "roughness");
+        parsed.ao            = ReadFloat(*layer, path, slot, "ao");
+        parsed.macroUvScale  = ReadFloat(*layer, path, slot, "macro_uv_scale");
+        parsed.macroStrength = ReadFloat(*layer, path, slot, "macro_strength");
 
         ValidateLayer(parsed, path, slot);
         table.m_layers[slot] = std::move(parsed);
@@ -128,15 +144,16 @@ TerrainMaterialTable TerrainMaterialTable::Default() {
     TerrainMaterialTable table;
 
     // 取值与 assets/config/materials.toml 一致，保证测试与运行期行为可比。
-    // 字段顺序见 MaterialLayer 声明：name / textureLayer / 高度带(3) / 坡度带(3) / uvScale / tintRGB。
-    table.m_layers[0] =
-        MaterialLayer { "grass", 1, 0.0F, 96.0F, 16.0F, 0.0F, 0.35F, 0.10F, 0.12F, 0.31F, 0.55F, 0.24F };
-    table.m_layers[1] =
-        MaterialLayer { "dirt", 2, 0.0F, 160.0F, 24.0F, 0.20F, 0.60F, 0.15F, 0.10F, 0.45F, 0.33F, 0.21F };
-    table.m_layers[2] =
-        MaterialLayer { "rock", 3, 40.0F, 512.0F, 24.0F, 0.45F, 1.0F, 0.15F, 0.16F, 0.55F, 0.55F, 0.56F };
-    table.m_layers[3] =
-        MaterialLayer { "sand", 4, 0.0F, 6.0F, 3.0F, 0.0F, 0.30F, 0.10F, 0.18F, 0.83F, 0.74F, 0.48F };
+    // 字段顺序见 MaterialLayer 声明：name / textureLayer / 高度带(3) / 坡度带(3) / uvScale /
+    // tintRGB / roughness / ao / macroUvScale / macroStrength。
+    table.m_layers[0] = MaterialLayer { "grass", 1, 0.0F, 96.0F, 16.0F, 0.0F, 0.35F, 0.10F, 0.12F, 0.31F, 0.55F,
+                                        0.24F, 0.90F, 0.85F, 0.020F, 0.35F };
+    table.m_layers[1] = MaterialLayer { "dirt", 2, 0.0F, 160.0F, 24.0F, 0.20F, 0.60F, 0.15F, 0.10F, 0.45F, 0.33F,
+                                        0.21F, 0.88F, 0.75F, 0.015F, 0.40F };
+    table.m_layers[2] = MaterialLayer { "rock", 3, 40.0F, 512.0F, 24.0F, 0.45F, 1.0F, 0.15F, 0.16F, 0.55F, 0.55F,
+                                        0.56F, 0.40F, 0.70F, 0.030F, 0.30F };
+    table.m_layers[3] = MaterialLayer { "sand", 4, 0.0F, 6.0F, 3.0F, 0.0F, 0.30F, 0.10F, 0.18F, 0.83F, 0.74F,
+                                        0.48F, 0.95F, 0.90F, 0.025F, 0.25F };
 
     return table;
 }
@@ -160,11 +177,15 @@ MaterialUniform BuildMaterialUniform(const TerrainMaterialTable& table, double o
         out.slopeMin = layer.slopeMin;
         out.slopeMax = layer.slopeMax;
         out.slopeBlend = layer.slopeBlend;
-        out.slopeUnused = 0.0F;
+        out.roughness = layer.roughness;
         out.tintR = layer.tintR;
         out.tintG = layer.tintG;
         out.tintB = layer.tintB;
         out.uvScale = layer.uvScale;
+        out.macroUvScale = layer.macroUvScale;
+        out.macroStrength = layer.macroStrength;
+        out.ao = layer.ao;
+        out.macroAoUnused = 0.0F;
     }
 
     return uniform;

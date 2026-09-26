@@ -19,7 +19,7 @@ inline constexpr int kFrameRateCapMin     = 60;  ///< 滑块下限（Hz）
 inline constexpr int kFrameRateCapUnset   = 0;   ///< 存储哨兵：未设置 → 取当前显示器刷新率
 inline constexpr int kFallbackRefreshRate = 60;  ///< 刷新率未知 / 非正时的回退刷新率（Hz）
 
-/// 系统设置（T15 / T17 / T20）：显示模式、窗口分辨率、主音量、帧率上限、曝光。
+/// 系统设置（T15 / T17 / T20 / T23）：显示模式、窗口分辨率、主音量、帧率上限、曝光、MSAA 档位。
 /// 随程序退出落盘、下次启动读回。
 struct SystemSettings {
     DisplayMode displayMode  = DisplayMode::Windowed;          ///< 显示模式
@@ -28,6 +28,7 @@ struct SystemSettings {
     int         masterVolume = 80;                             ///< 主音量（0–100）
     int         frameRateCap = kFrameRateCapUnset;             ///< 帧率上限（Hz）；哨兵 0 = 取刷新率
     float       exposure     = 1.0F;                           ///< HDR 色调映射曝光（T20 / ADR 0010）
+    int         msaaSamples  = 4;                              ///< MSAA 档位（1 / 2 / 4 / 8；T23 / ADR 0010 P3）
 };
 
 /// 设置文件格式版本；不匹配即报错（不做静默迁移）。
@@ -42,6 +43,36 @@ inline constexpr int kMasterVolumeDefault = 80;
 inline constexpr float kExposureMin     = 0.1F;
 inline constexpr float kExposureMax     = 8.0F;
 inline constexpr float kExposureDefault = 1.0F;
+
+/// MSAA 档位（T23 / ADR 0010 P3）：**只允许 {1, 2, 4, 8}**，默认 4×（1 = 关闭）。
+///
+/// 口径与 `exposure` 完全一致：`msaa_samples` 是**可选字段**（缺失取默认，旧版设置文件仍能载入），
+/// 类型错误报错，数值越界由 `ClampMsaaSampleCount` 钳制到**最近的合法档**。
+inline constexpr int kMsaaSampleCountMin     = 1;
+inline constexpr int kMsaaSampleCountMax     = 8;
+inline constexpr int kMsaaSampleCountDefault = 4;
+
+/// 纯函数：把 MSAA 档位钳制到**最近的合法档** `{1, 2, 4, 8}`（越界即钳制，不报错）。
+///
+/// 规则（由 `tests/system_settings_test.cpp` 钉死）：取距离最近的合法档；**距离相等时向上取**
+/// （例：3 距 2 与 4 各 1 ⇒ 取 4；6 距 4 与 8 各 2 ⇒ 取 8）。低于 1 → 1，高于 8 → 8。
+[[nodiscard]] inline int ClampMsaaSampleCount(int samples) noexcept {
+    if (samples <= 1) {
+        return 1;
+    }
+    constexpr int kTiers[] = { 1, 2, 4, 8 };
+    int           best     = kTiers[0];
+    int           bestGap  = samples - kTiers[0];
+    for (const int tier : kTiers) {
+        const int gap = (samples > tier) ? (samples - tier) : (tier - samples);
+        // `<=` 使距离相等时**后出现的更大档位**胜出（即向上取）。
+        if (gap <= bestGap) {
+            bestGap = gap;
+            best    = tier;
+        }
+    }
+    return best;
+}
 
 /// 纯函数：把曝光钳制到 `[kExposureMin, kExposureMax]`（越界即钳制，不报错）。
 [[nodiscard]] inline float ClampExposure(float exposure) noexcept {
@@ -116,6 +147,8 @@ inline constexpr float kExposureDefault = 1.0F;
 ///     以保证旧版设置文件仍能载入；存在但类型错误则报错；越界由 `ResolveFrameRateCap` 后续钳制。
 ///   - `exposure`（T20）：**可选字段**——缺失按 `kExposureDefault` 处理（旧版设置文件仍能载入）；
 ///     存在但类型错误则报错；越界由 `ClampExposure` 钳制到 `[kExposureMin, kExposureMax]`。
+///   - `msaa_samples`（T23）：**可选字段**——缺失按 `kMsaaSampleCountDefault` 处理（旧版设置文件仍能载入）；
+///     存在但类型错误则报错；越界由 `ClampMsaaSampleCount` 钳制到最近的合法档 `{1, 2, 4, 8}`。
 [[nodiscard]] SystemSettings LoadSystemSettings(const std::filesystem::path& path);
 
 /// 把设置写为 TOML（UTF-8、LF）。前置条件：父目录已存在，否则抛 `std::runtime_error`。

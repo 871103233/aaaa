@@ -12,6 +12,7 @@ namespace {
 using vx::ClampExposure;
 using vx::ClampFrameRateCap;
 using vx::ClampMasterVolume;
+using vx::ClampMsaaSampleCount;
 using vx::DisplayMode;
 using vx::IsResolutionEditable;
 using vx::LoadSystemSettings;
@@ -257,3 +258,85 @@ TEST(SystemSettings, ExposureClampedOnLoadAndRoundTrips) {
 
     RemoveQuietly(path);
 }
+
+// T23 ①（纯函数）：MSAA 档位钳制到最近的合法档 {1, 2, 4, 8}；**距离相等时向上取**。
+// 规则在头文件 `ClampMsaaSampleCount` 的注释里写死，本用例逐点钉死：
+//   3 距 2 与 4 各 1 ⇒ 取 4；6 距 4 与 8 各 2 ⇒ 取 8；5 距 4 为 1（更近）⇒ 取 4；7 距 8 为 1 ⇒ 取 8。
+TEST(SystemSettings, ClampMsaaSampleCountPureFunction) {
+    // 合法档保持原值。
+    EXPECT_EQ(ClampMsaaSampleCount(1), 1);
+    EXPECT_EQ(ClampMsaaSampleCount(2), 2);
+    EXPECT_EQ(ClampMsaaSampleCount(4), 4);
+    EXPECT_EQ(ClampMsaaSampleCount(8), 8);
+    // 档位之间：取最近；距离相等 → 向上取。
+    EXPECT_EQ(ClampMsaaSampleCount(3), 4) << "3 距 2 与 4 相等 → 向上取 4";
+    EXPECT_EQ(ClampMsaaSampleCount(5), 4) << "5 距 4 更近 → 取 4";
+    EXPECT_EQ(ClampMsaaSampleCount(6), 8) << "6 距 4 与 8 相等 → 向上取 8";
+    EXPECT_EQ(ClampMsaaSampleCount(7), 8) << "7 距 8 更近 → 取 8";
+    // 越界钳制到端点。
+    EXPECT_EQ(ClampMsaaSampleCount(0), vx::kMsaaSampleCountMin);
+    EXPECT_EQ(ClampMsaaSampleCount(-5), vx::kMsaaSampleCountMin);
+    EXPECT_EQ(ClampMsaaSampleCount(9), vx::kMsaaSampleCountMax);
+    EXPECT_EQ(ClampMsaaSampleCount(64), vx::kMsaaSampleCountMax);
+}
+
+// T23 ②：`msaa_samples` 为**可选字段**——缺失取默认 4；类型错误报错；越界载入时钳制；写入后往返一致。
+TEST(SystemSettings, MsaaSamplesOptionalClampedAndRoundTrips) {
+    const std::filesystem::path path = TempPath("vx_settings_msaa.toml");
+
+    // 字段缺失 → 默认 4（旧版设置文件仍能载入）。
+    WriteText(path,
+              "schema_version = 1\n"
+              "display_mode = \"windowed\"\n"
+              "window_width = 1280\n"
+              "window_height = 720\n"
+              "master_volume = 80\n");
+    EXPECT_EQ(LoadSystemSettings(path).msaaSamples, vx::kMsaaSampleCountDefault);
+
+    // 存在且合法 → 原样读入（1 = 关闭 MSAA 的合法档）。
+    RemoveQuietly(path);
+    WriteText(path,
+              "schema_version = 1\n"
+              "display_mode = \"windowed\"\n"
+              "window_width = 1280\n"
+              "window_height = 720\n"
+              "master_volume = 80\n"
+              "msaa_samples = 1\n");
+    EXPECT_EQ(LoadSystemSettings(path).msaaSamples, 1);
+
+    // 越界（3）→ 载入时钳制到最近的合法档 4（不因用户手改出界而拒绝启动）。
+    RemoveQuietly(path);
+    WriteText(path,
+              "schema_version = 1\n"
+              "display_mode = \"windowed\"\n"
+              "window_width = 1280\n"
+              "window_height = 720\n"
+              "master_volume = 80\n"
+              "msaa_samples = 3\n");
+    EXPECT_EQ(LoadSystemSettings(path).msaaSamples, 4);
+
+    // 类型错误 → 明确报错（与其它字段同一错误策略）。
+    RemoveQuietly(path);
+    WriteText(path,
+              "schema_version = 1\n"
+              "display_mode = \"windowed\"\n"
+              "window_width = 1280\n"
+              "window_height = 720\n"
+              "master_volume = 80\n"
+              "msaa_samples = \"high\"\n");
+    EXPECT_THROW((void)LoadSystemSettings(path), std::runtime_error);
+
+    // 往返：写 8 → 读 8；写越界值 5 → 落盘钳制为 4、读回 4。
+    RemoveQuietly(path);
+    SystemSettings written;
+    written.msaaSamples = 8;
+    SaveSystemSettings(path, written);
+    EXPECT_EQ(LoadSystemSettings(path).msaaSamples, 8);
+
+    written.msaaSamples = 5;
+    SaveSystemSettings(path, written);
+    EXPECT_EQ(LoadSystemSettings(path).msaaSamples, 4);
+
+    RemoveQuietly(path);
+}
+

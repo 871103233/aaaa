@@ -1,6 +1,7 @@
 #pragma once
 
 #include "render/camera.hpp"
+#include "render/shadow_cascade.hpp"
 
 #include <SDL3/SDL.h>
 
@@ -71,8 +72,13 @@ struct TextureArrayDesc {
 };
 
 /// 材质 uniform 块的最大字节数（`SetMaterialUniform` 的容量上限）。
-/// 当前片元块 = 渲染原点（`vec4`）+ 4 层 × 3 个 `vec4` = 208 字节；留余量给后续参数。
+/// 当前片元块 = 渲染原点（`vec4`）+ 4 层 × 4 个 `vec4` = 272 字节（ADR 0010 P2 起每层含
+/// roughness / ao / 宏观参数）；留余量给后续参数。
 inline constexpr std::size_t kMaxMaterialUniformBytes = 512;
+
+/// 光照 uniform 块的最大字节数（`SetLightingUniform` 的容量上限）。
+/// 当前片元块 = 8 个 `vec4` = 128 字节（见 `render/lighting_table.hpp` 的 `LightingUniform`）；留余量给后续参数。
+inline constexpr std::size_t kMaxLightingUniformBytes = 256;
 
 /// 一帧渲染的开销统计（**通用**：不含任何世界 / 地形语义，供调试设施只读展示）。
 ///
@@ -131,8 +137,11 @@ protected:
 /// Shader 约定（由构建期两段式管线产出双格式，见 ADR 0002）：
 ///   - 顶点着色器入口 `main`：消费上面 `MeshVertex` 的两个 location，
 ///     并绑定一个只读 storage buffer（slot 0，内容为 `CameraUniform`）；
-///   - 片元着色器入口 `main`：采样两个纹理数组（slot 0 / 1，见 `SetSampledTextureArrays`）
-///     并读取一个 uniform 块（slot 0，见 `SetMaterialUniform`）。
+///   - 片元着色器入口 `main`：采样六个纹理数组（slot 0..4 = albedo / normal / roughness / AO / macro
+///     材质四件套与宏观变化，slot 5 = 阴影深度数组）
+///     并读取三个 uniform 块（slot 0 = 材质，slot 1 = 光照；slot 2 = 阴影，见 `SetShadowCascades`）。
+///   - 阴影通道另用 `shadow.vert` + 空入口 `shadow.frag`：无颜色目标、只写深度，
+///     顶点 slot 0 绑定该级的光空间矩阵（与相机矩阵**同类**机制：`SDL_BindGPUVertexStorageBuffers`）。
 ///   产物路径为 `<shader_dir>/<shader_name>.vert{.spv|.dxil}` 与 `<shader_name>.frag{...}`，
 ///   缺失时构造函数抛 `std::runtime_error`（与 `TriangleRenderer` 一致）。
 ///
@@ -172,15 +181,35 @@ public:
     /// 释放一个纹理数组的 GPU 资源；无效句柄为无操作。
     void ReleaseTextureArray(TextureArrayHandle handle) noexcept;
 
-    /// 绑定两个纹理数组到网格着色器的采样槽 0（albedo）/ 1（normal）。
-    /// 槽序与 `assets/shaders/mesh.frag` 的 `set = 2, binding = 0/1` 一致。
-    void SetSampledTextureArrays(TextureArrayHandle albedo, TextureArrayHandle normal) noexcept;
+    /// 绑定五个材质纹理数组到网格着色器的采样槽 0..4
+    /// （albedo / normal / roughness / AO / macro）。
+    ///
+    /// 槽序与 `assets/shaders/mesh.frag` 的 `set = 2, binding = 0..4` 一致；`macro` 为**单层**数组。
+    void SetSampledTextureArrays(TextureArrayHandle albedo, TextureArrayHandle normal, TextureArrayHandle roughness,
+                                 TextureArrayHandle ao, TextureArrayHandle macro) noexcept;
 
     /// 设置片元着色器的材质 uniform 块（**原样字节**，引擎不解释其语义）。
     ///
     /// 需与 mesh.frag 的 std140 `set = 3, binding = 0` 布局一致（块内容由世界层构建）。
     /// 只做拷贝、不分配；`size > kMaxMaterialUniformBytes` 时忽略。
     void SetMaterialUniform(const void* data, std::size_t size) noexcept;
+
+    /// 设置片元着色器的光照 uniform 块（**原样字节**，引擎不解释其语义），与 `SetMaterialUniform` 完全同构。
+    ///
+    /// 需与 mesh.frag 的 std140 `set = 3, binding = 1` 布局一致（块内容由 `BuildLightingUniform` 构建）。
+    /// 之所以独立成第二个槽位：SDL3_gpu 的片元阶段有 4 个 uniform 槽，槽 0 已被材质占用，光照用槽 1。
+    /// 只做拷贝、不分配；`size > kMaxLightingUniformBytes` 时忽略。
+    void SetLightingUniform(const void* data, std::size_t size) noexcept;
+
+    /// 设置本帧的阴影级联参数（T21b / ADR 0010 P1）。
+    ///
+    /// `uniform` 是 CPU 构建的片元槽 2 块（由 `BuildShadowUniform` 投影，见 `shadow_cascade.hpp`）；
+    /// `cascadeCount` / `resolution` 是深度数组的层数与边长（来自配置，**与相机无关**）。
+    /// 引擎只做拷贝与记录：**不创建资源、不分配**；深度数组按需在 `RenderFrame` 内惰性重建，
+    /// 级数 / 分辨率变化时自动重建（参照 `EnsureDepthTarget` 的写法）。
+    /// 前置条件：`cascadeCount ∈ [1, kMaxShadowCascades]`；`resolution` 是 2 的幂且 ≥ 256（越界会被钳制）。
+    void SetShadowCascades(const ShadowUniform& uniform, std::uint32_t cascadeCount,
+                           std::uint32_t resolution) noexcept;
 
     /// 设置本帧相机常量；下一次 `RenderFrame` 生效。
     void SetCamera(const CameraView& camera) noexcept;
@@ -191,6 +220,19 @@ public:
     /// 引擎不在此解释语义（ADR 0010：参数进配置，改值不需重编 Shader）。
     void SetExposure(float exposure) noexcept { m_exposure = exposure; }
 
+    /// 设置 MSAA 档位（T23 / ADR 0010 P3）；下一次 `RenderFrame` 生效。
+    ///
+    /// 取值来自上层（`game/` 读 `settings.toml` 的 `msaa_samples` 后传入，**引擎层不读配置文件**）。
+    /// `1` = 关闭 MSAA（**零额外开销**：不创建 MSAA 纹理，直接渲进单采样 HDR 目标 + 单采样深度）；
+    /// `2 / 4 / 8` = 主通道渲进多采样颜色目标 + 多采样深度，再解析（resolve）到单采样 HDR 目标，
+    /// 色调映射通道**始终读单采样 HDR 目标**（不读 MSAA 纹理，故 MSAA 纹理 `usage` 只需 `COLOR_TARGET`）。
+    ///
+    /// 引擎**不定义档位口径**（那是配置层的 `ClampMsaaSampleCount`）；这里只做**硬件能力**适配：
+    /// 若请求档位不被当前设备支持（`SDL_GPUTextureSupportsSampleCount`），会向下取受支持的最高档，
+    /// 以保证**管线采样数与渲染目标采样数一致**（否则 `SDL_BeginGPURenderPass` 会报错）。
+    /// 档位变化与硬件降级都会记一条日志（含生效档位）。
+    void SetMsaaSampleCount(std::uint32_t sampleCount) noexcept;
+
     /// 只读：渲染开销统计与纹理显存记账（见 `RenderStats`）。
     ///
     /// 其中绘制统计为**最近一次** `RenderFrame` 的实测值；纹理字节为当前总量。
@@ -198,9 +240,10 @@ public:
 
     /// 渲染一帧：网格渲到离屏 HDR 目标 → 色调映射到交换链 → 可选的叠加层。
     ///
-    /// 顺序（ADR 0010 的 P0）：主通道写 `R16G16B16A16_FLOAT` HDR 颜色目标（+ 深度），
+    /// 顺序（ADR 0010 的 P0 / P3）：主通道写 `R16G16B16A16_FLOAT` HDR 颜色目标（+ 深度），
     /// 随后全屏三角形做「曝光 + ACES 近似 + sRGB 编码」输出到交换链；叠加层最后以交换链为目标绘制，
-    /// **不**被色调映射处理。
+    /// **不**被色调映射处理。MSAA 档位 > 1 时，主通道写多采样颜色目标并在同一渲染通道内 resolve 到
+    /// 该 HDR 目标（`SDL_GPUColorTargetInfo::resolve_texture`），色调映射通道仍采样单采样 HDR 目标。
     ///
     /// `meshes` 中被跳过的情况：指针为空、句柄无效、或该槽位已释放。
     /// 返回 false 表示本帧拿不到交换链纹理（如窗口最小化），调用方可直接跳过。
@@ -215,11 +258,36 @@ private:
         std::uint32_t  indexCount   = 0;
     };
 
-    /// 保证深度目标与当前交换链尺寸一致（尺寸变化时重建）。
-    void EnsureDepthTarget(std::uint32_t width, std::uint32_t height);
+    /// 保证主通道图形管线与请求的 MSAA 档位一致（档位变化时用常驻 Shader 重建）。
+    void EnsureMainPipeline(std::uint32_t sampleCount);
+
+    /// 按给定档位创建主通道图形管线（用常驻的 `m_meshVertexShader` / `m_meshFragmentShader`），
+    /// 写入 `m_pipeline` 与 `m_pipelineSampleCount`；失败抛 `std::runtime_error`。
+    void CreateMainPipeline(std::uint32_t sampleCount);
+
+    /// 保证深度目标与当前交换链尺寸、MSAA 档位一致（尺寸或档位变化时重建）。
+    /// 档位 = 1 即单采样深度（回到 P0 行为）；档位 > 1 为多采样深度（`D32_FLOAT`，`sample_count = 档位`）。
+    void EnsureDepthTarget(std::uint32_t width, std::uint32_t height, std::uint32_t sampleCount);
 
     /// 保证离屏 HDR 颜色目标（`R16G16B16A16_FLOAT`）与当前交换链尺寸一致（尺寸变化时重建）。
     void EnsureHdrTarget(std::uint32_t width, std::uint32_t height);
+
+    /// 保证 MSAA 颜色目标（`R16G16B16A16_FLOAT`，`sample_count = 档位`）与尺寸 / 档位一致。
+    /// **档位 = 1 时释放该纹理并保持空指针**（零开销路径：主通道直接渲进单采样 HDR 目标）。
+    void EnsureMsaaColorTarget(std::uint32_t width, std::uint32_t height, std::uint32_t sampleCount);
+
+    /// 保证阴影深度数组（`D32_FLOAT`，`2D_ARRAY`，层数 = 级数）与请求的级数 / 分辨率一致（变化时重建）。
+    void EnsureShadowTarget();
+
+    /// 把 `m_shadowUniform.lightMatrices`（各级光空间矩阵）上传到每级的顶点只读 storage buffer。
+    void UploadShadowMatrices(SDL_GPUCommandBuffer* commandBuffer);
+
+    /// 绑定并绘制一批网格（主通道与阴影通道共用同一实现）；同时累加本帧绘制统计。
+    /// 前置条件：调用方已绑定图形管线（两通道的顶点输入布局一致，均为 `MeshVertex`）。
+    void DrawMeshes(SDL_GPURenderPass* pass, const MeshHandle* meshes, std::size_t meshCount);
+
+    /// 把纹理显存**按项**打到日志（材质数组 / 深度 / HDR / 阴影），供预算核对（ADR 0010 记账义务）。
+    void LogTextureAccounting(std::uint32_t width, std::uint32_t height) const;
 
     /// 把 `m_cameraUniform` 传到相机常量的 GPU 缓冲。
     void UploadCameraUniform(SDL_GPUCommandBuffer* commandBuffer);
@@ -228,8 +296,19 @@ private:
     SDL_Window*              m_window   = nullptr;
     SDL_GPUGraphicsPipeline* m_pipeline = nullptr;
 
+    /// 主通道管线**常驻**的 Shader 对象（T23）：档位变化时需按新的采样数重建管线，
+    /// 故不再"创建管线后立即释放"，而是持有到析构（释放时机对渲染结果无影响）。
+    SDL_GPUShader* m_meshVertexShader   = nullptr;
+    SDL_GPUShader* m_meshFragmentShader = nullptr;
+
+    /// `m_pipeline` 当前烘焙的采样数档位（必须与渲进的目标一致；不一致时 `EnsureMainPipeline` 重建）。
+    std::uint32_t m_pipelineSampleCount = 1;
+
     /// 色调映射管线：全屏三角形，HDR 颜色目标 → 交换链（无深度、不剔除）。
     SDL_GPUGraphicsPipeline* m_tonemapPipeline = nullptr;
+
+    /// 阴影深度管线：**仅顶点着色器**、无颜色目标、深度目标 = `D32_FLOAT` 深度数组的一层。
+    SDL_GPUGraphicsPipeline* m_shadowPipeline = nullptr;
 
     SDL_GPUBuffer*         m_cameraUniformBuffer  = nullptr;
     SDL_GPUTransferBuffer* m_cameraTransferBuffer = nullptr;
@@ -238,19 +317,69 @@ private:
     SDL_GPUTexture* m_depthTexture = nullptr;
     std::uint32_t   m_depthWidth   = 0;
     std::uint32_t   m_depthHeight  = 0;
-    std::uint64_t   m_depthBytes   = 0;  ///< 深度目标的显存记账（字节）
+    std::uint32_t   m_depthSampleCount = 1;  ///< 深度目标的采样数档位（1 = 单采样）
+    std::uint64_t   m_depthBytes   = 0;  ///< 深度目标的显存记账（字节，已折入 MSAA 采样数）
 
-    /// 离屏 HDR 颜色目标（主通道写入、色调映射通道采样）。
+    /// 离屏 HDR 颜色目标（主通道写入 / resolve 目标、色调映射通道采样）。
     SDL_GPUTexture* m_hdrTexture = nullptr;
     std::uint32_t   m_hdrWidth   = 0;
     std::uint32_t   m_hdrHeight  = 0;
     std::uint64_t   m_hdrBytes   = 0;  ///< HDR 目标的显存记账（字节）
+
+    // ---- MSAA（T23 / ADR 0010 P3）：多采样颜色目标 + 档位 ----
+
+    /// 请求的 MSAA 档位（`SetMsaaSampleCount` 写入；仅用于判断是否需要重打日志）。
+    std::uint32_t m_requestedMsaaSampleCount = 1;
+
+    /// **生效**的 MSAA 档位（`SetMsaaSampleCount` 按硬件能力归一后写入；1 = 关闭）。
+    std::uint32_t m_msaaSampleCount = 1;
+
+    /// 是否已至少打印过一次 MSAA 档位日志：保证**启动期一定记一次生效档位**，
+    /// 同时允许调用方重复传入同一档位时不刷屏。
+    bool m_msaaSampleCountLogged = false;
+
+    /// 多采样颜色目标（`R16G16B16A16_FLOAT`、`sample_count = 档位`、`usage` 仅 `COLOR_TARGET`）。
+    /// **档位 = 1 时为空指针**（不创建，走零开销路径）。
+    SDL_GPUTexture* m_msaaColorTexture       = nullptr;
+    std::uint32_t   m_msaaWidth              = 0;
+    std::uint32_t   m_msaaHeight             = 0;
+    std::uint32_t   m_msaaColorSampleCount   = 0;
+    std::uint64_t   m_msaaColorBytes         = 0;  ///< MSAA 颜色目标的显存记账（字节）
 
     /// 色调映射采样 HDR 目标用的采样器（clamp 寻址 + 线性过滤，单级）。
     SDL_GPUSampler* m_hdrSampler = nullptr;
 
     /// 曝光系数（由 `SetExposure` 写入，随色调映射 uniform 上传）。
     float m_exposure = 1.0F;
+
+    // ---- 阴影（T21b / ADR 0010 P1）：深度数组 + 每级矩阵缓冲 + 片元槽 2 的参数块 ----
+
+    /// 阴影深度数组（`D32_FLOAT`、`2D_ARRAY`、层数 = 级数）；级数 / 分辨率变化时重建。
+    SDL_GPUTexture* m_shadowTexture           = nullptr;
+    std::uint32_t   m_shadowTextureResolution = 0;
+    std::uint32_t   m_shadowTextureCascades   = 0;
+    std::uint64_t   m_shadowTextureBytes      = 0;  ///< 阴影深度数组的显存记账（字节）
+
+    /// 本帧请求的级数与分辨率（`SetShadowCascades` 写入；纹理按需重建）。
+    std::uint32_t m_shadowCascadeCount = 1;
+    std::uint32_t m_shadowResolution   = 256;
+
+    /// 每级一个只读 storage buffer（存该级光空间矩阵）。SDL_gpu 的 storage buffer 绑定**不带偏移**，
+    /// 故每级一个缓冲、渲染该级时绑定对应缓冲。属缓冲资源，不计入 `textureBytes`。
+    std::array<SDL_GPUBuffer*, kMaxShadowCascades> m_shadowMatrixBuffers {};
+
+    /// 上传 4 级矩阵共用的常驻暂存缓冲（每帧一次 map + 逐级 copy）。
+    SDL_GPUTransferBuffer* m_shadowMatrixTransfer = nullptr;
+
+    /// 本帧阴影 uniform（片元槽 2）与其有效标志（`SetShadowCascades` 写入）。
+    ShadowUniform m_shadowUniform {};
+    bool          m_shadowUniformValid = false;
+
+    /// 阴影采样器：clamp 寻址 + **最近邻**（手动 3×3 PCF，深度值不插值）+ 不采样 mip。
+    SDL_GPUSampler* m_shadowSampler = nullptr;
+
+    /// 任一渲染目标在本次 `RenderFrame` 中被（重）创建 → 重新打印一次显存记账日志。
+    bool m_textureAccountingDirty = false;
 
     /// 渲染开销统计与显存记账（`Stats()` 暴露）。
     RenderStats m_stats {};
@@ -268,10 +397,17 @@ private:
     std::vector<std::uint32_t>   m_freeTextureSlots;
     TextureArrayHandle           m_albedoTexture;
     TextureArrayHandle           m_normalTexture;
+    TextureArrayHandle           m_roughnessTexture;
+    TextureArrayHandle           m_aoTexture;
+    TextureArrayHandle           m_macroTexture;
 
     /// 片元 uniform 块的暂存字节（固定容量，`SetMaterialUniform` 只做 memcpy、不分配）。
     std::array<std::uint8_t, kMaxMaterialUniformBytes> m_materialUniform {};
     std::size_t                                        m_materialUniformSize = 0;
+
+    /// 光照 uniform 块的暂存字节（固定容量，`SetLightingUniform` 只做 memcpy、不分配）。
+    std::array<std::uint8_t, kMaxLightingUniformBytes> m_lightingUniform {};
+    std::size_t                                        m_lightingUniformSize = 0;
 
     /// `UpdateMeshVertices` 复用的常驻暂存缓冲：容量足够时**不**重新分配（避免每帧堆分配）。
     SDL_GPUTransferBuffer* m_vertexStagingBuffer   = nullptr;

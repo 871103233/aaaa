@@ -1,3 +1,4 @@
+#include "render/mesh_renderer.hpp"
 #include "terrain/material_blender.hpp"
 #include "terrain/material_table.hpp"
 #include "terrain/terrain_types.hpp"
@@ -6,9 +7,12 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 
 namespace {
@@ -21,6 +25,68 @@ using vx::MaterialLayer;
 using vx::TerrainMaterialTable;
 
 constexpr std::uint64_t kSeed = 0x5EED0001ULL;
+
+/// 一个材质层的全部字段（含 T22 新增的 roughness / ao / macro_*），用于拼临时 TOML。
+struct LayerSpec {
+    const char* name          = "x";
+    int         textureLayer  = 1;
+    double      heightMin     = 0.0;
+    double      heightMax     = 100.0;
+    double      heightBlend   = 10.0;
+    double      slopeMin      = 0.0;
+    double      slopeMax      = 1.0;
+    double      slopeBlend    = 0.1;
+    double      uvScale       = 0.1;
+    double      tintR         = 0.5;
+    double      tintG         = 0.5;
+    double      tintB         = 0.5;
+    double      roughness     = 0.8;
+    double      ao            = 0.8;
+    double      macroUvScale  = 0.02;
+    double      macroStrength = 0.3;
+};
+
+/// 与内置默认表 / 仓库 TOML 一致的四个槽位；测试改其中的单个字段即可。
+[[nodiscard]] std::array<LayerSpec, static_cast<std::size_t>(kMaterialSlotCount)> DefaultLayerSpecs() {
+    return { LayerSpec { "grass", 1, 0.0, 96.0, 16.0, 0.0, 0.35, 0.10, 0.12, 0.31, 0.55, 0.24, 0.90, 0.85, 0.020, 0.35 },
+             LayerSpec { "dirt", 2, 0.0, 160.0, 24.0, 0.20, 0.60, 0.15, 0.10, 0.45, 0.33, 0.21, 0.88, 0.75, 0.015, 0.40 },
+             LayerSpec { "rock", 3, 40.0, 512.0, 24.0, 0.45, 1.0, 0.15, 0.16, 0.55, 0.55, 0.56, 0.40, 0.70, 0.030, 0.30 },
+             LayerSpec { "sand", 4, 0.0, 6.0, 3.0, 0.0, 0.30, 0.10, 0.18, 0.83, 0.74, 0.48, 0.95, 0.90, 0.025, 0.25 } };
+}
+
+[[nodiscard]] std::string EmitMaterials(int schemaVersion,
+                                        const std::array<LayerSpec, static_cast<std::size_t>(kMaterialSlotCount)>& layers) {
+    std::ostringstream out;
+    out << "schema_version = " << schemaVersion << "\n";
+    for (const LayerSpec& layer : layers) {
+        out << "[[layer]]\n"
+            << "name = \"" << layer.name << "\"\n"
+            << "texture_layer = " << layer.textureLayer << "\n"
+            << "height_min = " << layer.heightMin << "\n"
+            << "height_max = " << layer.heightMax << "\n"
+            << "height_blend = " << layer.heightBlend << "\n"
+            << "slope_min = " << layer.slopeMin << "\n"
+            << "slope_max = " << layer.slopeMax << "\n"
+            << "slope_blend = " << layer.slopeBlend << "\n"
+            << "uv_scale = " << layer.uvScale << "\n"
+            << "tint_r = " << layer.tintR << "\n"
+            << "tint_g = " << layer.tintG << "\n"
+            << "tint_b = " << layer.tintB << "\n"
+            << "roughness = " << layer.roughness << "\n"
+            << "ao = " << layer.ao << "\n"
+            << "macro_uv_scale = " << layer.macroUvScale << "\n"
+            << "macro_strength = " << layer.macroStrength << "\n";
+    }
+    return out.str();
+}
+
+/// 写一份临时材质表并返回路径；内容由调用方给出。
+[[nodiscard]] std::filesystem::path WriteTempMaterials(const std::string& fileName, const std::string& content) {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / fileName;
+    std::ofstream               out(path, std::ios::trunc);
+    out << content;
+    return path;
+}
 
 using Weights = std::array<float, static_cast<std::size_t>(kMaterialSlotCount)>;
 
@@ -149,6 +215,11 @@ TEST(TerrainMaterial, LoadsCommittedConfig) {
         EXPECT_FLOAT_EQ(table.Layer(slot).slopeMin, fallback.Layer(slot).slopeMin) << "slot=" << slot;
         EXPECT_FLOAT_EQ(table.Layer(slot).uvScale, fallback.Layer(slot).uvScale) << "slot=" << slot;
         EXPECT_FLOAT_EQ(table.Layer(slot).tintR, fallback.Layer(slot).tintR) << "slot=" << slot;
+        // T22 / ADR 0010 P2 新增字段：仓库 TOML 与内置默认表必须同源。
+        EXPECT_FLOAT_EQ(table.Layer(slot).roughness, fallback.Layer(slot).roughness) << "slot=" << slot;
+        EXPECT_FLOAT_EQ(table.Layer(slot).ao, fallback.Layer(slot).ao) << "slot=" << slot;
+        EXPECT_FLOAT_EQ(table.Layer(slot).macroUvScale, fallback.Layer(slot).macroUvScale) << "slot=" << slot;
+        EXPECT_FLOAT_EQ(table.Layer(slot).macroStrength, fallback.Layer(slot).macroStrength) << "slot=" << slot;
     }
 }
 
@@ -197,29 +268,25 @@ TEST(TerrainMaterial, NarrowBandIsMuchNarrowerThanFullRangeRamp) {
     }
 }
 
-// T19 / ADR 0009：GPU uniform 块必须由**加载出来的材质表**投影得到，禁止手抄第二份常量。
+// T19 / ADR 0009 / T22：GPU uniform 块必须由**加载出来的材质表**投影得到，禁止手抄第二份常量。
 // 写一份与原表不同的临时 TOML，加载后构建 uniform，断言 uniform 逐字段等于该表的值，
 // 且与内置默认表给出的 uniform **不同**（证明它确实随表变化）。
+// 同时钉死 T22 扩展后的 std140 布局字节数与新增字段的投影位置。
 TEST(TerrainMaterial, UniformIsDerivedFromLoadedTableNotHandCopied) {
-    const std::filesystem::path path = std::filesystem::temp_directory_path() / "vx_modified_materials.toml";
-    {
-        std::ofstream out(path, std::ios::trunc);
-        ASSERT_TRUE(out.good());
-        out << "schema_version = 2\n";
-        // 槽位 0 刻意改掉 height_max / uv_scale / tint；其余层给合法值。
-        out << "[[layer]]\nname = \"grass\"\ntexture_layer = 1\nheight_min = 0.0\nheight_max = 111.0\n"
-               "height_blend = 16.0\nslope_min = 0.0\nslope_max = 0.35\nslope_blend = 0.10\n"
-               "uv_scale = 0.99\ntint_r = 0.11\ntint_g = 0.22\ntint_b = 0.33\n";
-        out << "[[layer]]\nname = \"dirt\"\ntexture_layer = 2\nheight_min = 0.0\nheight_max = 160.0\n"
-               "height_blend = 24.0\nslope_min = 0.20\nslope_max = 0.60\nslope_blend = 0.15\n"
-               "uv_scale = 0.10\ntint_r = 0.45\ntint_g = 0.33\ntint_b = 0.21\n";
-        out << "[[layer]]\nname = \"rock\"\ntexture_layer = 3\nheight_min = 40.0\nheight_max = 512.0\n"
-               "height_blend = 24.0\nslope_min = 0.45\nslope_max = 1.0\nslope_blend = 0.15\n"
-               "uv_scale = 0.16\ntint_r = 0.55\ntint_g = 0.55\ntint_b = 0.56\n";
-        out << "[[layer]]\nname = \"sand\"\ntexture_layer = 4\nheight_min = 0.0\nheight_max = 6.0\n"
-               "height_blend = 3.0\nslope_min = 0.0\nslope_max = 0.30\nslope_blend = 0.10\n"
-               "uv_scale = 0.18\ntint_r = 0.83\ntint_g = 0.74\ntint_b = 0.48\n";
-    }
+    std::array<LayerSpec, static_cast<std::size_t>(kMaterialSlotCount)> specs = DefaultLayerSpecs();
+    // 槽位 0 刻意改掉 height_max / uv_scale / tint / roughness / ao / macro_*。
+    specs[0].heightMax     = 111.0;
+    specs[0].uvScale       = 0.99;
+    specs[0].tintR         = 0.11;
+    specs[0].tintG         = 0.22;
+    specs[0].tintB         = 0.33;
+    specs[0].roughness     = 0.33;
+    specs[0].ao            = 0.44;
+    specs[0].macroUvScale  = 0.077;
+    specs[0].macroStrength = 0.66;
+
+    const std::filesystem::path path =
+        WriteTempMaterials("vx_modified_materials.toml", EmitMaterials(3, specs));
 
     const TerrainMaterialTable table   = TerrainMaterialTable::LoadFromFile(path);
     const vx::MaterialUniform  uniform = vx::BuildMaterialUniform(table, 12.0, 34.0, 56.0);
@@ -227,7 +294,9 @@ TEST(TerrainMaterial, UniformIsDerivedFromLoadedTableNotHandCopied) {
     EXPECT_FLOAT_EQ(uniform.renderOriginX, 12.0F);
     EXPECT_FLOAT_EQ(uniform.renderOriginY, 34.0F);
     EXPECT_FLOAT_EQ(uniform.renderOriginZ, 56.0F);
-    EXPECT_EQ(sizeof(vx::MaterialUniform), static_cast<std::size_t>(16 + 48 * kMaterialSlotCount));
+    // T22 布局：渲染原点（vec4）+ 每层 4 个 vec4 = 16 + 64×4 = 272 字节（≤ kMaxMaterialUniformBytes=512）。
+    EXPECT_EQ(sizeof(vx::MaterialUniform), static_cast<std::size_t>(16 + 64 * kMaterialSlotCount));
+    EXPECT_LE(sizeof(vx::MaterialUniform), vx::kMaxMaterialUniformBytes);
 
     for (int slot = 0; slot < kMaterialSlotCount; ++slot) {
         const MaterialLayer&            layer = table.Layer(slot);
@@ -244,7 +313,19 @@ TEST(TerrainMaterial, UniformIsDerivedFromLoadedTableNotHandCopied) {
         EXPECT_FLOAT_EQ(out.tintG, layer.tintG) << "slot=" << slot;
         EXPECT_FLOAT_EQ(out.tintB, layer.tintB) << "slot=" << slot;
         EXPECT_FLOAT_EQ(out.uvScale, layer.uvScale) << "slot=" << slot;
+        // T22 新增字段：必须由 BuildMaterialUniform 投影，且落在约定的 vec4 位置。
+        EXPECT_FLOAT_EQ(out.roughness, layer.roughness) << "slot=" << slot;
+        EXPECT_FLOAT_EQ(out.ao, layer.ao) << "slot=" << slot;
+        EXPECT_FLOAT_EQ(out.macroUvScale, layer.macroUvScale) << "slot=" << slot;
+        EXPECT_FLOAT_EQ(out.macroStrength, layer.macroStrength) << "slot=" << slot;
+        EXPECT_FLOAT_EQ(out.macroAoUnused, 0.0F) << "slot=" << slot;
     }
+
+    // 新增字段确实随 TOML 变化（改的是槽位 0）。
+    EXPECT_FLOAT_EQ(uniform.layers[0].roughness, 0.33F);
+    EXPECT_FLOAT_EQ(uniform.layers[0].ao, 0.44F);
+    EXPECT_FLOAT_EQ(uniform.layers[0].macroUvScale, 0.077F);
+    EXPECT_FLOAT_EQ(uniform.layers[0].macroStrength, 0.66F);
 
     const vx::MaterialUniform fallbackUniform =
         vx::BuildMaterialUniform(TerrainMaterialTable::Default(), 0.0, 0.0, 0.0);
@@ -252,7 +333,9 @@ TEST(TerrainMaterial, UniformIsDerivedFromLoadedTableNotHandCopied) {
     for (std::size_t slot = 0; slot < uniform.layers.size(); ++slot) {
         if (uniform.layers[slot].uvScale != fallbackUniform.layers[slot].uvScale ||
             uniform.layers[slot].tintR != fallbackUniform.layers[slot].tintR ||
-            uniform.layers[slot].heightMax != fallbackUniform.layers[slot].heightMax) {
+            uniform.layers[slot].heightMax != fallbackUniform.layers[slot].heightMax ||
+            uniform.layers[slot].roughness != fallbackUniform.layers[slot].roughness ||
+            uniform.layers[slot].macroStrength != fallbackUniform.layers[slot].macroStrength) {
             differs = true;
         }
     }
@@ -260,4 +343,73 @@ TEST(TerrainMaterial, UniformIsDerivedFromLoadedTableNotHandCopied) {
 
     std::error_code ignored;
     std::filesystem::remove(path, ignored);
+}
+
+// T22 / ADR 0010 P2：新字段的合法解析（roughness / ao / macro_uv_scale / macro_strength 原样进入表）。
+TEST(TerrainMaterial, NewPbrFieldsAreParsedFromToml) {
+    std::array<LayerSpec, static_cast<std::size_t>(kMaterialSlotCount)> specs = DefaultLayerSpecs();
+    specs[1].roughness     = 0.123;
+    specs[1].ao            = 0.456;
+    specs[1].macroUvScale  = 0.0789;
+    specs[1].macroStrength = 0.654;
+
+    const std::filesystem::path path =
+        WriteTempMaterials("vx_pbr_fields_materials.toml", EmitMaterials(3, specs));
+    const TerrainMaterialTable table = TerrainMaterialTable::LoadFromFile(path);
+
+    EXPECT_FLOAT_EQ(table.Layer(1).roughness, 0.123F);
+    EXPECT_FLOAT_EQ(table.Layer(1).ao, 0.456F);
+    EXPECT_FLOAT_EQ(table.Layer(1).macroUvScale, 0.0789F);
+    EXPECT_FLOAT_EQ(table.Layer(1).macroStrength, 0.654F);
+
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+}
+
+// T22 校验：越界 / 非法的新字段必须在启动期抛异常（沿用既有"禁止静默回退"口径）。
+TEST(TerrainMaterial, InvalidNewPbrFieldsThrow) {
+    const auto loadWithBadField = [](const char* fileName, auto mutate) {
+        std::array<LayerSpec, static_cast<std::size_t>(kMaterialSlotCount)> specs = DefaultLayerSpecs();
+        mutate(specs[0]);
+        const std::filesystem::path path = WriteTempMaterials(fileName, EmitMaterials(3, specs));
+        const bool                  threw = [&path] {
+            try {
+                (void)TerrainMaterialTable::LoadFromFile(path);
+            } catch (const std::runtime_error&) {
+                return true;
+            }
+            return false;
+        }();
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
+        return threw;
+    };
+
+    EXPECT_TRUE(loadWithBadField("vx_bad_roughness.toml", [](LayerSpec& s) { s.roughness = 1.5; }))
+        << "roughness > 1 必须报错";
+    EXPECT_TRUE(loadWithBadField("vx_bad_roughness_neg.toml", [](LayerSpec& s) { s.roughness = -0.01; }))
+        << "roughness < 0 必须报错";
+    EXPECT_TRUE(loadWithBadField("vx_bad_ao.toml", [](LayerSpec& s) { s.ao = 2.0; })) << "ao > 1 必须报错";
+    EXPECT_TRUE(loadWithBadField("vx_bad_macro_uv.toml", [](LayerSpec& s) { s.macroUvScale = 0.0; }))
+        << "macro_uv_scale == 0 必须报错";
+    EXPECT_TRUE(loadWithBadField("vx_bad_macro_uv_neg.toml", [](LayerSpec& s) { s.macroUvScale = -0.1; }))
+        << "macro_uv_scale < 0 必须报错";
+    EXPECT_TRUE(loadWithBadField("vx_bad_macro_strength.toml", [](LayerSpec& s) { s.macroStrength = 1.01; }))
+        << "macro_strength > 1 必须报错";
+    EXPECT_TRUE(loadWithBadField("vx_bad_macro_strength_neg.toml", [](LayerSpec& s) { s.macroStrength = -0.5; }))
+        << "macro_strength < 0 必须报错";
+}
+
+// T22 / ADR 0010 P2：schema_version 必须等于 3；旧版本（2）与新版本（4）都必须报错。
+TEST(TerrainMaterial, SchemaVersionMustBeThree) {
+    const std::array<LayerSpec, static_cast<std::size_t>(kMaterialSlotCount)> specs = DefaultLayerSpecs();
+    for (const int version : { 2, 4 }) {
+        const std::filesystem::path path =
+            WriteTempMaterials("vx_schema_version_materials.toml", EmitMaterials(version, specs));
+        EXPECT_THROW((void)TerrainMaterialTable::LoadFromFile(path), std::runtime_error)
+            << "schema_version=" << version << " 必须报错";
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
+    }
+    EXPECT_EQ(TerrainMaterialTable::kSchemaVersion, 3);
 }

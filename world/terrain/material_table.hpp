@@ -41,27 +41,53 @@ struct MaterialLayer {
     float tintR   = 1.0F;  ///< 层色（乘在采样到的 albedo 上）；取值 [0, 1]
     float tintG   = 1.0F;
     float tintB   = 1.0F;
+
+    /// PBR 粗糙度基准（ADR 0010 P2）；取值 [0, 1]。地表为电介质，**不引入 metallic**。
+    /// 最终粗糙度 = 本值 × 粗糙度贴图的逐像素 ±20% 变化，再钳到 `kMinRoughness`（避免 GGX 除零）。
+    float roughness = 1.0F;
+
+    /// 环境光遮蔽系数；取值 [0, 1]。**只作用于天空光 / 环境项**，不作用于直接光（ADR 0010 P2）。
+    float ao = 1.0F;
+
+    /// 宏观变化贴图的 UV 尺度（每世界格的重复次数）；必须 > 0，且**显著小于 `uvScale`**。
+    /// 宏观变化贴图只有 1 层，故各层用各自的尺度采样同一张图，用于打破基础贴图的平铺重复感。
+    float macroUvScale = 0.02F;
+
+    /// 宏观调制强度；取值 [0, 1]。乘在 albedo 与 roughness 上（围绕 1 上下浮动）。
+    float macroStrength = 0.0F;
 };
 
 /// GPU 侧的一个材质层参数块；字段排布与 `assets/shaders/mesh.frag` 的 std140 块逐字对应。
 ///
-/// 布局（std140，每行一个 `vec4`）：
-///   - `height` = `(heightMin, heightMax, heightBlend, textureIndex)`，`textureIndex = textureLayer - 1`
-///   - `slope`  = `(slopeMin, slopeMax, slopeBlend, 0)`
-///   - `tintUv` = `(tintR, tintG, tintB, uvScale)`
+/// 布局（std140，每行一个 `vec4`；共 4 行 = 64 字节）：
+///   - `height`  = `(heightMin, heightMax, heightBlend, textureIndex)`，`textureIndex = textureLayer - 1`
+///   - `slope`   = `(slopeMin, slopeMax, slopeBlend, roughness)` —— `w` 复用为 PBR 粗糙度，填满该 `vec4`
+///   - `tintUv`  = `(tintR, tintG, tintB, uvScale)`
+///   - `macroAo` = `(macroUvScale, macroStrength, ao, 0)` —— `w` 是整块**唯一**的填充槽
+///
+/// 4 个新增字段（roughness / macroUvScale / macroStrength / ao）**紧凑排进一个 `vec4`**，
+/// 并把既有的 `slope.w` 填充位复用给 `roughness`，故 15 个有效字段只占 4 个 `vec4`、仅 1 个填充槽。
 struct MaterialLayerUniform {
-    float heightMin      = 0.0F;
-    float heightMax      = 0.0F;
-    float heightBlend    = 0.0F;
-    float textureIndex   = 0.0F;
-    float slopeMin       = 0.0F;
-    float slopeMax       = 0.0F;
-    float slopeBlend     = 0.0F;
-    float slopeUnused    = 0.0F;
-    float tintR          = 1.0F;
-    float tintG          = 1.0F;
-    float tintB          = 1.0F;
-    float uvScale        = 1.0F;
+    // vec4 #1：高度带
+    float heightMin    = 0.0F;
+    float heightMax    = 0.0F;
+    float heightBlend  = 0.0F;
+    float textureIndex = 0.0F;
+    // vec4 #2：坡度带；w 复用为 PBR 粗糙度
+    float slopeMin    = 0.0F;
+    float slopeMax    = 0.0F;
+    float slopeBlend  = 0.0F;
+    float roughness   = 1.0F;
+    // vec4 #3：层色与每层 UV 尺度
+    float tintR       = 1.0F;
+    float tintG       = 1.0F;
+    float tintB       = 1.0F;
+    float uvScale     = 1.0F;
+    // vec4 #4：宏观变化与 AO（w = 填充）
+    float macroUvScale   = 0.02F;
+    float macroStrength  = 0.0F;
+    float ao             = 1.0F;
+    float macroAoUnused  = 0.0F;
 };
 
 /// 片元着色器的材质 uniform 块（`set = 3, binding = 0`）。
@@ -76,7 +102,7 @@ struct MaterialUniform {
     std::array<MaterialLayerUniform, static_cast<std::size_t>(kMaterialSlotCount)> layers {};
 };
 
-static_assert(sizeof(MaterialUniform) == 16 + 48 * static_cast<std::size_t>(kMaterialSlotCount),
+static_assert(sizeof(MaterialUniform) == 16 + 64 * static_cast<std::size_t>(kMaterialSlotCount),
               "MaterialUniform 必须与 mesh.frag 的 std140 布局逐字节一致");
 
 class TerrainMaterialTable;
@@ -98,7 +124,8 @@ class TerrainMaterialTable {
 public:
     /// 当前表格式版本；写入配置文件的 `schema_version` 必须与之相等。
     /// 2：新增 `uv_scale` 与 `tint_r/g/b`（ADR 0009）。
-    static constexpr int kSchemaVersion = 2;
+    /// 3：新增 `roughness` / `ao` / `macro_uv_scale` / `macro_strength`（ADR 0010 P2）。
+    static constexpr int kSchemaVersion = 3;
 
     /// 从 TOML 文件加载并校验；失败抛 `std::runtime_error`（启动期允许异常，ADR 0005）。
     /// 前置条件：`path` 指向待加载的材质表文件。

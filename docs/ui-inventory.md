@@ -91,10 +91,11 @@
 | 主音量 | 0–100 | 80 | 见下 | 立即写入设置并施加到音频增益路径（暂无音源） |
 | 帧率上限 | **60 ~ 当前显示器刷新率** | 当前显示器刷新率 | 见下 | 立即生效；上限档走垂直同步，其余走睡眠式限帧 |
 | 曝光（色调映射） | **0.1 ~ 8.0** | 1.0 | 见下 | **启动时读入**并作用于色调映射（ADR 0010 P0）。**当前无界面控件**（后续 P1 加光照参数时一并补 ESC 面板控件）；越界钳制、缺失取默认，**不需重编 Shader** |
+| MSAA 档位 | **1 / 2 / 4 / 8**（1 = 关闭） | 4 | 见下 | **启动时读入**并作用于主通道的多采样目标（ADR 0010 P3）。越界取**最近的合法档（并列向上）**，缺失取默认；**档位 = 1 时不创建多采样纹理（零额外开销）**；若硬件不支持所选档，按能力降到不高于请求的最高受支持档。**当前无界面控件**（档位变化需重启生效） |
 
 **落盘**：设置保存为 TOML（复用 toml++，见 ADR 0005）。**实际路径 = `SDL_GetPrefPath("voxel-engine", "voxel_game")` + `settings.toml`**
 （Windows 本机实测：`C:\Users\<用户>\AppData\Roaming\voxel-engine\voxel_game\settings.toml`）。
-字段：`schema_version` / `display_mode`（`windowed` / `fullscreen`）/ `window_width` / `window_height` / `master_volume` / `frame_rate_cap` / `exposure`。
+字段：`schema_version` / `display_mode`（`windowed` / `fullscreen`）/ `window_width` / `window_height` / `master_volume` / `frame_rate_cap` / `exposure` / `msaa_samples`。
 **要求**：启动时读取并应用；文件缺失用默认值（**不报错**）；文件存在但非法（语法 / schema / 字段缺失或类型错 / 尺寸非正）则**明确报错**；数值越界则钳制。
 
 ## 4. 登记规则

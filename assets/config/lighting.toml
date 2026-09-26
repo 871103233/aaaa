@@ -1,0 +1,120 @@
+# 光照与雾配置表（T21a 光照 / T21b 级联阴影 / T21c 指数高度雾）
+#
+# 依据：docs/adr/0010-render-quality-pipeline.md（P1 光照与阴影：方向光 + CSM 级联阴影 + 半球天空光 + 指数高度雾；
+#       "光照方向 / 强度 / 颜色、雾密度与颜色一律进配置文件，禁止在着色器里写死第二份"）、
+#       docs/adr/0005-config-parsing.md（TOML + toml++，启动期一次性加载）、
+#       docs/adr/0009-terrain-material-pipeline.md（配置表 → 单入口投影成 uniform 的机制）。
+#
+# 权威解释在代码：字段语义、单位与线性化规则见 engine/render/lighting_table.hpp。本文件只提供数值。
+#
+# 本表是 CPU 与 GPU 的**唯一事实来源**：这些数值由 BuildLightingUniform 打包成片元着色器
+# set = 3, binding = 1 的 std140 uniform 块，阴影参数由 BuildShadowUniform 打包成 set = 3, binding = 2；
+# **禁止**在 assets/shaders/mesh.frag / shadow.vert 里另写一份。
+#
+# 单位与口径（务必先读）：
+#   - 颜色一律按 **sRGB 作者色**给出（各分量 ∈ [0, 1]，即美术在取色器里看到的数值）。
+#     它们在 CPU 侧一次性转线性（pow(c, 2.2)）后写进 uniform —— 因为它们是常量；
+#     地表 albedo 来自纹理、无法在 CPU 侧预转，故仍由着色器在片元内转线性。两者口径一致。
+#   - intensity / density / height_falloff 是无量纲或"每格"量，意义见下。
+#   - 本文件缺失、语法错、字段缺失、数值越界、schema_version 不符 → **抛异常并中止启动**，不静默回退。
+#
+# 约束（加载时校验，违反即中止启动）：
+#   - schema_version 必须等于 LightingTable::kSchemaVersion；
+#   - sun.direction 长度必须非零（加载后由 BuildLightingUniform 归一化）；
+#   - 所有颜色分量 ∈ [0, 1]；sun.intensity / sky.intensity / fog.density / fog.height_falloff ≥ 0；
+#   - shadow.cascade_count ∈ [1, 4]；shadow.resolution 是 2 的幂且 ≥ 256；
+#     shadow.max_distance > 0；shadow.split_lambda ∈ [0, 1]；depth_bias / normal_offset ≥ 0。
+
+schema_version = 2
+
+# ---------------------------------------------------------------------------
+# 太阳（方向光）
+# ---------------------------------------------------------------------------
+[sun]
+# direction：**由地表指向太阳**的单位方向（即"光的来向"；光照行进方向是它的相反数）。
+#   着色器按 `max(dot(N, direction), 0)` 使用它（N = 世界空间单位法线）。
+#   [0.45, 0.80, 0.30] ≈ 从东北偏上斜射下来：归一化后 y ≈ 0.83，即太阳高度约 56°（正午前后）。
+#   **不要**在这里追求精确长度，BuildLightingUniform 会归一化；但长度不能为 0。
+direction = [0.45, 0.80, 0.30]
+
+# color：日光作者色（sRGB）。轻微偏暖（蓝通道略低）以模拟大气散射。
+color = [1.00, 0.96, 0.88]
+
+# intensity：日光强度（无量纲，线性光倍数）。1.30 与下面的天空强度配合，
+#   使受光的平地（N = +Y，dot ≈ 0.83）总光照约 1.2~1.6，经 ACES + sRGB 后落在 0.2~0.8，不死白。
+intensity = 1.30
+
+# ---------------------------------------------------------------------------
+# 天空（半球光）
+# ---------------------------------------------------------------------------
+[sky]
+# zenith_color：天顶色（sRGB），半球光的"朝上一侧"。
+zenith_color = [0.42, 0.62, 0.92]
+
+# horizon_color：地平色（sRGB）。有两处用途：
+#   ① 作为清屏色（game/main.cpp 取它的线性值），使远处天空与地形背景一致；
+#   ② 作为 fog.color 缺失时的默认雾色（远景自然融入天空，见 T21c 验收判据）。
+horizon_color = [0.70, 0.80, 0.92]
+
+# ground_color：地面反弹色（sRGB），半球光的"朝下一侧"（给背光面 / 朝下法线以暖色）。
+ground_color = [0.34, 0.29, 0.23]
+
+# intensity：半球天空光强度（无量纲）。它替代旧的写死环境项（kAmbientLight = 0.10），
+#   使**背光面呈天空色而非死黑**。1.00 的实测依据见 mesh.frag 顶部的中值色调自检表。
+intensity = 1.00
+
+# ---------------------------------------------------------------------------
+# 雾（T21c：指数高度雾）
+# ---------------------------------------------------------------------------
+[fog]
+# enabled：false 时片元着色器**完全跳过**雾计算（不含多余的 length/exp 运算）。
+enabled = true
+
+# density：雾密度（单位：1 / 格，即每个世界单位的消光系数）。
+#   fogAmount = 1 - exp(-density · 视距 · 高度衰减项)。
+#   0.0030 → 视距 20 格约 6% 遮挡（近景不被洗白）、150 格约 36%、300 格约 59%（远景融入天空）。
+density = 0.0030
+
+# height_falloff：高度衰减系数（单位：1 / 格）。
+#   高度衰减项 = exp(-height_falloff · max(片元高度 - 相机高度, 0)) ∈ (0, 1]：
+#   高于相机的地形雾更稀薄、低于相机的地面雾最浓。0.02 → 高于相机 50 格处雾量降到约 37%。
+height_falloff = 0.02
+
+# color：雾色（sRGB，**可选字段**）。缺失时**默认取 sky.horizon_color**（此处即 [0.70, 0.80, 0.92]），
+#   因此保持注释状态即可：远景与天空地平色一致，不出现硬边。
+# color = [0.70, 0.80, 0.92]
+
+# ---------------------------------------------------------------------------
+# 阴影（T21b：级联阴影 CSM）
+# ---------------------------------------------------------------------------
+# 级联分割与各级光空间矩阵**不在这里**：它们依赖相机 near / far / fov / aspect 与渲染原点，
+# 由 game/ 每帧用 engine/render/shadow_cascade.hpp 的纯函数（ComputeCascadeSplits /
+# BuildCascadeLightMatrix / BuildShadowUniform）现场计算后传入渲染器。本段只提供**与相机无关**的参数。
+[shadow]
+# enabled：false 时片元着色器**整段跳过**阴影采样，且不执行阴影通道（省一次深度数组遍历）。
+enabled = true
+
+# cascade_count：级联数，必须 ∈ [1, 4]。
+#   3 级在"覆盖 180 格 + 2048²"下，最远一级每 texel 约 0.26 格，近景仍足够锐利（显存 3 × 16 MB = 48 MB）。
+cascade_count = 3
+
+# resolution：每级阴影图边长（正方形），必须是 **2 的幂且 ≥ 256**。
+#   显存 = cascade_count × resolution² × 4 B（D32_FLOAT）：2048² × 3 级 = 48 MB（记入启动日志与 F1 面板）。
+resolution = 2048
+
+# max_distance：阴影覆盖距离（格，相机视距）。实际使用值取 min(相机远平面, max_distance)；
+#   超出它的片元不投影（远景本就被雾混向天空色，无阴影不突兀）。
+max_distance = 180.0
+
+# split_lambda：级联分割的 log/uniform 混合系数，必须 ∈ [0, 1]。
+#   0 = 均匀分割（近处精度差、远处浪费）；1 = 完全对数分割（近处极密、远处极疏）。
+#   0.75 偏向对数：近景（约占屏幕大半）拿到高分辨率级联，远景用大级联粗投影。
+split_lambda = 0.75
+
+# depth_bias：深度偏移（阴影图 [0,1] 深度单位），必须 ≥ 0，抗自遮挡（acne）。
+#   0.0015 对 2048² / 180 格覆盖 ≈ 0.27 格的深度余量，足以压住高度场地形在斜射下的自遮挡。
+depth_bias = 0.0015
+
+# normal_offset：法线偏移（世界单位 / 格），必须 ≥ 0。
+#   采样点沿几何法线外移 0.05 格，使掠射表面离开自身深度（Peter-panning 因此极小：仅 5cm 量级）。
+normal_offset = 0.05

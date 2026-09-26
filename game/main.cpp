@@ -24,7 +24,9 @@
 #include "platform/settings.hpp"
 #include "platform/window.hpp"
 #include "render/camera.hpp"
+#include "render/lighting_table.hpp"
 #include "render/mesh_renderer.hpp"
+#include "render/shadow_cascade.hpp"
 #include "terrain/material_table.hpp"
 #include "terrain/material_textures.hpp"
 #include "terrain/terrain_collision.hpp"
@@ -319,6 +321,33 @@ int main(int argc, char** argv) {
         const vx::TerrainMaterialTable materials =
             vx::TerrainMaterialTable::LoadFromFile(SourceAssetPath("assets/config/materials.toml"));
 
+        // T21a / T21c：光照与雾配置。与材质表**同源解析**（同一个 SourceAssetPath，同一个 toml++），
+        // 加载失败（缺失 / 语法错 / 校验不过 / schema_version 不符）抛异常 → 外层 catch → 启动失败，
+        // 与材质表口径一致：**禁止静默回退**。
+        const vx::LightingTable lighting =
+            vx::LightingTable::LoadFromFile(SourceAssetPath("assets/config/lighting.toml"));
+        VX_LOG_INFO("光照配置已加载：太阳方向 (%.2f, %.2f, %.2f)（**由地表指向太阳**）强度 %.2f；"
+                    "天空强度 %.2f；雾 %s（密度 %.4f /格，高度衰减 %.4f /格，雾色 (%.2f, %.2f, %.2f)）",
+                    static_cast<double>(lighting.Sun().direction[0]),
+                    static_cast<double>(lighting.Sun().direction[1]),
+                    static_cast<double>(lighting.Sun().direction[2]), static_cast<double>(lighting.Sun().intensity),
+                    static_cast<double>(lighting.Sky().intensity), lighting.Fog().enabled ? "启用" : "关闭",
+                    static_cast<double>(lighting.Fog().density), static_cast<double>(lighting.Fog().heightFalloff),
+                    static_cast<double>(lighting.Fog().color[0]), static_cast<double>(lighting.Fog().color[1]),
+                    static_cast<double>(lighting.Fog().color[2]));
+
+        // T21b：阴影配置日志（级数 / 分辨率 / 覆盖距离 / 显存预估与占比）。
+        const vx::ShadowSettings& shadowSettings = lighting.Shadow();
+        const double shadowMb = static_cast<double>(shadowSettings.cascadeCount) *
+                                static_cast<double>(shadowSettings.resolution) *
+                                static_cast<double>(shadowSettings.resolution) * 4.0 / (1024.0 * 1024.0);
+        VX_LOG_INFO("阴影配置：%s（级数 %d，分辨率 %d²，覆盖 %.0f 格，split_lambda %.2f，"
+                    "depth_bias %.4f，normal_offset %.3f 格）；阴影图预估 %.2f MB（占 VRAM 预算 300 MB 的 %.1f%%）",
+                    shadowSettings.enabled ? "启用" : "关闭", shadowSettings.cascadeCount, shadowSettings.resolution,
+                    static_cast<double>(shadowSettings.maxDistance), static_cast<double>(shadowSettings.splitLambda),
+                    static_cast<double>(shadowSettings.depthBias), static_cast<double>(shadowSettings.normalOffset),
+                    shadowMb, 100.0 * shadowMb / 300.0);
+
         // T11：从预设地图构建世界（种子 / 范围 / 地形编辑全部来自文件，不再硬编码）。
         const std::filesystem::path mapPath = SourceAssetPath(kDefaultMapFile);
         const vx::MapPreset         preset  = vx::MapPreset::LoadFromFile(mapPath);
@@ -337,10 +366,11 @@ int main(int argc, char** argv) {
         const int displayRefreshRate = window.DisplayRefreshRate();
         systemSettings.frameRateCap = vx::ResolveFrameRateCap(systemSettings.frameRateCap, displayRefreshRate);
 
-        VX_LOG_INFO("已加载设置：显示模式=%s，分辨率=%d x %d，主音量=%d，帧率上限=%d Hz，曝光=%.2f",
+        VX_LOG_INFO("已加载设置：显示模式=%s，分辨率=%d x %d，主音量=%d，帧率上限=%d Hz，曝光=%.2f，MSAA=%d×",
                     (systemSettings.displayMode == vx::DisplayMode::Fullscreen) ? "fullscreen" : "windowed",
                     systemSettings.windowWidth, systemSettings.windowHeight, systemSettings.masterVolume,
-                    systemSettings.frameRateCap, static_cast<double>(systemSettings.exposure));
+                    systemSettings.frameRateCap, static_cast<double>(systemSettings.exposure),
+                    systemSettings.msaaSamples);
         VX_LOG_INFO("显示器刷新率：%d Hz（未知时回退 %d Hz）", displayRefreshRate, vx::kFallbackRefreshRate);
 
         // 应用设置：窗口模式恢复客户区尺寸；全屏走桌面无边框全屏。
@@ -412,25 +442,40 @@ int main(int argc, char** argv) {
         // T20 / ADR 0010：把配置里的曝光交给色调映射通道（参数进配置，改值不需重编 Shader）。
         renderer.SetExposure(systemSettings.exposure);
 
-        // T19 / ADR 0009：程序生成的占位材质贴图（albedo 细节 + 由高度噪声梯度得到的法线），
-        // 上传为两个 2D 纹理数组（各 4 层），供片元着色器逐像素混合。无二进制资产、种子确定性。
+        // T23 / ADR 0010 P3：把配置里的 MSAA 档位交给渲染器（引擎层不读配置文件；档位 = 1 时零额外开销）。
+        renderer.SetMsaaSampleCount(static_cast<std::uint32_t>(systemSettings.msaaSamples));
+
+        // T22 / ADR 0010 P2：程序生成的占位材质贴图（多尺度 albedo / 法线 + roughness + AO + 宏观变化），
+        // 上传为五个 2D 纹理数组（albedo/normal/roughness/AO 各 4 层，macro 1 层），供片元着色器逐像素混合
+        // 并做 PBR。无二进制资产、种子确定性。显存由 CreateTextureArray 自动计入 RenderStats::textureBytes。
         const vx::MaterialTextureSet materialTextures = vx::GenerateMaterialTextures(preset.seed);
         const vx::TextureArrayDesc   albedoDesc { materialTextures.size, materialTextures.size,
                                                   materialTextures.layerCount, materialTextures.albedoRgba.data() };
         const vx::TextureArrayDesc   normalDesc { materialTextures.size, materialTextures.size,
                                                   materialTextures.layerCount, materialTextures.normalRgba.data() };
-        const vx::TextureArrayHandle albedoTexture = renderer.CreateTextureArray(albedoDesc);
-        const vx::TextureArrayHandle normalTexture = renderer.CreateTextureArray(normalDesc);
-        renderer.SetSampledTextureArrays(albedoTexture, normalTexture);
+        const vx::TextureArrayDesc   roughnessDesc { materialTextures.size, materialTextures.size,
+                                                     materialTextures.layerCount, materialTextures.roughnessRgba.data() };
+        const vx::TextureArrayDesc   aoDesc { materialTextures.size, materialTextures.size,
+                                              materialTextures.layerCount, materialTextures.aoRgba.data() };
+        const vx::TextureArrayDesc   macroDesc { materialTextures.size, materialTextures.size,
+                                                 vx::kMaterialMacroLayerCount, materialTextures.macroRgba.data() };
+        const vx::TextureArrayHandle albedoTexture    = renderer.CreateTextureArray(albedoDesc);
+        const vx::TextureArrayHandle normalTexture    = renderer.CreateTextureArray(normalDesc);
+        const vx::TextureArrayHandle roughnessTexture = renderer.CreateTextureArray(roughnessDesc);
+        const vx::TextureArrayHandle aoTexture        = renderer.CreateTextureArray(aoDesc);
+        const vx::TextureArrayHandle macroTexture     = renderer.CreateTextureArray(macroDesc);
+        renderer.SetSampledTextureArrays(albedoTexture, normalTexture, roughnessTexture, aoTexture, macroTexture);
         {
-            // 含 mip 的显存估算：4/3 × 第 0 级字节 × 2 张（albedo + 法线）。
-            const double mipFactor  = 4.0 / 3.0;
-            const double baseBytes  = static_cast<double>(materialTextures.size) * materialTextures.size *
-                                     materialTextures.layerCount * 4.0;
-            VX_LOG_INFO("材质贴图已生成并上传：%u×%u × %u 层，R8G8B8A8_UNORM；albedo + 法线两张，"
-                        "含 mip 约 %.2f MB 显存（第 0 级 %.2f MB/张）",
+            // 材质数组总量 = 每层第 0 级字节 × 4/3（mip）× 总层数；层数 = 4×4 + 1（macro）。
+            const double mipFactor = 4.0 / 3.0;
+            const double baseBytes = static_cast<double>(materialTextures.size) * materialTextures.size * 4.0;
+            const double totalLayerCount =
+                static_cast<double>(materialTextures.layerCount) * 4.0 + static_cast<double>(vx::kMaterialMacroLayerCount);
+            VX_LOG_INFO("材质贴图已生成并上传：%u×%u，R8G8B8A8_UNORM；albedo/normal/roughness/AO 各 %u 层 + macro %u 层，"
+                        "含 mip 约 %.2f MB 显存（第 0 级 %.2f MB/层）",
                         materialTextures.size, materialTextures.size, materialTextures.layerCount,
-                        baseBytes * mipFactor * 2.0 / (1024.0 * 1024.0), baseBytes / (1024.0 * 1024.0));
+                        vx::kMaterialMacroLayerCount, baseBytes * mipFactor * totalLayerCount / (1024.0 * 1024.0),
+                        baseBytes / (1024.0 * 1024.0));
         }
 
         // T12：出生点来自预设地图（世界列坐标）；角色脚底抬离地表一点，随后自然落到地表。
@@ -549,11 +594,12 @@ int main(int argc, char** argv) {
         vx::Clock                clock;
         vx::FixedStepAccumulator accumulator(vx::kFixedDt);
 
-        // T20 / ADR 0010：主通道写 HDR 目标，清屏色须按**线性光**给出（色调映射通道最后编码到 sRGB）。
-        // 作者色 (0.45, 0.62, 0.85) 按 sRGB 观感给出，转线性用 pow(c, 2.2)；渲染层不解释颜色语义。
-        const SDL_FColor clearColor { static_cast<float>(std::pow(0.45, 2.2)),
-                                      static_cast<float>(std::pow(0.62, 2.2)),
-                                      static_cast<float>(std::pow(0.85, 2.2)), 1.0F };
+        // T20 / T21a：主通道写 HDR 目标，清屏色须按**线性光**给出（色调映射通道最后编码到 sRGB）。
+        // T21a 起不再写死：取配置里的**天空地平色**（sRGB 作者色 → 线性）。为什么是地平色而不是天顶色：
+        // 清屏色就是"没有几何处的天空背景"，而远景地形会被雾混向**地平色**
+        // （fog.color 缺失时默认 = sky.horizon_color），两者同源才能让远景与天空无缝衔接、无硬边。
+        const vx::ColorRgb clearLinear = vx::SrgbToLinear(lighting.Sky().horizonColor);
+        const SDL_FColor   clearColor { clearLinear[0], clearLinear[1], clearLinear[2], 1.0F };
 
         // T24：CPU 帧时间分解的相位计时器（逻辑步 / UI 构建 / 渲染提交）。
         PhaseTimer   logicTimer;
@@ -883,7 +929,25 @@ int main(int argc, char** argv) {
                 vx::BuildMaterialUniform(world.Materials(), renderOrigin.x, renderOrigin.y, renderOrigin.z);
             renderer.SetMaterialUniform(&materialUniform, sizeof(materialUniform));
 
-            renderer.SetCamera(RelativeCameraView(view, renderOrigin));
+            // 光照与雾参数（T21a / T21c）：来自启动期加载的同一份光照表，经 BuildLightingUniform 单入口投影。
+            // **相机世界位置每帧变化**（第三人对焦跟随 + 避障），而雾按视距插值，故 uniform 必须每帧重建。
+            // `view.eye` 是绝对世界坐标，与片元还原出的 worldPosition 同空间。
+            const vx::LightingUniform lightingUniform =
+                vx::BuildLightingUniform(lighting, static_cast<double>(view.eye.x),
+                                         static_cast<double>(view.eye.y), static_cast<double>(view.eye.z));
+            renderer.SetLightingUniform(&lightingUniform, sizeof(lightingUniform));
+
+            const vx::CameraView relativeView = RelativeCameraView(view, renderOrigin);
+            renderer.SetCamera(relativeView);
+
+            // T21b：级联分割与各级光空间矩阵由 game 每帧按相机参数算出（engine 不认识相机设置），
+            // 经 BuildShadowUniform 单入口投影成片元 uniform 槽 2 的参数块；级数 / 分辨率来自配置。
+            const vx::CameraSettings& cameraSettings = camera.Settings();
+            const vx::ShadowUniform   shadowUniform  = vx::BuildShadowUniform(
+                lighting, relativeView.view, cameraSettings.fieldOfViewDegrees, cameraSettings.aspectRatio,
+                cameraSettings.nearPlane, cameraSettings.farPlane);
+            renderer.SetShadowCascades(shadowUniform, static_cast<std::uint32_t>(lighting.Shadow().cascadeCount),
+                                       static_cast<std::uint32_t>(lighting.Shadow().resolution));
             // T24：渲染提交相位（RenderFrame 内含相机常量与动态顶点等内部上传）。
             renderTimer.Begin();
             if (!renderer.RenderFrame(tileHandles.data(), tileHandles.size(), clearColor, &debugOverlay)) {
