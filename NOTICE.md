@@ -9,7 +9,7 @@
 | --- | --- | --- | --- |
 | SDL3 | 窗口 / 输入 / 音频 / GPU 抽象 | zlib | V0.1 |
 | GLM | 数学库 | MIT（另有 Happy Bunny License 双许可） | V0.1 |
-| FastNoiseLite | 噪声生成 | MIT | V0.2 |
+| FastNoiseLite | 噪声生成 | MIT | V0.1 |
 | stb_image（`stb`） | 纹理加载 | Public Domain / MIT 双许可 | V0.1 |
 | Dear ImGui（`imgui`，含 SDL3 与 SDL3_gpu 绑定） | 调试 UI | MIT | V0.1 |
 | toml++（`tomlplusplus`） | 配置解析 | MIT | V0.1 |

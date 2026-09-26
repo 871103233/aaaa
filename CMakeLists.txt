@@ -93,7 +93,7 @@ include(Shaders)
 # 模块
 # ============================================================
 add_subdirectory(engine)
-add_subdirectory(voxel)
+add_subdirectory(world)
 add_subdirectory(game)
 
 # ============================================================

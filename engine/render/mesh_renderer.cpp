@@ -329,8 +329,8 @@ void MeshRenderer::UploadCameraUniform(SDL_GPUCommandBuffer* commandBuffer) {
     SDL_EndGPUCopyPass(copyPass);
 }
 
-bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount,
-                               const SDL_FColor& clearColor) {
+bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, const SDL_FColor& clearColor,
+                               IRenderOverlay* overlay) {
     SDL_GPUCommandBuffer* commandBuffer = SDL_AcquireGPUCommandBuffer(m_device);
     if (commandBuffer == nullptr) {
         throw std::runtime_error(std::string("SDL_AcquireGPUCommandBuffer 失败：") + SDL_GetError());
@@ -398,6 +398,12 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount,
     }
 
     SDL_EndGPURenderPass(pass);
+
+    // 叠加层：与 3D 通道共用本命令缓冲（交换链纹理只在获取它的命令缓冲里有效）。
+    if (overlay != nullptr) {
+        overlay->DrawOverlay(commandBuffer, swapchain, width, height);
+    }
+
     SDL_SubmitGPUCommandBuffer(commandBuffer);
     return true;
 }

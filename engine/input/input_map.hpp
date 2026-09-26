@@ -20,8 +20,8 @@ enum class MouseAxis : std::uint8_t {
 /// 动作映射 + 每帧输入采样。
 ///
 /// 契约（上层据此编程，测试逐条断言）：
-///   1. **平台层填充，上层只读**：平台层在事件阶段调用 `SetKeyDown` / `AddMouseDelta`；
-///      `voxel/` 与 `game/` **绝不**触摸 SDL 事件队列（SKILL 红线）。
+///   1. **平台层填充，上层只读**：平台层在事件阶段调用 `SetKeyDown` / `SetMouseButtonDown` /
+///      `AddMouseDelta`；`world/` 与 `game/` **绝不**触摸 SDL 事件队列（SKILL 红线）。
 ///   2. **每帧采样一次**：每帧在**固定步循环之外**调用一次 `BeginFrame()`。
 ///      `BeginFrame()` 提交本帧状态，并**清除上一帧的 pressed 边沿**——
 ///      因此 `pressed` 只反映"本帧新按下"，绝不跨帧残留（键一直按住也不会每帧触发）。
@@ -45,8 +45,16 @@ public:
     /// 把一个鼠标轴绑定到模拟动作。
     void BindMouseAxis(ActionId action, MouseAxis axis);
 
+    /// 把一个鼠标按键绑定到数字动作（如主 / 副笔刷）。
+    /// 前置条件：`button` 为 SDL 的鼠标按键号（`SDL_BUTTON_LEFT` 等，从 1 起）。
+    void BindMouseButton(ActionId action, std::uint8_t button);
+
     /// 平台层：记录某个按键当前的按下状态（由键盘事件驱动）。
     void SetKeyDown(SDL_Scancode key, bool isDown) noexcept;
+
+    /// 平台层：记录某个鼠标按键当前的按下状态（由鼠标按键事件驱动）。
+    /// 越界按键号被忽略（保持 `noexcept`，不做分配）。
+    void SetMouseButtonDown(std::uint8_t button, bool isDown) noexcept;
 
     /// 平台层：累积本帧鼠标相对位移（由鼠标移动事件驱动）。
     void AddMouseDelta(float deltaX, float deltaY) noexcept;
@@ -72,19 +80,25 @@ public:
 private:
     /// 单个动作的绑定表。
     struct Binding {
-        std::vector<SDL_Scancode> keys;
-        bool                      hasMouseAxis = false;
-        MouseAxis                 mouseAxis    = MouseAxis::X;
+        std::vector<SDL_Scancode>  keys;
+        std::vector<std::uint8_t>  mouseButtons;
+        bool                       hasMouseAxis = false;
+        MouseAxis                  mouseAxis    = MouseAxis::X;
     };
 
     [[nodiscard]] static std::size_t Index(ActionId action) noexcept {
         return static_cast<std::size_t>(action);
     }
 
+    /// 鼠标按键状态数组长度：SDL 鼠标按键号从 1 起，0 号不用，最大到 `SDL_BUTTON_X2`。
+    static constexpr std::size_t kMouseButtonCount = static_cast<std::size_t>(SDL_BUTTON_X2) + 1;
+
     std::array<Binding, kActionCount>     m_bindings {};
     std::array<ActionState, kActionCount> m_states {};
     std::array<bool, static_cast<std::size_t>(SDL_SCANCODE_COUNT)> m_keyDownNow {};
     std::array<bool, static_cast<std::size_t>(SDL_SCANCODE_COUNT)> m_keyDownPrev {};
+    std::array<bool, kMouseButtonCount>                            m_mouseDownNow {};
+    std::array<bool, kMouseButtonCount>                            m_mouseDownPrev {};
 
     float m_mouseDeltaX = 0.0F;  ///< 本帧已提交的水平位移
     float m_mouseDeltaY = 0.0F;  ///< 本帧已提交的垂直位移

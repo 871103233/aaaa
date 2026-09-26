@@ -1,5 +1,7 @@
 #include "platform/window.hpp"
 
+#include "input/input_map.hpp"
+
 #include <stdexcept>
 #include <string>
 
@@ -65,11 +67,29 @@ Window::~Window() {
     SDL_Quit();
 }
 
-bool Window::pump_events() noexcept {
+bool Window::pump_events(InputMap& input) noexcept {
     SDL_Event event {};
     while (SDL_PollEvent(&event)) {
-        if (event.type == SDL_EVENT_QUIT) {
-            return false;
+        switch (event.type) {
+            case SDL_EVENT_QUIT:
+                return false;
+            case SDL_EVENT_KEY_DOWN:
+                input.SetKeyDown(event.key.scancode, true);
+                break;
+            case SDL_EVENT_KEY_UP:
+                input.SetKeyDown(event.key.scancode, false);
+                break;
+            case SDL_EVENT_MOUSE_MOTION:
+                input.AddMouseDelta(event.motion.xrel, event.motion.yrel);
+                break;
+            case SDL_EVENT_MOUSE_BUTTON_DOWN:
+                input.SetMouseButtonDown(event.button.button, true);
+                break;
+            case SDL_EVENT_MOUSE_BUTTON_UP:
+                input.SetMouseButtonDown(event.button.button, false);
+                break;
+            default:
+                break;
         }
     }
     return true;

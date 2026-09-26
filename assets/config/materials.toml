@@ -1,0 +1,67 @@
+# 地表材质表（splat 权重混合）
+#
+# 依据：docs/adr/0004-hybrid-layered-world-representation.md（地表材质 = 多纹理权重混合）、
+#       docs/adr/0005-config-parsing.md（TOML + toml++，启动期一次性加载）、
+#       docs/adr/0008-sizes-precision-budget.md（高度范围 0~512 格）。
+#
+# 权威解释在代码：字段语义与权重模型见 world/terrain/material_table.hpp 与
+# world/terrain/material_blender.hpp。本文件只提供数值。
+#
+# 权重模型（每个顶点）：
+#     weight[slot] = heightFactor * slopeFactor
+#   heightFactor = 高度落在 [height_min, height_max] 的平滑隶属度（过渡带宽度 height_blend）
+#   slopeFactor  = 坡度落在 [slope_min, slope_max] 的平滑隶属度（过渡带宽度 slope_blend）
+#   四个槽位的权重会整体归一化（和 = 1）；为让过渡不是一条直线，高度会被一层
+#   确定性噪声上下抖动几格（见 material_blender.cpp）。
+#
+# 约束（加载时校验，违反即中止启动）：
+#   - 槽位数量必须等于 MeshVertex::materialWeights 的分量数（4）；
+#   - texture_layer ∈ [1, 255]：0 号层保留给"缺失纹理"占位；
+#   - 0 ≤ slope_min ≤ slope_max ≤ 1（坡度为 1 - normal.y）；
+#   - *_blend ≥ 0；height_min ≤ height_max。
+
+schema_version = 1
+
+# 槽位 0：草 —— 低海拔、缓坡
+[[layer]]
+name         = "grass"
+texture_layer = 1
+height_min   = 0.0
+height_max   = 96.0
+height_blend = 16.0
+slope_min    = 0.0
+slope_max    = 0.35
+slope_blend  = 0.10
+
+# 槽位 1：土 —— 中低海拔、中坡的过渡材质
+[[layer]]
+name         = "dirt"
+texture_layer = 2
+height_min   = 0.0
+height_max   = 160.0
+height_blend = 24.0
+slope_min    = 0.20
+slope_max    = 0.60
+slope_blend  = 0.15
+
+# 槽位 2：岩 —— 高海拔或陡坡
+[[layer]]
+name         = "rock"
+texture_layer = 3
+height_min   = 40.0
+height_max   = 512.0
+height_blend = 24.0
+slope_min    = 0.45
+slope_max    = 1.0
+slope_blend  = 0.15
+
+# 槽位 3：沙 —— 低洼滩地
+[[layer]]
+name         = "sand"
+texture_layer = 4
+height_min   = 0.0
+height_max   = 6.0
+height_blend = 3.0
+slope_min    = 0.0
+slope_max    = 0.30
+slope_blend  = 0.10

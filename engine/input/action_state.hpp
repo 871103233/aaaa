@@ -5,7 +5,7 @@
 
 namespace vx {
 
-/// 动作标识：上层（`voxel/` / `game/`）只认动作，**不认 SDL 键码**（SKILL 红线）。
+/// 动作标识：上层（`world/` / `game/`）只认动作，**不认 SDL 键码**（SKILL 红线）。
 ///
 /// 新增动作只能**追加**在 `Count` 之前，不得插队、不得复用（键位绑定与测试都引用这些值）。
 enum class ActionId : std::uint8_t {
@@ -19,6 +19,7 @@ enum class ActionId : std::uint8_t {
     Use,     ///< 副笔刷：堆建
     LookX,   ///< 模拟动作：本帧鼠标水平位移
     LookY,   ///< 模拟动作：本帧鼠标垂直位移
+    ToggleDebugPanel,  ///< 调试面板开关（T9；只在 game/ 消费，不参与模拟）
 
     Count,
 };

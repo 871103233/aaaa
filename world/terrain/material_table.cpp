@@ -1,0 +1,127 @@
+#include "terrain/material_table.hpp"
+
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <utility>
+
+#include <toml++/toml.hpp>
+
+namespace vx {
+namespace {
+
+[[nodiscard]] std::string Describe(const std::filesystem::path& path, std::size_t slot, const char* field) {
+    return path.string() + ": [[layer]] #" + std::to_string(slot) + " 字段 [" + field + "] ";
+}
+
+[[nodiscard]] float ReadFloat(const toml::table& layer, const std::filesystem::path& path, std::size_t slot,
+                              const char* field) {
+    const std::optional<double> value = layer[field].value<double>();
+    if (!value.has_value()) {
+        throw std::runtime_error(Describe(path, slot, field) + "缺失或不是数值");
+    }
+    return static_cast<float>(*value);
+}
+
+[[nodiscard]] int ReadInt(const toml::table& layer, const std::filesystem::path& path, std::size_t slot,
+                          const char* field) {
+    const std::optional<std::int64_t> value = layer[field].value<std::int64_t>();
+    if (!value.has_value()) {
+        throw std::runtime_error(Describe(path, slot, field) + "缺失或不是整数");
+    }
+    return static_cast<int>(*value);
+}
+
+[[nodiscard]] std::string ReadString(const toml::table& layer, const std::filesystem::path& path, std::size_t slot,
+                                     const char* field) {
+    const std::optional<std::string> value = layer[field].value<std::string>();
+    if (!value.has_value()) {
+        throw std::runtime_error(Describe(path, slot, field) + "缺失或不是字符串");
+    }
+    return *value;
+}
+
+void ValidateLayer(const MaterialLayer& layer, const std::filesystem::path& path, std::size_t slot) {
+    if (layer.textureLayer < 1 || layer.textureLayer > 255) {
+        throw std::runtime_error(Describe(path, slot, "texture_layer") + "必须落在 [1, 255]（0 号层保留给缺失纹理）");
+    }
+    if (layer.heightMin > layer.heightMax) {
+        throw std::runtime_error(Describe(path, slot, "height_min") + "不能大于 height_max");
+    }
+    if (layer.slopeMin < 0.0F || layer.slopeMax > 1.0F || layer.slopeMin > layer.slopeMax) {
+        throw std::runtime_error(Describe(path, slot, "slope_min/slope_max") + "必须满足 0 ≤ min ≤ max ≤ 1");
+    }
+    if (layer.heightBlend < 0.0F || layer.slopeBlend < 0.0F) {
+        throw std::runtime_error(Describe(path, slot, "height_blend/slope_blend") + "不能为负");
+    }
+}
+
+}  // namespace
+
+TerrainMaterialTable TerrainMaterialTable::LoadFromFile(const std::filesystem::path& path) {
+    toml::table document;
+    try {
+        document = toml::parse_file(path.string());
+    } catch (const std::exception& error) {
+        throw std::runtime_error("无法加载材质表 " + path.string() + ": " + error.what());
+    }
+
+    const std::optional<std::int64_t> schemaVersion = document["schema_version"].value<std::int64_t>();
+    if (!schemaVersion.has_value()) {
+        throw std::runtime_error(path.string() + ": 缺少 schema_version");
+    }
+    if (*schemaVersion != static_cast<std::int64_t>(kSchemaVersion)) {
+        throw std::runtime_error(path.string() + ": schema_version 不匹配（期望 " + std::to_string(kSchemaVersion) +
+                                 "，实际 " + std::to_string(*schemaVersion) + "）");
+    }
+
+    const toml::array* layers = document["layer"].as_array();
+    if (layers == nullptr) {
+        throw std::runtime_error(path.string() + ": 缺少 [[layer]] 数组");
+    }
+    if (layers->size() != static_cast<std::size_t>(kMaterialSlotCount)) {
+        throw std::runtime_error(path.string() + ": [[layer]] 数量必须等于 splat 槽位数 " +
+                                 std::to_string(kMaterialSlotCount) + "，实际 " + std::to_string(layers->size()));
+    }
+
+    TerrainMaterialTable table;
+    table.m_schemaVersion = static_cast<int>(*schemaVersion);
+
+    for (std::size_t slot = 0; slot < layers->size(); ++slot) {
+        const toml::table* layer = (*layers)[slot].as_table();
+        if (layer == nullptr) {
+            throw std::runtime_error(path.string() + ": [[layer]] #" + std::to_string(slot) + " 不是表");
+        }
+
+        MaterialLayer parsed;
+        parsed.name        = ReadString(*layer, path, slot, "name");
+        parsed.textureLayer = ReadInt(*layer, path, slot, "texture_layer");
+        parsed.heightMin   = ReadFloat(*layer, path, slot, "height_min");
+        parsed.heightMax   = ReadFloat(*layer, path, slot, "height_max");
+        parsed.heightBlend = ReadFloat(*layer, path, slot, "height_blend");
+        parsed.slopeMin    = ReadFloat(*layer, path, slot, "slope_min");
+        parsed.slopeMax    = ReadFloat(*layer, path, slot, "slope_max");
+        parsed.slopeBlend  = ReadFloat(*layer, path, slot, "slope_blend");
+
+        ValidateLayer(parsed, path, slot);
+        table.m_layers[slot] = std::move(parsed);
+    }
+
+    return table;
+}
+
+TerrainMaterialTable TerrainMaterialTable::Default() {
+    TerrainMaterialTable table;
+
+    // 取值与 assets/config/materials.toml 一致，保证测试与运行期行为可比。
+    table.m_layers[0] = MaterialLayer { "grass", 1, 0.0F, 96.0F, 16.0F, 0.0F, 0.35F, 0.10F };
+    table.m_layers[1] = MaterialLayer { "dirt", 2, 0.0F, 160.0F, 24.0F, 0.20F, 0.60F, 0.15F };
+    table.m_layers[2] = MaterialLayer { "rock", 3, 40.0F, 512.0F, 24.0F, 0.45F, 1.0F, 0.15F };
+    table.m_layers[3] = MaterialLayer { "sand", 4, 0.0F, 6.0F, 3.0F, 0.0F, 0.30F, 0.10F };
+
+    return table;
+}
+
+}  // namespace vx

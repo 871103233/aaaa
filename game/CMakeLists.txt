@@ -1,17 +1,34 @@
 # 可执行游戏目标
 #
-# 当前为 SDL3_gpu 冒烟测试（hello triangle），用于验证两个高风险假设：
-#   1. SDL3_gpu 能在本机创建设备并拿到交换链；
-#   2. 构建期产出的 SPIR-V + DXIL 双格式能被 SDL3_gpu 接受（见 ADR 0002）。
-# 验证通过后，main.cpp 会被真正的固定时间步长主循环取代。
+# 当前为 V0.1 地表世界的运行闭环：窗口 + 高度场 tile 生成 / 网格化 + Jolt 角色胶囊物理 +
+# 第三人称相机 + 固定时间步长主循环 + 笔刷挖堆 + ImGui 调试面板。
+# PoC 冒烟路径（TriangleRenderer）保留但不再使用。
+#
+# Shader 在构建期编译为 SPIR-V 与 DXIL **双格式**（见 ADR 0002 与 cmake/Shaders.cmake）：
+#   triangle.* —— 冒烟路径（TriangleRenderer）用；
+#   mesh.*     —— 真正的网格渲染路径（MeshRenderer）用。
 
-add_executable(voxel_game main.cpp)
+# ImGui：vcpkg 端口已把 SDL3 / SDLGPU3 后端的 .cpp 编进 imgui 库本体，
+# 因此这里只需链接 imgui::imgui（头文件 imgui_impl_sdl3.h / imgui_impl_sdlgpu3.h 由端口提供），
+# 无需再把后端源文件加入本目标（详见交付说明）。
+find_package(imgui CONFIG REQUIRED)
+
+add_executable(voxel_game
+    main.cpp
+    debug_overlay.cpp
+)
+
+# 让运行期能定位仓库内已提交的资产（材质表等），与 tests/CMakeLists.txt 口径一致。
+target_compile_definitions(voxel_game PRIVATE VOXEL_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 target_link_libraries(voxel_game
     PRIVATE voxel_engine
     PRIVATE voxel_world
+    PRIVATE imgui::imgui
 )
 
-# Shader 在构建期编译为 SPIR-V 与 DXIL 双格式，产物位于 <build>/assets/shaders/
+# Shader 产物输出到 <build>/assets/shaders/
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/triangle.vert)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/triangle.frag)
+add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/mesh.vert)
+add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/mesh.frag)

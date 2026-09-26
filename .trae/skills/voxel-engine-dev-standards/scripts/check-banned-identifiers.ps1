@@ -46,7 +46,7 @@
 [CmdletBinding()]
 param(
     [string]   $RepoRoot,
-    [string[]] $IncludeDir = @('engine', 'voxel', 'game', 'editor', 'tests'),
+    [string[]] $IncludeDir = @('engine', 'world', 'game', 'editor', 'tests'),
     [string[]] $IncludeExt = @('.h', '.hpp', '.hh', '.cpp', '.cxx', '.cc'),
     [string[]] $ExcludeDir = @('third_party', 'build', 'out', '.git', '.trae', 'external', 'vendor', 'cmake-build-debug', 'cmake-build-release'),
     [switch]   $SelfTest

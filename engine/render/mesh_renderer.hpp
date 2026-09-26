@@ -49,6 +49,31 @@ struct MeshHandle {
     [[nodiscard]] bool IsValid() const noexcept { return id != 0; }
 };
 
+/// 帧末叠加层：与 3D 主通道**共用同一个命令缓冲**，在提交前绘制覆盖内容（调试面板等 UI）。
+///
+/// 为什么需要这个钩子：交换链纹理只能在**获取它的那个命令缓冲**里引用，跨命令缓冲再获取一次会重复呈现；
+/// 因此叠加内容必须由 `MeshRenderer` 在 3D 通道结束后、`Submit` 之前回调绘制。
+/// 引擎层**不认识任何具体 UI 实现**（不含 ImGui 类型）：SDK 使用者自行实现本接口。
+///
+/// 线程约定：`DrawOverlay` 在渲染线程、`MeshRenderer::RenderFrame` 内部被调用。
+class IRenderOverlay {
+public:
+    virtual ~IRenderOverlay() = default;
+
+    IRenderOverlay(const IRenderOverlay&) = delete;
+    IRenderOverlay& operator=(const IRenderOverlay&) = delete;
+    IRenderOverlay(IRenderOverlay&&) = delete;
+    IRenderOverlay& operator=(IRenderOverlay&&) = delete;
+
+    /// 在 3D 通道之后、命令缓冲提交之前绘制叠加内容。
+    /// 前置条件：`commandBuffer` 已获取交换链纹理，`swapchain` 为本次渲染目标。
+    virtual void DrawOverlay(SDL_GPUCommandBuffer* commandBuffer, SDL_GPUTexture* swapchain, std::uint32_t width,
+                             std::uint32_t height) = 0;
+
+protected:
+    IRenderOverlay() = default;
+};
+
 /// 通用网格渲染路径：图形管线 + 顶点 / 索引缓冲 + 每帧相机常量 + 索引绘制。
 ///
 /// 与 `TriangleRenderer` 的分工：后者是 PoC 冒烟路径（顶点写死在 Shader 内、无相机），
@@ -84,12 +109,12 @@ public:
     /// 设置本帧相机常量；下一次 `RenderFrame` 生效。
     void SetCamera(const CameraView& camera) noexcept;
 
-    /// 渲染一帧：清屏（颜色 + 深度）→ 绑定相机常量 → 依次索引绘制。
+    /// 渲染一帧：清屏（颜色 + 深度）→ 绑定相机常量 → 依次索引绘制 → 可选的叠加层。
     ///
     /// `meshes` 中被跳过的情况：指针为空、句柄无效、或该槽位已释放。
     /// 返回 false 表示本帧拿不到交换链纹理（如窗口最小化），调用方可直接跳过。
-    [[nodiscard]] bool RenderFrame(const MeshHandle* meshes, std::size_t meshCount,
-                                   const SDL_FColor& clearColor);
+    [[nodiscard]] bool RenderFrame(const MeshHandle* meshes, std::size_t meshCount, const SDL_FColor& clearColor,
+                                   IRenderOverlay* overlay = nullptr);
 
 private:
     struct MeshResources {

@@ -267,6 +267,25 @@
 
 ---
 
+## 2026-09-25  T7 角色物理（Jolt）+ T9 ImGui 调试面板 + I1 Linux CI 系统依赖
+
+- 做了什么：
+  1. **T7 角色物理**：新增 `engine/physics/physics_world.*`（Jolt 生命周期薄封装：作业系统与临时分配器、固定步长推进、通用高度场与角色胶囊；**公共头以 pimpl 隔离，不含任何 Jolt 类型**）；新增 `world/terrain/terrain_collision.*` 作为地表专有胶水（tile → 高度场采样 / 碰撞体，挖掘后按脏 tile 重建）；`game/main.cpp` 用 `CharacterVirtual` 胶囊**替换掉原先"相机贴地"的临时做法**，相机改为跟随角色脚底并保留地形避障。
+  2. **T9 调试面板**：新增 `game/debug_overlay.*`，用 ImGui 的 SDL3 + SDL3_gpu 后端显示帧时间（本帧 + 120 样本环形缓冲的 P50/P95）、FPS、本帧固定步数、角色位置、相机、笔刷半径、tile 与脏 tile 计数、地表碰撞体 tile 数；F1 开关；滚动分位用固定数组排序，**每帧零堆分配**，隐藏时整帧跳过。
+  3. **配套加法式改动**（已由子代理显式上报，均为纯加法、不改既有行为）：`engine/render/mesh_renderer` 增加通用 `IRenderOverlay` 与 `RenderFrame(..., IRenderOverlay*)` 重载；`engine/input/action_state` 增加 `ActionId::ToggleDebugPanel`；`world/CMakeLists.txt` 增加一行源文件。
+  4. **I1 Linux CI**：`ci.yml` 的 Linux 依赖步骤补 `autoconf autoconf-archive automake libtool`（vcpkg 日志原文要求 `autoconf autoconf-archive automake libtoolize`）。
+- 为什么：T7 是"人物能自由活动"从"相机贴地假象"变成"真的走路"的分界——也是把相机避障从"唯一碰撞"降为"辅助避障"的前提；不换真角色，T8 的洞口、台阶、挖掘后站立全都没法验证。T9 的价值在于**把性能与状态变成看得见的数字**，否则 ADR 0008 的"只记录、不验收"就没有记录手段。I1 的根因链条值得记下：**`imgui[sdl3-binding,sdlgpu3-binding] → sdl3[dbus,ibus,x11,wayland] → dbus[systemd] → libsystemd → libxcrypt`**，`libxcrypt` 需要 `autotools` 才能构建；Windows 不开这些 Linux 专有特性，所以 Windows 作业一直是绿的——**平台不对称导致的失败，只在 Linux 侧暴露**。
+- 验证：
+  1. **构建**：`cmake --build --preset debug --clean-first` → 38/38 目标，退出码 0，**警告/错误行数 0**。
+  2. **测试**：`ctest --preset debug` → **39/39 passed**（原 34 项全绿 + 新增 5 项）。关键用例：`PhysicsCharacter.FallsAndRestsOnFlatHeightField`（落地静止不下穿）、`ClimbsOneGridUnitStepWhileWalking`（**1 格台阶自动上步**）、`SprintDoesNotPassThroughStep` / `SprintDoesNotPassThroughTallWall`（**冲刺不穿地形**）、`TerrainCollision.BuildHeightFieldSamplesReportsDimensionsAndValues`。
+  3. **门禁**：`scanned 47 file(s), 0 violation(s)`、`PASS`、退出码 0。
+  4. **运行期冒烟**：运行 15 秒 → `HasExited=False`、`Responding=True`；日志确认 `Jolt 物理已初始化` / `ImGui 调试面板已初始化（SDL3 + SDL3_gpu 后端）` / `角色物理就绪：地表碰撞体 9 个 tile；胶囊 半径 0.30 / 总高 1.80 格；重力 24.0、跳跃 8.0、最大坡度 50°、自动上台阶 1.0 格（dt=1/60）` / `F1 开关（当前显示）`。
+  5. **编码**：本批 15 个新增 / 修改文件 → `non-LF/BOM problems: 0`。
+  6. **ci.yml**：`bytes=4981 CR_count=0 non_ascii_count=0 BOM=False`（纯 ASCII + 纯 LF），diff 仅新增 4 个 apt 包。
+- 下一步 / 遗留：① **T8 未做**（最小可挖体积：局部 SDF + Surface Nets + 与地表相接的洞口过渡），随后 **T10 阶段验收**。② **新增待收敛项 7**：`joltphysics` 5.6.0 为**单精度**（`RVec3` = `Vec3`），与红线 6 的 `double` 世界坐标在大坐标上冲突，候选方案（双精度构建 / 物理做局部原点重定基 / 仅近场用物理）须在**流式加载任务开工前**经 ADR 收敛。③ **ImGui 面板当前只读**：`Window::pump_events` 独占事件队列、未转发 `ImGui_ImplSDL3_ProcessEvent`，要可拖动需在平台层加事件外露钩子。④ 其余已知未做：视锥体裁剪、真纹理（占位色）、笔刷按住连挖、窗口 resize 重算投影。⑤ 本批改动**尚未提交**。
+
+---
+
 ## 2026-09-25  修复 Linux CI：vcpkg 工作树带本地改动导致 checkout 被拒
 
 - 做了什么：把 `.github/workflows/ci.yml` 的 `Align vcpkg with pinned baseline` 步骤中
@@ -284,3 +303,25 @@
 - 下一步 / 遗留：① 若 `-f` 后 ubuntu 仍失败，备选方案是**在 workspace 内 depth=1 clone 一份 vcpkg 到锁定基线并 bootstrap**，
   彻底不依赖镜像预装状态（代价是多一次 clone）；② `docs/plans/v0.1.md` 的 **I1** 与前置条件 **P7** 待 CI 结果确认后收口；
   ③ 待收敛项 4（地表 LOD）与 6（遮挡剔除）仍开放。
+
+---
+
+## 2026-09-25  M2 + T4~T6：世界层更名与"能挖能堆的平滑地表"跑起来
+
+- 做了什么：
+  1. **M2 世界层更名**：`git mv voxel/ → world/`（保留历史），删除已随 ADR 0004 作废的 `voxel/chunk/chunk_types.hpp` 与其 6 项旧测试（`ChunkStateMachine.*` / `ChunkGeometry.*`），根 `CMakeLists.txt` 改为 `add_subdirectory(world)`；**门禁脚本默认扫描目录同步由 `voxel` 改为 `world`**（原默认值会让整个新世界层逃过门禁，属 M2 的连带遗留）。
+  2. **T4 地表高度场**：`world/terrain/` 新增 tile（**64×64 列、`int16` 1/16 格、65×65 采样**）、网格化与**梯度法线**、`world/generation/`（`SplitMix64` 种子派生 + FastNoiseLite 三层 FBm，pimpl 隔离第三方头）；`TerrainWorld` 实现 `engine/render/camera.hpp` 的 `ITerrainQuery`，使相机避障可用且 `engine/` 不反向依赖 `world/`。
+  3. **T5 地表材质**：`material_table`（`assets/config/materials.toml`，带 `schema_version`，toml++ 加载并在非法时**明确报错**）+ `material_blender`（按高度 + 坡度算归一化权重，含确定性噪声抖动）。
+  4. **T6 笔刷挖掘 / 堆建**：`world/dig/terrain_brush` 球笔刷改高度并**只标脏受影响 tile**；运行期只重传脏 tile 的 GPU 网格。
+  5. **渲染接线**：新增 `assets/shaders/mesh.vert|.frag`（splat 权重混合 4 个占位色）并在 `game/CMakeLists.txt` 注册 `add_shader`；重写 `game/main.cpp` 为完整闭环（窗口 → 输入 → 固定步长 → 第三人称相机 → 世界渲染 → 鼠标挖/堆）。
+  6. **两处必要的 engine 层加法**：`InputMap` 补鼠标按键通道（与键盘对称的 `BindMouseButton`/`SetMouseButtonDown`）；`Window::pump_events(InputMap&)` 改为**唯一**把 SDL 事件翻译成动作的地方（此前事件被直接丢弃，且红线禁止 `game/` 读事件队列）。
+  7. **FastNoiseLite vendoring**：`third_party/FastNoiseLite/FastNoiseLite.h`（MIT，107699 B，纯 LF、无 BOM）；`NOTICE.md` 的引入阶段由 V0.2 更正为 V0.1。
+  8. **规范同步**：SKILL §2 明确「**纯 header-only 的 vendored 库允许在 `world/` 的 .cpp 内直接使用，但不得进入公共头**（须 pimpl 或自有类型隔离），扩散即须抽 `engine/` 薄封装」——这是对既有"第三方只在平台层/引擎薄封装"规则的**显式放宽**，为的是不把能跑的代码倒回去做无收益的搬运；同时更新 §2 依赖链（`world`）、适用范围、性能预算（**删除旧的 96 KB / ≤700 draw call / 3×3×3 方块查询等作废数字**，改为引用 ADR 0008 并声明 Draw Call 与视距内存"只记录、不验收"）、红线表补「术语替换」一句（「区块/Section/方块」按新载体读作「地表 tile/体积块/体素单元」）。
+- 为什么：M2 必须在 T4 之前完成，否则新代码会长在已作废的目录名下、且门禁扫描不到。T4~T6 是 ADR 0004 落地的"最小可验证闭环"：**如果相邻 tile 边界不逐位相等就会出现裂缝**，如果笔刷不局限于受影响 tile 就会出现"挖一下卡一下"，这两条都是本方向最容易翻车的地方，故先以单测钉死（共享边界逐位相等、半径外逐列不变、脏 tile 精确）。渲染接线与两次 engine 层小改动是"让它真的能看见、能操作"的必要成本——尤其是事件队列的翻译位置，之前根本没有任何地方把 SDL 事件喂给 `InputMap`。
+- 验证：
+  1. **构建**：`cmake --build --preset debug --clean-first` → 34/34 目标，退出码 0，**警告 0 行、错误 0 行**；`mesh.*` / `triangle.*` 双格式产物齐全（`.spv` + `.dxil` 各 4 个）。
+  2. **测试**：`ctest --preset debug` → **34/34 passed**（旧 23 中删去 6 项区块测试后为 17，加新增 17 项）。关键用例：`TerrainTile` 共享边界**逐位相等**、生成确定性、挖/堆半径内逐列变化而半径外不变、脏 tile 集合精确、材质权重归一且陡坡偏岩。
+  3. **门禁**：`check-banned-identifiers.ps1 -RepoRoot .` → `scanned 24 file(s), 0 violation(s)`、`PASS`、退出码 0（**注意**：改默认目录前它不覆盖 `world/`；修复后已覆盖）。
+  4. **运行期冒烟**：启动 `build\debug\bin\voxel_game.exe` 运行 10 秒 → `alive=True responding=True`，日志 `地表世界就绪：种子 1592594996，tile 9 个，材质表 schema_version=1，笔刷半径 6.0 格`，之后被主动结束。说明材质表加载、9 个 tile 生成与网格化、`mesh.*` 双格式加载与管线创建、每帧拿到交换链纹理均成功。
+  5. **行尾与编码**：本批 25+ 个新增/修改文件逐字节检查 → `BOM=False`、`CR=0`（纯 LF）。
+- 下一步 / 遗留：① **目视未确认**：本环境无显示/截图能力，"地表是否满屏、绕序是否朝上、splat 占位色是否合预期"需人看一眼窗口。② **T7~T9 未开始**（Jolt 角色 / 可挖体积 / ImGui 面板）→ 随后是 T10 阶段验收。③ 本轮已知未做：**视锥体裁剪**（`references/meshing-and-render.md` §5 要求）、**真纹理**（现为占位色）、笔刷按住连挖、窗口 resize 重算投影、`world/objects/` 与 `world/streaming/` 未建。④ 待收敛项 4（地表 LOD）与 6（遮挡剔除）仍开放。⑤ 本批改动**尚未提交**。

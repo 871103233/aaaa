@@ -12,8 +12,19 @@ void InputMap::BindMouseAxis(ActionId action, MouseAxis axis) {
     binding.mouseAxis    = axis;
 }
 
+void InputMap::BindMouseButton(ActionId action, std::uint8_t button) {
+    m_bindings[Index(action)].mouseButtons.push_back(button);
+}
+
 void InputMap::SetKeyDown(SDL_Scancode key, bool isDown) noexcept {
     m_keyDownNow[static_cast<std::size_t>(key)] = isDown;
+}
+
+void InputMap::SetMouseButtonDown(std::uint8_t button, bool isDown) noexcept {
+    if (static_cast<std::size_t>(button) >= kMouseButtonCount) {
+        return;  // 0 号与越界按键号：忽略，避免越界写
+    }
+    m_mouseDownNow[static_cast<std::size_t>(button)] = isDown;
 }
 
 void InputMap::AddMouseDelta(float deltaX, float deltaY) noexcept {
@@ -43,6 +54,17 @@ void InputMap::BeginFrame() noexcept {
             }
         }
 
+        for (const std::uint8_t button : binding.mouseButtons) {
+            const std::size_t index = static_cast<std::size_t>(button);
+            if (index >= kMouseButtonCount || !m_mouseDownNow[index]) {
+                continue;
+            }
+            state.held = true;
+            if (!m_mouseDownPrev[index]) {
+                state.pressed = true;  // 鼠标按键同样按"抬起 → 按下"产生边沿
+            }
+        }
+
         if (binding.hasMouseAxis) {
             state.value = (binding.mouseAxis == MouseAxis::X) ? m_mouseDeltaX : m_mouseDeltaY;
         } else if (state.held) {
@@ -53,7 +75,8 @@ void InputMap::BeginFrame() noexcept {
     }
 
     // 本帧快照成为下一帧的"上一帧"：pressed 边沿因此不会跨帧残留。
-    m_keyDownPrev = m_keyDownNow;
+    m_keyDownPrev   = m_keyDownNow;
+    m_mouseDownPrev = m_mouseDownNow;
 }
 
 ActionState InputMap::State(ActionId action) const noexcept {

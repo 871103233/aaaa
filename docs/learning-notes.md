@@ -379,6 +379,20 @@
 - **易错点或关键取舍**：① 插值系数（alpha）只用于渲染，**绝不能回写进逻辑状态**；② 单帧补步必须封顶，否则卡顿后会陷入"越补越慢"的死亡螺旋；③ 上层（`world/`、`game/`）**不得直接读 SDL 事件队列**。
 - **相关**：`engine/core/fixed_step.hpp`、`engine/input/input_map.hpp`、`references/gameplay-v0.1.md`、ADR 0008
 
+### Jolt `CharacterVirtual`：台阶上不去的真正原因
+
+- **一句话定义**：`CharacterVirtual` 是 Jolt 提供的"角色控制器"——用形状扫掠 + 自带逻辑处理移动，而不是给胶囊挂刚体。
+- **在本项目里是什么 / 为什么需要**：角色胶囊用手感优先的控制器（走 / 冲刺 / 跳 / 上坡 / 自动上台阶），地形碰撞用 `HeightFieldShape` 逐 tile 生成并在挖掘后重建。
+- **易错点或关键取舍**：低速逼近台阶时中心过不去棱，**`mWalkStairsMinStepForward` 必须大于胶囊半径**（本项目取 `1.5 × 半径`）；`mWalkStairsStepUp` 需略大于台阶高（`+0.05` 余量）。另外 **vcpkg 的 `joltphysics` 5.6.0 未开 `JPH_DOUBLE_PRECISION`（`RVec3` = `Vec3`，单精度）**，与"世界定位用 `int`/`double`"的红线在大坐标上冲突 → 已登记为**待收敛项 7**。
+- **相关**：`engine/physics/physics_world.*`、`world/terrain/terrain_collision.*`、`docs/plans/v0.1.md` T7
+
+### vcpkg 的 ImGui 端口把后端编进了库本体
+
+- **一句话定义**：vcpkg 的 `imgui` 端口会按所开特性**把后端源码一起编成 `imgui.lib`**。
+- **在本项目里是什么 / 为什么需要**：开了 `sdl3-binding` + `sdlgpu3-binding` 后，`imgui_impl_sdl3.h` / `imgui_impl_sdlgpu3.h` 已随端口安装，**无需**再把后端 `.cpp` 加进自己的目标，只需 `find_package(imgui CONFIG REQUIRED)` + 链接 `imgui::imgui`。
+- **易错点或关键取舍**：ImGui 需在每帧 `NewFrame` **之前**收到平台事件（`ImGui_ImplSDL3_ProcessEvent`）才能交互。本项目 `Window::pump_events` 独占事件队列且不外露，因此当前面板是**只读展示**（可用 F1 开关，不可拖动）——要交互须在平台层加事件外露钩子。
+- **相关**：`game/debug_overlay.*`、`world/streaming` 无关；`docs/plans/v0.1.md` T9
+
 ### 技术白名单 / 红线表
 
 - **技术白名单**：技能规范中「唯一口径表」的旧称 —— 默认采用的技术清单，照此执行，每格只有一个值。

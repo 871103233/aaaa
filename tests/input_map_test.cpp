@@ -120,3 +120,31 @@ TEST(InputMap, MultipleKeysShareOneAction) {
     input.BeginFrame();
     EXPECT_TRUE(input.Held(ActionId::Sprint)) << "右 Shift 仍按住";
 }
+
+// 鼠标按键与键盘共用同一套动作语义：held / pressed 边沿 / 跨帧清除；越界按键号被忽略。
+TEST(InputMap, MouseButtonDrivesDigitalActionLikeAKey) {
+    InputMap input;
+    input.BindMouseButton(ActionId::Attack, SDL_BUTTON_LEFT);
+
+    EXPECT_FALSE(input.Held(ActionId::Attack));
+
+    input.SetMouseButtonDown(SDL_BUTTON_LEFT, true);
+    input.BeginFrame();
+    EXPECT_TRUE(input.Held(ActionId::Attack));
+    EXPECT_TRUE(input.Pressed(ActionId::Attack));
+
+    input.BeginFrame();  // 仍按住：held 保持，但不再是"本帧新按下"
+    EXPECT_TRUE(input.Held(ActionId::Attack));
+    EXPECT_FALSE(input.Pressed(ActionId::Attack));
+
+    input.SetMouseButtonDown(SDL_BUTTON_LEFT, false);
+    input.BeginFrame();
+    EXPECT_FALSE(input.Held(ActionId::Attack));
+
+    // 0 号与越界按键号必须被忽略，不得越界写或误触发动作
+    input.SetMouseButtonDown(0, true);
+    input.SetMouseButtonDown(200, true);
+    input.BeginFrame();
+    EXPECT_FALSE(input.Held(ActionId::Attack));
+}
+

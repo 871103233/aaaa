@@ -1,6 +1,6 @@
 ---
 name: voxel-engine-dev-standards
-description: Enforces this voxel engine repo's architecture and coding standards - chunk states, task system, thread roles, precision, save versioning. Load at the start of any new session or when resuming work on this repo, so the handoff docs are read first (SKILL.md, docs/devlog.md, docs/plans/*.md, docs/tech-plan-v1.3.md, docs/file-index.md, docs/learning-notes.md). Also requires every dispatched task to be turned into a readable plan entry before coding. Use when writing or editing engine and voxel code.
+description: Enforces this voxel engine repo's architecture and coding standards - layered hybrid world representation, task system, thread roles, precision, save versioning. Load at the start of any new session or when resuming work on this repo, so the handoff docs are read first (SKILL.md, docs/devlog.md, docs/plans/*.md, docs/tech-plan-v1.3.md, docs/file-index.md, docs/learning-notes.md). Also requires every dispatched task to be turned into a readable plan entry before coding. Use when writing or editing engine and voxel code.
 ---
 
 # 体素引擎开发规范
@@ -175,6 +175,7 @@ description: Enforces this voxel engine repo's architecture and coding standards
 | 4 | 地表 LOD 方案与接缝策略（CDLOD / Geometry Clipmaps + 顶点过渡） | LOD 任务开工前经 ADR 收敛 | **开放**（取代原「LOD 接缝：裙边 vs 顶点吸附」） |
 | 5 | 预算与精度口径重算（内存 / Draw Call / 密度精度 / 块尺寸） | `tech-plan-v2.0.md` 落地时 | **已收敛 → [ADR 0008](../../../docs/adr/0008-sizes-precision-budget.md)**（尺寸精度冻结；Draw Call 转为"只记录"） |
 | 6 | 遮挡剔除：硬件遮挡查询 vs 软件分层 | V0.5 开工前经 ADR 收敛 | **开放** |
+| 7 | **物理层的世界坐标精度方案**：vcpkg 的 `joltphysics` 5.6.0 未开 `JPH_DOUBLE_PRECISION`（`RVec3` = `Vec3`，单精度），与"世界定位用 `int` / `double`"的红线 6 在大坐标上冲突 | **流式加载 / 大世界任务开工前**经 ADR 收敛 | **开放**（候选：切双精度构建 / 物理本体做局部原点重定基 / 仅近场用物理） |
 
 > 收敛范围：1~3、5 已由 ADR 0005~0008 关闭；**4 决定大视距的全部预算数字**，
 > 在它收敛前，Draw Call 与视距内存**只记录、不验收**（ADR 0008 §2）；6 属 V0.5 才落地的细节。
@@ -208,8 +209,8 @@ description: Enforces this voxel engine repo's architecture and coding standards
 
 ## 适用范围
 
-**适用**：`engine/`、`voxel/`、`game/` 下的任何 C++ 改动；区块 / 生成 / 网格化 / 光照 / 流式加载 / 存档；
-构建配置、目录结构、第三方库引入；测试与 CI；性能优化；**技术选型变更与口径同步（见上一节）**。
+**适用**：`engine/`、`world/`、`game/` 下的任何 C++ 改动；世界生成 / 网格化 / 材质 / 挖掘 / 流式加载 / 存档；
+构建配置、目录结构、第三方库引入；测试与 CI；性能优化；**技术选型或开发方向变更与口径同步（见上一节）**。
 
 **不适用**：纯玩法数值调整；与引擎无关的独立脚本工具。
 
@@ -241,6 +242,8 @@ description: Enforces this voxel engine repo's architecture and coding standards
 > - **原则仍成立、措辞按新载体读**：#1「地形不进 ECS」——地形由**高度场与 SDF 体积**持有；
 >   #12「邻居边界采样就绪才可网格化」——作用域为**地表 tile / 体积块**（见 `references/chunk-and-streaming.md`）。
 > - **不受影响**：#2、#4、#6、#7、#8、#9、#10、#11、#15、#17。
+> - **术语替换（全表通用）**：凡出现「区块 / Section / 方块」的措辞，一律按新载体读作「**地表 tile / 体积块 / 体素单元**」；
+>   「脏区块」读作「脏 tile / 脏体积块」。这是措辞映射，不是规则放宽。
 
 | # | 需绕开的写法 | 必须执行 |
 | --- | --- | --- |
@@ -264,12 +267,15 @@ description: Enforces this voxel engine repo's architecture and coding standards
 
 ## 二、分层与依赖方向
 
-`platform → engine core → voxel world → game`
+`platform → engine core → world → game`
 
-- 依赖只能向上：下层不 include 上层头文件（`engine/` 不引用 `voxel/`、`game/`）。
-- `engine/` 内只放通用类型，不放体素 / 游戏专有类型（`Chunk`、`BlockId`、`Biome` 等）。
-- `voxel/` 只经引擎核心层与平台抽象层访问硬件，不直接调用平台 API。
-- 第三方库只在平台层或引擎核心的薄封装中直接引用。
+- 依赖只能向上：下层不 include 上层头文件（`engine/` 不引用 `world/`、`game/`）。
+- `engine/` 内只放通用类型，不放世界 / 游戏专有类型（`TerrainTile`、`DigVolume`、`Biome` 等）。
+- `world/` 只经引擎核心层与平台抽象层访问硬件，不直接调用平台 API。
+- **需要预编译**的第三方库只在平台层或引擎核心的薄封装中直接引用。
+- **纯 header-only 的 vendored 库**（`third_party/`，如 FastNoiseLite、toml++）允许在 `world/` 的 `.cpp` 内直接使用，
+  但**不得出现在任何公共头文件中**（须以 pimpl 或自有类型隔离）；同一库一旦扩散到多个模块、或泄漏进公共头，
+  必须抽到 `engine/` 薄封装后再用。`third_party/` 目录本身被门禁脚本排除。
 
 ## 三、编码约定
 
@@ -289,15 +295,14 @@ description: Enforces this voxel engine repo's architecture and coding standards
 
 ## 四、性能预算（超出即视为缺陷）
 
-- 帧目标 60 FPS：V0.3 视距 8 区块；V0.5 视距 16~24 区块。
-- Draw Call：**≤700/帧 @16 区块**；**≤1500/帧 @24 区块**。
-  要压到"几百"须上 Multi-Draw Indirect + 4×4 区域合批（列为 V0.5 之后备选）。
-- 内存（24 区块视距 = 2401 区块）：CPU ≈ 70~150 MB；**VRAM ≈ 150~550 MB**（网格常驻显存，纹理数组另计 32~64 MB）。中低端 GPU 会先于系统内存见底。
-- 单区块光照数据未压缩为 **96 KB**（`16×16×384 × 1 B`），估算时按 96 KB 计。
-- 单区块方块数据（Section 压缩 + palette）目标 8~20 KB。
-- 主线程帧内只做渲染、输入、相机、碰撞查询；区块生成、网格化、文件 IO、等待 GPU 都放到后台或上传阶段。
-- 碰撞查询范围：**3×3×3 个方块**（单位是方块，不是 Section）。
-- 任何性能相关改动必须附 Tracy 对比数据，不接受"感觉更快了"。
+**权威口径见 [ADR 0008](../../docs/adr/0008-sizes-precision-budget.md)（尺寸 / 精度 / 预算）与本技能「唯一口径表」的"预算与精度"一行；本节只列必须遵守的形态。**
+
+- **尺寸与精度**：地表 tile **64×64 列**、高度 `int16`（1/16 格）；可挖体积块 **32³ 体素**（33³ 采样）、密度 `int8`；世界垂直范围 0~512 格。
+- **V0.1 预算**（小场景，基线机 1080p）：**≥ 60 FPS**；CPU 常驻 **≤ 150 MB**；VRAM 常驻 **≤ 300 MB**。
+- **Draw Call 与长视距内存：只记录、不验收** —— 二者取决于尚未收敛的地表 LOD 方案（待收敛项 4）；收敛前不得给数字，也不得引用旧数字。
+- **已作废、不得再作验收依据的旧数字**：`16×16×384` / 光照 `96 KB` / `≤700 draw call` / `3×3×3 方块碰撞查询` / 2401 区块内存估算。
+- 主线程帧内只做渲染、输入、相机与碰撞查询；生成、网格化、文件 IO、等待 GPU 都放到后台或上传阶段。
+- 任何性能相关改动必须附 **Tracy** 对比数据（V0.2 起），不接受"感觉更快了"；比对须在 `tech-plan-v2.0.md` §7 的**固定基准场景**下进行。
 
 ## 五、范围控制
 
@@ -384,7 +389,7 @@ description: Enforces this voxel engine repo's architecture and coding standards
 | A 技术选型名词 | 渲染 / 生成 / 存储 / 并发 / 物理等选型术语 |
 | B 开发流程与工程用语 | PoC、CI、ADR、门禁、DoD、Sanitizer 等 |
 | C 已安装的工具 | 名称、版本、位置、**为什么需要它** |
-| D 本项目专属概念 | 区块状态机、双格式 Shader 管线等 |
+| D 本项目专属概念 | 分层混合世界、双格式 Shader 管线等 |
 | E 疑难问答 | 一次性的具体问题与答案（问题 + 结论 + 原因） |
 
 每条格式：
