@@ -1,5 +1,6 @@
 #pragma once
 
+#include <glm/gtc/quaternion.hpp>
 #include <glm/vec3.hpp>
 
 #include <cstddef>
@@ -80,6 +81,38 @@ public:
         bool       onGround = false;   ///< 是否被支撑（着地或站在过陡坡上）
     };
 
+    /// 动态**凸包**刚体描述（T33「倒塌整体」）。
+    ///
+    /// `positions` 是**局部坐标**（刚体局部原点 = 这些点的坐标系原点，通常取分量质心），
+    /// 世界定位由 `origin*` 承担（红线 6：世界定位用 `double`，局部顶点保持小数值）。
+    /// 形状由这些点求**凸包** —— 凹形会被填平，见 [ADR 0015](../../docs/adr/0015-structure-units-and-rigid-collapse.md) 后果 1。
+    /// 前置条件：`positions` 非空、`pointCount >= 4`、`mass > 0`。
+    struct ConvexHullDesc {
+        const float* positions  = nullptr;  ///< `3 * pointCount` 个局部坐标（x, y, z 依次）
+        std::size_t  pointCount = 0;
+        double       originX    = 0.0;      ///< 局部原点的世界 X（`double`，红线 6）
+        double       originY    = 0.0;      ///< 局部原点的世界 Y
+        double       originZ    = 0.0;      ///< 局部原点的世界 Z
+        float        mass       = 1.0F;     ///< 质量（须 `> 0`）
+        float        friction    = 0.5F;    ///< 摩擦系数（0~1，来自玩法配置；越大越不容易滑）
+        /// 弹性（0~1；`0` = 完全不回弹）。来自**材质表**（T43 / ADR 0016：岩略回弹、土 / 草几乎不回弹）。
+        float        restitution = 0.0F;
+        glm::vec3    linearVelocity { 0.0F };   ///< 初始线速度（格/秒）；用于"被炸飞"（T43 的爆心冲量）
+        glm::vec3    angularVelocity { 0.0F };  ///< 初始角速度（rad/s）；用于模拟倒塌的**初始不对称**
+    };
+
+    /// 动态刚体的位姿与速度。
+    ///
+    /// `position` 是**局部原点**的世界位置（`double`）—— 与 `ConvexHullDesc::origin*` 同一约定，
+    /// 因此 `world = position + rotation * 局部坐标` 可直接用于渲染与体素化回写。
+    /// （Jolt 内部以**质心**为位置，本类在这里把质心偏移折回局部原点，调用方无需关心。）
+    struct RigidBodyState {
+        glm::dvec3 position { 0.0 };
+        glm::quat  rotation { 1.0F, 0.0F, 0.0F, 0.0F };
+        glm::vec3  linearVelocity { 0.0F };
+        glm::vec3  angularVelocity { 0.0F };
+    };
+
     PhysicsWorld();
     ~PhysicsWorld();
 
@@ -91,6 +124,13 @@ public:
     /// 固定步推进动态刚体（角色不属于刚体系统，需另行调用 `MoveCharacter`）。
     /// 前置条件：`dt > 0`。
     void Update(float dt);
+
+    /// 设置物理世界的**重力**（对动态刚体生效；角色重力由 `MoveCharacter` 的入参决定，不读这里）。
+    ///
+    /// 为什么必须显式设置：Jolt 的默认重力是 `-9.81`，而本项目玩法层的重力是配置值（当前 24 格/秒²）——
+    /// 不设置就会出现"角色与倒塌体各按一套重力下落"的不自洽（红线：世界内一致性）。
+    /// 前置条件：各分量为有限值。下一次 `Update` 生效。
+    void SetGravity(const glm::vec3& gravity) noexcept;
 
     // ---- 通用碰撞体 ----
 
@@ -112,6 +152,23 @@ public:
 
     /// 创建一个静态盒体碰撞体。返回无效句柄表示创建失败（半长非正等），失败原因写入日志。
     [[nodiscard]] BodyHandle AddStaticBox(const BoxDesc& desc);
+
+    /// 创建一个**动态凸包**刚体（T33：倒塌整体）。返回无效句柄表示创建失败（参数非法 / 凸包构建失败）。
+    ///
+    /// 与上面的静态体共用同一套句柄表与对象层 ⇒ `RemoveBody` / `BodyCount` 通用；
+    /// 由 `Update(dt)` 按重力与碰撞求解，位姿用 `GetRigidBodyState` 读回。
+    /// 保留 Jolt 的默认**阻尼**（线 / 角各 0.05）与**休眠**：倒塌体落地后更快静止，利于落定判定。
+    [[nodiscard]] BodyHandle AddDynamicConvexHull(const ConvexHullDesc& desc);
+
+    /// 读取动态刚体的位姿（**局部原点**，见 `ConvexHullDesc`）与线 / 角速度；无效句柄返回默认（零）状态。
+    [[nodiscard]] RigidBodyState GetRigidBodyState(BodyHandle handle) const noexcept;
+
+    /// **唤醒**一个动态刚体（T46 / [ADR 0017](../../docs/adr/0017-landing-by-material-rigid-vs-granular.md)）。
+    ///
+    /// 为什么需要：Jolt 的休眠体**不会**因为"它脚下的静态形状被改写"自动醒来；而本项目会挖掉地形 / 残骸下方的
+    /// 体积碰撞体 —— 若不显式唤醒，保留中的刚性残骸就会**悬空不动**（违反"承重被破坏 ⇒ 上部不得悬空"）。
+    /// 静态体 / 无效句柄为无操作。
+    void ActivateBody(BodyHandle handle) noexcept;
 
     /// 移除一个碰撞体；无效句柄为无操作。
     void RemoveBody(BodyHandle handle) noexcept;

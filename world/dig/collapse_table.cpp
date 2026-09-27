@@ -18,6 +18,38 @@ namespace {
     return table[field].value<std::int64_t>();
 }
 
+[[nodiscard]] std::optional<double> ReadDouble(const toml::table& table, const char* field) {
+    return table[field].value<double>();
+}
+
+/// 读一个"必须是数值且落在 [low, high]"的字段（缺失 / 类型错 / 越界都抛，口径同其余配置表）。
+[[nodiscard]] double ReadDoubleInRange(const toml::table& table, const std::filesystem::path& path,
+                                       const char* field, double low, double high) {
+    const std::optional<double> value = ReadDouble(table, field);
+    if (!value.has_value()) {
+        throw std::runtime_error(DescribeField(path, field) + "缺失或不是数值");
+    }
+    if (!(*value >= low) || !(*value <= high)) {
+        throw std::runtime_error(DescribeField(path, field) + "必须落在 [" + std::to_string(low) + ", " +
+                                 std::to_string(high) + "]");
+    }
+    return *value;
+}
+
+/// 读一个"必须是整数且落在 [low, high]"的字段。
+[[nodiscard]] std::int64_t ReadIntInRange(const toml::table& table, const std::filesystem::path& path,
+                                          const char* field, std::int64_t low, std::int64_t high) {
+    const std::optional<std::int64_t> value = ReadInt(table, field);
+    if (!value.has_value()) {
+        throw std::runtime_error(DescribeField(path, field) + "缺失或不是整数");
+    }
+    if (*value < low || *value > high) {
+        throw std::runtime_error(DescribeField(path, field) + "必须落在 [" + std::to_string(low) + ", " +
+                                 std::to_string(high) + "]");
+    }
+    return *value;
+}
+
 }  // namespace
 
 CollapseTable CollapseTable::LoadFromFile(const std::filesystem::path& path) {
@@ -56,15 +88,6 @@ CollapseTable CollapseTable::LoadFromFile(const std::filesystem::path& path) {
     }
     table.m_spec.maxCantileverBlocks = static_cast<float>(*cantilever);
 
-    const std::optional<std::int64_t> spread = ReadInt(document, "pile_spread_blocks");
-    if (!spread.has_value()) {
-        throw std::runtime_error(DescribeField(path, "pile_spread_blocks") + "缺失或不是整数");
-    }
-    if (*spread < 0 || *spread > 2) {
-        throw std::runtime_error(DescribeField(path, "pile_spread_blocks") + "必须落在 [0, 2]");
-    }
-    table.m_spec.pileSpreadBlocks = static_cast<int>(*spread);
-
     const std::optional<std::int64_t> margin = ReadInt(document, "neighborhood_margin_blocks");
     if (!margin.has_value()) {
         throw std::runtime_error(DescribeField(path, "neighborhood_margin_blocks") + "缺失或不是整数");
@@ -73,6 +96,19 @@ CollapseTable CollapseTable::LoadFromFile(const std::filesystem::path& path) {
         throw std::runtime_error(DescribeField(path, "neighborhood_margin_blocks") + "必须落在 [0, 4]");
     }
     table.m_spec.neighborhoodMarginBlocks = static_cast<int>(*margin);
+
+    // ---- T33 / T43：刚体化倒塌参数（质量 / 摩擦 / 弹性由材质表提供，见 ADR 0016）----
+    table.m_spec.settleLinearSpeed =
+        static_cast<float>(ReadDoubleInRange(document, path, "settle_linear_speed", 0.001, 1000.0));
+    table.m_spec.settleAngularSpeed =
+        static_cast<float>(ReadDoubleInRange(document, path, "settle_angular_speed", 0.001, 1000.0));
+    table.m_spec.settleSteps = static_cast<int>(ReadIntInRange(document, path, "settle_steps", 1, 600));
+    table.m_spec.initialTiltSpeed =
+        static_cast<float>(ReadDoubleInRange(document, path, "initial_tilt_speed", 0.0, 20.0));
+    table.m_spec.impulseSpeed = static_cast<float>(ReadDoubleInRange(document, path, "impulse_speed", 0.0, 100.0));
+    table.m_spec.debrisDeleteMaxVoxels =
+        static_cast<int>(ReadIntInRange(document, path, "debris_delete_max_voxels", 0, 4096));
+    table.m_spec.maxActiveUnits = static_cast<int>(ReadIntInRange(document, path, "max_active_units", 1, 16));
 
     return table;
 }

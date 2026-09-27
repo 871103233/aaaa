@@ -17,6 +17,7 @@ add_library(voxel_engine STATIC
     platform/settings.cpp
     platform/window.cpp
     render/camera.cpp
+    render/frustum.cpp
     render/lighting_table.cpp
     render/mesh_renderer.cpp
     render/shadow_cascade.cpp

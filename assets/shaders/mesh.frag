@@ -52,7 +52,8 @@
 //   结论：草地 / 沙地保持哑光，**岩石出现可分辨的方向性高光且不出现死白**（T22 验收判据）。
 //   若调高 / 调低 `lighting.toml` 的强度或 `materials.toml` 的 roughness / tint，必须同步复核本表。
 //
-// 世界坐标还原：顶点是相机相对坐标（红线 6），这里加上 uniform 的**渲染原点**得到世界坐标。
+// 世界坐标还原：顶点着色器传出的 `v_relativePosition` 是**渲染相对**坐标
+// （网格局部坐标 + 逐网格偏移 = 世界坐标 − 渲染原点，T41），这里加上 uniform 的**渲染原点**得到世界坐标。
 //
 // 绑定约定（SDL3_gpu 的 SPIR-V 资源集；每阶段采样器上限 16，见 SDL_gpu.h，故 6 个采样器无需打包）：
 //   set 2 = 片元采样纹理：
@@ -409,14 +410,40 @@ void main() {
                                      pow(abs(geometricNormal), vec3(material.triplanar.w)), triWeight);
             const vec3 axisWeight = axisRaw / max(axisRaw.x + axisRaw.y + axisRaw.z, 1e-5);
 
+            // ---- T35 降档（项目所有者选定）：**跳过近零轴** ----
+            // 三轴权重之和为 1，而陡壁上通常只有一个轴显著（垂直壁 ≈ 1 个轴、45° 壁 ≈ 2 个轴），
+            // 其余轴的贡献可忽略。故把低于 epsilon 的轴权重**置零**（该轴不采样），再对剩余轴重新归一化：
+            //   最坏（斜壁）采样 3 → 2 次、垂直壁 3 → 1 次；外观差异仅来自被丢弃的近零贡献（< 2%）。
+            // 权重取自上一行、与旧实现**同一公式**，因此权重显著时逐像素结果不变。
+            const float kTriAxisEpsilon = 0.02;
+            vec3        axisBlend       = axisWeight;
+            if (axisBlend.x < kTriAxisEpsilon) {
+                axisBlend.x = 0.0;
+            }
+            if (axisBlend.y < kTriAxisEpsilon) {
+                axisBlend.y = 0.0;
+            }
+            if (axisBlend.z < kTriAxisEpsilon) {
+                axisBlend.z = 0.0;
+            }
+            axisBlend /= max(axisBlend.x + axisBlend.y + axisBlend.z, 1e-5);
+
             const vec2 uvX = worldPosition.zy * layer.tintUv.a + detail * kDetailStrength;
             const vec2 uvZ = worldPosition.xy * layer.tintUv.a + detail * kDetailStrength;
-            layerAlbedo = axisWeight.x * texture(u_albedo, vec3(uvX, textureLayer)).rgb +
-                          axisWeight.y * texture(u_albedo, vec3(planarUv, textureLayer)).rgb +
-                          axisWeight.z * texture(u_albedo, vec3(uvZ, textureLayer)).rgb;
-            layerNormal = axisWeight.x * (texture(u_normal, vec3(uvX, textureLayer)).rgb * 2.0 - 1.0) +
-                          axisWeight.y * (texture(u_normal, vec3(planarUv, textureLayer)).rgb * 2.0 - 1.0) +
-                          axisWeight.z * (texture(u_normal, vec3(uvZ, textureLayer)).rgb * 2.0 - 1.0);
+            layerAlbedo = vec3(0.0);
+            layerNormal = vec3(0.0);
+            if (axisBlend.x > 0.0) {
+                layerAlbedo += axisBlend.x * texture(u_albedo, vec3(uvX, textureLayer)).rgb;
+                layerNormal += axisBlend.x * (texture(u_normal, vec3(uvX, textureLayer)).rgb * 2.0 - 1.0);
+            }
+            if (axisBlend.y > 0.0) {
+                layerAlbedo += axisBlend.y * texture(u_albedo, vec3(planarUv, textureLayer)).rgb;
+                layerNormal += axisBlend.y * (texture(u_normal, vec3(planarUv, textureLayer)).rgb * 2.0 - 1.0);
+            }
+            if (axisBlend.z > 0.0) {
+                layerAlbedo += axisBlend.z * texture(u_albedo, vec3(uvZ, textureLayer)).rgb;
+                layerNormal += axisBlend.z * (texture(u_normal, vec3(uvZ, textureLayer)).rgb * 2.0 - 1.0);
+            }
         } else {
             layerAlbedo = texture(u_albedo, vec3(planarUv, textureLayer)).rgb;
             layerNormal = texture(u_normal, vec3(planarUv, textureLayer)).rgb * 2.0 - 1.0;

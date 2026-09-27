@@ -65,8 +65,8 @@ public:
                                      static_cast<double>(BlockOriginBlocks(m_block.coord.z) + k));
     }
 
-    /// 材质槽位（ADR 0014）：材质是"该列地表的可挖材质"这一**纯函数**（不随块存储），
-    /// 故越界与否走同一条路径，无需回退分支。
+    /// 材质槽位（ADR 0014 / T42）：① 块内**已写入**的体素材质优先（塌落搬来的残骸）；
+    /// ② 否则回落"该列地表的可挖材质"纯函数。越界与否走同一条路径，无需回退分支。
     [[nodiscard]] std::uint8_t SampleMaterial(int i, int j, int k) const override {
         return m_world.SampleMaterialSlot(BlockOriginBlocks(m_block.coord.x) + i,
                                           BlockOriginBlocks(m_block.coord.y) + j,
@@ -87,12 +87,103 @@ bool DigVolumeWorld::IsInsideRegion(double x, double y, double z) const noexcept
     return m_regions.IsDiggable(x, y, z);
 }
 
-std::uint8_t DigVolumeWorld::SampleMaterialSlot(int worldX, int /*worldY*/, int worldZ) const noexcept {
+std::uint8_t DigVolumeWorld::SampleMaterialSlot(int worldX, int worldY, int worldZ) const noexcept {
+    // ① 已写入的体素材质优先（T42：塌落把残骸的材质搬到了别处，它必须记住自己**原本是什么**）。
+    const auto found = m_blocks.find(BlockCoord { BlockIndexOf(static_cast<double>(worldX)),
+                                                 BlockIndexOf(static_cast<double>(worldY)),
+                                                 BlockIndexOf(static_cast<double>(worldZ)) });
+    if (found != m_blocks.end() && !found->second.material.empty()) {
+        const VolumeBlock& block = found->second;
+        const std::uint8_t stored =
+            block.material[DensityIndex(worldX - BlockOriginBlocks(block.coord.x),
+                                        worldY - BlockOriginBlocks(block.coord.y),
+                                        worldZ - BlockOriginBlocks(block.coord.z))];
+        if (stored != kNoMaterialSlot) {
+            return stored;
+        }
+    }
+
+    // ② 未写入 ⇒ 回落"该列地表派生的可挖材质"（纯函数，与引入存储之前逐位一致）。
     std::uint8_t slot = kNoMaterialSlot;
     if (m_terrain.QueryDigMaterialSlot(static_cast<float>(worldX), static_cast<float>(worldZ), slot)) {
         return slot;
     }
     return kNoMaterialSlot;
+}
+
+std::vector<std::uint8_t> DigVolumeWorld::ReadMaterialRegion(int minX, int minY, int minZ, int sizeX, int sizeY,
+                                                             int sizeZ) const {
+    std::vector<std::uint8_t> materials;
+    if (sizeX <= 0 || sizeY <= 0 || sizeZ <= 0) {
+        return materials;
+    }
+    materials.assign(static_cast<std::size_t>(sizeX) * static_cast<std::size_t>(sizeY) *
+                         static_cast<std::size_t>(sizeZ),
+                     kNoMaterialSlot);
+
+    // 逐列（x, z）：地表派生值**每列只查一次**；列内按 y 走块（y 单调 ⇒ 每 32 步才换一次块查找）。
+    for (int rz = 0; rz < sizeZ; ++rz) {
+        for (int rx = 0; rx < sizeX; ++rx) {
+            const int worldX = minX + rx;
+            const int worldZ = minZ + rz;
+            const int blockX = BlockIndexOf(static_cast<double>(worldX));
+            const int blockZ = BlockIndexOf(static_cast<double>(worldZ));
+
+            std::uint8_t derived       = kNoMaterialSlot;
+            bool         derivedCached = false;
+            const VolumeBlock* block   = nullptr;
+            int                blockY  = std::numeric_limits<int>::min();
+
+            for (int ry = 0; ry < sizeY; ++ry) {
+                const int worldY  = minY + ry;
+                const int currentY = BlockIndexOf(static_cast<double>(worldY));
+                if (currentY != blockY) {
+                    blockY                 = currentY;
+                    const auto blockFound  = m_blocks.find(BlockCoord { blockX, blockY, blockZ });
+                    block                  = (blockFound != m_blocks.end()) ? &blockFound->second : nullptr;
+                }
+
+                std::uint8_t slot = kNoMaterialSlot;
+                if (block != nullptr && !block->material.empty()) {
+                    slot = block->material[DensityIndex(worldX - BlockOriginBlocks(blockX),
+                                                        worldY - BlockOriginBlocks(blockY),
+                                                        worldZ - BlockOriginBlocks(blockZ))];
+                }
+                if (slot == kNoMaterialSlot) {
+                    if (!derivedCached) {
+                        derivedCached = true;
+                        (void)m_terrain.QueryDigMaterialSlot(static_cast<float>(worldX), static_cast<float>(worldZ),
+                                                             derived);
+                    }
+                    slot = derived;
+                }
+                materials[static_cast<std::size_t>(rx) + static_cast<std::size_t>(sizeX) *
+                                                              (static_cast<std::size_t>(ry) +
+                                                               static_cast<std::size_t>(sizeY) *
+                                                                   static_cast<std::size_t>(rz))] = slot;
+            }
+        }
+    }
+    return materials;
+}
+
+void DigVolumeWorld::SetMaterialSlot(int worldX, int worldY, int worldZ, std::uint8_t slot) {
+    const BlockCoord coord { BlockIndexOf(static_cast<double>(worldX)), BlockIndexOf(static_cast<double>(worldY)),
+                             BlockIndexOf(static_cast<double>(worldZ)) };
+    const auto       found = m_blocks.find(coord);
+    if (found == m_blocks.end()) {
+        return;  // 区域外（无块）⇒ 材质无处可存；调用方（塌落回写）本就只写"确实存在的块"
+    }
+
+    VolumeBlock& block = found->second;
+    if (block.material.empty()) {
+        // 懒分配：只有"残骸落在这里"才付这 33³ 字节（未发生倒塌的块永远为零内存）。
+        block.material.assign(static_cast<std::size_t>(kVolumeSampleCount) * static_cast<std::size_t>(kVolumeSampleCount) *
+                                  static_cast<std::size_t>(kVolumeSampleCount),
+                              kNoMaterialSlot);
+    }
+    block.material[DensityIndex(worldX - BlockOriginBlocks(coord.x), worldY - BlockOriginBlocks(coord.y),
+                                worldZ - BlockOriginBlocks(coord.z))] = slot;
 }
 
 void DigVolumeWorld::BuildSurfaceHeightCache() {
@@ -180,39 +271,69 @@ float DigVolumeWorld::TerrainDerivedDensity(double x, double y, double z) const 
         std::clamp(delta, static_cast<double>(kDensityMin), static_cast<double>(kDensityMax)));
 }
 
-void DigVolumeWorld::InitFromHeightField() {
-    m_blocks.clear();
-    BuildSurfaceHeightCache();
+void DigVolumeWorld::FillBlockDensity(const BlockCoord& coord) {
+    const int originX = BlockOriginBlocks(coord.x);
+    const int originY = BlockOriginBlocks(coord.y);
+    const int originZ = BlockOriginBlocks(coord.z);
 
-    for (const BlockCoord& coord : m_regions.Blocks()) {
-        const int originX = BlockOriginBlocks(coord.x);
-        const int originY = BlockOriginBlocks(coord.y);
-        const int originZ = BlockOriginBlocks(coord.z);
-
-        VolumeBlock block;
-        block.coord = coord;
-        block.density.assign(static_cast<std::size_t>(kVolumeSampleCount) * static_cast<std::size_t>(kVolumeSampleCount) *
-                                 static_cast<std::size_t>(kVolumeSampleCount),
-                             0);
-        for (int k = 0; k < kVolumeSampleCount; ++k) {
-            for (int j = 0; j < kVolumeSampleCount; ++j) {
-                for (int i = 0; i < kVolumeSampleCount; ++i) {
-                    const float density =
-                        TerrainDerivedDensity(static_cast<double>(originX + i), static_cast<double>(originY + j),
-                                              static_cast<double>(originZ + k));
-                    block.density[DensityIndex(i, j, k)] = static_cast<std::int8_t>(std::lround(density));
-                }
+    VolumeBlock block;
+    block.coord = coord;
+    block.density.assign(static_cast<std::size_t>(kVolumeSampleCount) * static_cast<std::size_t>(kVolumeSampleCount) *
+                             static_cast<std::size_t>(kVolumeSampleCount),
+                         0);
+    for (int k = 0; k < kVolumeSampleCount; ++k) {
+        for (int j = 0; j < kVolumeSampleCount; ++j) {
+            for (int i = 0; i < kVolumeSampleCount; ++i) {
+                const float density =
+                    TerrainDerivedDensity(static_cast<double>(originX + i), static_cast<double>(originY + j),
+                                          static_cast<double>(originZ + k));
+                block.density[DensityIndex(i, j, k)] = static_cast<std::int8_t>(std::lround(density));
             }
         }
-        m_blocks.emplace(coord, std::move(block));
     }
+    m_blocks.emplace(coord, std::move(block));
+}
 
-    std::vector<BlockCoord> all;
-    all.reserve(m_blocks.size());
-    for (const auto& entry : m_blocks) {
-        all.push_back(entry.first);
+void DigVolumeWorld::MeshBlock(const BlockCoord& coord) {
+    const auto found = m_blocks.find(coord);
+    if (found == m_blocks.end()) {
+        return;
     }
-    (void)RemeshDirtyBlocks(all);
+    VolumeBlock&      stored = found->second;
+    const BlockSampler sampler(*this, stored);
+    stored.mesh = BuildVolumeMesh(sampler);
+    stored.fill = ClassifyFill(stored.density);  // T30：与密度同步（塌落邻域收缩依赖它）
+}
+
+void DigVolumeWorld::InitFromHeightField() {
+    BeginInitFromHeightField();
+    (void)StepInitFromHeightField(InitTotalSteps());
+}
+
+void DigVolumeWorld::BeginInitFromHeightField() {
+    m_blocks.clear();
+    BuildSurfaceHeightCache();
+    m_initCursor = 0;
+}
+
+bool DigVolumeWorld::StepInitFromHeightField(std::size_t maxSteps) {
+    const std::vector<BlockCoord>& coords = m_regions.Blocks();
+    const std::size_t              blocks = coords.size();
+    const std::size_t              total  = blocks * 2U;
+
+    std::size_t steps = 0;
+    while (m_initCursor < total && steps < maxSteps) {
+        // 第一轮 [0, blocks)：逐块填密度（全部就位后网格化才与一次性初始化逐位一致）；
+        // 第二轮 [blocks, 2·blocks)：逐块网格化。
+        if (m_initCursor < blocks) {
+            FillBlockDensity(coords[m_initCursor]);
+        } else {
+            MeshBlock(coords[m_initCursor - blocks]);
+        }
+        ++m_initCursor;
+        ++steps;
+    }
+    return m_initCursor >= total;
 }
 
 float DigVolumeWorld::SampleDensity(double x, double y, double z) const noexcept {
@@ -309,6 +430,14 @@ bool DigVolumeWorld::CarveSphere(const glm::dvec3& center, float radiusBlocks, s
     }
 
     return changedAny;
+}
+
+bool DigVolumeWorld::RemeshBlock(const BlockCoord& coord) {
+    if (m_blocks.find(coord) == m_blocks.end()) {
+        return false;
+    }
+    MeshBlock(coord);
+    return true;
 }
 
 std::size_t DigVolumeWorld::RemeshDirtyBlocks(const std::vector<BlockCoord>& dirty) {
@@ -466,6 +595,18 @@ std::size_t DigVolumeWorld::CarvedBlockCount() const noexcept {
 std::size_t DigVolumeWorld::VoxelBytes() const noexcept {
     return m_blocks.size() * static_cast<std::size_t>(kVolumeSampleCount) * static_cast<std::size_t>(kVolumeSampleCount) *
            static_cast<std::size_t>(kVolumeSampleCount);
+}
+
+std::size_t DigVolumeWorld::MaterialBytes() const noexcept {
+    std::size_t bytes = 0;
+    for (const auto& entry : m_blocks) {
+        bytes += entry.second.material.size();
+    }
+    return bytes;
+}
+
+const TerrainMaterialTable& DigVolumeWorld::Materials() const noexcept {
+    return m_terrain.Materials();
 }
 
 }  // namespace vx

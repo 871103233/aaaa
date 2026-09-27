@@ -15,6 +15,7 @@
 #include "core/frame_limiter.hpp"
 #include "core/log.hpp"
 #include "debug_overlay.hpp"
+#include "destruction_queue.hpp"
 #include "gameplay_input.hpp"
 #include "generation/map_preset.hpp"
 #include "input/input_map.hpp"
@@ -25,15 +26,18 @@
 #include "platform/settings.hpp"
 #include "platform/window.hpp"
 #include "render/camera.hpp"
+#include "render/frustum.hpp"
 #include "render/lighting_table.hpp"
 #include "render/mesh_renderer.hpp"
 #include "render/shadow_cascade.hpp"
+#include "rigid_collapse.hpp"
 #include "terrain/material_table.hpp"
 #include "terrain/material_textures.hpp"
 #include "terrain/terrain_collision.hpp"
 #include "terrain/terrain_types.hpp"
 #include "terrain/terrain_world.hpp"
 #include "terrain/world_bounds.hpp"
+#include "ui_text.hpp"
 #include "dig/collapse_table.hpp"
 #include "dig/dig_region.hpp"
 #include "dig/dig_volume.hpp"
@@ -55,6 +59,7 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -80,11 +85,39 @@ constexpr float kFlySpeed           = 28.0F;                      ///< 飞行速
 constexpr double kRebaseDistance    = 24.0;                       ///< 渲染原点重定基阈值（格）
 constexpr float kCameraFollowDistance = 14.0F;                    ///< 第三人称相机跟随距离（格）
 
+/// **帧尖峰（hitch）打点阈值**（毫秒）：= 2 × 帧预算（60 Hz ⇒ 33 ms）。
+///
+/// 判据出自 [references/performance-and-hitches.md](../../.trae/skills/voxel-engine-dev-standards/references/performance-and-hitches.md)
+/// §0 的"尖峰型"一行；超过阈值即打印一条**可定位**的日志（三相 CPU / draw call / 提交网格数 /
+/// 是否在等交换链）—— 这是 SKILL「卡顿消除」第五硬规则"观测先于结论"的落地。
+constexpr double kHitchThresholdMs = 33.0;
+
+/// 尖峰日志的最小间隔（毫秒）：持续低帧时避免把日志刷爆（观测本身不能制造新的卡顿）。
+constexpr double kHitchLogMinIntervalMs = 200.0;
+
+/// **延后破坏工作的每帧预算**（毫秒，T37）。
+///
+/// 预算用尽即让出本帧（剩余留到后续帧）；**单个单位超预算时仍至少做一件**，保证进度。
+/// 实测单个体积块的"重网格 + 上传"约 5~9 ms、"碰撞体重建"约 9 ms（debug），
+/// 故最坏帧会多花约 9 ms —— 仍在 60 Hz 的一帧（16.7 ms）之内，不构成冻结。
+constexpr double kDestructionBudgetMs = 3.0;
+
 // ---------------------------------------------------------------
 // 角色物理参数（T7 验收口径：20 格/秒冲刺不穿地形；1 格台阶可自动上步）
 // ---------------------------------------------------------------
 
 constexpr float kGravity                    = 24.0F;  ///< 重力加速度（格/秒²）
+/// T33：倒塌整体的渲染网格池 —— 每个槽位的顶点数上限（4 的倍数）。
+/// 单个整体的外表面超过它时**只截断外观**（物理与回写不受影响）并告警；池在加载期建好（见 `RigidCollapseRuntime`）。
+constexpr std::size_t kCollapseMeshCapacityVerts = 98304U;
+
+/// T46（[ADR 0017](../../docs/adr/0017-landing-by-material-rigid-vs-granular.md) 决策四）：网格池**槽位数**。
+///
+/// 为什么是 16 而不是 4：岩石类残骸落定后**保留几何体**（不回写）⇒ 槽位**不再随落定释放**。
+/// 4 槽会在第 5 次倒塌时用尽（然后本次不抽出任何整体 = "炸了不塌"）；项目所有者选定"**永久保留 + 扩池**"。
+/// 代价 = 每槽 98304 顶点 + 147456 索引 ≈ 3.18 MB ⇒ 16 槽约 **51 MB 显存**（启动日志会打印实测值）。
+/// 池满时的兜底：把**最旧**的保留残骸惰性回写腾位（见 `RetireOldestRetained`）。
+constexpr std::size_t kCollapseMeshSlots = 16U;
 constexpr float kCharacterRadius            = 0.3F;   ///< 胶囊半径（格）
 constexpr float kCharacterCylinderHalfHeight = 0.6F;  ///< 胶囊圆柱段半高（格）
 constexpr float kCharacterMaxSlopeDegrees   = 50.0F;  ///< 可行走最大坡度（度）
@@ -154,37 +187,60 @@ struct CpuFrameCost {
 #endif
 }
 
-/// 把 tile 网格改写成**相机相对**的上传数据。
-///
-/// 世界定位在这里完成最后一次转换：tile 内定点坐标（float）先升到 `double` 加上 tile 的世界整数原点，
-/// 再减去 `double` 渲染原点，最后才落回 `float`（红线 6）。因此进入 GPU 的世界定位永远是小数值，
-/// 顶点 float 的有效位不会被千里之外的大坐标吃掉。
-[[nodiscard]] vx::MeshData BuildRenderMesh(const vx::TerrainTileMesh& tileMesh, const glm::dvec3& renderOrigin) {
-    vx::MeshData mesh = tileMesh.mesh;  // 索引沿用，只改写顶点位置
+/// 一个网格的**世界空间** AABB（世界范围 ≤ 512 格，`float` 足以精确表示整数坐标）。
+/// `valid == false` 表示没有包围盒（空网格 / 未上传），剔除时按"可见"处理（宁可多提交）。
+struct WorldAabb {
+    glm::vec3 min { 0.0F };
+    glm::vec3 max { 0.0F };
+    bool      valid = false;
+};
 
-    const double originX = static_cast<double>(vx::TileOriginColumn(tileMesh.coord.x));
-    const double originZ = static_cast<double>(vx::TileOriginColumn(tileMesh.coord.z));
-
-    for (vx::MeshVertex& vertex : mesh.vertices) {
-        vertex.position[0] = static_cast<float>(originX + static_cast<double>(vertex.position[0]) - renderOrigin.x);
-        vertex.position[1] = static_cast<float>(static_cast<double>(vertex.position[1]) - renderOrigin.y);
-        vertex.position[2] = static_cast<float>(originZ + static_cast<double>(vertex.position[2]) - renderOrigin.z);
+/// 由**块内局部顶点** + 该块的世界原点求世界 AABB（上传时算一次，之后每帧只做剔除判定）。
+[[nodiscard]] WorldAabb BoundsOfVertices(const std::vector<vx::MeshVertex>& vertices, const glm::dvec3& worldOrigin) {
+    WorldAabb bounds;
+    if (vertices.empty()) {
+        return bounds;  // `valid` 保持 false
     }
-    return mesh;
+    glm::vec3 minimum(std::numeric_limits<float>::max());
+    glm::vec3 maximum(std::numeric_limits<float>::lowest());
+    for (const vx::MeshVertex& vertex : vertices) {
+        const glm::vec3 world(static_cast<float>(worldOrigin.x + static_cast<double>(vertex.position[0])),
+                              static_cast<float>(worldOrigin.y + static_cast<double>(vertex.position[1])),
+                              static_cast<float>(worldOrigin.z + static_cast<double>(vertex.position[2])));
+        minimum = glm::min(minimum, world);
+        maximum = glm::max(maximum, world);
+    }
+    bounds.min   = minimum;
+    bounds.max   = maximum;
+    bounds.valid = true;
+    return bounds;
 }
 
 /// 上传（或重传）一个已网格化 tile 的 GPU 网格。
+///
+/// T41：**不再依赖渲染原点** —— 顶点就是 tile **局部**坐标（0..64 格，由地表网格化器产出），
+/// "这块 tile 在世界哪里"由随网格登记的**原点**（= tile 世界原点）在绘制时补上（偏移 = 原点 − 渲染原点）。
+/// 因此渲染原点重定基**不会**再触发任何上传（这正是 T41 要消除的卡顿）。
+/// `boundsOut` 非空时写出该网格的**世界空间** AABB（T39：每帧视锥剔除用，上传时算一次）。
 void UploadTileMesh(vx::MeshRenderer& renderer, vx::MeshHandle& handle, const vx::TerrainWorld& world,
-                    const vx::TileCoord& coord, const glm::dvec3& renderOrigin) {
+                    const vx::TileCoord& coord, WorldAabb* boundsOut = nullptr) {
+    if (boundsOut != nullptr) {
+        *boundsOut = WorldAabb {};
+    }
     const vx::TerrainTileMesh* tileMesh = world.FindMesh(coord.x, coord.z);
     if (tileMesh == nullptr) {
         return;
+    }
+    const glm::dvec3 tileOrigin(static_cast<double>(vx::TileOriginColumn(coord.x)), 0.0,
+                                static_cast<double>(vx::TileOriginColumn(coord.z)));
+    if (boundsOut != nullptr) {
+        *boundsOut = BoundsOfVertices(tileMesh->mesh.vertices, tileOrigin);
     }
     if (handle.IsValid()) {
         renderer.ReleaseMesh(handle);
         handle = vx::MeshHandle {};
     }
-    handle = renderer.UploadMesh(BuildRenderMesh(*tileMesh, renderOrigin));
+    handle = renderer.UploadMesh(tileMesh->mesh, tileOrigin);
 }
 
 /// 把绝对世界空间相机求值结果平移到渲染原点附近：`eye` / `target` / `view` 全部减去渲染原点。
@@ -201,9 +257,38 @@ void UploadTileMesh(vx::MeshRenderer& renderer, vx::MeshHandle& handle, const vx
     return relative;
 }
 
-/// 把主角胶囊的**局部**顶点（脚底为原点）搬到**相机相对**空间：`world = 脚底 + 局部 - 渲染原点`。
-/// 与地表网格同一约定（红线 6）：世界定位用 `double` 累加后再落回 `float`，且减去当前渲染原点，
-/// 因此渲染原点重定基时不会抖动。就地改写 `vertices`（长度与 `local` 一致），避免每帧堆分配。
+/// 视锥剔除判据（T39）：世界 AABB → 渲染空间 → 与相机视锥做**保守**相交。
+///
+/// 为什么不能只按相机视锥剔除：**影子可以落在"看不到投射体"的地方**（高塔在画面外、影子在画面内）。
+/// 只按视锥剔除会重现"阴影随视角消失"—— 那正是 B6 / B8 修过的缺陷。故这里先把 AABB 沿**太阳方向
+/// 的反向**扫掠到地面（= 该物体最坏情况下能投影到的区域），取"物体 ∪ 影子落点"的并集再判可见性：
+/// 保守（可能多留几个网格），但**不会丢阴影**。
+///
+/// 渲染空间：上传的顶点是**相机相对**坐标，故 AABB 也要减去渲染原点（红线 6）。
+[[nodiscard]] bool VisibleToCamera(const vx::Frustum& frustum, const WorldAabb& bounds, const glm::dvec3& renderOrigin,
+                                   const glm::vec3& sunDirection) {
+    if (!bounds.valid) {
+        return true;  // 无包围盒 ⇒ 保守提交
+    }
+    glm::vec3 minimum = bounds.min;
+    glm::vec3 maximum = bounds.max;
+
+    // 影子的水平位移 ≈ (太阳方向的水平分量) × (高度 / 太阳高度的正弦)；竖直方向落到地面（y = 0）。
+    const float     sunY  = std::max(sunDirection.y, 1.0e-3F);  // 太阳近地平线时钳一个下限，避免扫掠发散
+    const float     top   = std::max(maximum.y, 0.0F);
+    const float     reach = top / sunY;
+    const glm::vec3 offset(-sunDirection.x * reach, -top, -sunDirection.z * reach);
+    minimum = glm::min(minimum, minimum + offset);
+    maximum = glm::max(maximum, maximum + offset);
+
+    const glm::vec3 origin = glm::vec3(renderOrigin);  // 渲染原点取整，float 可精确表示
+    return vx::FrustumIntersectsAabb(frustum, minimum - origin, maximum - origin);
+}
+
+/// 把主角胶囊的**局部**顶点（脚底为原点）搬到**渲染相对**空间：`渲染相对 = 脚底 + 局部 − 渲染原点`。
+/// 与地表 / 体积网格的分工（T41）：后者的顶点是**网格局部**坐标、位置由逐网格 uniform 补上；
+/// 动态网格没有固定原点，故仍按本式在 CPU 侧烘焙（世界定位用 `double` 累加后再落回 `float`，红线 6），
+/// 并在刷新顶点时把 `origin` 一并设为**当前渲染原点**（偏移恒 0）。就地改写 `vertices`，避免每帧堆分配。
 void UpdateCharacterRenderVertices(std::vector<vx::MeshVertex>& vertices, const vx::MeshData& local,
                                    const glm::dvec3& feet, const glm::dvec3& renderOrigin) {
     for (std::size_t i = 0; i < vertices.size(); ++i) {
@@ -216,8 +301,8 @@ void UpdateCharacterRenderVertices(std::vector<vx::MeshVertex>& vertices, const 
     }
 }
 
-/// 把光球球体的**局部**顶点（球心为原点）搬到**相机相对**空间：先按 `alpha` 在上一 / 当前逻辑步位置之间
-/// 插值（与主角、相机同一套渲染插值约定，红线 11：插值只用于渲染），再减去渲染原点。
+/// 把光球球体的**局部**顶点（球心为原点）搬到**渲染相对**空间：先按 `alpha` 在上一 / 当前逻辑步位置之间
+/// 插值（与主角、相机同一套渲染插值约定，红线 11：插值只用于渲染），再减去渲染原点（与主角同约定，T41）。
 void UpdateOrbRenderVertices(std::vector<vx::MeshVertex>& vertices, const vx::MeshData& local,
                              const glm::dvec3& previousCenter, const glm::dvec3& center, double alpha,
                              const glm::dvec3& renderOrigin) {
@@ -301,12 +386,19 @@ constexpr float kMuzzleHeightRatio = 0.75F;
 ///
 /// 分流规则与爆炸一致：**区域内以体积为准**（已挖掉的地方就是空的 ⇒ 光球能飞进洞里），
 /// 区域外以地表高度场为准（`y <= 地表高度` 即实心）。
+///
+/// T46（[ADR 0017](../../docs/adr/0017-landing-by-material-rigid-vs-granular.md)）：**保留中的岩石残骸**也参与判定
+/// —— 它们不在体素里（落定后不回写），若不在这里挡住，光球会**穿过"看着是实心"的岩石**（世界不自洽）。
 class GameOrbWorldQuery final : public vx::IOrbWorldQuery {
 public:
-    GameOrbWorldQuery(const vx::TerrainWorld& terrain, const vx::DigVolumeWorld& volumes) noexcept
-        : m_terrain(terrain), m_volumes(volumes) {}
+    GameOrbWorldQuery(const vx::TerrainWorld& terrain, const vx::DigVolumeWorld& volumes,
+                      const vx::RigidCollapseRuntime& collapse) noexcept
+        : m_terrain(terrain), m_volumes(volumes), m_collapse(collapse) {}
 
     [[nodiscard]] bool IsSolid(double x, double y, double z) const override {
+        if (m_collapse.ContainsRetainedPoint(glm::dvec3(x, y, z))) {
+            return true;  // 保留中的岩石残骸（T46）—— 命中后由调用方先把它惰性体素化
+        }
         if (m_volumes.IsInsideRegion(x, y, z)) {
             return m_volumes.IsSolid(x, y, z);
         }
@@ -318,8 +410,9 @@ public:
     }
 
 private:
-    const vx::TerrainWorld&   m_terrain;
-    const vx::DigVolumeWorld& m_volumes;
+    const vx::TerrainWorld&          m_terrain;
+    const vx::DigVolumeWorld&        m_volumes;
+    const vx::RigidCollapseRuntime&  m_collapse;
 };
 
 /// 相机避障 / 安全网的采样步长（格）：固定步长 ⇒ 结果确定（红线 7），无分配。
@@ -383,9 +476,15 @@ private:
 
 /// 上传（或重传）一个可挖体积块的 GPU 网格。该块无表面（全实心 / 全空）时释放旧网格。
 ///
-/// 与地表 tile 同约定：块内局部坐标 + 块整数原点 − 渲染原点，最后才落回 `float`（红线 6）。
+/// T41：与地表 tile 同约定 —— 顶点就是块**局部**坐标（0..32 格，由 Surface Nets 产出），
+/// "这块在世界哪里"由随网格登记的**原点**（= 块世界原点）在绘制时补上；**不再依赖渲染原点**，
+/// 故渲染原点重定基不会触发上传。
+/// `boundsOut` 非空时写出该网格的**世界空间** AABB（T39：每帧视锥剔除用，上传时算一次）。
 void UploadVolumeMesh(vx::MeshRenderer& renderer, vx::MeshHandle& handle, const vx::DigVolumeWorld& volumes,
-                      const vx::BlockCoord& coord, const glm::dvec3& renderOrigin) {
+                      const vx::BlockCoord& coord, WorldAabb* boundsOut = nullptr) {
+    if (boundsOut != nullptr) {
+        *boundsOut = WorldAabb {};
+    }
     if (handle.IsValid()) {
         renderer.ReleaseMesh(handle);  // 挖除会改变顶点数，故不能用 UpdateMeshVertices
         handle = vx::MeshHandle {};
@@ -396,16 +495,13 @@ void UploadVolumeMesh(vx::MeshRenderer& renderer, vx::MeshHandle& handle, const 
         return;
     }
 
-    vx::MeshData mesh = *blockMesh;
-    const double originX = static_cast<double>(vx::BlockOriginBlocks(coord.x));
-    const double originY = static_cast<double>(vx::BlockOriginBlocks(coord.y));
-    const double originZ = static_cast<double>(vx::BlockOriginBlocks(coord.z));
-    for (vx::MeshVertex& vertex : mesh.vertices) {
-        vertex.position[0] = static_cast<float>(originX + static_cast<double>(vertex.position[0]) - renderOrigin.x);
-        vertex.position[1] = static_cast<float>(originY + static_cast<double>(vertex.position[1]) - renderOrigin.y);
-        vertex.position[2] = static_cast<float>(originZ + static_cast<double>(vertex.position[2]) - renderOrigin.z);
+    const glm::dvec3 blockOrigin(static_cast<double>(vx::BlockOriginBlocks(coord.x)),
+                                 static_cast<double>(vx::BlockOriginBlocks(coord.y)),
+                                 static_cast<double>(vx::BlockOriginBlocks(coord.z)));
+    if (boundsOut != nullptr) {
+        *boundsOut = BoundsOfVertices(blockMesh->vertices, blockOrigin);
     }
-    handle = renderer.UploadMesh(mesh);
+    handle = renderer.UploadMesh(*blockMesh, blockOrigin);
 }
 
 /// T27：爆炸写回世界所需的全部句柄与缓冲（避免十几个参数一路传下去）。
@@ -420,8 +516,12 @@ struct WorldEditContext {
     std::vector<vx::MeshHandle>&       tileHandles;
     const std::vector<vx::BlockCoord>& volumeCoords;
     std::vector<vx::MeshHandle>&       volumeHandles;
-    const glm::dvec3&                  renderOrigin;  ///< 引用：原点重定基后自动看到新值
-    std::size_t                        totalCollapseVoxels = 0;  ///< 累计塌落体素数（面板）
+    std::vector<WorldAabb>&            tileBounds;    ///< T39：地表 tile 的世界 AABB（剔除用；上传时更新）
+    std::vector<WorldAabb>&            volumeBounds;  ///< T39：可挖体积块的世界 AABB（同上）
+    vx::PendingDestruction&            pending;       ///< T37：延后破坏队列（爆炸只入队，重活按帧预算做）
+    vx::PhysicsWorld&                  physics;       ///< T33：倒塌整体的动态刚体建在它上面
+    vx::RigidCollapseRuntime&          rigidCollapse; ///< T33：倒塌整体的运行时（刚体 + 渲染网格池）
+    std::size_t                        totalCollapseVoxels = 0;  ///< 累计失去支撑 / 回写的体素数（面板）
 };
 
 /// T27：一次爆炸的结果（供日志、面板与"角色被埋"救场判定使用）。
@@ -441,12 +541,10 @@ DetonationOutcome Detonate(WorldEditContext& context, const glm::dvec3& point, c
     DetonationOutcome outcome;
 
     if (context.volumes.IsInsideRegion(point.x, point.y, point.z)) {
-        // T30：分段计时 —— 把单次爆炸拆成六段，先在日志里量出真实的耗时分布，再据此优化。
+        // T30：分段计时 —— 先量出真实的耗时分布，再据此优化。
+        // T37 起当帧只做「挖除 + 塌落」两段，其余（重网格 / 上传 / 碰撞体重建）交给延后队列。
         PhaseTimer carveTimer;
-        PhaseTimer remeshTimer;
         PhaseTimer collapseTimer;
-        PhaseTimer uploadTimer;
-        PhaseTimer collisionTimer;
 
         carveTimer.Begin();
         std::vector<vx::BlockCoord> dirty;
@@ -456,54 +554,72 @@ DetonationOutcome Detonate(WorldEditContext& context, const glm::dvec3& point, c
         }
         const double carveMs = carveTimer.EndMs();
 
-        remeshTimer.Begin();
-        outcome.remeshed = context.volumes.RemeshDirtyBlocks(dirty);
-        const double remeshMs = remeshTimer.EndMs();
-
-        // T29：挖除后做一次支撑检查（单次、不迭代）——失去支撑的实心体沿本列下落，质量守恒。
+        // T33：挖除后做一次「支撑检查 → 连通分量分组 → 抽出」，失去支撑的**每个整体**转成 Jolt 动态刚体。
+        // 判据读的是**密度**（挖除阶段已写好），与网格化无关，故可以留在当帧；凸包构建与回写的成本见日志。
         collapseTimer.Begin();
-        const vx::CollapseResult collapse =
-            vx::ApplyCollapse(context.volumes, vx::CollapseSeed { carved }, context.collapse);
-        const double collapseMs = collapseTimer.EndMs();
-
-        double collapseRemeshMs = 0.0;
-        if (!collapse.dirty.empty()) {
-            remeshTimer.Begin();
-            outcome.remeshed += context.volumes.RemeshDirtyBlocks(collapse.dirty);
-            collapseRemeshMs = remeshTimer.EndMs();
-            dirty.insert(dirty.end(), collapse.dirty.begin(), collapse.dirty.end());
-        }
-        outcome.collapsedVoxels = collapse.movedVoxels;
-        context.totalCollapseVoxels += collapse.movedVoxels;
-
-        std::sort(dirty.begin(), dirty.end());
-        dirty.erase(std::unique(dirty.begin(), dirty.end()), dirty.end());
-
-        uploadTimer.Begin();
-        for (const vx::BlockCoord& coord : dirty) {
-            for (std::size_t i = 0; i < context.volumeCoords.size(); ++i) {
-                if (context.volumeCoords[i] == coord) {
-                    UploadVolumeMesh(context.renderer, context.volumeHandles[i], context.volumes, coord,
-                                     context.renderOrigin);
-                    break;
-                }
+        // T46（ADR 0017 决策四）：网格池被"**保留中的岩石残骸**"占满时先**腾位**（最旧优先惰性回写）——
+        // 否则 `maxUnits = FreeSlots() = 0` ⇒ 本次爆炸**不抽出任何整体**（看起来就是"炸了却不塌"）。
+        if (context.rigidCollapse.FreeSlots() == 0) {
+            vx::CollapseWriteback retiredOldest;
+            if (context.rigidCollapse.RetireOldestRetained(context.physics, context.volumes, context.renderer,
+                                                           retiredOldest)) {
+                dirty.insert(dirty.end(), retiredOldest.dirty.begin(), retiredOldest.dirty.end());
+                VX_LOG_INFO("倒塌网格池已满 ⇒ 腾位：最旧的岩石残骸惰性体素化（T46）：回写 %zu 个（丢弃 %zu）",
+                            retiredOldest.writtenVoxels, retiredOldest.droppedVoxels);
             }
         }
-        const double uploadMs = uploadTimer.EndMs();
+        // T43（ADR 0016 决策一）：把**爆心与爆炸半径**一并交给塌落 —— 失去支撑的整体由此获得"被炸飞"的
+        // 冲量（逐体素向外、按距离线性衰减 ⇒ 越靠近爆心飞得越快，并因此产生翻滚角速度），
+        // 而不再只靠人工倾斜方向。半径 = 本次爆炸半径（与挖除同一口径）。
+        vx::CollapseSeed collapseSeed;
+        collapseSeed.bounds    = carved;
+        collapseSeed.epicenter = point;
+        collapseSeed.radius    = spec.explosionRadiusBlocks;
+        // T46：每次爆炸最多抽出几个整体仍由 `max_active_units` 控制（池有 16 槽，但一次爆炸不该全占了）。
+        const std::size_t maxUnitsThisBlast =
+            std::min(context.rigidCollapse.FreeSlots(), static_cast<std::size_t>(context.collapse.maxActiveUnits));
+        vx::CollapsePlan collapsePlan = vx::ApplyCollapse(context.volumes, collapseSeed, context.collapse,
+                                                         maxUnitsThisBlast);
+        std::size_t spawnedUnits = 0;
+        for (vx::CollapseUnit& unit : collapsePlan.units) {
+            const std::size_t voxelCount = unit.voxels.size();
+            // T46 修订：把**落地口径**与"表面材质直方图"一起记下来（`Spawn` 会 move 走 `unit`，故先取）。
+            const bool rigidDebris   = unit.rigidDebris;
+            const int  shownRock     = unit.surfaceMaterialCounts[2];
+            const int  shownDirt     = unit.surfaceMaterialCounts[1];
+            const int  shownGrass    = unit.surfaceMaterialCounts[0];
+            const int  shownSand     = unit.surfaceMaterialCounts[3];
+            if (context.rigidCollapse.Spawn(context.physics, context.volumes, context.renderer, context.collapse,
+                                            std::move(unit))) {
+                ++spawnedUnits;
+                VX_LOG_INFO("倒塌整体已刚体化（T33）：体素 %zu 个 ⇒ 交给 Jolt 求解倾斜 / 旋转 / 碰撞；"
+                            "落地口径 = %s（**表面**材质 cell 数：岩 %d / 土 %d / 草 %d / 沙 %d）",
+                            voxelCount, rigidDebris ? "**保留几何体**（不回写，T46）" : "回写并与地面融合（T46）",
+                            shownRock, shownDirt, shownGrass, shownSand);
+            }
+        }
+        const double collapseMs = collapseTimer.EndMs();
 
-        // T28：重建受影响块的三角网碰撞体 —— 不做这一步就会出现"看得见的新洞、走不进去"。
-        collisionTimer.Begin();
-        (void)context.volumeCollision.SyncBlocks(context.volumes, dirty);
-        const double collisionMs = collisionTimer.EndMs();
+        outcome.collapsedVoxels = collapsePlan.unsupportedVoxels;
+        if (!collapsePlan.dirty.empty()) {
+            dirty.insert(dirty.end(), collapsePlan.dirty.begin(), collapsePlan.dirty.end());
+        }
 
-        VX_LOG_INFO("爆炸耗时分解（可挖体积）：中心 (%.1f, %.1f, %.1f) 半径 %.1f 格；"
-                    "挖除 %.2f ms / 网格化 %.2f ms / 塌落 %.2f ms（邻域 %zu 采样、失去支撑 %zu 体素、移动 %zu）"
-                    "/ 塌落后网格化 %.2f ms / 网格上传 %.2f ms（%zu 块）/ 碰撞体重建 %.2f ms（%zu 块）"
-                    "⇒ 合计 %.2f ms",
-                    point.x, point.y, point.z, static_cast<double>(spec.explosionRadiusBlocks), carveMs, remeshMs,
-                    collapseMs, collapse.regionSamples, collapse.unsupportedVoxels, collapse.movedVoxels,
-                    collapseRemeshMs, uploadMs, dirty.size(), collisionMs, dirty.size(),
-                    carveMs + remeshMs + collapseMs + collapseRemeshMs + uploadMs + collisionMs);
+        // T37：**重网格 / GPU 上传 / 三角网碰撞体重建**（实测每块 5~9 ms，一次爆炸波及 6~7 块 ≈ 100 ms）
+        // 一律入队，由 `ProcessPendingDestruction` 按每帧预算推进 —— 当帧只付"挖除 + 抽出 + 刚体化"的成本。
+        // 语义已确认：接受"全部脏块分帧"（洞口 / 倒塌残骸可在 1~N 帧内补齐）。
+        outcome.remeshed = dirty.size();
+        context.pending.MergeVolumeBlocks(dirty);
+
+        VX_LOG_INFO("爆炸（当帧 = 挖除 + 抽出 + 刚体化）：中心 (%.1f, %.1f, %.1f) 半径 %.1f 格；挖除 %.2f ms / 倒塌 %.2f ms"
+                    "（邻域 %zu 采样、失去支撑 %zu 体素、整体 %zu 个、已刚体化 %zu 个、因上限跳过 %zu 个、"
+                    "清除小碎片 %zu 个 / %zu 体素；**保留中岩石残骸 %zu 个 / 自由槽位 %zu**）"
+                    "⇒ 入队 %zu 个块的延后工作（重网格 + 碰撞体；队内现共 %zu 个单位）",
+                    point.x, point.y, point.z, static_cast<double>(spec.explosionRadiusBlocks), carveMs, collapseMs,
+                    collapsePlan.regionSamples, collapsePlan.unsupportedVoxels, collapsePlan.units.size(),
+                    spawnedUnits, collapsePlan.skippedUnits, collapsePlan.deletedUnits, collapsePlan.deletedVoxels,
+                    context.rigidCollapse.RetainedUnits(), context.rigidCollapse.FreeSlots(),
+                    dirty.size(), context.pending.PendingUnits());
         return outcome;
     }
 
@@ -520,32 +636,109 @@ DetonationOutcome Detonate(WorldEditContext& context, const glm::dvec3& point, c
     }
 
     outcome.terrainChanged = true;
-    outcome.remeshed       = context.world.RemeshDirtyTiles(result.dirtyTiles);
-    for (const vx::TileCoord& coord : result.dirtyTiles) {
-        for (std::size_t i = 0; i < context.tileCoords.size(); ++i) {
-            if (context.tileCoords[i] == coord) {
-                UploadTileMesh(context.renderer, context.tileHandles[i], context.world, coord, context.renderOrigin);
+    outcome.remeshed       = result.dirtyTiles.size();
+    // T37：地表爆破的重网格 / 上传 / 碰撞体重建同样延后 —— `ApplyTerrainCrater` 只改高度列，本身很便宜。
+    // "被体积接管的 tile 不重建高度场碰撞体"的既有判据（ADR 0012）由处理器的 `TileCollision` 分支保留。
+    context.pending.MergeTiles(result.dirtyTiles);
+    VX_LOG_DEBUG("光球爆炸（地表爆破）：中心 (%.1f, %.1f, %.1f)，坑半径 %.1f 格；改动 %zu 列 ⇒ 入队 %zu 个 tile 的"
+                 "延后工作（重网格 + 碰撞体；队内现共 %zu 个单位）",
+                 point.x, point.y, point.z, static_cast<double>(spec.explosionRadiusBlocks), result.changedColumns,
+                 result.dirtyTiles.size(), context.pending.PendingUnits());
+    return outcome;
+}
+
+/// T37：延后破坏工作的**执行器** —— 按每帧预算推进队列（SKILL「不冻结画面」）。
+///
+/// 顺序完全由 `PendingDestruction` 决定（先全部"重网格 + 上传"，再全部"重建碰撞体"），
+/// 因此"分帧做完"与"当帧一次做完"的世界状态**逐位相同**（红线 7 / 11）。
+struct DestructionProcessor {
+    /// 处理至多 `budgetMs` 毫秒的延后工作，返回本帧处理的单位数（供面板显示"本帧重网格单元"）。
+    ///
+    /// **每帧至少处理一个单位**：单个单位（一个体积块的重网格 + 上传，或一次碰撞体重建）实测 5~9 ms，
+    /// 可能超过预算，但让出本帧没有任何意义（进度会停），故"超预算也做一件"是刻意的取舍。
+    std::size_t Process(WorldEditContext& context, double budgetMs) {
+        if (context.pending.Empty()) {
+            return 0;
+        }
+        vx::Clock                    clock;
+        std::size_t                  processed = 0;
+        vx::PendingDestruction::Unit unit;
+        while (context.pending.TakeNext(unit)) {
+            Apply(context, unit);
+            ++processed;
+            if (clock.Tick() * 1000.0 >= budgetMs) {
+                break;
+            }
+        }
+        if (context.pending.Empty()) {
+            VX_LOG_DEBUG("延后破坏处理完成：本帧处理 %zu 个单位，队列已排空（洞口 / 塌落至此补齐）", processed);
+        }
+        return processed;
+    }
+
+private:
+    void Apply(WorldEditContext& context, const vx::PendingDestruction::Unit& unit) {
+        switch (unit.kind) {
+            case vx::PendingDestruction::UnitKind::VolumeRemesh: {
+                (void)context.volumes.RemeshBlock(unit.block);
+                const std::size_t index = VolumeIndex(context, unit.block);
+                if (index < context.volumeHandles.size()) {
+                    UploadVolumeMesh(context.renderer, context.volumeHandles[index], context.volumes, unit.block,
+                                     &context.volumeBounds[index]);
+                }
+                break;
+            }
+            case vx::PendingDestruction::UnitKind::TileRemesh: {
+                m_tileScratch.clear();
+                m_tileScratch.push_back(unit.tile);
+                (void)context.world.RemeshDirtyTiles(m_tileScratch);
+                const std::size_t index = TileIndex(context, unit.tile);
+                if (index < context.tileHandles.size()) {
+                    UploadTileMesh(context.renderer, context.tileHandles[index], context.world, unit.tile,
+                                   &context.tileBounds[index]);
+                }
+                break;
+            }
+            case vx::PendingDestruction::UnitKind::VolumeCollision:
+                // T28：重建受影响块的三角网碰撞体 —— 不做这一步就会出现"看得见的新洞、走不进去"。
+                (void)context.volumeCollision.SyncBlock(context.volumes, unit.block);
+                // T46（ADR 0017 决策二）：**碰撞体一变，支撑条件就可能变了** —— 唤醒与它相交的保留岩石残骸。
+                // 不唤醒的话，Jolt 的休眠体不会因"脚下静态形状被改写"自动醒来 ⇒ 岩石会悬空不动。
+                context.rigidCollapse.AwakenIntersecting(unit.block, context.physics);
+                break;
+            case vx::PendingDestruction::UnitKind::TileCollision: {
+                // 既有判据（ADR 0012）：**被体积接管的 tile 不重建高度场碰撞体**，
+                // 否则会把刚交出去的隐形高度场又装回来（角色会被挡在自己挖的洞口外）。
+                const vx::TerrainTileMesh* tileMesh = context.world.FindMesh(unit.tile.x, unit.tile.z);
+                if (tileMesh != nullptr && !tileMesh->mesh.indices.empty()) {
+                    (void)context.collision.SyncTile(context.world, unit.tile.x, unit.tile.z);
+                }
                 break;
             }
         }
     }
-    // 重建受影响 tile 的碰撞体；**被体积接管的 tile 不重建**（否则会把刚交出去的隐形高度场又装回来，
-    // 见 ADR 0012 的接管判据）。
-    std::vector<vx::TileCoord> collisionTiles;
-    for (const vx::TileCoord& coord : result.dirtyTiles) {
-        const vx::TerrainTileMesh* tileMesh = context.world.FindMesh(coord.x, coord.z);
-        if (tileMesh != nullptr && tileMesh->mesh.indices.empty()) {
-            continue;
+
+    /// 块坐标 → 句柄 / 包围盒数组下标；找不到返回"越界值"（调用方据此跳过）。
+    [[nodiscard]] static std::size_t VolumeIndex(const WorldEditContext& context, const vx::BlockCoord& block) {
+        for (std::size_t i = 0; i < context.volumeCoords.size(); ++i) {
+            if (context.volumeCoords[i] == block) {
+                return i;
+            }
         }
-        collisionTiles.push_back(coord);
+        return context.volumeHandles.size();
     }
-    const std::size_t rebuiltBodies = context.collision.SyncTiles(context.world, collisionTiles);
-    VX_LOG_DEBUG("光球爆炸（地表爆破）：中心 (%.1f, %.1f, %.1f)，坑半径 %.1f 格；改动 %zu 列，重网格 %zu tile，"
-                 "重建碰撞体 %zu 个",
-                 point.x, point.y, point.z, static_cast<double>(spec.explosionRadiusBlocks), result.changedColumns,
-                 outcome.remeshed, rebuiltBodies);
-    return outcome;
-}
+    [[nodiscard]] static std::size_t TileIndex(const WorldEditContext& context, const vx::TileCoord& tile) {
+        for (std::size_t i = 0; i < context.tileCoords.size(); ++i) {
+            if (context.tileCoords[i] == tile) {
+                return i;
+            }
+        }
+        return context.tileHandles.size();
+    }
+
+    /// 复用缓冲：单 tile 重网格需要一个单元素 vector，避免每单位分配一次（红线 10）。
+    std::vector<vx::TileCoord> m_tileScratch;
+};
 
 /// 缺陷 B2 的物理侧（T27 复用）：**地表被抬高后**把被埋住的角色顶回地面。
 ///
@@ -582,6 +775,128 @@ void ApplyFrameRateCap(vx::Window& window, vx::FrameLimiter& limiter, int target
                     window.PresentModeName(), refreshRate);
     }
 }
+
+// ---------------------------------------------------------------
+// 启动加载（T36 / SKILL「不冻结画面」）：窗口与加载画面尽早出现，长任务按帧切分
+// ---------------------------------------------------------------
+
+/// 加载期每帧的重计算预算（毫秒）。
+///
+/// 远小于一帧（60 Hz ≈ 16.7 ms）⇒ 加载画面以接近刷新率持续刷新，玩家看到的是"进度在走"
+/// 而不是"画面停住"。这是 SKILL「不冻结画面」在启动加载上的量化落地：**不许**在渲染帧内
+/// 同步跑完一个明显超一帧预算的任务。
+constexpr double kLoadWorkBudgetMs = 8.0;
+
+/// 加载阶段（顺序即**实际执行顺序**，也是进度顺序）。
+enum class LoadStage : int {
+    Textures = 0,     ///< 程序生成材质贴图 + 上传（最重，实测约 1.9 s）
+    TerrainTiles,     ///< 地表 tile 生成与网格化
+    DiggableVolumes,  ///< 可挖体积密度填充与等值面网格化
+    CollisionBodies,  ///< 地表高度场 / 可挖体积三角网碰撞体
+    Finalize,         ///< 收尾（世界边界 / 出生点 / 角色 / 相机 / 系统面板数据 / 渲染原点）
+    MeshUpload,       ///< 网格上传（tile + 体积 + 角色 + 光球）
+    kCount
+};
+
+/// 各阶段的进度权重（无量纲，只需相对大小；量级取自 T36 的启动耗时分解）。
+inline constexpr double kLoadStageWeights[static_cast<int>(LoadStage::kCount)] = { 1.9, 2.0, 1.6, 1.0, 0.1, 0.6 };
+
+/// 材质贴图分步生成的**每批行数**：256² 下单行约 0.8 ms，故 6 行 ≈ 5 ms，落在预算内。
+constexpr std::size_t kTextureRowsPerSlice = 6;
+
+/// 可挖体积分步初始化的**每批步数**：一步 = 一个块的密度填充或网格化（约 1~5 ms），故取 1。
+constexpr std::size_t kVolumeInitStepsPerSlice = 1;
+
+/// 网格上传的**每批个数**：单个网格的上传是一次阻塞拷贝，取 4 使其 ≲ 5 ms。
+constexpr std::size_t kMeshUploadsPerSlice = 4;
+
+/// 阶段 → 加载画面上的文字标签（经 `UiText` 取值，故无 CJK 字体时也不会出现缺字）。
+[[nodiscard]] vx::UiLabel LoadStageLabel(LoadStage stage) noexcept {
+    switch (stage) {
+        case LoadStage::Textures:
+            return vx::UiLabel::LoadingStageTextures;
+        case LoadStage::TerrainTiles:
+            return vx::UiLabel::LoadingStageTerrainTiles;
+        case LoadStage::DiggableVolumes:
+            return vx::UiLabel::LoadingStageDigVolumes;
+        case LoadStage::CollisionBodies:
+            return vx::UiLabel::LoadingStageCollision;
+        case LoadStage::Finalize:
+            return vx::UiLabel::LoadingStageFinalize;
+        case LoadStage::MeshUpload:
+            return vx::UiLabel::LoadingStageMeshUpload;
+        case LoadStage::kCount:
+            break;
+    }
+    return vx::UiLabel::LoadingTitle;
+}
+
+/// 加载画面控制器：在长任务之间**照常出帧**（窗口保持响应、进度持续刷新）。
+///
+/// 这是 SKILL「不冻结画面」在启动加载上的落地：先给画面（加载画面 + 真实进度），再给结果
+/// （世界就绪后自然替换）。加载期只画叠加层、不提交任何世界网格 —— 材质纹理与相机尚未就绪。
+struct LoadingScreen {
+    vx::Window&       window;
+    vx::MeshRenderer& renderer;
+    vx::DebugOverlay& overlay;
+    vx::InputMap&     input;  ///< 只作为 `pump_events` 的接收者；加载期不消费任何动作
+    SDL_FColor        clearColor { 0.0F, 0.0F, 0.0F, 1.0F };
+    bool              quitRequested = false;
+
+    /// 出一帧加载画面（并处理本帧窗口事件）。返回 false 表示用户请求关闭窗口。
+    [[nodiscard]] bool Pump(LoadStage stage, double stageFraction) {
+        if (quitRequested) {
+            return false;
+        }
+        if (!window.pump_events(input)) {
+            quitRequested = true;
+            return false;
+        }
+        input.BeginFrame();  // 与主循环同构：每帧只采样一次动作，避免加载期的按键边沿滞留到进入游戏后
+
+        // 总进度 = 各阶段权重的前缀和 + 当前阶段的**加权部分进度**（只有一项分母，故只需相对大小）。
+        const int    index        = static_cast<int>(stage);
+        const double fraction     = std::clamp(stageFraction, 0.0, 1.0);
+        double       weightsDone  = 0.0;
+        double       weightsTotal = 0.0;
+        for (int i = 0; i < static_cast<int>(LoadStage::kCount); ++i) {
+            weightsTotal += kLoadStageWeights[i];
+            if (i < index) {
+                weightsDone += kLoadStageWeights[i];
+            } else if (i == index) {
+                weightsDone += kLoadStageWeights[i] * fraction;
+            }
+        }
+
+        overlay.SetLoadingStatus(LoadStageLabel(stage), static_cast<float>(weightsDone / weightsTotal));
+        overlay.BeginFrame();
+        overlay.BuildLoadingUI();
+        overlay.EndFrame();
+        (void)renderer.RenderFrame(nullptr, 0, clearColor, &overlay);
+        return true;
+    }
+
+    /// 在每帧 `kLoadWorkBudgetMs` 的预算内推进一个分片任务，预算用尽时出一帧加载画面。
+    ///
+    /// `step()` 处理一小批工作并返回**本阶段进度** `[0, 1]`（`1.0` = 完成）。每帧至少调用一次
+    /// `step()`，因此进度必然单调前进；预算是"上限"而非"配额"。
+    template <typename StepFn>
+    [[nodiscard]] bool Run(LoadStage stage, StepFn&& step) {
+        vx::Clock clock;
+        while (true) {
+            const double fraction = step();
+            if (fraction >= 1.0) {
+                return Pump(stage, 1.0);
+            }
+            if (clock.Tick() * 1000.0 >= kLoadWorkBudgetMs) {
+                if (!Pump(stage, fraction)) {
+                    return false;
+                }
+                (void)clock.Tick();  // 忘掉出加载画面的耗时，重新开始计预算
+            }
+        }
+    }
+};
 
 }  // namespace
 
@@ -666,11 +981,16 @@ int main(int argc, char** argv) {
         const vx::CollapseTable collapseTable =
             vx::CollapseTable::LoadFromFile(SourceAssetPath("assets/config/collapse.toml"));
         const vx::CollapseSpec& collapseSpec = collapseTable.Spec();
-        VX_LOG_INFO("塌落规则已加载（schema_version=%d）：%s；悬挑上限 %.1f 格（跨度超过即失去支撑）；"
-                    "碎堆摊开 %d 格；支撑检查邻域外扩 %d 块",
+        VX_LOG_INFO("倒塌规则已加载（schema_version=%d，T33 刚体化 / T43 真实感）：%s；悬挑上限 %.1f 格"
+                    "（跨度超过即失去支撑）；邻域外扩 %d 块；落定阈值 %.2f 格-秒 / %.2f rad-秒 × %d 步；"
+                    "爆心冲量 %.2f 格-秒（无冲量时退回人工不对称 %.2f rad-秒）；小碎片清除阈值 %d 体素；"
+                    "活跃整体上限 %d（质量 / 摩擦 / 弹性改由材质表驱动，见 ADR 0016）",
                     collapseTable.SchemaVersion(), collapseSpec.enabled ? "启用" : "关闭",
-                    static_cast<double>(collapseSpec.maxCantileverBlocks), collapseSpec.pileSpreadBlocks,
-                    collapseSpec.neighborhoodMarginBlocks);
+                    static_cast<double>(collapseSpec.maxCantileverBlocks), collapseSpec.neighborhoodMarginBlocks,
+                    static_cast<double>(collapseSpec.settleLinearSpeed),
+                    static_cast<double>(collapseSpec.settleAngularSpeed), collapseSpec.settleSteps,
+                    static_cast<double>(collapseSpec.impulseSpeed), static_cast<double>(collapseSpec.initialTiltSpeed),
+                    collapseSpec.debrisDeleteMaxVoxels, collapseSpec.maxActiveUnits);
 
         // T11：从预设地图构建世界（种子 / 范围 / 地形编辑全部来自文件，不再硬编码）。
         const std::filesystem::path mapPath = SourceAssetPath(kDefaultMapFile);
@@ -705,9 +1025,105 @@ int main(int argc, char** argv) {
         }
         vx::ApplyMasterVolumeGain(systemSettings.masterVolume);
 
-        // T17：帧率限速。目标 == 刷新率 → 垂直同步；低于刷新率 → 睡眠限帧（禁止忙等）。
+        // T17：帧率限速的目标在**加载结束后**才生效（见下）；加载期先关掉垂直同步与睡眠限帧 ——
+        // 否则每出一帧加载画面都要等一个垂直同步间隔，7 s 左右的重计算会被放大成十几秒。
         vx::FrameLimiter frameLimiter;
-        ApplyFrameRateCap(window, frameLimiter, systemSettings.frameRateCap, displayRefreshRate);
+        (void)window.SetVSync(false);
+        frameLimiter.SetTargetFps(0);
+        VX_LOG_INFO("加载期呈现模式 → %s（不做垂直同步 / 限帧，让加载画面以工作节奏刷新；"
+                    "世界就绪后恢复为 %d Hz 的目标）",
+                    window.PresentModeName(), systemSettings.frameRateCap);
+
+        // T36 / SKILL「不冻结画面」：**窗口、渲染器、ImGui 面板全部前置到这里**，之后所有长任务都
+        // 在加载画面的帧之间分步推进。此前这些资源在重计算之后才创建，导致启动期只能黑屏干等。
+        vx::MeshRenderer renderer(window.device(), window.handle(), shaderDir);
+
+        // T20 / ADR 0010：把配置里的曝光交给色调映射通道（参数进配置，改值不需重编 Shader）。
+        renderer.SetExposure(systemSettings.exposure);
+
+        // T23 / ADR 0010 P3：把配置里的 MSAA 档位交给渲染器（引擎层不读配置文件；档位 = 1 时零额外开销）。
+        renderer.SetMsaaSampleCount(static_cast<std::uint32_t>(systemSettings.msaaSamples));
+
+        // 调试面板（T9）：基于 imgui 的 SDL3 + SDL3_gpu 后端；F1 开关。
+        // T15：系统面板与它共用同一个 ImGui 上下文（由本对象托管），并通过事件转发变为**可交互**。
+        // 它同时是**加载画面**的绘制者，故必须先于任何长任务建立。
+        vx::DebugOverlay debugOverlay(window.device(), window.handle());
+
+        // T15：把 SDL 事件转发给 ImGui 后端（全生命周期只安装一次）。平台层仍是唯一读事件队列的地方，
+        // game/ 只是注册回调；未接这一步之前面板只读，正是因为事件从未到达 ImGui。
+        window.SetEventCallback(&vx::DebugOverlay::OnSdlEvent, &debugOverlay);
+
+        // T20 / T21a：主通道写 HDR 目标，清屏色须按**线性光**给出（色调映射通道最后编码到 sRGB）。
+        // T21a 起不再写死：取配置里的**天空地平色**（sRGB 作者色 → 线性）。为什么是地平色而不是天顶色：
+        // 清屏色就是"没有几何处的天空背景"，而远景地形会被雾混向**地平色**
+        // （fog.color 缺失时默认 = sky.horizon_color），两者同源才能让远景与天空无缝衔接、无硬边。
+        const vx::ColorRgb clearLinear = vx::SrgbToLinear(lighting.Sky().horizonColor);
+        const SDL_FColor   clearColor { clearLinear[0], clearLinear[1], clearLinear[2], 1.0F };
+
+        // 输入绑定（动作名 → 按键）。加载期只被 `pump_events` 填事件、不消费动作。
+        vx::InputMap input;
+        input.BindKey(vx::ActionId::MoveForward, SDL_SCANCODE_W);
+        input.BindKey(vx::ActionId::MoveBackward, SDL_SCANCODE_S);
+        input.BindKey(vx::ActionId::MoveLeft, SDL_SCANCODE_A);
+        input.BindKey(vx::ActionId::MoveRight, SDL_SCANCODE_D);
+        input.BindKey(vx::ActionId::Jump, SDL_SCANCODE_SPACE);
+        input.BindKey(vx::ActionId::Sprint, SDL_SCANCODE_LSHIFT);
+        input.BindKey(vx::ActionId::ToggleDebugPanel, SDL_SCANCODE_F1);
+        input.BindKey(vx::ActionId::ToggleFly, SDL_SCANCODE_F);         // T12：飞行模式开关
+        input.BindKey(vx::ActionId::FlyDown, SDL_SCANCODE_LCTRL);       // T12：飞行时下降
+        input.BindKey(vx::ActionId::ToggleSystemPanel, SDL_SCANCODE_ESCAPE);  // T15：Esc 开关系统面板（语义已统一）
+        input.BindMouseButton(vx::ActionId::Attack, SDL_BUTTON_LEFT);   // T27：左键 = 发射光球
+        input.BindMouseAxis(vx::ActionId::LookX, vx::MouseAxis::X);
+        input.BindMouseAxis(vx::ActionId::LookY, vx::MouseAxis::Y);
+
+        LoadingScreen loading { window, renderer, debugOverlay, input, clearColor };
+
+        // ---- 阶段 1：材质贴图（生成 + 上传）----
+        // T22 / ADR 0010 P2：程序生成的占位材质贴图（多尺度 albedo / 法线 + roughness + AO + 宏观变化），
+        // 上传为五个 2D 纹理数组（albedo/normal/roughness/AO 各 4 层，macro 1 层），供片元着色器逐像素混合
+        // 并做 PBR。无二进制资产、种子确定性。显存由 CreateTextureArray 自动计入 RenderStats::textureBytes。
+        //
+        // T36：一次跑完约 1.9 s，是启动期最重的一步 ⇒ 改为**分步**（每次几个像素行），期间照常出加载画面。
+        // 分步与一次性生成**逐字节相同**（红线 7：只改变"何时可见"）。
+        vx::MaterialTextureBuilder textureBuilder(preset.seed);
+        if (!loading.Run(LoadStage::Textures, [&textureBuilder]() {
+                return textureBuilder.Step(kTextureRowsPerSlice)
+                           ? 1.0
+                           : static_cast<double>(textureBuilder.Progress());
+            })) {
+            VX_LOG_INFO("加载期收到退出请求（材质贴图阶段），退出");
+            return EXIT_SUCCESS;
+        }
+        {
+            const vx::MaterialTextureSet materialTextures = textureBuilder.Take();
+            const vx::TextureArrayDesc   albedoDesc { materialTextures.size, materialTextures.size,
+                                                    materialTextures.layerCount, materialTextures.albedoRgba.data() };
+            const vx::TextureArrayDesc   normalDesc { materialTextures.size, materialTextures.size,
+                                                    materialTextures.layerCount, materialTextures.normalRgba.data() };
+            const vx::TextureArrayDesc   roughnessDesc { materialTextures.size, materialTextures.size,
+                                                       materialTextures.layerCount, materialTextures.roughnessRgba.data() };
+            const vx::TextureArrayDesc   aoDesc { materialTextures.size, materialTextures.size,
+                                                materialTextures.layerCount, materialTextures.aoRgba.data() };
+            const vx::TextureArrayDesc   macroDesc { materialTextures.size, materialTextures.size,
+                                                   vx::kMaterialMacroLayerCount, materialTextures.macroRgba.data() };
+            const vx::TextureArrayHandle albedoTexture    = renderer.CreateTextureArray(albedoDesc);
+            const vx::TextureArrayHandle normalTexture    = renderer.CreateTextureArray(normalDesc);
+            const vx::TextureArrayHandle roughnessTexture = renderer.CreateTextureArray(roughnessDesc);
+            const vx::TextureArrayHandle aoTexture        = renderer.CreateTextureArray(aoDesc);
+            const vx::TextureArrayHandle macroTexture     = renderer.CreateTextureArray(macroDesc);
+            renderer.SetSampledTextureArrays(albedoTexture, normalTexture, roughnessTexture, aoTexture, macroTexture);
+
+            // 材质数组总量 = 每层第 0 级字节 × 4/3（mip）× 总层数；层数 = 4×4 + 1（macro）。
+            const double mipFactor       = 4.0 / 3.0;
+            const double baseBytes       = static_cast<double>(materialTextures.size) * materialTextures.size * 4.0;
+            const double totalLayerCount = static_cast<double>(materialTextures.layerCount) * 4.0 +
+                                           static_cast<double>(vx::kMaterialMacroLayerCount);
+            VX_LOG_INFO("材质贴图已生成并上传：%u×%u，R8G8B8A8_UNORM；albedo/normal/roughness/AO 各 %u 层 + macro %u 层，"
+                        "含 mip 约 %.2f MB 显存（第 0 级 %.2f MB/层）",
+                        materialTextures.size, materialTextures.size, materialTextures.layerCount,
+                        vx::kMaterialMacroLayerCount, baseBytes * mipFactor * totalLayerCount / (1024.0 * 1024.0),
+                        baseBytes / (1024.0 * 1024.0));
+        }
 
         vx::TerrainWorld world(preset.seed, materials);
         world.SetMapPreset(preset);  // 噪声先行、编辑覆盖其上（必须在 LoadTile 之前）
@@ -721,11 +1137,24 @@ int main(int argc, char** argv) {
         const std::size_t           tilesZ = static_cast<std::size_t>(2 * preset.tileRadiusZ + 1);
         tileCoords.reserve(tilesX * tilesZ);
         tileHandles.reserve(tilesX * tilesZ);
-        for (int tileZ = -preset.tileRadiusZ; tileZ <= preset.tileRadiusZ; ++tileZ) {
-            for (int tileX = -preset.tileRadiusX; tileX <= preset.tileRadiusX; ++tileX) {
-                world.LoadTile(tileX, tileZ);  // 生成 + 网格化
-                tileCoords.push_back(vx::TileCoord { tileX, tileZ });
-                tileHandles.push_back(vx::MeshHandle {});
+        {
+            // ---- 阶段 2：地形 tile 生成 + 网格化（逐 tile 分片）----
+            const std::size_t tileCount = tilesX * tilesZ;
+            std::size_t       loaded    = 0;
+            if (!loading.Run(LoadStage::TerrainTiles, [&]() {
+                    if (loaded >= tileCount) {
+                        return 1.0;
+                    }
+                    const int tileZ = -preset.tileRadiusZ + static_cast<int>(loaded / tilesX);
+                    const int tileX = -preset.tileRadiusX + static_cast<int>(loaded % tilesX);
+                    world.LoadTile(tileX, tileZ);  // 生成 + 网格化
+                    tileCoords.push_back(vx::TileCoord { tileX, tileZ });
+                    tileHandles.push_back(vx::MeshHandle {});
+                    ++loaded;
+                    return static_cast<double>(loaded) / static_cast<double>(tileCount);
+                })) {
+                VX_LOG_INFO("加载期收到退出请求（地形 tile 阶段），退出");
+                return EXIT_SUCCESS;
             }
         }
         VX_LOG_INFO("预设地图已加载：%s（文件 %s）—— 种子 %llu，tile 半径 [%d, %d]（%zu 个 tile），"
@@ -739,10 +1168,33 @@ int main(int argc, char** argv) {
         vx::PhysicsWorld     physics;
         vx::TerrainCollision terrainCollision(physics);
 
+        // T33：Jolt 的重力必须与玩法层**同一口径**（Jolt 默认 -9.81，而角色 / 弹道用 `kGravity`）——
+        // 否则倒塌的塔与角色会各按一套重力下落，世界不自洽。
+        physics.SetGravity(glm::vec3(0.0F, -kGravity, 0.0F));
+
+        // T33：倒塌整体的运行时 —— 渲染网格池在**加载期**建好（SKILL 第四节硬规则 4：
+        // 资源与管线创建不得发生在渲染热路径）。倒塌发生时只做"就地写顶点 + 每帧推位姿"。
+        // T46：槽位数由 `kCollapseMeshSlots` 决定（岩石残骸保留几何体 ⇒ 槽位不随落定释放）。
+        vx::RigidCollapseRuntime rigidCollapse;
+        rigidCollapse.Init(renderer, kCollapseMeshSlots, kCollapseMeshCapacityVerts);
+
         // T8：**可挖体积世界**（ADR 0004 层 ②）——只在标记区域内存在。初始密度由地表高度场推导
-        // （地下实心 / 空中空），建好即网格化一次；块集合与 `digRegions.Blocks()` 一一对应。
+        // （地下实心 / 空中空），块集合与 `digRegions.Blocks()` 一一对应。
+        //
+        // T36：块数可达数百（每块 33³ 采样 + 一次等值面网格化），一次跑完要停下等好几秒 ⇒ 分步推进：
+        // 每帧在预算内做一步（填一块密度 / 网格化一块），两次之间照常出加载画面。
         vx::DigVolumeWorld digVolumes(world, digRegions);
-        digVolumes.InitFromHeightField();
+        digVolumes.BeginInitFromHeightField();
+        if (!loading.Run(LoadStage::DiggableVolumes, [&digVolumes]() {
+                if (digVolumes.StepInitFromHeightField(kVolumeInitStepsPerSlice)) {
+                    return 1.0;
+                }
+                return static_cast<double>(digVolumes.InitCompletedSteps()) /
+                       static_cast<double>(digVolumes.InitTotalSteps());
+            })) {
+            VX_LOG_INFO("加载期收到退出请求（可挖体积阶段），退出");
+            return EXIT_SUCCESS;
+        }
         std::vector<vx::BlockCoord> volumeCoords = digRegions.Blocks();
         std::vector<vx::MeshHandle> volumeHandles(volumeCoords.size());
         {
@@ -753,31 +1205,50 @@ int main(int argc, char** argv) {
                     ++surfaceBlocks;
                 }
             }
-            VX_LOG_INFO("可挖体积就绪：%zu 个块（密度 %.2f MB），其中 %zu 块存在等值面（Surface Nets 网格化，"
-                        "法线由密度梯度给出）；**区域内已由体积接管地表网格**（ADR 0011）",
+            VX_LOG_INFO("可挖体积就绪：%zu 个块（密度 %.2f MB + 体素材质 %.2f MB，后者**懒分配**），其中 %zu 块存在等值面"
+                        "（Surface Nets 网格化，法线由密度梯度给出）；**区域内已由体积接管地表网格**（ADR 0011）",
                         volumeCoords.size(), static_cast<double>(digVolumes.VoxelBytes()) / (1024.0 * 1024.0),
-                        surfaceBlocks);
+                        static_cast<double>(digVolumes.MaterialBytes()) / (1024.0 * 1024.0), surfaceBlocks);
         }
 
         // ---- T28 碰撞接管（ADR 0012）----
         // 判据直接取"该 tile 的地表网格是否已经没有任何面"：它与 ADR 0011 的四边形跳过判据**同源**
         // （同一次 `BuildTerrainMesh`），因此不可能出现"渲染交给体积、碰撞却留在高度场"的漂移。
-        std::size_t collisionTiles       = 0;
-        std::size_t takenOverTiles       = 0;
-        for (const vx::TileCoord& coord : tileCoords) {
-            const vx::TerrainTileMesh* tileMesh = world.FindMesh(coord.x, coord.z);
-            const bool empty = (tileMesh != nullptr) && tileMesh->mesh.indices.empty();
-            if (empty) {
-                ++takenOverTiles;  // 可见面全归体积 ⇒ 高度场碰撞体交出去
-                continue;
-            }
-            if (terrainCollision.SyncTile(world, coord.x, coord.z)) {
-                ++collisionTiles;
+        //
+        // T36：建碰撞体要逐个跑 Jolt 的网格形状构建（单块可达数十毫秒）⇒ 与 tile 判定合并成一个分片任务，
+        // 每帧在预算内建若干个，中间照常出加载画面。
+        vx::VolumeCollision volumeCollision(physics);
+        std::size_t         collisionTiles = 0;
+        std::size_t         takenOverTiles = 0;
+        {
+            const std::size_t tileCount   = tileCoords.size();
+            const std::size_t volumeCount = volumeCoords.size();
+            const std::size_t totalUnits  = tileCount + volumeCount;
+            std::size_t       unit        = 0;
+            if (!loading.Run(LoadStage::CollisionBodies, [&]() {
+                    if (unit >= totalUnits) {
+                        return 1.0;
+                    }
+                    if (unit < tileCount) {
+                        const vx::TileCoord&       coord    = tileCoords[unit];
+                        const vx::TerrainTileMesh* tileMesh = world.FindMesh(coord.x, coord.z);
+                        const bool empty = (tileMesh != nullptr) && tileMesh->mesh.indices.empty();
+                        if (empty) {
+                            ++takenOverTiles;  // 可见面全归体积 ⇒ 高度场碰撞体交出去
+                        } else if (terrainCollision.SyncTile(world, coord.x, coord.z)) {
+                            ++collisionTiles;
+                        }
+                    } else {
+                        (void)volumeCollision.SyncBlock(digVolumes, volumeCoords[unit - tileCount]);
+                    }
+                    ++unit;
+                    return static_cast<double>(unit) / static_cast<double>(totalUnits);
+                })) {
+                VX_LOG_INFO("加载期收到退出请求（碰撞体阶段），退出");
+                return EXIT_SUCCESS;
             }
         }
-
-        vx::VolumeCollision volumeCollision(physics);
-        const std::size_t   volumeBodies = volumeCollision.SyncBlocks(digVolumes, volumeCoords);
+        const std::size_t volumeBodies = volumeCollision.BlockBodyCount();
         VX_LOG_INFO("碰撞接管（ADR 0012）：地表高度场碰撞体 %zu 个；%zu/%zu 个 tile 的可见面已全由体积绘制"
                     "（其高度场碰撞体已交出）；可挖体积三角网碰撞体 %zu 个",
                     collisionTiles, takenOverTiles, tileCoords.size(), volumeBodies);
@@ -806,45 +1277,11 @@ int main(int argc, char** argv) {
                     bounds.max.y, bounds.max.z, boundaryWallBodies, vx::kBoundaryWallThickness,
                     vx::kOutOfBoundsMargin);
 
-        vx::MeshRenderer renderer(window.device(), window.handle(), shaderDir);
-
-        // T20 / ADR 0010：把配置里的曝光交给色调映射通道（参数进配置，改值不需重编 Shader）。
-        renderer.SetExposure(systemSettings.exposure);
-
-        // T23 / ADR 0010 P3：把配置里的 MSAA 档位交给渲染器（引擎层不读配置文件；档位 = 1 时零额外开销）。
-        renderer.SetMsaaSampleCount(static_cast<std::uint32_t>(systemSettings.msaaSamples));
-
-        // T22 / ADR 0010 P2：程序生成的占位材质贴图（多尺度 albedo / 法线 + roughness + AO + 宏观变化），
-        // 上传为五个 2D 纹理数组（albedo/normal/roughness/AO 各 4 层，macro 1 层），供片元着色器逐像素混合
-        // 并做 PBR。无二进制资产、种子确定性。显存由 CreateTextureArray 自动计入 RenderStats::textureBytes。
-        const vx::MaterialTextureSet materialTextures = vx::GenerateMaterialTextures(preset.seed);
-        const vx::TextureArrayDesc   albedoDesc { materialTextures.size, materialTextures.size,
-                                                  materialTextures.layerCount, materialTextures.albedoRgba.data() };
-        const vx::TextureArrayDesc   normalDesc { materialTextures.size, materialTextures.size,
-                                                  materialTextures.layerCount, materialTextures.normalRgba.data() };
-        const vx::TextureArrayDesc   roughnessDesc { materialTextures.size, materialTextures.size,
-                                                     materialTextures.layerCount, materialTextures.roughnessRgba.data() };
-        const vx::TextureArrayDesc   aoDesc { materialTextures.size, materialTextures.size,
-                                              materialTextures.layerCount, materialTextures.aoRgba.data() };
-        const vx::TextureArrayDesc   macroDesc { materialTextures.size, materialTextures.size,
-                                                 vx::kMaterialMacroLayerCount, materialTextures.macroRgba.data() };
-        const vx::TextureArrayHandle albedoTexture    = renderer.CreateTextureArray(albedoDesc);
-        const vx::TextureArrayHandle normalTexture    = renderer.CreateTextureArray(normalDesc);
-        const vx::TextureArrayHandle roughnessTexture = renderer.CreateTextureArray(roughnessDesc);
-        const vx::TextureArrayHandle aoTexture        = renderer.CreateTextureArray(aoDesc);
-        const vx::TextureArrayHandle macroTexture     = renderer.CreateTextureArray(macroDesc);
-        renderer.SetSampledTextureArrays(albedoTexture, normalTexture, roughnessTexture, aoTexture, macroTexture);
-        {
-            // 材质数组总量 = 每层第 0 级字节 × 4/3（mip）× 总层数；层数 = 4×4 + 1（macro）。
-            const double mipFactor = 4.0 / 3.0;
-            const double baseBytes = static_cast<double>(materialTextures.size) * materialTextures.size * 4.0;
-            const double totalLayerCount =
-                static_cast<double>(materialTextures.layerCount) * 4.0 + static_cast<double>(vx::kMaterialMacroLayerCount);
-            VX_LOG_INFO("材质贴图已生成并上传：%u×%u，R8G8B8A8_UNORM；albedo/normal/roughness/AO 各 %u 层 + macro %u 层，"
-                        "含 mip 约 %.2f MB 显存（第 0 级 %.2f MB/层）",
-                        materialTextures.size, materialTextures.size, materialTextures.layerCount,
-                        vx::kMaterialMacroLayerCount, baseBytes * mipFactor * totalLayerCount / (1024.0 * 1024.0),
-                        baseBytes / (1024.0 * 1024.0));
+        // T36：加载到了收尾段 —— 下面都是毫秒级的设置（出生点 / 角色 / 相机 / 面板数据 / 渲染原点），
+        // 但仍照常出帧，保证"任何一步都不让画面停下等待"这条规则在这里也成立。
+        if (!loading.Pump(LoadStage::Finalize, 0.5)) {
+            VX_LOG_INFO("加载期收到退出请求（收尾阶段），退出");
+            return EXIT_SUCCESS;
         }
 
         // T12：出生点来自预设地图（世界列坐标）；角色脚底抬离地表一点，随后自然落到地表。
@@ -889,14 +1326,6 @@ int main(int argc, char** argv) {
         camera.SetYaw(0.7F);
         camera.SetPitch(-0.42F);  // 略微俯视地表
 
-        // 调试面板（T9）：基于 imgui 的 SDL3 + SDL3_gpu 后端；F1 开关。
-        // T15：系统面板与它共用同一个 ImGui 上下文（由本对象托管），并通过事件转发变为**可交互**。
-        vx::DebugOverlay debugOverlay(window.device(), window.handle());
-
-        // T15：把 SDL 事件转发给 ImGui 后端（全生命周期只安装一次）。平台层仍是唯一读事件队列的地方，
-        // game/ 只是注册回调；未接这一步之前面板只读，正是因为事件从未到达 ImGui。
-        window.SetEventCallback(&vx::DebugOverlay::OnSdlEvent, &debugOverlay);
-
         // 系统面板（T15，Esc）：面板就地编辑一份设置副本，主循环据此调用平台层与落盘。
         vx::SystemPanelContext panelContext;
         panelContext.settings           = systemSettings;
@@ -926,16 +1355,50 @@ int main(int argc, char** argv) {
         // 渲染原点：整数世界定位，上传的 float 顶点都以它为基准（红线 6）。
         glm::dvec3 renderOrigin(std::floor(static_cast<double>(spawnX)), std::floor(static_cast<double>(spawnSurface)),
                                 std::floor(static_cast<double>(spawnZ)));
-        for (std::size_t i = 0; i < tileCoords.size(); ++i) {
-            UploadTileMesh(renderer, tileHandles[i], world, tileCoords[i], renderOrigin);
+
+        if (!loading.Pump(LoadStage::Finalize, 1.0)) {
+            VX_LOG_INFO("加载期收到退出请求（收尾阶段），退出");
+            return EXIT_SUCCESS;
         }
 
-        // T8：可挖体积网格上传（区域内已接管地表）。之后每次爆炸只重传被挖脏的块。
+        // T39：每个网格的**世界空间** AABB（上传时算一次，之后每帧只做视锥剔除判定）。
+        std::vector<WorldAabb> tileBounds(tileCoords.size());
+        std::vector<WorldAabb> volumeBounds(volumeCoords.size());
+
+        // T37：延后破坏队列与其执行器（爆炸只入队；重网格 / 上传 / 碰撞体重建按每帧预算推进）。
+        vx::PendingDestruction pendingDestruction;
+        DestructionProcessor   destructionProcessor;
+
+        // ---- 阶段 6：网格上传（tile + 可挖体积）----
+        // T36：每个网格的上传都是一次**阻塞到 GPU 完成**的拷贝；`UploadMesh` 会创建 GPU 资源并等待，
+        // 而 SDL_gpu 的命令缓冲是单线程的 ⇒ 上传必须留在主线程，只能靠"每帧只传几个"来摊平。
         std::size_t volumeMeshCount = 0;
-        for (std::size_t i = 0; i < volumeCoords.size(); ++i) {
-            UploadVolumeMesh(renderer, volumeHandles[i], digVolumes, volumeCoords[i], renderOrigin);
-            if (volumeHandles[i].IsValid()) {
-                ++volumeMeshCount;
+        {
+            const std::size_t tileCount   = tileCoords.size();
+            const std::size_t volumeCount = volumeCoords.size();
+            const std::size_t totalUnits  = tileCount + volumeCount;
+            std::size_t       unit        = 0;
+            if (!loading.Run(LoadStage::MeshUpload, [&]() {
+                    if (unit >= totalUnits) {
+                        return 1.0;
+                    }
+                    const std::size_t batchEnd = std::min(unit + kMeshUploadsPerSlice, totalUnits);
+                    for (; unit < batchEnd; ++unit) {
+                        if (unit < tileCount) {
+                            UploadTileMesh(renderer, tileHandles[unit], world, tileCoords[unit], &tileBounds[unit]);
+                        } else {
+                            const std::size_t index = unit - tileCount;
+                            UploadVolumeMesh(renderer, volumeHandles[index], digVolumes, volumeCoords[index],
+                                             &volumeBounds[index]);
+                            if (volumeHandles[index].IsValid()) {
+                                ++volumeMeshCount;
+                            }
+                        }
+                    }
+                    return static_cast<double>(unit) / static_cast<double>(totalUnits);
+                })) {
+                VX_LOG_INFO("加载期收到退出请求（网格上传阶段），退出");
+                return EXIT_SUCCESS;
             }
         }
         VX_LOG_INFO("可挖体积网格已上传：%zu/%zu 个块有可见表面（其余块全实心或全空，无等值面）", volumeMeshCount,
@@ -943,11 +1406,13 @@ int main(int argc, char** argv) {
 
         // T13：主角**可视**胶囊体（装饰用，尺寸与碰撞胶囊一致；不参与任何物理）。
         // 一次性上传局部网格（脚底为原点），此后每帧只就地刷新顶点位置；绘制顺序由每帧的绘制列表决定。
+        // T41：该网格每帧按**当前渲染原点**烘焙渲染相对顶点，故原点传当前渲染原点（偏移恒 0；
+        // 首次绘制前必被 `UpdateMeshVertices` 刷新，故初始值只求自洽，不求精确）。
         vx::CapsuleMeshSpec capsuleSpec;
         capsuleSpec.radius             = kCharacterRadius;
         capsuleSpec.cylinderHalfHeight = kCharacterCylinderHalfHeight;
         const vx::MeshData  capsuleLocalMesh = vx::BuildCapsuleMesh(capsuleSpec);
-        const vx::MeshHandle characterMesh   = renderer.UploadMesh(capsuleLocalMesh);
+        const vx::MeshHandle characterMesh   = renderer.UploadMesh(capsuleLocalMesh, renderOrigin);
         std::vector<vx::MeshVertex> characterVertices = capsuleLocalMesh.vertices;
         if (!characterMesh.IsValid()) {
             VX_LOG_WARN("主角可视网格上传失败（网格为空），本帧起将看不到角色");
@@ -962,7 +1427,8 @@ int main(int argc, char** argv) {
         orbHandles.reserve(orbPool.Capacity());
         orbVertices.reserve(orbPool.Capacity());
         for (std::size_t i = 0; i < orbPool.Capacity(); ++i) {
-            orbHandles.push_back(renderer.UploadMesh(orbLocalMesh, /*emissive=*/true));
+            // T41：与主角同约定 —— 每帧按当前渲染原点烘焙渲染相对顶点（原点传当前渲染原点）。
+            orbHandles.push_back(renderer.UploadMesh(orbLocalMesh, renderOrigin, /*emissive=*/true));
             orbVertices.push_back(orbLocalMesh.vertices);
         }
         if (orbHandles.empty() || !orbHandles.front().IsValid()) {
@@ -972,8 +1438,9 @@ int main(int argc, char** argv) {
                     orbPool.Capacity(), static_cast<double>(orbSpec.emissiveRgb[0]),
                     static_cast<double>(orbSpec.emissiveRgb[1]), static_cast<double>(orbSpec.emissiveRgb[2]));
 
-        // T27：弹道世界查询 + 爆炸写回上下文（两者都只在固定步内使用；`renderOrigin` 取引用，重定基后自动跟随）。
-        const GameOrbWorldQuery orbQuery(world, digVolumes);
+        // T27：弹道世界查询 + 爆炸写回上下文（两者都只在固定步内使用）。
+        // T41 起上传不再依赖渲染原点（顶点是网格局部坐标），故上下文不含 `renderOrigin`。
+        const GameOrbWorldQuery orbQuery(world, digVolumes, rigidCollapse);
         // 缺陷修复（人工实测第 7 轮）：相机的地形查询必须**包含可挖体积**（否则站在洞里的角色会把相机顶出洞外）。
         const GameCameraQuery   cameraQuery(world, digVolumes);
         WorldEditContext        editContext { world,
@@ -986,42 +1453,33 @@ int main(int argc, char** argv) {
                                               tileHandles,
                                               volumeCoords,
                                               volumeHandles,
-                                              renderOrigin };
+                                              tileBounds,
+                                              volumeBounds,
+                                              pendingDestruction,
+                                              physics,
+                                              rigidCollapse };
 
-        // 每帧的绘制列表（tile + 体积 + 主角 + 活动光球）：容量固定，稳态零分配。
+        // 每帧的绘制列表（tile + 体积 + 主角 + 活动光球 + **倒塌整体**）：容量固定，稳态零分配。
         std::vector<vx::MeshHandle> frameHandles;
-        frameHandles.reserve(tileHandles.size() + volumeHandles.size() + 1 + orbHandles.size());
+        frameHandles.reserve(tileHandles.size() + volumeHandles.size() + 1 + orbHandles.size() +
+                             static_cast<std::size_t>(collapseSpec.maxActiveUnits));
 
-        vx::InputMap input;
-        input.BindKey(vx::ActionId::MoveForward, SDL_SCANCODE_W);
-        input.BindKey(vx::ActionId::MoveBackward, SDL_SCANCODE_S);
-        input.BindKey(vx::ActionId::MoveLeft, SDL_SCANCODE_A);
-        input.BindKey(vx::ActionId::MoveRight, SDL_SCANCODE_D);
-        input.BindKey(vx::ActionId::Jump, SDL_SCANCODE_SPACE);
-        input.BindKey(vx::ActionId::Sprint, SDL_SCANCODE_LSHIFT);
-        input.BindKey(vx::ActionId::ToggleDebugPanel, SDL_SCANCODE_F1);
-        input.BindKey(vx::ActionId::ToggleFly, SDL_SCANCODE_F);         // T12：飞行模式开关
-        input.BindKey(vx::ActionId::FlyDown, SDL_SCANCODE_LCTRL);       // T12：飞行时下降
-        input.BindKey(vx::ActionId::ToggleSystemPanel, SDL_SCANCODE_ESCAPE);  // T15：Esc 开关系统面板（语义已统一）
-        input.BindMouseButton(vx::ActionId::Attack, SDL_BUTTON_LEFT);   // T27：左键 = 发射光球
-        input.BindMouseAxis(vx::ActionId::LookX, vx::MouseAxis::X);
-        input.BindMouseAxis(vx::ActionId::LookY, vx::MouseAxis::Y);
+        /// T33：本帧**落定**（倒了、停住了）的倒塌整体 —— 帧末统一体素化回写（缓冲复用，稳态零分配）。
+        std::vector<vx::ActiveCollapseUnit> settledCollapseUnits;
+        settledCollapseUnits.reserve(static_cast<std::size_t>(collapseSpec.maxActiveUnits));
 
         vx::Clock                clock;
         vx::FixedStepAccumulator accumulator(vx::kFixedDt);
-
-        // T20 / T21a：主通道写 HDR 目标，清屏色须按**线性光**给出（色调映射通道最后编码到 sRGB）。
-        // T21a 起不再写死：取配置里的**天空地平色**（sRGB 作者色 → 线性）。为什么是地平色而不是天顶色：
-        // 清屏色就是"没有几何处的天空背景"，而远景地形会被雾混向**地平色**
-        // （fog.color 缺失时默认 = sky.horizon_color），两者同源才能让远景与天空无缝衔接、无硬边。
-        const vx::ColorRgb clearLinear = vx::SrgbToLinear(lighting.Sky().horizonColor);
-        const SDL_FColor   clearColor { clearLinear[0], clearLinear[1], clearLinear[2], 1.0F };
-
         // T24：CPU 帧时间分解的相位计时器（逻辑步 / UI 构建 / 渲染提交）。
         PhaseTimer   logicTimer;
         PhaseTimer   uiTimer;
         PhaseTimer   renderTimer;
         CpuFrameCost cpuCost;  // 上一帧的值（面板早于本帧渲染构建，与 frameSeconds 同源）
+
+        // ---- 加载结束（T36）：恢复玩家设置的帧率上限 / 呈现模式，并撤下加载画面。----
+        // 自此进入稳态主循环：加载期"先给画面、再给结果"的阶段到此结束。
+        ApplyFrameRateCap(window, frameLimiter, systemSettings.frameRateCap, displayRefreshRate);
+        debugOverlay.ClearLoadingStatus();
 
         // T14：鼠标捕获（相对模式）状态。game 只持有**意图**，SDL 的真实状态由平台层维护
         // （窗口失焦时平台层会自动释放，见 `Window::pump_events`）。启动即捕获，玩家一进游戏就能转视角。
@@ -1081,7 +1539,18 @@ int main(int argc, char** argv) {
                     static_cast<double>(orbSpec.gravityScale), static_cast<double>(orbSpec.explosionRadiusBlocks),
                     static_cast<double>(orbSpec.explosionDepthBlocks), static_cast<double>(orbSpec.explosionRimBlocks));
 
-        std::size_t lastDirtyTiles = 0;
+        // T38：帧尖峰打点所需的状态（跨帧保持）。
+        std::size_t         submittedMeshCount = 0;  ///< **上一帧**提交的网格数（与 `cpuCost` / 面板同源）
+        vx::Clock           hitchLogClock;           ///< 尖峰日志的节流时钟（最多每 `kHitchLogMinIntervalMs` 一条）
+        bool                cullingLogged = false;   ///< T39：剔除结果只打一条日志（启动后第一次提交时）
+
+        // T39：剔除所需的**太阳方向**（来自配置、不随帧变化，只算一次）。影子往太阳的反方向落。
+        const glm::vec3 sunDirection = [&lighting]() {
+            const glm::vec3 direction(lighting.Sun().direction[0], lighting.Sun().direction[1],
+                                      lighting.Sun().direction[2]);
+            const float     length = glm::length(direction);
+            return (length > 0.0F) ? (direction / length) : glm::vec3(0.0F, 1.0F, 0.0F);
+        }();
 
         while (window.pump_events(input)) {
             input.BeginFrame();  // 每帧采样一次，且只在固定步循环之外
@@ -1213,10 +1682,15 @@ int main(int argc, char** argv) {
             // T24：逻辑步相位（固定步循环：物理 + 相机 + 光球 + 出界检查）。
             logicTimer.Begin();
             const vx::StepPlan plan = accumulator.Advance(clock.Tick());
-            std::size_t          explosionCount       = 0;
             bool                 terrainExplosionSeen  = false;
+            settledCollapseUnits.clear();
             for (int step = 0; step < plan.steps; ++step) {
                 StepCharacter(physics, character, camera, command, flying);
+
+                // T33：推进**动态刚体**（倒塌整体）—— 重力已在启动时设为 `-kGravity`（与角色同一口径）。
+                // 随后做落定检测：连续 `settle_steps` 个固定步低于阈值 ⇒ 转为"待回写"（本帧末体素化回写）。
+                physics.Update(static_cast<float>(vx::kFixedDt));
+                rigidCollapse.Step(physics, collapseSpec, settledCollapseUnits);
 
                 // T28 自检：2 秒后打一次角色落地状态（见 `groundCheckLogged` 的说明）。
                 simulatedSeconds += static_cast<float>(vx::kFixedDt);
@@ -1258,8 +1732,18 @@ int main(int argc, char** argv) {
                 for (vx::Orb& orb : orbPool.Orbs()) {
                     vx::OrbHit hit;
                     if (vx::StepOrb(orb, orbQuery, kGravity, orbSpec.gravityScale, static_cast<float>(vx::kFixedDt), hit)) {
+                        // T46（ADR 0017 决策二）：命中的若是**保留中的岩石残骸**（光球被它的 OBB 挡住），
+                        // 先把它**惰性体素化**回写 —— 它这才"变回可挖的地形"，随后按常规被这次爆炸挖除。
+                        // ⇒ 岩石平时保持形状，**仍然可挖**，光球也不会穿过去。
+                        vx::CollapseWriteback retired;
+                        if (rigidCollapse.RetireRetainedAt(physics, digVolumes, renderer, hit.point, retired)) {
+                            pendingDestruction.MergeVolumeBlocks(retired.dirty);
+                            VX_LOG_INFO("光球命中岩石残骸 ⇒ 惰性体素化（T46）：回写 %zu 个（丢弃 %zu、接地沉降 %zu）；"
+                                        "入队 %zu 个块重建",
+                                        retired.writtenVoxels, retired.droppedVoxels, retired.settledVoxels,
+                                        retired.dirty.size());
+                        }
                         const DetonationOutcome outcome = Detonate(editContext, hit.point, orbSpec);
-                        explosionCount += (outcome.remeshed > 0) ? 1U : 0U;
                         terrainExplosionSeen = terrainExplosionSeen || outcome.terrainChanged;
                     }
                 }
@@ -1268,32 +1752,55 @@ int main(int argc, char** argv) {
             if (plan.steps > 0) {
                 jumpRequested = false;
             }
-            lastDirtyTiles = explosionCount;  // 面板：本帧因爆炸而重网格的单元数（地表 tile 或体积块）
+            // T33：把本帧**落定**的倒塌整体体素化回写为地形（残骸可站、可继续挖），
+            // 其重网格 / 碰撞体重建 / GPU 上传交给 T37 的延后队列按每帧预算推进。
+            // 回写按最终姿态把体素落位到最近格 ⇒ 重叠 / 越界时可能少量丢弃（ADR 0015 后果 3 已登记）。
+            for (const vx::ActiveCollapseUnit& settled : settledCollapseUnits) {
+                const vx::CollapseWriteback writeback = rigidCollapse.Writeback(physics, digVolumes, renderer, settled);
+                pendingDestruction.MergeVolumeBlocks(writeback.dirty);
+                editContext.totalCollapseVoxels += writeback.writtenVoxels;
+                const vx::CollapsePose restPose { settled.posePosition, settled.poseRotation };
+                VX_LOG_INFO("倒塌落定（T33）：回写体素 %zu 个（丢弃 %zu 个、**接地沉降 %zu 个**）；倾角 %.0f°、"
+                            "落点 (%.1f, %.1f, %.1f)；入队 %zu 个块重建；**体素材质**共 %.2f MB（T42，懒分配）",
+                            writeback.writtenVoxels, writeback.droppedVoxels, writeback.settledVoxels,
+                            static_cast<double>(restPose.TiltDegrees()), settled.posePosition.x,
+                            settled.posePosition.y, settled.posePosition.z, writeback.dirty.size(),
+                            static_cast<double>(digVolumes.MaterialBytes()) / (1024.0 * 1024.0));
+                if (writeback.stuckVoxels > 0) {
+                    // T46：沉降走满上限仍未接地 ⇒ 仍会有悬空体素。**不静默**（判据要求"泥土不能悬空"）。
+                    VX_LOG_WARN("散体接地沉降达上限：%zu 个体素仍未接地（T46 / ADR 0017 后果 6）", writeback.stuckVoxels);
+                }
+            }
+            settledCollapseUnits.clear();
+
+            // T33：把活跃倒塌整体的位姿推给渲染器（每帧一次 64 B 推送 / 个，**不重烘焙顶点**）。
+            rigidCollapse.SyncRender(renderer);
+
+            const std::size_t destructionUnits = destructionProcessor.Process(editContext, kDestructionBudgetMs);
             if (terrainExplosionSeen) {
                 // 地表爆破的外环会抬高地形 ⇒ 复用缺陷 B2 的救场：把被埋住的角色顶回地面。
                 LiftCharacterIfBuried(physics, character, camera, world);
             }
             const double logicMs = logicTimer.EndMs();
 
-            // 浮点原点重定基：相机漂移过远时把渲染原点搬到相机附近并整体重传（低频，不在热路径上）。
+            // 浮点原点重定基（T41）：渲染原点漂移过远时把它搬到相机附近。
+            // T41 起这**只是一次常量更新** —— 顶点承载的是**网格局部**坐标，"这块在哪"由
+            // `renderer.SetRenderOrigin` 每帧下发的偏移（网格原点 − 渲染原点）在绘制时补上，
+            // 因此重定基**不再重传任何网格**（旧做法在这里逐个 `ReleaseMesh` + `UploadMesh` 137 个网格，
+            // 每次阻塞到 GPU 完成，debug 下当帧停顿 ≈70~140 ms —— 那正是"走动时周期性卡顿"的根因）。
             const glm::vec3 focus = camera.TargetCurrent();
             const glm::dvec3 focusDouble(static_cast<double>(focus.x), static_cast<double>(focus.y),
                                          static_cast<double>(focus.z));
             if (glm::distance(renderOrigin, focusDouble) > kRebaseDistance) {
                 renderOrigin = glm::dvec3(std::floor(focusDouble.x), std::floor(focusDouble.y),
                                           std::floor(focusDouble.z));
-                for (std::size_t i = 0; i < tileCoords.size(); ++i) {
-                    UploadTileMesh(renderer, tileHandles[i], world, tileCoords[i], renderOrigin);
-                }
-                // T8：体积网格的顶点同样以渲染原点为基准，故一并重传（低频，不在热路径上）。
-                for (std::size_t i = 0; i < volumeCoords.size(); ++i) {
-                    UploadVolumeMesh(renderer, volumeHandles[i], digVolumes, volumeCoords[i], renderOrigin);
-                }
-                VX_LOG_INFO("渲染原点重定基到 (%.0f, %.0f, %.0f)", renderOrigin.x, renderOrigin.y, renderOrigin.z);
+                VX_LOG_INFO("渲染原点重定基到 (%.0f, %.0f, %.0f)（T41：只更新 uniform，零重传）", renderOrigin.x,
+                            renderOrigin.y, renderOrigin.z);
             }
 
-            // T13：每帧把主角胶囊改写为相机相对顶点并就地刷新。位置取相机目标的插值位置，
+            // T13：每帧把主角胶囊改写为**渲染相对**顶点并就地刷新。位置取相机目标的插值位置，
             // 与渲染插值一致（alpha 只用于渲染，绝不回写模拟状态，红线 11）；装饰用，不影响碰撞。
+            // T41：顶点按当前渲染原点烘焙 ⇒ 原点也传当前渲染原点（偏移恒 0），重定基后二者一起跟着变。
             if (characterMesh.IsValid()) {
                 const glm::vec3 feetRender =
                     glm::mix(camera.TargetPrevious(), camera.TargetCurrent(), static_cast<float>(plan.alpha));
@@ -1301,7 +1808,7 @@ int main(int argc, char** argv) {
                                                   static_cast<double>(feetRender.z));
                 UpdateCharacterRenderVertices(characterVertices, capsuleLocalMesh, feetRenderDouble, renderOrigin);
                 // 唯一可能的失败是句柄失效或顶点数变化，这里两者都不会发生（已在上面校验句柄）。
-                (void)renderer.UpdateMeshVertices(characterMesh, characterVertices);
+                (void)renderer.UpdateMeshVertices(characterMesh, characterVertices, renderOrigin);
             }
 
             // T27：活动光球每帧就地刷新顶点（球心 = 弹道位置，取渲染插值；与主角同一套约定）。
@@ -1313,23 +1820,35 @@ int main(int argc, char** argv) {
                 }
                 UpdateOrbRenderVertices(orbVertices[i], orbLocalMesh, orb.previousPosition, orb.position, plan.alpha,
                                         renderOrigin);
-                (void)renderer.UpdateMeshVertices(orbHandles[i], orbVertices[i]);
+                (void)renderer.UpdateMeshVertices(orbHandles[i], orbVertices[i], renderOrigin);
             }
 
             // 渲染：alpha 只用于在上一 / 当前逻辑状态之间插值，绝不回写模拟状态（红线 11）。
             const vx::CameraView view = camera.Evaluate(plan.alpha, &cameraQuery);
+            // 渲染原点相对视图：顶点上传时已减去渲染原点，故**相机与剔除必须用同一坐标系**（红线 6）。
+            // 提前到这里是因为下面的绘制列表要用它的 `viewProjection` 做视锥剔除（T39）。
+            const vx::CameraView relativeView = RelativeCameraView(view, renderOrigin);
+
+            // T39：**先剔除再提交**（`references/performance-and-hitches.md` §1.3 硬规则 3）。
+            // 判据 = 相机视锥 ∩（物体 ∪ 其影子落点）：前者去掉"背后 / 侧向"的网格，后者保证不丢阴影。
+            const vx::Frustum frustum = vx::FrustumFromViewProjection(relativeView.viewProjection);
 
             // T27：本帧绘制列表 = 地表 tile + 可挖体积块 + 主角 + **活动**光球（失效槽位不进列表，
             // 因此不会为它们付出 draw call 与统计）。容量在启动时已预留，稳态零分配。
             frameHandles.clear();
-            for (const vx::MeshHandle& handle : tileHandles) {
-                if (handle.IsValid()) {
-                    frameHandles.push_back(handle);
+            std::size_t visibleTiles   = 0;
+            std::size_t visibleVolumes = 0;
+            for (std::size_t i = 0; i < tileHandles.size(); ++i) {
+                if (tileHandles[i].IsValid() && VisibleToCamera(frustum, tileBounds[i], renderOrigin, sunDirection)) {
+                    frameHandles.push_back(tileHandles[i]);
+                    ++visibleTiles;
                 }
             }
-            for (const vx::MeshHandle& handle : volumeHandles) {
-                if (handle.IsValid()) {
-                    frameHandles.push_back(handle);
+            for (std::size_t i = 0; i < volumeHandles.size(); ++i) {
+                if (volumeHandles[i].IsValid() &&
+                    VisibleToCamera(frustum, volumeBounds[i], renderOrigin, sunDirection)) {
+                    frameHandles.push_back(volumeHandles[i]);
+                    ++visibleVolumes;
                 }
             }
             if (characterMesh.IsValid()) {
@@ -1339,6 +1858,26 @@ int main(int argc, char** argv) {
                 if (orbPool.Orbs()[i].active && orbHandles[i].IsValid()) {
                     frameHandles.push_back(orbHandles[i]);
                 }
+            }
+            // T33：活跃倒塌整体的网格（落定后即移出列表 ⇒ 不再为它付 draw call）。
+            // 它们的位置每帧在变，故**不参与** T39 的静态视锥剔除（数量 ≤ `max_active_units`，代价可忽略）。
+            for (const vx::ActiveCollapseUnit& unit : rigidCollapse.Active()) {
+                if (unit.mesh.IsValid()) {
+                    frameHandles.push_back(unit.mesh);
+                }
+            }
+            // 提交量（T38）：在 `RenderFrame` 之后记录，**下一帧**的尖峰日志才能与同批实测值（draw call /
+            // 三相耗时 / 帧时长）对齐 —— 三者都取"最近一次"的实测值，混帧会让定位结论失真。
+            const std::size_t submittedThisFrame = frameHandles.size();
+
+            // T39：剔除结果**首次可观测**（`references/performance-and-hitches.md` §3"提交量必须由剔除结果
+            // 决定"）：只打一条，用于确认剔除真的在起作用（而不是把整个世界都提交了）。
+            if (!cullingLogged) {
+                cullingLogged = true;
+                VX_LOG_INFO("首帧视锥剔除（T39）：地表 tile %zu/%zu、可挖体积块 %zu/%zu 通过（含阴影扫掠余量）；"
+                            "本帧提交网格 %zu 个",
+                            visibleTiles, tileHandles.size(), visibleVolumes, volumeHandles.size(),
+                            submittedThisFrame);
             }
 
             // 调试面板：统计经独立接口采集，只在渲染线程构建，不进世界层热路径。
@@ -1360,7 +1899,7 @@ int main(int argc, char** argv) {
             stats.carvedBlockCount  = digVolumes.CarvedBlockCount();
             stats.mouseCaptured     = mouseCaptured;
             stats.loadedTileCount   = tileCoords.size();
-            stats.lastDirtyTileCount = lastDirtyTiles;
+            stats.lastDirtyTileCount = destructionUnits;
             stats.tileBodyCount     = terrainCollision.TileBodyCount();
             stats.physicsReady      = true;
 
@@ -1377,6 +1916,7 @@ int main(int argc, char** argv) {
             stats.cpuLogicMs  = cpuCost.logicMs;
             stats.cpuUiMs     = cpuCost.uiMs;
             stats.cpuRenderMs = cpuCost.renderMs;
+            stats.swapchainWaitMs = renderStats.swapchainWaitMs;  // T38：与 draw call 同源的"在等"量
 
             // T24：面板构建（含 ImGui::Render）计入 UI 构建耗时。
             uiTimer.Begin();
@@ -1425,7 +1965,7 @@ int main(int argc, char** argv) {
             }
 
             // 材质参数（高度带 / 坡度带 / UV 尺度 / 层色）来自与 TerrainWorld **同一份**材质表；
-            // 渲染原点每次重定基后都要刷新（原点进 uniform，片元据此把相机相对坐标还原为世界坐标）。
+            // 渲染原点每次重定基后都要刷新（原点进 uniform，片元据此把渲染相对坐标还原为世界坐标）。
             const vx::MaterialUniform materialUniform =
                 vx::BuildMaterialUniform(world.Materials(), renderOrigin.x, renderOrigin.y, renderOrigin.z);
             renderer.SetMaterialUniform(&materialUniform, sizeof(materialUniform));
@@ -1438,9 +1978,12 @@ int main(int argc, char** argv) {
                                          static_cast<double>(view.eye.y), static_cast<double>(view.eye.z));
             renderer.SetLightingUniform(&lightingUniform, sizeof(lightingUniform));
 
-            const vx::CameraView relativeView = RelativeCameraView(view, renderOrigin);
+            // 相机常量（T39 起 `relativeView` 在**构建绘制列表之前**就已算好，见那里的视锥剔除）。
             renderer.SetCamera(relativeView);
-
+            // T41：每帧下发渲染原点 —— 顶点只承载网格局部坐标，逐网格变换 = 平移(网格原点 − 渲染原点) × 旋转。
+            // 这是"渲染原点重定基"的全部代价（一次常量写入，零重传）。`renderOrigin` 是整数（取整），
+            // 传入 `double` 与上传时登记的网格原点相减不会引入误差。
+            renderer.SetRenderOrigin(renderOrigin);
             // T21b：级联分割与各级光空间矩阵由 game 每帧按相机参数算出（engine 不认识相机设置），
             // 经 BuildShadowUniform 单入口投影成片元 uniform 槽 2 的参数块；级数 / 分辨率来自配置。
             // 缺陷 1：投射体扩展需要"最高投射体相对渲染原点的高度"——由已加载地形推导：
@@ -1463,6 +2006,23 @@ int main(int argc, char** argv) {
             }
             const double renderMs = renderTimer.EndMs();
             cpuCost = CpuFrameCost { logicMs, uiMs, renderMs };  // 供下一帧面板显示
+            submittedMeshCount = submittedThisFrame;             // T38：同上，供下一帧尖峰日志使用
+
+            // ---- T38 帧尖峰打点（`references/performance-and-hitches.md` §2 的第一步）----
+            // 与面板同源：`stats.frameSeconds` / `cpuCost` / `renderStats` 都取"最近一次"的实测值。
+            // 一条日志里同时给出"三相 CPU + draw call + 提交网格数 + 等交换链耗时"，据此可立刻区分
+            // 「CPU 忙 / GPU 忙 / 在空等」——这正是本轮之前缺失、导致误判（把 GPU 侧成本判到 CPU）的那一步。
+            const double frameMs = stats.frameSeconds * 1000.0;
+            if (frameMs > kHitchThresholdMs && hitchLogClock.Tick() * 1000.0 >= kHitchLogMinIntervalMs) {
+                (void)hitchLogClock.Tick();  // 重置节流窗口
+                VX_LOG_WARN("帧尖峰 %.1f ms（阈值 %.0f ms）：逻辑 %.2f + UI %.2f + 渲染提交 %.2f ms；"
+                            "draw call %u、提交网格 %zu、固定步 %d、等交换链 %.2f ms ⇒ 主要受限在 %s",
+                            frameMs, kHitchThresholdMs, cpuCost.logicMs, cpuCost.uiMs, cpuCost.renderMs,
+                            renderStats.drawCalls, submittedMeshCount, plan.steps, renderStats.swapchainWaitMs,
+                            (renderStats.swapchainWaitMs > cpuCost.renderMs * 0.5)
+                                ? "等交换链（GPU / 呈现）"
+                                : "CPU 侧（逻辑 / UI / 提交）");
+            }
 
             // T17：帧末补睡到目标间隔，限制帧率。垂直同步档 `TargetFps() == 0`，本调用立即返回。
             // 只用睡眠、绝不忙等（见 FrameLimiter 注释）。

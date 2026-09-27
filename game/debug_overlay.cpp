@@ -15,6 +15,7 @@
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 
@@ -103,8 +104,8 @@ void DebugOverlay::OnSdlEvent(void* userData, const SDL_Event& event) {
 }
 
 void DebugOverlay::BeginFrame() {
-    // 只要还有任一 ImGui 窗口可见就必须起帧（系统面板打开时调试面板可能隐藏）。
-    m_frameActive = m_visible || m_systemPanel.IsOpen();
+    // 只要还有任一 ImGui 窗口可见就必须起帧（系统面板打开时调试面板可能隐藏；加载画面同样要出帧）。
+    m_frameActive = m_visible || m_systemPanel.IsOpen() || m_loadingActive;
     if (!m_frameActive) {
         m_wantCaptureMouse    = false;
         m_wantCaptureKeyboard = false;
@@ -129,6 +130,37 @@ void DebugOverlay::BeginFrame() {
     m_wantCaptureKeyboard = io.WantCaptureKeyboard;
 }
 
+void DebugOverlay::SetLoadingStatus(UiLabel stage, float progress) noexcept {
+    m_loadingActive   = true;
+    m_loadingStage    = stage;
+    m_loadingProgress = std::clamp(progress, 0.0F, 1.0F);
+}
+
+void DebugOverlay::BuildLoadingUI() {
+    if (!m_frameActive || !m_loadingActive) {
+        return;
+    }
+    const bool cjk = m_cjkFontLoaded;
+
+    // 居中、不可移动、自动尺寸：加载期玩家无需与它交互，只要"看得见进度在走"。
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Always, ImVec2(0.5F, 0.5F));
+    ImGui::SetNextWindowBgAlpha(0.92F);
+    ImGui::Begin(UiText(UiLabel::LoadingTitle, cjk), nullptr,
+                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize);
+
+    ImGui::TextUnformatted(UiText(m_loadingStage, cjk));
+
+    char percent[16] = {};
+    std::snprintf(percent, sizeof(percent), UiText(UiLabel::LoadingProgressFormat, cjk),
+                  static_cast<double>(m_loadingProgress) * 100.0);
+    ImGui::ProgressBar(m_loadingProgress, ImVec2(360.0F, 0.0F), percent);
+
+    ImGui::TextUnformatted(UiText(UiLabel::LoadingHint, cjk));
+    ImGui::End();
+}
+
 void DebugOverlay::BuildUI(const DebugStats& stats, SystemPanelContext& panelContext) {
     if (!m_frameActive) {
         return;
@@ -148,6 +180,7 @@ void DebugOverlay::BuildUI(const DebugStats& stats, SystemPanelContext& panelCon
     const double frameMs = stats.frameSeconds * 1000.0;
     const double p50Ms   = Percentile(0.50) * 1000.0;
     const double p95Ms   = Percentile(0.95) * 1000.0;
+    const double p99Ms   = Percentile(0.99) * 1000.0;  // T38：尾部（hitch）判据，见 references/performance-and-hitches.md
     const double fps     = (stats.frameSeconds > 0.0) ? (1.0 / stats.frameSeconds) : 0.0;
 
     ImGui::SetNextWindowBgAlpha(0.88F);
@@ -155,7 +188,7 @@ void DebugOverlay::BuildUI(const DebugStats& stats, SystemPanelContext& panelCon
                  ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings);
 
     ImGui::SeparatorText(UiText(UiLabel::SectionTiming, cjk));
-    StatRow(UiText(UiLabel::FrameTime, cjk), UiText(UiLabel::FrameTimeFormat, cjk), frameMs, p50Ms, p95Ms);
+    StatRow(UiText(UiLabel::FrameTime, cjk), UiText(UiLabel::FrameTimeFormat, cjk), frameMs, p50Ms, p95Ms, p99Ms);
     StatRow(UiText(UiLabel::Fps, cjk), UiText(UiLabel::FpsFormat, cjk), fps);
     StatRow(UiText(UiLabel::FrameRateCap, cjk), UiText(UiLabel::FrameRateCapFormat, cjk), stats.frameRateCap);
     StatRow(UiText(UiLabel::FixedSteps, cjk), UiText(UiLabel::FixedStepsFormat, cjk), stats.stepsThisFrame,
@@ -208,6 +241,8 @@ void DebugOverlay::BuildUI(const DebugStats& stats, SystemPanelContext& panelCon
     StatRow(UiText(UiLabel::CpuLogicStep, cjk), UiText(UiLabel::MillisecondsFormat, cjk), stats.cpuLogicMs);
     StatRow(UiText(UiLabel::CpuUiBuild, cjk), UiText(UiLabel::MillisecondsFormat, cjk), stats.cpuUiMs);
     StatRow(UiText(UiLabel::CpuRenderSubmit, cjk), UiText(UiLabel::MillisecondsFormat, cjk), stats.cpuRenderMs);
+    // T38：单独列出"等交换链"耗时 —— 它混在渲染提交里会把"在空等 GPU"误判成"CPU 忙"。
+    StatRow(UiText(UiLabel::SwapchainWait, cjk), UiText(UiLabel::MillisecondsFormat, cjk), stats.swapchainWaitMs);
 
     // T24：各 pass GPU 时间。SDL3_gpu **没有时间戳查询 API**，故如实标注"不可用"——绝不编造数字。
     ImGui::SeparatorText(UiText(UiLabel::SectionGpuPassTime, cjk));

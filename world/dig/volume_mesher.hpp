@@ -100,4 +100,13 @@ protected:
 /// 前置条件：`sampler` 的生命周期覆盖本调用；越界采样索引必须给出与邻块一致的密度。
 [[nodiscard]] MeshData BuildVolumeMesh(const IVolumeSampler& sampler);
 
+/// 同一套 Surface Nets（ADR 0007）在**任意尺寸区域**上的入口（T42）：`size*` 是该区域的**体素数**
+/// （采样数 = `size* + 1`，两侧各多取一圈用于围裙）。输出约定与 `BuildVolumeMesh` **逐字相同**
+/// （顶点为区域局部坐标、法线 = 密度梯度、材质 = 实体侧众数）。
+///
+/// 为什么需要它：倒塌整体原先用"逐体素方块面 + 面法线"自造网格，与地形 / 洞的等值面口径不同 ⇒
+/// 掉落中棱角明显、落地后又变回平滑（项目所有者实测）。改用本入口后，切下来的那一块**就是它原本的
+/// 那一片等值面**（顶点与原地形网格在重叠处逐位一致），三态（静止 / 运动中 / 落定）外观连续。
+[[nodiscard]] MeshData BuildRegionMesh(const IVolumeSampler& sampler, int sizeX, int sizeY, int sizeZ);
+
 }  // namespace vx

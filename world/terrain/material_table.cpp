@@ -65,6 +65,28 @@ namespace {
     return *value;
 }
 
+/// 读一个**可选**数值（T43）：缺失即取 `fallback`；写了但不是数值 ⇒ 抛（口径同其它字段，不静默忽略类型错）。
+[[nodiscard]] float ReadOptionalFloat(const toml::table& layer, const std::filesystem::path& path, std::size_t slot,
+                                      const char* field, float fallback) {
+    if (!layer.contains(field)) {
+        return fallback;
+    }
+    return ReadFloat(layer, path, slot, field);
+}
+
+/// 读一个**可选**布尔（T43）：缺失即取 `fallback`；类型错 ⇒ 抛。
+[[nodiscard]] bool ReadOptionalBool(const toml::table& layer, const std::filesystem::path& path, std::size_t slot,
+                                    const char* field, bool fallback) {
+    if (!layer.contains(field)) {
+        return fallback;
+    }
+    const std::optional<bool> value = layer[field].value<bool>();
+    if (!value.has_value()) {
+        throw std::runtime_error(Describe(path, slot, field) + "不是布尔值");
+    }
+    return *value;
+}
+
 void ValidateLayer(const MaterialLayer& layer, const std::filesystem::path& path, std::size_t slot) {
     if (layer.textureLayer < 1 || layer.textureLayer > 255) {
         throw std::runtime_error(Describe(path, slot, "texture_layer") + "必须落在 [1, 255]（0 号层保留给缺失纹理）");
@@ -97,6 +119,16 @@ void ValidateLayer(const MaterialLayer& layer, const std::filesystem::path& path
     }
     if (layer.macroStrength < 0.0F || layer.macroStrength > 1.0F) {
         throw std::runtime_error(Describe(path, slot, "macro_strength") + "必须落在 [0, 1]");
+    }
+    // T43 / ADR 0016：物理参数（可选；非法即抛）。
+    if (!(layer.density > 0.0F)) {
+        throw std::runtime_error(Describe(path, slot, "density") + "必须大于 0（每格³ 质量）");
+    }
+    if (layer.friction < 0.0F || layer.friction > 1.0F) {
+        throw std::runtime_error(Describe(path, slot, "friction") + "必须落在 [0, 1]");
+    }
+    if (layer.restitution < 0.0F || layer.restitution > 1.0F) {
+        throw std::runtime_error(Describe(path, slot, "restitution") + "必须落在 [0, 1]");
     }
 }
 
@@ -161,6 +193,13 @@ TerrainMaterialTable TerrainMaterialTable::LoadFromFile(const std::filesystem::p
         // `subsurface` 可缺省（缺省 = 自身，兼容旧文件）；一旦写了就参与下面的名字校验。
         subsurfaceNames[slot] = layer->contains("subsurface") ? ReadString(*layer, path, slot, "subsurface")
                                                              : parsed.name;
+        // T43 / ADR 0016：物理参数（可选，缺省 = `MaterialLayer` 的默认值 ⇒ 旧文件行为不变）。
+        parsed.density        = ReadOptionalFloat(*layer, path, slot, "density", parsed.density);
+        parsed.friction       = ReadOptionalFloat(*layer, path, slot, "friction", parsed.friction);
+        parsed.restitution    = ReadOptionalFloat(*layer, path, slot, "restitution", parsed.restitution);
+        parsed.indestructible = ReadOptionalBool(*layer, path, slot, "indestructible", parsed.indestructible);
+        // T46 / ADR 0017：落地后的表示（可选，缺省 = 散体 ⇒ 旧文件行为不变）。
+        parsed.rigidDebris = ReadOptionalBool(*layer, path, slot, "rigid_debris", parsed.rigidDebris);
 
         ValidateLayer(parsed, path, slot);
         table.m_layers[slot] = std::move(parsed);
@@ -227,6 +266,31 @@ TerrainMaterialTable TerrainMaterialTable::Default() {
     table.m_layers[1].subsurfaceSlot = 1;  // dirt  → dirt
     table.m_layers[2].subsurfaceSlot = 2;  // rock  → rock
     table.m_layers[3].subsurfaceSlot = 1;  // sand  → dirt
+
+    // T43 / ADR 0016：物理参数（与 materials.toml 逐值一致；参照真实材料：土 ~1.5、花岗岩 ~2.6）。
+    table.m_layers[0].density        = 1.3F;   // grass
+    table.m_layers[0].friction       = 0.75F;
+    table.m_layers[0].restitution    = 0.02F;
+    table.m_layers[0].indestructible = false;
+    table.m_layers[1].density        = 1.5F;   // dirt
+    table.m_layers[1].friction       = 0.60F;
+    table.m_layers[1].restitution    = 0.02F;
+    table.m_layers[1].indestructible = false;
+    table.m_layers[2].density        = 2.6F;   // rock
+    table.m_layers[2].friction       = 0.70F;
+    table.m_layers[2].restitution    = 0.12F;
+    table.m_layers[2].indestructible = false;
+    table.m_layers[3].density        = 1.6F;   // sand
+    table.m_layers[3].friction       = 0.50F;
+    table.m_layers[3].restitution    = 0.05F;
+    table.m_layers[3].indestructible = false;
+
+    // T46 / ADR 0017：落地后的表示（与 materials.toml 逐值一致）。
+    // 岩 = 刚性（碎块落地后保留几何体）；草 / 土 / 沙 = 散体（回写并与地面融合、且接地沉降）。
+    table.m_layers[0].rigidDebris = false;  // grass
+    table.m_layers[1].rigidDebris = false;  // dirt
+    table.m_layers[2].rigidDebris = true;   // rock
+    table.m_layers[3].rigidDebris = false;  // sand
 
     // C 项：三平面参数（默认值即 TriplanarSettings 的成员初值，与 assets/config/materials.toml 的 [triplanar] 一致）。
     table.m_triplanar = TriplanarSettings {};

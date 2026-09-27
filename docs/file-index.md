@@ -77,7 +77,7 @@ voxel-engine/
 | `engine/` | 引擎核心：可复用的通用能力 | 可依赖 `platform` 与第三方 | 不放世界 / 游戏专有类型（`TerrainTile`、`DigVolume`、`Biome` 等），不含游戏内容 |
 | `engine/core/` | 主循环装配、固定步长累加器、单调计时、统一日志接口 | 可依赖 `engine/platform` 与第三方 | 不放渲染与世界逻辑 |
 | `engine/input/` | 输入动作状态层：按键 / 鼠标 → 动作，每帧采样一次 | 可依赖 `engine/platform` | 上层只消费动作；**本层之外不得读 SDL 事件队列** |
-| `engine/physics/` | Jolt 薄封装：生命周期、固定步长推进、通用高度场 / 角色胶囊（**公共头不含 Jolt 类型**） | 可依赖 `engine/core` 与第三方 | 不放地形专有类型；世界坐标进出须显式转换并注明精度（见待收敛项 7） |
+| `engine/physics/` | Jolt 薄封装：生命周期、固定步长推进、通用高度场 / 角色胶囊 / 动态凸包刚体（**公共头不含 Jolt 类型**；`ActivateBody` = T46 唤醒保留残骸） | 可依赖 `engine/core` 与第三方 | 不放地形专有类型；世界坐标进出须显式转换并注明精度（见待收敛项 7） |
 | `engine/platform/` | 平台抽象：窗口、输入、计时、文件 IO | 可依赖第三方（SDL3） | 不放渲染与游戏逻辑 |
 | `engine/render/` | 渲染封装（RHI 薄层） | 可依赖 `engine/platform` | 不把具体图形 API 语义泄漏到上层 |
 | `engine/CMakeLists.txt` | 聚合 `engine/` 源文件为 `voxel_engine` 静态库 | — | 新增源文件须在此登记 |
@@ -160,22 +160,23 @@ voxel-engine/
 | `engine/input/input_map.hpp` | 输入动作状态层（上层只消费动作；鼠标按键与键盘对称） |
 | `engine/platform/window.hpp` | 窗口与事件循环；**唯一**把 SDL 事件翻译进 `InputMap` 的地方；相对鼠标模式（捕获 / 释放）在此封装 |
 | `engine/render/triangle_renderer.hpp` | PoC 冒烟测试路径（保留可编译，未接线） |
-| `engine/render/mesh_renderer.hpp` | 通用网格渲染路径（顶点/索引缓冲、相机 UBO、索引绘制、纹理数组、HDR 目标 + 色调映射通道、渲染开销记账、**自发光网格**：片元 uniform 槽 3 逐网格推送） |
+| `engine/render/mesh_renderer.hpp` | 通用网格渲染路径（顶点/索引缓冲、相机 UBO、索引绘制、纹理数组、HDR 目标 + 色调映射通道、渲染开销记账、**自发光网格**：片元 uniform 槽 3 逐网格推送、**变长几何就地更新**：`UpdateMeshGeometry` 只上传用到的顶点 / 索引前缀 + 每网格 `usedIndexCount`（T42）） |
 | `engine/render/lighting_table.hpp` | `assets/config/lighting.toml` 的加载与校验；**光照 → GPU 的唯一投影入口**（`LightingUniform` / `BuildLightingUniform`） |
 | `engine/render/shadow_cascade.hpp` | CSM **纯函数**：级联分割、texel 对齐的光空间矩阵、`ShadowUniform`（无世界 / 游戏专有类型） |
 | `engine/render/camera.hpp` | 第三人称相机 + 避障；`ITerrainQuery` 查询契约（由 `world/` 实现） |
 | `world/terrain/terrain_world.hpp` | 地表世界入口：tile 容器、网格、脏重网格，并实现 `ITerrainQuery` |
-| `world/terrain/material_table.hpp` | `assets/config/materials.toml` 的加载与校验；**CPU→GPU 材质参数唯一投影入口**（`MaterialUniform` / `BuildMaterialUniform`） |
+| `world/terrain/material_table.hpp` | `assets/config/materials.toml` 的加载与校验；**CPU→GPU 材质参数唯一投影入口**（`MaterialUniform` / `BuildMaterialUniform`）。**T43 起每层另有四个物理字段**（`density` / `friction` / `restitution` / `indestructible`，见 [ADR 0016](adr/0016-collapse-realism-impulse-material-debris.md)）与 **T46 的落地口径字段 `rigid_debris`**（刚性碎块落地后保留几何体，见 [ADR 0017](adr/0017-landing-by-material-rigid-vs-granular.md)）：**都不参与地表着色、因此不进 GPU uniform**，只决定倒塌整体的质量 / 摩擦 / 弹性、小碎片清除的守卫与落地后的表示；五个字段**可选**、缺省值等价于引入前的口径 ⇒ `schema_version` 保持 4 |
 | `world/terrain/material_textures.hpp` | 程序生成占位材质贴图（albedo + 法线，确定性、可平铺；ADR 0009） |
 | `world/terrain/world_bounds.hpp` | 世界边界盒与四周**空气墙**放置（**纯函数**，由 tile 范围推导；对任意地图尺寸生效） |
 | `world/dig/dig_region.hpp` | 可挖区域标记表（`assets/config/dig_regions.toml`，ADR 0006 的**数据文件**部分；含包围盒**向外吸附**、优先级 / sealed 合并、块数上限校验），并实现**层间交接过滤器** `ITerrainQuadFilter`（ADR 0011） |
-| `world/dig/dig_volume.hpp` | 可挖体积世界（ADR 0004 层 ②）：33³ `int8` 密度块（由高度场初始化）、球体挖除、脏块重网格、区域外密度回退；**只在标记区域内存在** |
-| `world/dig/volume_mesher.hpp` | Surface Nets 等值面网格化（ADR 0007）：块内局部顶点 + 密度梯度法线 + 块间共享边界采样；纯函数（只依赖采样器接口） |
+| `world/dig/dig_volume.hpp` | 可挖体积世界（ADR 0004 层 ②）：33³ `int8` 密度块（由高度场初始化）、球体挖除、脏块重网格、区域外密度回退；**只在标记区域内存在**；**体素材质持久化**（T42 / ADR 0014 修订：`VolumeBlock::material` 33³ **懒分配**、`0xFF` = 未写入回落列派生、`ReadMaterialRegion` / `SetMaterialSlot` / `MaterialBytes`） |
+| `world/dig/volume_mesher.hpp` | Surface Nets 等值面网格化（ADR 0007）：块内局部顶点 + 密度梯度法线 + 块间共享边界采样；纯函数（只依赖采样器接口）。**T42 增 `BuildRegionMesh(sampler, sizeX, sizeY, sizeZ)`**：同一套数学用于**任意尺寸区域**（倒塌整体的外观与地形同源的口径） |
 | `world/dig/volume_collision.hpp` | 可挖体积 → 物理层的**三角网静态碰撞体**提供者（T28 / ADR 0012）：每个有网格的块一个 Jolt `MeshShape`，挖除 / 塌落后按脏块重建 |
-| `world/dig/volume_collapse.hpp` | 破坏后的**塌落**（T29 / ADR 0012 第二节）：按「载荷通路（纵向接地）+ 悬挑跨度」判支撑、失去支撑的实心体按连续段**质量守恒地**逐列下落并堆成碎石；单次判定、不迭代 |
-| `world/dig/collapse_table.hpp` | 塌落规则表（`assets/config/collapse.toml`）：`enabled` / `max_cantilever_blocks` / `pile_spread_blocks` / `neighborhood_margin_blocks`，逐项校验、非法即抛 |
+| `world/dig/volume_collapse.hpp` | 破坏后的**倒塌**（T29 起 / **T33 改为整体刚体化**，ADR 0015）：按「载荷通路（纵向接地）+ 悬挑跨度」判支撑 → 失支撑实心体按 **6 邻域连通分量**分组（每分量 = 一个整体）→ 抽出体素 + 生成凸包点集。**T42 增**：抽出前抓**体素补丁**（密度 + 有效材质，包围盒 ±1 格）与 `BuildCollapseUnitMesh`（用同一份 Surface Nets 把补丁网格化成"它原本那一片表面"，局部坐标与凸包同源）；回写数学 `WritebackCollapseUnit`（按落定位姿体素化回写 + **把材质搬到落点**）。**T43 增**（[ADR 0016](adr/0016-collapse-realism-impulse-material-debris.md)）：`CollapseSeed` 带**爆心 / 半径**、`ComputeUnitPhysics`（逐体素冲量 ⇒ 整体 `V` / `ω`；质量 = Σ 密度、摩擦 / 弹性 = 多数材质；**无 GPU / Jolt 依赖 ⇒ 可单测**）、**小碎片清除 + `indestructible` 守卫**。**T46 增**（[ADR 0017](adr/0017-landing-by-material-rigid-vs-granular.md)）：`CollapseUnit::rigidDebris`（由**表面材质**的 `rigid_debris` 决定 —— 与渲染网格同源的表面 cell 直方图）、`surfaceMaterialCounts`、补丁**归属掩码** `patchIsUnit`、`hullPoints` 的**局部 AABB**、两个纯函数 `LocalAabbContainsPoint`（光球命中判据）/ `UnitWorldAabb`（唤醒判据）、**散体接地沉降**（回写后把"下方为空"的体素沿本列下落；刚性不沉降 ⇒ 形状不变），`CollapseWriteback` 增 `settledVoxels` / `stuckVoxels`。**同日缺陷修复**：`UnitPatchSampler` 索引改 1:1 + 非本整体实心当空气、`BuildCollapseUnitMesh` 多覆盖一格 cell ⇒ **碎块外观网格自闭合**（修"部分面透明、碰撞却在"）。单次判定、不迭代 |
+| `world/dig/collapse_table.hpp` | 倒塌规则表（`assets/config/collapse.toml`，`schema_version = 3`）：`enabled` / `max_cantilever_blocks` / `neighborhood_margin_blocks` / `settle_linear_speed` / `settle_angular_speed` / `settle_steps` / `initial_tilt_speed` / `impulse_speed` / `debris_delete_max_voxels` / `max_active_units`，逐项校验、非法即抛（**v3 删除** `mass_per_voxel` / `friction`：质量 / 摩擦 / 弹性改由材质表驱动，见 T43） |
 | `world/dig/projectile_table.hpp` | 弹丸规格表（`assets/config/projectiles.toml`）：弹道 / 爆炸破坏 / 自发光；`[[projectile]]` 数组留出多类型扩展 |
 | `game/orb.hpp` | 光球（T27）：弹道推进与命中检测（**纯函数**，只依赖 `IOrbWorldQuery`）、程序化球网格、固定容量弹丸池 |
+| `game/rigid_collapse.hpp` | 倒塌整体的运行时（T33 / ADR 0015）：网格池（**只在启动时**建 GPU 资源）、`Spawn` 用 `UpdateMeshGeometry` 写一次**与地形同源的等值面**（T42；只上传用到的前缀，超容量按整个四边形截断）、每步读刚体位姿 + 落定检测、每帧只推 `mat4`、落定后 `Writeback` + 清空槽位（索引数 0 = 不可见）。**T46 / [ADR 0017](adr/0017-landing-by-material-rigid-vs-granular.md)**：刚性整体落定后**保留几何体**（`retained`，不回写 ⇒ 形状不变）；池 **16 槽**；`ContainsRetainedPoint`（光球命中判定）/ `RetireRetainedAt`（命中 ⇒ 惰性回写）/ `RetireOldestRetained`（池满腾位）/ `AwakenIntersecting`（块碰撞体重建后唤醒相交残骸） |
 | `game/out_of_bounds.hpp` | 出界判定（**纯函数**）+ 救援余量；越界/坠落时送回出生点 |
 | `game/character_movement.hpp` | 主角移动基向量（**纯函数**：由相机 yaw 得前向 / 右向；方向语义有单测钉死） |
 | `game/character_mesh.hpp` | 主角**程序化胶囊代理网格**（可见占位体，尺寸同碰撞胶囊） |

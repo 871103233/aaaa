@@ -232,6 +232,45 @@ TEST(DigVolume, MaterialSlotInheritsSurfaceThenMapsToSubsurface) {
     EXPECT_EQ(volumes.SampleMaterialSlot(5, 200, 5), 1U) << "材质按**列**派生，与高度无关（体积内无深度分层）";
 }
 
+// T42：**体素级材质持久化**（ADR 0014 的切换条件被触发）—— 写入的材质优先于"该列地表派生"，
+// 未写入处仍逐位回落派生（零回归），且只有被写过的块才付出内存（懒分配 33³ / 块）。
+// 这是"塌落残骸落地后颜色不变"的存储前提。
+TEST(DigVolume, PersistedMaterialOverridesColumnDerivationAndIsLazy) {
+    const MapPreset preset = FlatPreset();
+
+    TerrainWorld world(preset.seed, TerrainMaterialTable::Default());
+    world.SetMapPreset(preset);
+    world.LoadTile(0, 0);
+
+    const DigRegionTable regions = DigRegionTable::FromRegions(
+        { MakeRegion("block", true, 0, BlockCoord { 0, 3, 0 }, BlockCoord { 0, 3, 0 }) });
+    DigVolumeWorld volumes(world, regions);
+    volumes.InitFromHeightField();
+
+    const std::size_t blockMaterialBytes = static_cast<std::size_t>(vx::kVolumeSampleCount) *
+                                           static_cast<std::size_t>(vx::kVolumeSampleCount) *
+                                           static_cast<std::size_t>(vx::kVolumeSampleCount);
+    const std::uint8_t derived = volumes.SampleMaterialSlot(5, 110, 5);
+    EXPECT_EQ(volumes.MaterialBytes(), 0U) << "从未写过材质 ⇒ **零内存**（与引入存储之前完全一致）";
+
+    const std::uint8_t marked = static_cast<std::uint8_t>((static_cast<unsigned>(derived) + 1U) % 4U);
+    ASSERT_NE(marked, derived) << "本用例要求标记材质与列派生不同，否则判据无意义";
+
+    volumes.SetMaterialSlot(5, 110, 5, marked);
+    EXPECT_EQ(volumes.SampleMaterialSlot(5, 110, 5), marked) << "已写入的体素材质优先";
+    EXPECT_EQ(volumes.SampleMaterialSlot(5, 111, 5), derived) << "同列未写入的样本仍回落列派生";
+    EXPECT_EQ(volumes.MaterialBytes(), blockMaterialBytes) << "只分配被写过的那个块（每块 33³ 字节）";
+
+    volumes.SetMaterialSlot(-100, -100, -100, marked);  // 区域外（无块）⇒ 忽略，不分配
+    EXPECT_EQ(volumes.MaterialBytes(), blockMaterialBytes);
+
+    // 区域读：与 `DensityRegion` 同布局；已写入的优先、未写入的回落派生。
+    const std::vector<std::uint8_t> column = volumes.ReadMaterialRegion(5, 110, 5, 1, 2, 1);
+    ASSERT_EQ(column.size(), 2U);
+    EXPECT_EQ(column[0], marked);
+    EXPECT_EQ(column[1], derived);
+}
+
 TEST(DigVolume, CarvingAirChangesNothing) {
     const MapPreset preset = FlatPreset();
 
@@ -248,4 +287,65 @@ TEST(DigVolume, CarvingAirChangesNothing) {
     EXPECT_FALSE(volumes.CarveSphere(glm::dvec3(16.0, 127.5, 16.0), 1.0F, dirty))
         << "球体全在空处时不应有改动";
     EXPECT_TRUE(dirty.empty());
+}
+
+// T36 / SKILL「不冻结画面」：**分步**初始化必须与一次性初始化**逐位一致** —— 分帧只允许改变
+// "何时可见"，不得改变结果（红线 7）。这条是启动加载"每帧只走一步"的正确性凭据。
+//
+// 区域取 2×1×2 = 4 块（相邻块共享边界采样），因此不等价于"各块独立生成"：若分步实现让邻块
+// 尚未填充密度时就去网格化，边界采样会回落到未取整的高度场推导值，本用例会立刻失败。
+TEST(DigVolume, SteppedInitMatchesOneShotInitExactly) {
+    const MapPreset preset = FlatPreset();
+
+    TerrainWorld worldOneShot(preset.seed, TerrainMaterialTable::Default());
+    worldOneShot.SetMapPreset(preset);
+    worldOneShot.LoadTile(0, 0);
+
+    TerrainWorld worldStepped(preset.seed, TerrainMaterialTable::Default());
+    worldStepped.SetMapPreset(preset);
+    worldStepped.LoadTile(0, 0);
+
+    const DigRegionTable regions = DigRegionTable::FromRegions(
+        { MakeRegion("blocks", true, 0, BlockCoord { 0, 3, 0 }, BlockCoord { 1, 3, 1 }) });
+
+    DigVolumeWorld oneShot(worldOneShot, regions);
+    oneShot.InitFromHeightField();
+
+    DigVolumeWorld stepped(worldStepped, regions);
+    stepped.BeginInitFromHeightField();
+    EXPECT_EQ(stepped.InitCompletedSteps(), 0U);
+    EXPECT_EQ(stepped.InitTotalSteps(), regions.Blocks().size() * 2U)
+        << "步骤总数 = 2 × 块数（先逐块填密度、再逐块网格化）";
+
+    // 每批只走一步（最细分帧），期间进度必须单调前进且未完成时不到 100%。
+    std::size_t previous = stepped.InitCompletedSteps();
+    while (!stepped.StepInitFromHeightField(1)) {
+        EXPECT_GT(stepped.InitCompletedSteps(), previous);
+        EXPECT_LT(stepped.InitCompletedSteps(), stepped.InitTotalSteps());
+        previous = stepped.InitCompletedSteps();
+    }
+    EXPECT_EQ(stepped.InitCompletedSteps(), stepped.InitTotalSteps());
+
+    ASSERT_EQ(stepped.Blocks().size(), oneShot.Blocks().size());
+    for (const auto& entry : oneShot.Blocks()) {
+        const auto found = stepped.Blocks().find(entry.first);
+        ASSERT_NE(found, stepped.Blocks().end()) << "分步初始化缺少块";
+        EXPECT_EQ(found->second.density, entry.second.density) << "密度数组必须逐位相同";
+        EXPECT_EQ(found->second.fill, entry.second.fill);
+        EXPECT_EQ(found->second.carved, entry.second.carved);
+        EXPECT_EQ(found->second.mesh.indices, entry.second.mesh.indices);
+
+        ASSERT_EQ(found->second.mesh.vertices.size(), entry.second.mesh.vertices.size());
+        for (std::size_t i = 0; i < entry.second.mesh.vertices.size(); ++i) {
+            const vx::MeshVertex& expected = entry.second.mesh.vertices[i];
+            const vx::MeshVertex& actual   = found->second.mesh.vertices[i];
+            EXPECT_FLOAT_EQ(actual.position[0], expected.position[0]);
+            EXPECT_FLOAT_EQ(actual.position[1], expected.position[1]);
+            EXPECT_FLOAT_EQ(actual.position[2], expected.position[2]);
+            EXPECT_FLOAT_EQ(actual.normal[0], expected.normal[0]);
+            EXPECT_FLOAT_EQ(actual.normal[1], expected.normal[1]);
+            EXPECT_FLOAT_EQ(actual.normal[2], expected.normal[2]);
+            EXPECT_FLOAT_EQ(actual.material, expected.material);
+        }
+    }
 }

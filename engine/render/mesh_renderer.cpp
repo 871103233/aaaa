@@ -1,5 +1,7 @@
 #include "render/mesh_renderer.hpp"
 
+#include "core/clock.hpp"
+
 #include "core/log.hpp"
 
 #include <algorithm>
@@ -180,13 +182,15 @@ MeshRenderer::MeshRenderer(SDL_GPUDevice* device, SDL_Window* window, std::files
     const ShaderArtifact artifact = select_shader_artifact(m_device);
     const std::string    extension = artifact.extension;
 
-    // 顶点着色器：1 个只读 storage buffer（相机常量）。
+    // 顶点着色器：1 个只读 storage buffer（相机常量，set 0）
+    //             + **1 个 uniform 块**（T41：逐网格顶点偏移，set 1，逐网格 `SDL_PushGPUVertexUniformData`）。
+    // 数量必须与 SPIR-V 里声明的资源一致（SDL3_gpu 的 set 约定：顶点 set 0 = 只读资源、set 1 = uniform）。
     // 注意：T23 起把两个 Shader **持有到析构**（而非创建管线后立即释放）——MSAA 档位变化时
     // 需按新的采样数**重建主通道管线**，重建要复用同一批 Shader 对象，避免重新读盘。
     m_meshVertexShader =
         create_shader_from_file(m_device, shader_dir / (shader_name + ".vert" + extension),
                                 SDL_GPU_SHADERSTAGE_VERTEX, artifact.format,
-                                ShaderResourceCounts { 0, 0, 1, 0 });
+                                ShaderResourceCounts { 0, 0, /*storageBuffers=*/1, /*uniformBuffers=*/1 });
     // 片元着色器：6 个采样纹理（slot 0..4 = albedo / normal / roughness / AO / macro，slot 5 = 阴影深度数组）
     //              + 4 个 uniform 块（slot 0 材质、slot 1 光照、slot 2 阴影、**slot 3 自发光**，T27）。
     // SDL_gpu 每阶段采样器上限为 16（MAX_TEXTURE_SAMPLERS_PER_STAGE），6 个无需把 roughness/AO 打包进通道；
@@ -246,7 +250,8 @@ MeshRenderer::MeshRenderer(SDL_GPUDevice* device, SDL_Window* window, std::files
         SDL_GPUShader* shadowVertex =
             create_shader_from_file(m_device, shader_dir / ("shadow.vert" + extension),
                                     SDL_GPU_SHADERSTAGE_VERTEX, artifact.format,
-                                    ShaderResourceCounts { /*samplers=*/0, 0, /*storageBuffers=*/1, 0 });
+                                    ShaderResourceCounts { /*samplers=*/0, 0, /*storageBuffers=*/1,
+                                                           /*uniformBuffers=*/1 });  // set 1 = 逐网格偏移（T41）
         // SDL3_gpu 的 SDL_CreateGPUGraphicsPipeline 断言片元着色器非空（'!"Fragment shader cannot be NULL!"'），
         // 故即使 num_color_targets = 0 也必须挂一个空入口（shadow.frag 不做任何计算）。
         SDL_GPUShader* shadowFragment =
@@ -496,6 +501,9 @@ MeshRenderer::~MeshRenderer() {
     if (m_vertexStagingBuffer != nullptr) {
         SDL_ReleaseGPUTransferBuffer(m_device, m_vertexStagingBuffer);
     }
+    if (m_indexStagingBuffer != nullptr) {
+        SDL_ReleaseGPUTransferBuffer(m_device, m_indexStagingBuffer);
+    }
     if (m_cameraUniformBuffer != nullptr) {
         SDL_ReleaseGPUBuffer(m_device, m_cameraUniformBuffer);
     }
@@ -536,7 +544,7 @@ MeshRenderer::~MeshRenderer() {
     }
 }
 
-MeshHandle MeshRenderer::UploadMesh(const MeshData& mesh, bool emissive) {
+MeshHandle MeshRenderer::UploadMesh(const MeshData& mesh, const glm::dvec3& origin, bool emissive) {
     if (mesh.vertices.empty() || mesh.indices.empty()) {
         return MeshHandle {};
     }
@@ -551,7 +559,14 @@ MeshHandle MeshRenderer::UploadMesh(const MeshData& mesh, bool emissive) {
         create_and_upload_buffer(m_device, SDL_GPU_BUFFERUSAGE_INDEX, mesh.indices.data(), indexBytes);
     resources.vertexCount = static_cast<std::uint32_t>(mesh.vertices.size());
     resources.indexCount = static_cast<std::uint32_t>(mesh.indices.size());
+    // 静态网格的"实际绘制索引数" = 上传的索引数（T42；变长网格由 `UpdateMeshGeometry` 改写）。
+    resources.usedIndexCount = resources.indexCount;
     resources.emissive  = emissive;
+    // 世界原点只作"这块网格在世界哪里"的登记（T41）；绘制时与渲染原点相减得平移量。
+    // 存 `double`（红线 6）：偏移在 double 下相减后才落回 float，大坐标也不会丢精度。
+    resources.origin[0] = origin.x;
+    resources.origin[1] = origin.y;
+    resources.origin[2] = origin.z;
 
     std::uint32_t slot = 0;
     if (!m_freeSlots.empty()) {
@@ -565,11 +580,36 @@ MeshHandle MeshRenderer::UploadMesh(const MeshData& mesh, bool emissive) {
     return MeshHandle { slot + 1 };
 }
 
-bool MeshRenderer::UpdateMeshVertices(MeshHandle handle, const std::vector<MeshVertex>& vertices) {
+bool MeshRenderer::EnsureStagingBuffer(SDL_GPUTransferBuffer*& buffer, std::uint32_t& capacity,
+                                       std::uint32_t bytes) {
+    if (bytes == 0U) {
+        return true;  // 没有要上传的字节：保留既有缓冲（也不视为失败）
+    }
+    if (buffer != nullptr && capacity >= bytes) {
+        return true;  // 容量够 ⇒ 不重新分配（稳态零 GPU 资源创建）
+    }
+    if (buffer != nullptr) {
+        SDL_ReleaseGPUTransferBuffer(m_device, buffer);
+        buffer = nullptr;
+    }
+    SDL_GPUTransferBufferCreateInfo stagingInfo {};
+    stagingInfo.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+    stagingInfo.size  = bytes;
+    buffer = SDL_CreateGPUTransferBuffer(m_device, &stagingInfo);
+    if (buffer == nullptr) {
+        capacity = 0;
+        return false;
+    }
+    capacity = bytes;
+    return true;
+}
+
+bool MeshRenderer::UpdateMeshVertices(MeshHandle handle, const std::vector<MeshVertex>& vertices,
+                                      const glm::dvec3& origin) {
     if (!handle.IsValid() || handle.id > m_meshes.size()) {
         return false;
     }
-    const MeshResources& resources = m_meshes[handle.id - 1];
+    MeshResources& resources = m_meshes[handle.id - 1];
     if (resources.vertexBuffer == nullptr) {
         return false;
     }
@@ -579,21 +619,9 @@ bool MeshRenderer::UpdateMeshVertices(MeshHandle handle, const std::vector<MeshV
     }
 
     const std::uint32_t vertexBytes = static_cast<std::uint32_t>(vertices.size() * sizeof(MeshVertex));
-    if (m_vertexStagingBuffer == nullptr || m_vertexStagingCapacity < vertexBytes) {
-        // 扩容只在首次或网格变大时发生，稳态（定长动态网格）下不触发，故不构成每帧分配。
-        if (m_vertexStagingBuffer != nullptr) {
-            SDL_ReleaseGPUTransferBuffer(m_device, m_vertexStagingBuffer);
-            m_vertexStagingBuffer = nullptr;
-        }
-        SDL_GPUTransferBufferCreateInfo stagingInfo {};
-        stagingInfo.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
-        stagingInfo.size  = vertexBytes;
-        m_vertexStagingBuffer = SDL_CreateGPUTransferBuffer(m_device, &stagingInfo);
-        if (m_vertexStagingBuffer == nullptr) {
-            m_vertexStagingCapacity = 0;
-            return false;
-        }
-        m_vertexStagingCapacity = vertexBytes;
+    // 扩容只在首次或网格变大时发生，稳态（定长动态网格）下不触发，故不构成每帧分配。
+    if (!EnsureStagingBuffer(m_vertexStagingBuffer, m_vertexStagingCapacity, vertexBytes)) {
+        return false;
     }
 
     // cycle = true：即便该暂存缓冲仍被上一帧的命令缓冲引用，也可安全复用（SDL 内部换名）。
@@ -614,7 +642,97 @@ bool MeshRenderer::UpdateMeshVertices(MeshHandle handle, const std::vector<MeshV
     SDL_UploadToGPUBuffer(copyPass, &source, &destination, /*cycle=*/false);
     SDL_EndGPUCopyPass(copyPass);
     SDL_SubmitGPUCommandBuffer(commandBuffer);
+    // 顶点与变换必须**同源**（T41）：调用方按 `origin` 烘焙了这批顶点，这里一并更新登记的原点，
+    // 否则渲染原点重定基后平移会与该批顶点错配。失败路径不改原点（顶点也没有被改写）。
+    // 这条路径是"渲染相对顶点"的烘焙路径（角色 / 光球）⇒ 旋转恒为**单位**（T33 的刚体走 `SetMeshTransform`）。
+    resources.origin[0] = origin.x;
+    resources.origin[1] = origin.y;
+    resources.origin[2] = origin.z;
+    resources.rotation = glm::quat(1.0F, 0.0F, 0.0F, 0.0F);
     return true;
+}
+
+bool MeshRenderer::UpdateMeshGeometry(MeshHandle handle, const MeshData& mesh, const glm::dvec3& origin) {
+    if (!handle.IsValid() || handle.id > m_meshes.size()) {
+        return false;
+    }
+    MeshResources& resources = m_meshes[handle.id - 1];
+    if (resources.vertexBuffer == nullptr || resources.indexBuffer == nullptr) {
+        return false;
+    }
+    // 容量是上传时定死的（池槽位不重建）⇒ 超出即拒绝，由调用方决定截断还是跳过。
+    if (mesh.vertices.size() > static_cast<std::size_t>(resources.vertexCount) ||
+        mesh.indices.size() > static_cast<std::size_t>(resources.indexCount)) {
+        return false;
+    }
+
+    const std::uint32_t vertexBytes = static_cast<std::uint32_t>(mesh.vertices.size() * sizeof(MeshVertex));
+    const std::uint32_t indexBytes  = static_cast<std::uint32_t>(mesh.indices.size() * sizeof(std::uint32_t));
+
+    // 更新登记的位姿（与顶点同源）：本路径的顶点是**网格局部坐标**，旋转由 `SetMeshTransform` 每帧推。
+    resources.origin[0] = origin.x;
+    resources.origin[1] = origin.y;
+    resources.origin[2] = origin.z;
+    resources.rotation = glm::quat(1.0F, 0.0F, 0.0F, 0.0F);
+
+    if (indexBytes == 0U) {
+        // 空网格 = **不可见**：不改缓冲、不做任何上传（"清空一个倒塌槽位"因此是零成本）。
+        resources.usedIndexCount = 0;
+        return true;
+    }
+
+    if (!EnsureStagingBuffer(m_vertexStagingBuffer, m_vertexStagingCapacity, vertexBytes) ||
+        !EnsureStagingBuffer(m_indexStagingBuffer, m_indexStagingCapacity, indexBytes)) {
+        return false;
+    }
+
+    void* mappedVertices = SDL_MapGPUTransferBuffer(m_device, m_vertexStagingBuffer, /*cycle=*/true);
+    if (mappedVertices == nullptr) {
+        return false;
+    }
+    std::memcpy(mappedVertices, mesh.vertices.data(), vertexBytes);
+    SDL_UnmapGPUTransferBuffer(m_device, m_vertexStagingBuffer);
+
+    void* mappedIndices = SDL_MapGPUTransferBuffer(m_device, m_indexStagingBuffer, /*cycle=*/true);
+    if (mappedIndices == nullptr) {
+        return false;
+    }
+    std::memcpy(mappedIndices, mesh.indices.data(), indexBytes);
+    SDL_UnmapGPUTransferBuffer(m_device, m_indexStagingBuffer);
+
+    SDL_GPUCommandBuffer* commandBuffer = SDL_AcquireGPUCommandBuffer(m_device);
+    if (commandBuffer == nullptr) {
+        return false;
+    }
+    SDL_GPUCopyPass* copyPass = SDL_BeginGPUCopyPass(commandBuffer);
+    // **只上传用到的前缀**（T42）：池槽位按最大容量建，而实际形状通常只有其一小部分。
+    SDL_GPUTransferBufferLocation vertexSource { m_vertexStagingBuffer, 0 };
+    SDL_GPUBufferRegion           vertexDestination { resources.vertexBuffer, 0, vertexBytes };
+    SDL_UploadToGPUBuffer(copyPass, &vertexSource, &vertexDestination, /*cycle=*/false);
+
+    SDL_GPUTransferBufferLocation indexSource { m_indexStagingBuffer, 0 };
+    SDL_GPUBufferRegion           indexDestination { resources.indexBuffer, 0, indexBytes };
+    SDL_UploadToGPUBuffer(copyPass, &indexSource, &indexDestination, /*cycle=*/false);
+
+    SDL_EndGPUCopyPass(copyPass);
+    SDL_SubmitGPUCommandBuffer(commandBuffer);
+
+    resources.usedIndexCount = static_cast<std::uint32_t>(mesh.indices.size());
+    return true;
+}
+
+void MeshRenderer::SetMeshTransform(MeshHandle handle, const glm::dvec3& origin, const glm::quat& rotation) noexcept {
+    if (!handle.IsValid() || handle.id > m_meshes.size()) {
+        return;
+    }
+    MeshResources& resources = m_meshes[handle.id - 1];
+    if (resources.vertexBuffer == nullptr) {
+        return;
+    }
+    resources.origin[0] = origin.x;
+    resources.origin[1] = origin.y;
+    resources.origin[2] = origin.z;
+    resources.rotation  = rotation;
 }
 
 void MeshRenderer::ReleaseMesh(MeshHandle handle) noexcept {
@@ -1032,7 +1150,8 @@ void MeshRenderer::LogTextureAccounting(std::uint32_t width, std::uint32_t heigh
 }
 
 void MeshRenderer::DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURenderPass* pass, const MeshHandle* meshes,
-                              std::size_t meshCount, bool pushEmissive) {
+                              std::size_t meshCount, bool pushEmissive, EmissivePushState& emissiveState,
+                              MeshTransformPushState& transformState) {
     if (meshes == nullptr) {
         return;
     }
@@ -1046,22 +1165,63 @@ void MeshRenderer::DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURender
         if (resources.vertexBuffer == nullptr || resources.indexBuffer == nullptr) {
             continue;
         }
+        // T42：变长网格（倒塌整体池）可能"本帧不可见"（尚未填充，或落定后被清空）——
+        // 此时索引数为 0，直接跳过（**不推 uniform、不绑定、不绘制**）。
+        if (resources.usedIndexCount == 0U) {
+            continue;
+        }
 
-        // 自发光（T27，片元 uniform 槽 3）：只对 `emissive = true` 的网格叠加，其余推送零值。
-        // 逐网格推送：`SDL_gpu.h` 明说 push 数据对**后续**绘制生效，故每次绘制前都要推。
+        // 逐网格模型变换（T41 起；T33 由 `vec4` 偏移泛化为 `mat4`）：把**网格局部坐标**变成渲染相对坐标。
+        // 每帧对每个网格只是一次 64 字节的 `SDL_PushGPUVertexUniformData`（**不是**上传，
+        // 不创建 / 不拷贝 GPU 缓冲），且 uniform 对**后续**绘制持续生效 ⇒ 与自发光同一套去重。
+        // 为什么用矩阵而不是"偏移 + 旋转分开传"：倒塌中的刚体**位置与姿态都在变**，
+        // 而局部顶点完全不变 ⇒ 一次 64 B 推送即可，CPU 无需重烘焙上万顶点（T33）。
+        {
+            MeshTransformUniform transform;
+            transform.modelToRender    = glm::mat4_cast(resources.rotation);
+            transform.modelToRender[3] = glm::vec4(static_cast<float>(resources.origin[0] - m_renderOrigin.x),
+                                                   static_cast<float>(resources.origin[1] - m_renderOrigin.y),
+                                                   static_cast<float>(resources.origin[2] - m_renderOrigin.z), 1.0F);
+            const float* matrix  = &transform.modelToRender[0][0];
+            bool         changed = !transformState.pushed;
+            for (int element = 0; element < 16 && !changed; ++element) {
+                changed = transformState.matrix[element] != matrix[element];
+            }
+            if (changed) {
+                SDL_PushGPUVertexUniformData(commandBuffer, 0, &transform, static_cast<Uint32>(sizeof(transform)));
+                transformState.pushed = true;
+                for (int element = 0; element < 16; ++element) {
+                    transformState.matrix[element] = matrix[element];
+                }
+            }
+        }
+
+        // 自发光（T27，片元 uniform 槽 3）：只对 `emissive = true` 的网格叠加，其余为零值。
+        // T39：uniform 数据对**后续**绘制持续生效，故只在"值变了"时推送 —— 推送次数从 O(网格数)
+        // 降到 O(值变化次数)（本场景：非自发光一批 + 自发光一批 ⇒ 约 2 次），绘制结果逐像素不变。
         if (pushEmissive) {
             struct EmissiveParams {
                 float emissive[4];  ///< rgb = 自发光颜色（线性光），a = 强度（0 = 普通地表网格）
             };
-            EmissiveParams emissiveParams {};
+            EmissiveParams params {};
             if (resources.emissive) {
-                emissiveParams.emissive[0] = m_emissiveColor[0];
-                emissiveParams.emissive[1] = m_emissiveColor[1];
-                emissiveParams.emissive[2] = m_emissiveColor[2];
-                emissiveParams.emissive[3] = 1.0F;
+                params.emissive[0] = m_emissiveColor[0];
+                params.emissive[1] = m_emissiveColor[1];
+                params.emissive[2] = m_emissiveColor[2];
+                params.emissive[3] = 1.0F;
             }
-            SDL_PushGPUFragmentUniformData(commandBuffer, 3, &emissiveParams,
-                                           static_cast<Uint32>(sizeof(emissiveParams)));
+            const bool changed = !emissiveState.pushed || emissiveState.color[0] != params.emissive[0] ||
+                                 emissiveState.color[1] != params.emissive[1] ||
+                                 emissiveState.color[2] != params.emissive[2] ||
+                                 emissiveState.strength != params.emissive[3];
+            if (changed) {
+                SDL_PushGPUFragmentUniformData(commandBuffer, 3, &params, static_cast<Uint32>(sizeof(params)));
+                emissiveState.pushed     = true;
+                emissiveState.color[0]   = params.emissive[0];
+                emissiveState.color[1]   = params.emissive[1];
+                emissiveState.color[2]   = params.emissive[2];
+                emissiveState.strength   = params.emissive[3];
+            }
         }
         SDL_GPUBufferBinding vertexBinding { resources.vertexBuffer, 0 };
         SDL_BindGPUVertexBuffers(pass, 0, &vertexBinding, 1);
@@ -1069,13 +1229,14 @@ void MeshRenderer::DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURender
         SDL_GPUBufferBinding indexBinding { resources.indexBuffer, 0 };
         SDL_BindGPUIndexBuffer(pass, &indexBinding, SDL_GPU_INDEXELEMENTSIZE_32BIT);
 
-        SDL_DrawGPUIndexedPrimitives(pass, resources.indexCount, /*num_instances=*/1, /*first_index=*/0,
+        SDL_DrawGPUIndexedPrimitives(pass, resources.usedIndexCount, /*num_instances=*/1, /*first_index=*/0,
                                      /*vertex_offset=*/0, /*first_instance=*/0);
 
         // 统计**实际执行**的绘制（T24）：主通道与阴影通道的索引绘制都计入。
+        // T42 起按 `usedIndexCount`（**实际绘制**的索引 / 顶点）记账，而不是缓冲容量。
         ++m_stats.drawCalls;
-        m_stats.triangleCount += resources.indexCount / 3U;
-        m_stats.vertexCount += resources.vertexCount;
+        m_stats.triangleCount += resources.usedIndexCount / 3U;
+        m_stats.vertexCount += resources.usedIndexCount;
     }
 }
 
@@ -1105,7 +1266,14 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
     SDL_GPUTexture* swapchain = nullptr;
     std::uint32_t   width     = 0;
     std::uint32_t   height    = 0;
-    if (!SDL_WaitAndAcquireGPUSwapchainTexture(commandBuffer, m_window, &swapchain, &width, &height)) {
+
+    // T38：把"**等待**交换链纹理"的耗时单独计量（见 `RenderStats::swapchainWaitMs`）——
+    // 这段等待发生在 RenderFrame 内部，若并入渲染提交耗时，会把"在空等 GPU"误判成"CPU 忙"。
+    vx::Clock  swapchainClock;
+    const bool swapchainAcquired =
+        SDL_WaitAndAcquireGPUSwapchainTexture(commandBuffer, m_window, &swapchain, &width, &height);
+    m_stats.swapchainWaitMs = swapchainClock.Tick() * 1000.0;
+    if (!swapchainAcquired) {
         SDL_CancelGPUCommandBuffer(commandBuffer);
         throw std::runtime_error(std::string("获取交换链纹理失败：") + SDL_GetError());
     }
@@ -1140,9 +1308,15 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
     m_stats.vertexCount   = 0;
 
     // ---- 阴影通道（T21b / ADR 0010 P1）：必须在**主通道之前**，逐级把同一批网格写进深度数组的一层 ----
-    // 顶点是相机相对坐标，光空间矩阵也建立在同一坐标系（见 shadow_cascade.hpp），故这里直接复用
-    // 主通道的顶点 / 索引缓冲，不需要任何重传或坐标补偿。
+    // 顶点是**网格局部**坐标（T41），`DrawMeshes` 会为两个通道各推一次"网格世界原点 − 渲染原点"
+    // 把它补成渲染原点相对坐标；光空间矩阵也建立在同一坐标系（见 shadow_cascade.hpp），
+    // 故这里直接复用主通道的顶点 / 索引缓冲，不需要任何重传或坐标补偿。
     if (m_shadowUniformValid && m_shadowUniform.enabled > 0.5F && m_shadowTexture != nullptr) {
+        // 阴影通道不推自发光（`pushEmissive = false`），此状态仅用于满足签名；主通道另有独立状态。
+        // 逐网格模型变换（T41 / T33）两通道都要推，且**各持一份去重状态**（见 `DrawMeshes`）；
+        // 该状态可跨级联复用：它记录的是"命令缓冲里当前生效的值"，故下一级的第一批网格若不同会照常推送。
+        EmissivePushState      shadowEmissiveState;
+        MeshTransformPushState shadowTransformState;
         for (std::uint32_t cascade = 0; cascade < m_shadowCascadeCount; ++cascade) {
             SDL_GPUDepthStencilTargetInfo shadowTarget {};
             shadowTarget.texture          = m_shadowTexture;
@@ -1165,7 +1339,8 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
             SDL_GPUBuffer* matrixBuffers[1] = { m_shadowMatrixBuffers[cascade] };
             SDL_BindGPUVertexStorageBuffers(shadowPass, 0, matrixBuffers, 1);
 
-            DrawMeshes(commandBuffer, shadowPass, meshes, meshCount, /*pushEmissive=*/false);
+            DrawMeshes(commandBuffer, shadowPass, meshes, meshCount, /*pushEmissive=*/false, shadowEmissiveState,
+                       shadowTransformState);
             SDL_EndGPURenderPass(shadowPass);
         }
     }
@@ -1250,7 +1425,11 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
                                        static_cast<Uint32>(sizeof(ShadowUniform)));
     }
 
-    DrawMeshes(commandBuffer, pass, meshes, meshCount, /*pushEmissive=*/true);
+    // T39：主通道的推送去重状态（每帧新建 ⇒ 通道开始时"从未推送过"，行为与逐网格推送等价）。
+    // T41 / T33：逐网格模型变换同样逐网格推送，主通道另有自己的一份去重状态。
+    EmissivePushState      emissiveState;
+    MeshTransformPushState transformState;
+    DrawMeshes(commandBuffer, pass, meshes, meshCount, /*pushEmissive=*/true, emissiveState, transformState);
 
     SDL_EndGPURenderPass(pass);
 

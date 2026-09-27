@@ -83,10 +83,22 @@ enum class UiLabel : int {
     CpuLogicStep,                 ///< 行标签：逻辑步（物理 + 相机）
     CpuUiBuild,                   ///< 行标签：UI 构建
     CpuRenderSubmit,              ///< 行标签：渲染提交
+    SwapchainWait,                ///< 行标签：等待交换链（T38；混在渲染提交里会掩盖"在空等 GPU"）
     MillisecondsFormat,           ///< 毫秒数值格式（`%.2f ms`）
     SectionGpuPassTime,           ///< 分区：各 pass GPU 时间
     GpuPassTime,                  ///< 行标签：各 pass GPU 时间
     GpuTimeUnavailable,           ///< 取值：GPU 时间不可用（SDL3_gpu 无时间戳查询）
+
+    // ---- 加载画面（启动加载；见 SKILL「不冻结画面」）----
+    LoadingTitle,             ///< 标题：正在生成世界
+    LoadingHint,              ///< 提示：画面不会卡住，可继续操作窗口
+    LoadingProgressFormat,    ///< 进度百分比格式（`%.0f%%`）
+    LoadingStageTextures,     ///< 阶段：材质贴图
+    LoadingStageTerrainTiles, ///< 阶段：地形 tile
+    LoadingStageDigVolumes,   ///< 阶段：可挖体积
+    LoadingStageCollision,    ///< 阶段：碰撞体
+    LoadingStageMeshUpload,   ///< 阶段：网格上传
+    LoadingStageFinalize,     ///< 阶段：收尾
 
     kCount  ///< 标签总数（必须保持在最后）
 };
@@ -116,7 +128,7 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsEnglish = {
     "V0.1 Debug Panel",
     "Timing",
     "Frame time",
-    "%.2f ms (P50 %.2f / P95 %.2f ms)",
+    "%.2f ms (P50 %.2f / P95 %.2f / P99 %.2f ms)",
     "FPS",
     "%.1f",
     "Fixed steps",
@@ -161,10 +173,20 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsEnglish = {
     "Logic (physics + camera)",
     "UI build",
     "Render submit",
+    "Wait for swapchain",
     "%.2f ms",
     "GPU passes",
     "Pass GPU time",
     "unavailable (SDL3_gpu has no timestamp queries)",
+    "Generating world",
+    "The view keeps updating while the world is generated; the window stays responsive",
+    "%.0f%%",
+    "Material textures",
+    "Terrain tiles",
+    "Diggable volumes",
+    "Collision bodies",
+    "Mesh upload",
+    "Finalizing",
 };
 
 /// 中文标签表：仅当**成功加载 CJK 字体**时启用（此时不可能缺字）。
@@ -189,7 +211,7 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsChinese = {
     "V0.1 调试面板",
     "时间步",
     "帧时间",
-    "%.2f ms（P50 %.2f / P95 %.2f ms）",
+    "%.2f ms（P50 %.2f / P95 %.2f / P99 %.2f ms）",
     "FPS",
     "%.1f",
     "本帧固定步",
@@ -234,10 +256,20 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsChinese = {
     "逻辑步（物理 + 相机）",
     "UI 构建",
     "渲染提交",
+    "等交换链（GPU / 呈现）",
     "%.2f ms",
     "各 pass GPU 时间",
     "各 pass GPU 时间",
     "不可用（SDL3_gpu 无时间戳查询）",
+    "正在生成世界",
+    "生成期间画面持续刷新、窗口保持响应；世界就绪后自动进入",
+    "%.0f%%",
+    "材质贴图",
+    "地形 tile",
+    "可挖体积",
+    "碰撞体",
+    "网格上传",
+    "收尾",
 };
 
 /// 纯函数：判断字符串是否**只含 ASCII 字节**（`cjkFontAvailable = false` 时的硬约束）。

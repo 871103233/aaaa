@@ -2,7 +2,9 @@
 
 #include "terrain/material_table.hpp"
 
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace vx {
@@ -51,7 +53,49 @@ struct MaterialTextureSet {
 /// 前置条件：`size ≥ 4`（法线用中心差分，需要邻域）。
 /// 返回的各数组尺寸：albedo / normal / roughness / ao 为 `layerCount * size * size * 4`；
 /// macro 为 `kMaterialMacroLayerCount * size * size * 4`。
+///
+/// 本函数等价于"建一个 `MaterialTextureBuilder` 再一次跑完"，两者**逐字节相同**（红线 7）。
+/// 启动路径请改用构建器分步推进 —— 本函数一次跑完约需 1.9 s（256²），会让画面停下等待
+/// （见 SKILL「不冻结画面」）。
 [[nodiscard]] MaterialTextureSet GenerateMaterialTextures(std::uint64_t worldSeed,
                                                           std::uint32_t   size = kMaterialTextureSize);
+
+/// **可分步（可切帧）**的材质贴图生成器：与 `GenerateMaterialTextures` 是同一份实现，
+/// 只是把"什么时候算完"交给调用方 —— 每次 `Step` 只算几个像素行（数毫秒），
+/// 调用方在两次调用之间出一帧加载画面即可让窗口与进度持续刷新。
+///
+/// 用途（SKILL「不冻结画面」）：启动加载时把 1.9 s 的贴图生成摊到数百帧上，玩家看到的是
+/// "进度在走"，而不是"画面停住"。**分步只改变"何时可见"，不改变任何字节**（红线 7）。
+///
+/// 线程约定：只在逻辑线程（主线程）使用；生命周期内不触碰 GPU（上传由调用方做）。
+class MaterialTextureBuilder final {
+public:
+    /// 前置条件：`size ≥ 4`（法线用中心差分，需要邻域）。
+    explicit MaterialTextureBuilder(std::uint64_t worldSeed, std::uint32_t size = kMaterialTextureSize);
+    ~MaterialTextureBuilder();
+
+    MaterialTextureBuilder(const MaterialTextureBuilder&) = delete;
+    MaterialTextureBuilder& operator=(const MaterialTextureBuilder&) = delete;
+    MaterialTextureBuilder(MaterialTextureBuilder&&) = delete;
+    MaterialTextureBuilder& operator=(MaterialTextureBuilder&&) = delete;
+
+    /// 处理至多 `maxRows` 个像素行（"逐层像素 → 逐层法线 → 宏观变化"连续计数），返回是否全部完成。
+    /// `maxRows == 0` 时不做任何工作，只返回当前是否完成。
+    bool Step(std::size_t maxRows);
+
+    [[nodiscard]] bool Done() const noexcept;
+
+    /// 总进度（已完成行数 / 总行数），恒 ∈ `[0, 1]`。
+    [[nodiscard]] float Progress() const noexcept;
+
+    /// 取走结果（**只能调用一次**；之后本对象的进度语义不再有意义）。前置条件：`Done()`。
+    [[nodiscard]] MaterialTextureSet Take();
+
+private:
+    /// 实现细节（噪声实例 / 分步状态）留在 .cpp：`FastNoiseLite` 依赖是 `voxel_world` 的
+    /// **PRIVATE** 依赖（见 `world/CMakeLists.txt`），不得经公共头泄漏给 game / tests。
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+};
 
 }  // namespace vx

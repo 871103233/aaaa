@@ -100,6 +100,39 @@ private:
     return glm::vec3(vertex.normal[0], vertex.normal[1], vertex.normal[2]);
 }
 
+/// 采样索引平移包装（T42 的"子区域"用例）：区域本地索引 `(i, j, k)` ↔ 内层采样器的 `(i + o, …)`。
+class OffsetSampler final : public IVolumeSampler {
+public:
+    OffsetSampler(const IVolumeSampler& inner, int offsetX, int offsetY, int offsetZ) noexcept
+        : m_inner(inner), m_offsetX(offsetX), m_offsetY(offsetY), m_offsetZ(offsetZ) {}
+
+    [[nodiscard]] float Sample(int i, int j, int k) const override {
+        return m_inner.Sample(i + m_offsetX, j + m_offsetY, k + m_offsetZ);
+    }
+
+    [[nodiscard]] std::uint8_t SampleMaterial(int i, int j, int k) const override {
+        return m_inner.SampleMaterial(i + m_offsetX, j + m_offsetY, k + m_offsetZ);
+    }
+
+private:
+    const IVolumeSampler& m_inner;
+    int                   m_offsetX;
+    int                   m_offsetY;
+    int                   m_offsetZ;
+};
+
+/// 三个三角形顶点的面积之和（用于"子区域与整块面积一致"的判据）。
+[[nodiscard]] double SurfaceArea(const MeshData& mesh) {
+    double area = 0.0;
+    for (std::size_t triangle = 0; triangle + 2 < mesh.indices.size(); triangle += 3) {
+        const glm::vec3 a = Position(mesh, mesh.indices[triangle]);
+        const glm::vec3 b = Position(mesh, mesh.indices[triangle + 1]);
+        const glm::vec3 c = Position(mesh, mesh.indices[triangle + 2]);
+        area += 0.5 * static_cast<double>(glm::length(glm::cross(b - a, c - a)));
+    }
+    return area;
+}
+
 constexpr float       kSphereRadius = 12.0F;
 const     glm::vec3   kSphereCenter(16.0F, 16.0F, 16.0F);
 
@@ -252,4 +285,87 @@ TEST(VolumeMesher, SphereSurfaceAreaMatchesAnalyticValue) {
                                      << expected << "）";
     EXPECT_LT(area, expected * 1.15) << "三角形总面积偏大 ⇒ 可能有四边形重复发射（实测 " << area << "，期望约 "
                                      << expected << "）";
+}
+
+// T42：`BuildRegionMesh` 是 `BuildVolumeMesh` 的**任意尺寸泛化** —— 32³ 尺寸下两者必须**逐位相同**
+// （同一份采样、同一套数学、同一个发射顺序）。这条用例钉死"泛化没有引入任何数值差异"。
+TEST(VolumeMesher, RegionEntryIsBitIdenticalToBlockEntryAtBlockSize) {
+    const SphereSampler sampler(kSphereRadius);
+    const MeshData      whole   = vx::BuildVolumeMesh(sampler);
+    const MeshData      region  = vx::BuildRegionMesh(sampler, kVolumeBlockSize, kVolumeBlockSize, kVolumeBlockSize);
+
+    ASSERT_FALSE(whole.vertices.empty());
+    ASSERT_EQ(region.vertices.size(), whole.vertices.size());
+    ASSERT_EQ(region.indices, whole.indices);
+    for (std::size_t index = 0; index < whole.vertices.size(); ++index) {
+        const vx::MeshVertex& left  = whole.vertices[index];
+        const vx::MeshVertex& right = region.vertices[index];
+        for (int axis = 0; axis < 3; ++axis) {
+            EXPECT_FLOAT_EQ(right.position[axis], left.position[axis]);
+            EXPECT_FLOAT_EQ(right.normal[axis], left.normal[axis]);
+        }
+        EXPECT_FLOAT_EQ(right.material, left.material);
+    }
+}
+
+// T42（A′ 的核心判据）：把同一个形状放进**任意尺寸的子区域**里网格化，得到的等值面必须与"整块网格化"
+// 在**世界空间一致**（位置 / 法线在 4 ULP 量级、材质逐位相同），面积也一致
+// —— 这正是"倒塌整体 = 它原本那一片表面"的保证。
+//
+// 为什么位置只要求 4 ULP 而不是逐位相同：子区域的顶点位置是在**平移过的局部坐标系**里算出来的
+// （`float(i − 2) + frac`），再加回 2 复原世界坐标时会**重新舍入**（加法的指数与被加数不同）——
+// 这是浮点结合次序的正常差异，不是缺陷；数量级远小于"采样错位 / 偏移错一"（那会是 ~1 格）。
+TEST(VolumeMesher, SubRegionEqualsWholeBlockInWorldSpace) {
+    const SphereSampler sampler(kSphereRadius);
+    const MeshData      whole = vx::BuildVolumeMesh(sampler);
+
+    // 子区域：块内偏移 (2, 2, 2)、边长 28 —— 球（半径 12、球心 16）完整落在其中。
+    constexpr int       kOffset    = 2;
+    constexpr int       kSize      = 28;
+    constexpr float     kTolerance = 1.0e-4F;
+    const OffsetSampler offset(sampler, kOffset, kOffset, kOffset);
+    const MeshData      sub = vx::BuildRegionMesh(offset, kSize, kSize, kSize);
+
+    ASSERT_FALSE(sub.vertices.empty());
+    // 面积（位置一致 ⇒ 面积必然一致）：容差只为浮点求和次序留余量。
+    const double wholeArea = SurfaceArea(whole);
+    const double subArea   = SurfaceArea(sub);
+    EXPECT_NEAR(subArea, wholeArea, wholeArea * 1.0e-6) << "子区域与整块的面积不一致 ⇒ 有四边形漏发或位置不同";
+
+    // 逐个顶点：把子区域顶点平移到块坐标后，必须在整块网格的顶点集合里找到**一致**的三元组。
+    std::size_t matched = 0;
+    for (const vx::MeshVertex& candidate : sub.vertices) {
+        bool found = false;
+        for (const vx::MeshVertex& reference : whole.vertices) {
+            bool samePosition = true;
+            bool sameNormal   = true;
+            for (int axis = 0; axis < 3; ++axis) {
+                samePosition = samePosition &&
+                               std::abs((candidate.position[axis] + static_cast<float>(kOffset)) -
+                                        reference.position[axis]) <= kTolerance;
+                sameNormal = sameNormal &&
+                             std::abs(candidate.normal[axis] - reference.normal[axis]) <= kTolerance;
+            }
+            if (samePosition && sameNormal && candidate.material == reference.material) {
+                found = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(found) << "子区域顶点在整块网格里找不到对应顶点：(" << candidate.position[0] << ", "
+                           << candidate.position[1] << ", " << candidate.position[2] << ")";
+        matched += found ? 1U : 0U;
+    }
+    EXPECT_EQ(matched, sub.vertices.size());
+}
+
+// T42：区域入口同样遵守 ADR 0014 的材质口径 —— 未实现 `SampleMaterial` 的采样器回落
+// `kNoMaterialOverride`（否则倒塌整体的顶点会带一个越界槽位、片元选层出错）。
+TEST(VolumeMesher, RegionEntryFallsBackToNoMaterialOverride) {
+    const PlaneSampler plane(4.0F);  // 8³ 区域内的水平面（下实上空）
+    const MeshData     region = vx::BuildRegionMesh(plane, 8, 8, 8);
+
+    ASSERT_FALSE(region.vertices.empty());
+    for (const vx::MeshVertex& vertex : region.vertices) {
+        EXPECT_FLOAT_EQ(vertex.material, vx::kNoMaterialOverride);
+    }
 }

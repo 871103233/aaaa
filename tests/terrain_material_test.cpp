@@ -236,6 +236,12 @@ TEST(TerrainMaterial, LoadsCommittedConfig) {
         EXPECT_FLOAT_EQ(table.Layer(slot).ao, fallback.Layer(slot).ao) << "slot=" << slot;
         EXPECT_FLOAT_EQ(table.Layer(slot).macroUvScale, fallback.Layer(slot).macroUvScale) << "slot=" << slot;
         EXPECT_FLOAT_EQ(table.Layer(slot).macroStrength, fallback.Layer(slot).macroStrength) << "slot=" << slot;
+        // T43 / T46 新增字段（物理参数 + 落地后的表示）：仓库 TOML 与内置默认表必须同源。
+        EXPECT_FLOAT_EQ(table.Layer(slot).density, fallback.Layer(slot).density) << "slot=" << slot;
+        EXPECT_FLOAT_EQ(table.Layer(slot).friction, fallback.Layer(slot).friction) << "slot=" << slot;
+        EXPECT_FLOAT_EQ(table.Layer(slot).restitution, fallback.Layer(slot).restitution) << "slot=" << slot;
+        EXPECT_EQ(table.Layer(slot).indestructible, fallback.Layer(slot).indestructible) << "slot=" << slot;
+        EXPECT_EQ(table.Layer(slot).rigidDebris, fallback.Layer(slot).rigidDebris) << "slot=" << slot;
     }
 }
 

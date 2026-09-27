@@ -19,6 +19,7 @@
 #include <Jolt/Physics/Collision/ObjectLayer.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
+#include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
 #include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
@@ -35,7 +36,7 @@ namespace vx {
 namespace {
 
 // ---------------------------------------------------------------
-// 物理规模参数（V0.1 小场景：若干静态地表 tile + 1 个胶囊角色，无动态刚体）
+// 物理规模参数（V0.1 小场景：若干静态地表 tile + 1 个胶囊角色 + T33 的少量动态倒塌体）
 // ---------------------------------------------------------------
 
 constexpr JPH::uint kMaxBodies            = 4096;
@@ -210,6 +211,34 @@ void release_jolt() {
     return result.Get();
 }
 
+/// 从点云构造一个 `ConvexHullShape`；失败返回空 `RefConst`。
+///
+/// 用于 T33 的"倒塌整体"（[ADR 0015](../../docs/adr/0015-structure-units-and-rigid-collapse.md)）：
+/// 顶点是**局部坐标**（分量质心为原点），世界定位由刚体的位置承担。
+/// Jolt 会求这些点的凸包 ⇒ **凹形被填平**（已知限制，ADR 0015 后果 1）。
+[[nodiscard]] JPH::ShapeRefC build_convex_hull_shape(const PhysicsWorld::ConvexHullDesc& desc) {
+    if (desc.positions == nullptr || desc.pointCount < 4) {
+        VX_LOG_ERROR("凸包参数非法：点数 %zu（须 ≥ 4），positions=%s", desc.pointCount,
+                     (desc.positions != nullptr) ? "非空" : "空");
+        return {};
+    }
+
+    JPH::Array<JPH::Vec3> points;
+    points.reserve(desc.pointCount);
+    for (std::size_t i = 0; i < desc.pointCount; ++i) {
+        points.push_back(JPH::Vec3(desc.positions[i * 3 + 0], desc.positions[i * 3 + 1],
+                                   desc.positions[i * 3 + 2]));
+    }
+
+    JPH::ConvexHullShapeSettings settings(points);
+    JPH::ShapeSettings::ShapeResult result = settings.Create();
+    if (result.HasError()) {
+        VX_LOG_ERROR("构造 ConvexHullShape 失败：%s", result.GetError().c_str());
+        return {};
+    }
+    return result.Get();
+}
+
 }  // namespace
 
 struct PhysicsWorld::Impl {
@@ -229,11 +258,18 @@ struct PhysicsWorld::Impl {
     std::unique_ptr<JPH::PhysicsSystem>       system;
 
     std::vector<JPH::BodyID>    bodies;  ///< 槽位 → BodyID；已释放槽位保存无效 ID
+    /// 与 `bodies` 同槽位：该刚体**形状局部原点相对质心**的偏移。
+    ///
+    /// Jolt 的刚体位置存的是**质心**（`Body::mPosition`），而本类的对外约定是**局部原点**
+    /// （见 `ConvexHullDesc` / `RigidBodyState`）⇒ 创建时把偏移补进位置，读回时再减掉。
+    /// 静态体恒为零。
+    std::vector<JPH::Vec3>      bodyComLocals;
     std::vector<std::uint32_t>  freeBodySlots;
     std::vector<CharacterEntry> characters;
 
-    /// 把一个成功创建的静态刚体登记进槽位表，返回句柄（`slot + 1`）。
-    [[nodiscard]] PhysicsWorld::BodyHandle RegisterBody(const JPH::BodyID& bodyID) {
+    /// 把一个成功创建的刚体登记进槽位表，返回句柄（`slot + 1`）。
+    [[nodiscard]] PhysicsWorld::BodyHandle RegisterBody(const JPH::BodyID& bodyID,
+                                                       const JPH::Vec3& comLocal = JPH::Vec3::sZero()) {
         std::uint32_t slot = 0;
         if (!freeBodySlots.empty()) {
             slot = freeBodySlots.back();
@@ -242,7 +278,9 @@ struct PhysicsWorld::Impl {
         } else {
             slot = static_cast<std::uint32_t>(bodies.size());
             bodies.push_back(bodyID);
+            bodyComLocals.push_back(comLocal);
         }
+        bodyComLocals[slot] = comLocal;
         return slot + 1;
     }
 };
@@ -274,6 +312,10 @@ void PhysicsWorld::Update(float dt) {
     if (error != JPH::EPhysicsUpdateError::None) {
         VX_LOG_WARN("Jolt PhysicsSystem::Update 返回错误码 %d", static_cast<int>(error));
     }
+}
+
+void PhysicsWorld::SetGravity(const glm::vec3& gravity) noexcept {
+    m_impl->system->SetGravity(JPH::Vec3(gravity.x, gravity.y, gravity.z));
 }
 
 PhysicsWorld::BodyHandle PhysicsWorld::AddHeightField(const HeightFieldDesc& desc) {
@@ -376,6 +418,84 @@ bool PhysicsWorld::UpdateMesh(BodyHandle handle, const MeshDesc& desc) {
     return true;
 }
 
+PhysicsWorld::BodyHandle PhysicsWorld::AddDynamicConvexHull(const ConvexHullDesc& desc) {
+    if (!(desc.mass > 0.0F)) {
+        VX_LOG_ERROR("动态凸包参数非法：质量必须为正（%g）", static_cast<double>(desc.mass));
+        return 0;
+    }
+    const JPH::ShapeRefC shape = build_convex_hull_shape(desc);
+    if (shape == nullptr) {
+        return 0;
+    }
+
+    // Jolt 的刚体位置 = **质心**；本类对外以**局部原点**为准（`ConvexHullDesc::origin*`）⇒
+    // 这里把质心偏移补上。创建时旋转为单位四元数，故质心偏移无需旋转。
+    const JPH::Vec3 comLocal = shape->GetCenterOfMass();
+
+    JPH::BodyCreationSettings bodySettings(
+        shape,
+        JPH::RVec3(static_cast<JPH::Real>(desc.originX) + comLocal.GetX(),
+                   static_cast<JPH::Real>(desc.originY) + comLocal.GetY(),
+                   static_cast<JPH::Real>(desc.originZ) + comLocal.GetZ()),
+        JPH::Quat::sIdentity(), JPH::EMotionType::Dynamic, kObjectLayerStatic);
+    bodySettings.mAllowSleeping              = true;  // 落定后由 Jolt 休眠（省 CPU）
+    bodySettings.mFriction                   = desc.friction;
+    bodySettings.mRestitution                = desc.restitution;  // 来自材质表（T43 / ADR 0016）
+    bodySettings.mOverrideMassProperties     = JPH::EOverrideMassProperties::CalculateInertia;
+    bodySettings.mMassPropertiesOverride.mMass = desc.mass;
+    // 初速：线速度来自"爆心冲量"（被炸飞），角速度来自冲量折算或人工不对称（T43）。
+    bodySettings.mLinearVelocity = JPH::Vec3(desc.linearVelocity.x, desc.linearVelocity.y, desc.linearVelocity.z);
+    bodySettings.mAngularVelocity =
+        JPH::Vec3(desc.angularVelocity.x, desc.angularVelocity.y, desc.angularVelocity.z);
+
+    const JPH::BodyID bodyID =
+        m_impl->system->GetBodyInterface().CreateAndAddBody(bodySettings, JPH::EActivation::Activate);
+    if (bodyID.IsInvalid()) {
+        VX_LOG_ERROR("创建动态凸包刚体失败（点数 %zu）", desc.pointCount);
+        return 0;
+    }
+    return m_impl->RegisterBody(bodyID, comLocal);
+}
+
+PhysicsWorld::RigidBodyState PhysicsWorld::GetRigidBodyState(BodyHandle handle) const noexcept {
+    RigidBodyState state;
+    if (handle == 0 || handle > m_impl->bodies.size()) {
+        return state;
+    }
+    const JPH::BodyID bodyID = m_impl->bodies[handle - 1];
+    if (bodyID.IsInvalid()) {
+        return state;
+    }
+    const JPH::BodyInterface& bodyInterface = m_impl->system->GetBodyInterface();
+
+    JPH::RVec3 centerOfMass;
+    JPH::Quat  rotation;
+    bodyInterface.GetPositionAndRotation(bodyID, centerOfMass, rotation);
+    const JPH::Vec3 linear  = bodyInterface.GetLinearVelocity(bodyID);
+    const JPH::Vec3 angular = bodyInterface.GetAngularVelocity(bodyID);
+
+    // 质心 → 局部原点（与 `Body::GetWorldTransform()` 同式：减去"旋转后的质心局部偏移"）。
+    const JPH::Vec3 localOffset = rotation * m_impl->bodyComLocals[handle - 1];
+    state.position = glm::dvec3(centerOfMass.GetX() - localOffset.GetX(),
+                               centerOfMass.GetY() - localOffset.GetY(),
+                               centerOfMass.GetZ() - localOffset.GetZ());
+    state.rotation = glm::quat(rotation.GetW(), rotation.GetX(), rotation.GetY(), rotation.GetZ());
+    state.linearVelocity  = glm::vec3(linear.GetX(), linear.GetY(), linear.GetZ());
+    state.angularVelocity = glm::vec3(angular.GetX(), angular.GetY(), angular.GetZ());
+    return state;
+}
+
+void PhysicsWorld::ActivateBody(BodyHandle handle) noexcept {
+    if (handle == 0 || handle > m_impl->bodies.size()) {
+        return;
+    }
+    const JPH::BodyID bodyID = m_impl->bodies[handle - 1];
+    if (bodyID.IsInvalid()) {
+        return;
+    }
+    m_impl->system->GetBodyInterface().ActivateBody(bodyID);
+}
+
 void PhysicsWorld::RemoveBody(BodyHandle handle) noexcept {
     if (handle == 0 || handle > m_impl->bodies.size()) {
         return;
@@ -389,6 +509,7 @@ void PhysicsWorld::RemoveBody(BodyHandle handle) noexcept {
     bodyInterface.RemoveBody(bodyID);
     bodyInterface.DestroyBody(bodyID);
     m_impl->bodies[slot] = JPH::BodyID();
+    m_impl->bodyComLocals[slot] = JPH::Vec3::sZero();  // 槽位复用前清掉质心偏移（静态体为零）
     m_impl->freeBodySlots.push_back(slot);
 }
 

@@ -2,6 +2,7 @@
 
 #include "render/mesh_renderer.hpp"
 #include "system_panel.hpp"
+#include "ui_text.hpp"
 
 #include <SDL3/SDL.h>
 
@@ -45,6 +46,7 @@ struct DebugStats {
     double        cpuLogicMs    = 0.0;  ///< 最近一帧逻辑步耗时（固定步循环：物理 + 相机，毫秒）
     double        cpuUiMs       = 0.0;  ///< 最近一帧 UI 构建耗时（毫秒）
     double        cpuRenderMs   = 0.0;  ///< 最近一帧渲染提交耗时（`RenderFrame` 及其内部上传，毫秒）
+    double        swapchainWaitMs = 0.0;  ///< 最近一帧**等待交换链纹理**的毫秒数（T38；取自 `RenderStats`）
 };
 
 /// 极简 ImGui 调试面板（T9）。基于 imgui 的 **SDL3 平台后端 + SDL3_gpu 渲染后端**。
@@ -98,6 +100,18 @@ public:
     /// 因此不影响面板交互）。
     void SetGameplayMouseCaptured(bool captured) noexcept { m_gameplayMouseCaptured = captured; }
 
+    /// 设置**加载画面**的状态：阶段标签 + 总进度（`progress ∈ [0,1]`）。
+    ///
+    /// 置位后 `BeginFrame` 照常起帧，`BuildLoadingUI` 会绘制一个居中窗口显示当前阶段与进度条。
+    /// 这是 SKILL「不冻结画面」要求的**可见进度反馈**——没有进度反馈的等待会被玩家判定为"卡死"。
+    /// 无堆分配（阶段是枚举、进度是浮点），可逐帧调用。
+    void SetLoadingStatus(UiLabel stage, float progress) noexcept;
+    void ClearLoadingStatus() noexcept { m_loadingActive = false; }
+    [[nodiscard]] bool LoadingActive() const noexcept { return m_loadingActive; }
+
+    /// 构建加载画面。前置条件：已调用 `BeginFrame`；未置位加载状态时为无操作。
+    void BuildLoadingUI();
+
     /// 开始一帧 ImGui。当调试面板与系统面板都不可见时为无操作
     /// （因此 `BuildUI` / `EndFrame` / `DrawOverlay` 也一并空转，开销近似为零）。
     void BeginFrame();
@@ -136,6 +150,11 @@ private:
     bool m_wantCaptureKeyboard = false;
     /// 玩法是否处于相对鼠标（捕获）状态；为 true 时对本帧 ImGui 置 `NoMouse`。
     bool m_gameplayMouseCaptured = false;
+
+    /// 加载画面的状态（见 `SetLoadingStatus`）：是否置位、当前阶段、总进度。
+    bool    m_loadingActive   = false;
+    UiLabel m_loadingStage    = UiLabel::LoadingTitle;
+    float   m_loadingProgress = 0.0F;
 
     std::array<float, kHistorySize> m_history {};
     std::size_t                     m_historyCount = 0;

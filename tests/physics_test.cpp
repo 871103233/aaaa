@@ -11,9 +11,12 @@
 
 #include <gtest/gtest.h>
 
+#include <glm/gtc/quaternion.hpp>
+#include <glm/trigonometric.hpp>
 #include <glm/vec3.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -71,6 +74,28 @@ constexpr float kNoFallTolerance     = 0.2F;  ///< 允许的最小穿透量（�
         lowest = std::min(lowest, static_cast<float>(physics.GetCharacterState(character).position.y));
     }
     return lowest;
+}
+
+/// 轴对齐盒体（半长 `hx/hy/hz`）的 8 个角点，**局部原点在盒心**。
+/// 凸包形状由点集求出，故这 8 点即可代表一个盒体。
+[[nodiscard]] std::vector<float> MakeBoxHullPoints(float hx, float hy, float hz) {
+    std::vector<float> points;
+    for (const float sx : { -1.0F, 1.0F }) {
+        for (const float sy : { -1.0F, 1.0F }) {
+            for (const float sz : { -1.0F, 1.0F }) {
+                points.push_back(sx * hx);
+                points.push_back(sy * hy);
+                points.push_back(sz * hz);
+            }
+        }
+    }
+    return points;
+}
+
+/// 位姿的**倾角**（度）：局部 +Y 轴与世界上方的夹角（`0` = 完全直立）。
+[[nodiscard]] float TiltDegrees(const glm::quat& rotation) {
+    const glm::vec3 up = rotation * glm::vec3(0.0F, 1.0F, 0.0F);
+    return glm::degrees(std::acos(std::clamp(up.y, -1.0F, 1.0F)));
 }
 
 }  // namespace
@@ -315,4 +340,157 @@ TEST(PhysicsBody, CharacterRestsOnMeshBodySurface) {
     EXPECT_TRUE(state.onGround) << "三角网面必须能支撑角色";
     EXPECT_NEAR(state.position.y, 100.0, kRestTolerance);
     EXPECT_GE(lowest, 100.0 - kNoFallTolerance) << "不得穿过三角网面";
+}
+
+// ---- T33：动态**凸包**刚体（"倒塌整体"）----
+//
+// 这是"挖断支撑后整体倾倒 / 翻滚"的物理基础（ADR 0015：**统一连通分量刚体化**）：
+//   - `AddDynamicConvexHull` 用点云求凸包并交给 Jolt 动态求解；
+//   - 位姿按**局部原点**读写（Jolt 内部以质心为位置，本类把它折算回局部原点）。
+// 下面三项分别覆盖：受重力下落并停在地面上；有初始角速度时**会转动**（"逐列下落"做不到的效果）；
+// 以及非法参数的拒绝。
+
+// 立方体凸包从空中落下：必须停在平坦高度场上，且不漂移、不倾斜。
+TEST(PhysicsBody, DynamicConvexHullFallsAndRestsOnFlatGround) {
+    PhysicsWorld physics;
+    physics.SetGravity(glm::vec3(0.0F, -kGravity, 0.0F));
+
+    const std::vector<float> samples = MakeFlatSamples(5.0F);
+    ASSERT_NE(physics.AddHeightField(MakeDesc(samples)), 0u);
+
+    const std::vector<float> points = MakeBoxHullPoints(1.0F, 1.0F, 1.0F);
+
+    PhysicsWorld::ConvexHullDesc desc;
+    desc.positions  = points.data();
+    desc.pointCount = points.size() / 3;
+    desc.originX    = 32.0;
+    desc.originY    = 20.0;  // 局部原点 = 盒心，从空中 20 格处落下
+    desc.originZ    = 32.0;
+    desc.mass       = 100.0F;
+
+    const PhysicsWorld::BodyHandle body = physics.AddDynamicConvexHull(desc);
+    ASSERT_NE(body, 0u);
+
+    float lowest = 20.0F;
+    for (int i = 0; i < 300; ++i) {  // 5 秒：足够落下并落定
+        physics.Update(kFixedDt);
+        lowest = std::min(lowest, static_cast<float>(physics.GetRigidBodyState(body).position.y));
+    }
+
+    const PhysicsWorld::RigidBodyState state = physics.GetRigidBodyState(body);
+    EXPECT_NEAR(state.position.y, 6.0, 0.15);   // 半长 1 ⇒ 盒心停在地表 5 + 1
+    EXPECT_NEAR(state.position.x, 32.0, 0.05);  // 无水平外力 ⇒ 不漂移
+    EXPECT_NEAR(state.position.z, 32.0, 0.05);
+    EXPECT_GE(lowest, 5.0 - kNoFallTolerance) << "不得穿过地面";
+    EXPECT_LT(TiltDegrees(state.rotation), 5.0F) << "平放在平地上不应倾斜";
+}
+
+// 细长柱在空中自由下落 + 初始角速度：**必须转动**（这是刚体化相对于逐列下落的核心差异），
+// 且下落加速度必须是 `SetGravity` 设的值（而不是 Jolt 默认的 9.81）。
+TEST(PhysicsBody, DynamicConvexHullRotatesFromInitialAngularVelocity) {
+    PhysicsWorld physics;
+    physics.SetGravity(glm::vec3(0.0F, -kGravity, 0.0F));
+
+    const std::vector<float> points = MakeBoxHullPoints(0.5F, 4.0F, 0.5F);  // 高 8 格、截面 1×1 的柱
+
+    PhysicsWorld::ConvexHullDesc desc;
+    desc.positions       = points.data();
+    desc.pointCount      = points.size() / 3;
+    desc.originX         = 0.0;
+    desc.originY         = 100.0;  // 远离地面 ⇒ 1 秒内不会碰到任何东西
+    desc.originZ         = 0.0;
+    desc.mass            = 60.0F;
+    desc.angularVelocity = glm::vec3(0.0F, 0.0F, 1.0F);  // 绕 Z 轴 1 rad/s
+
+    const PhysicsWorld::BodyHandle body = physics.AddDynamicConvexHull(desc);
+    ASSERT_NE(body, 0u);
+
+    const int steps = 60;  // 1 秒
+    for (int i = 0; i < steps; ++i) {
+        physics.Update(kFixedDt);
+    }
+
+    const PhysicsWorld::RigidBodyState state = physics.GetRigidBodyState(body);
+    // 绕 Z 匀速转 1 秒 ⇒ 倾角 ≈ 57°，远超 30° 判据（T33 判据 ①）。
+    EXPECT_GT(TiltDegrees(state.rotation), 30.0F) << "给定初始角速度后必须转动（整体刚体化）";
+    // Jolt 的默认阻尼（线 / 角各 0.05）保留不关 ⇒ 1 秒后角速度略降（≈ 0.95 rad/s），仍远大于 0。
+    EXPECT_NEAR(state.angularVelocity.z, 1.0F, 0.1F);
+    // 半隐式欧拉：n 步后下落 ≈ g·dt²·n(n+1)/2 ≈ 12 格（含阻尼）；Jolt 默认重力 9.81 只会落 ≈ 5 格。
+    EXPECT_NEAR(state.position.y, 100.0 - 12.2, 0.6) << "重力必须是 SetGravity 设置的值，而不是 Jolt 默认的 9.81";
+    EXPECT_NEAR(state.linearVelocity.y, -kGravity, 1.0F);  // 同上：含阻尼（实测 ≈ -23.4）
+}
+
+// 非法凸包参数（点数不足 / 质量非正 / 空指针）必须拒绝并返回无效句柄，不得静默创建退化刚体。
+TEST(PhysicsBody, DynamicConvexHullValidatesInput) {
+    PhysicsWorld physics;
+
+    const std::vector<float> points = MakeBoxHullPoints(1.0F, 1.0F, 1.0F);
+
+    PhysicsWorld::ConvexHullDesc desc;
+    desc.positions  = points.data();
+    desc.pointCount = points.size() / 3;
+    desc.mass       = 10.0F;
+
+    PhysicsWorld::ConvexHullDesc tooFew = desc;
+    tooFew.pointCount                   = 3;
+    EXPECT_EQ(physics.AddDynamicConvexHull(tooFew), 0u);
+
+    PhysicsWorld::ConvexHullDesc zeroMass = desc;
+    zeroMass.mass                         = 0.0F;
+    EXPECT_EQ(physics.AddDynamicConvexHull(zeroMass), 0u);
+
+    PhysicsWorld::ConvexHullDesc nullPoints = desc;
+    nullPoints.positions                    = nullptr;
+    EXPECT_EQ(physics.AddDynamicConvexHull(nullPoints), 0u);
+
+    EXPECT_EQ(physics.BodyCount(), 0u);
+
+    const PhysicsWorld::BodyHandle body = physics.AddDynamicConvexHull(desc);
+    ASSERT_NE(body, 0u);
+    EXPECT_EQ(physics.BodyCount(), 1u);
+
+    physics.RemoveBody(body);
+    EXPECT_EQ(physics.BodyCount(), 0u);
+    EXPECT_EQ(physics.GetRigidBodyState(body).position, glm::dvec3(0.0)) << "无效句柄读回零位姿，不得崩溃";
+}
+
+// T46：`ActivateBody` —— "支撑被挖掉后唤醒保留残骸"的入口（ADR 0017 决策二）。两条硬要求：
+//   ① 无效句柄 / 静态体是**无操作**（不崩溃）；② 唤醒一个**已静止**的刚体后，它不会因此弹跳 / 漂移。
+TEST(PhysicsBody, ActivateBodyToleratesInvalidHandlesAndKeepsRestingHullStable) {
+    PhysicsWorld physics;
+    physics.SetGravity(glm::vec3(0.0F, -24.0F, 0.0F));
+
+    physics.ActivateBody(0);     // 无效句柄
+    physics.ActivateBody(9999);  // 越界句柄
+
+    const PhysicsWorld::BodyHandle ground =
+        physics.AddStaticBox(PhysicsWorld::BoxDesc { glm::dvec3(0.0, 0.0, 0.0), glm::dvec3(4.0, 0.5, 4.0) });
+    ASSERT_NE(ground, 0u);
+    physics.ActivateBody(ground);  // 静态体：无操作
+    EXPECT_EQ(physics.BodyCount(), 1u);
+
+    const std::vector<float>     points = MakeBoxHullPoints(1.0F, 1.0F, 1.0F);
+    PhysicsWorld::ConvexHullDesc desc;
+    desc.positions  = points.data();
+    desc.pointCount = points.size() / 3;
+    desc.originX    = 0.0;
+    desc.originY    = 3.0;  // 从地面盒顶（y = 0.5）上方落下
+    desc.originZ    = 0.0;
+    desc.mass       = 10.0F;
+    const PhysicsWorld::BodyHandle body = physics.AddDynamicConvexHull(desc);
+    ASSERT_NE(body, 0u);
+
+    for (int i = 0; i < 300; ++i) {  // 5 秒：落到盒顶并静止（Jolt 会把静止体休眠）
+        physics.Update(kFixedDt);
+    }
+    const PhysicsWorld::RigidBodyState resting = physics.GetRigidBodyState(body);
+    EXPECT_NEAR(resting.position.y, 1.5, 0.15) << "盒心停在地面盒顶 0.5 + 半长 1";
+
+    physics.ActivateBody(body);  // T46：唤醒（游戏层在"块碰撞体重建"时对相交的保留残骸调用）
+    for (int i = 0; i < 30; ++i) {
+        physics.Update(kFixedDt);
+    }
+    const PhysicsWorld::RigidBodyState after = physics.GetRigidBodyState(body);
+    EXPECT_NEAR(after.position.y, resting.position.y, 0.1) << "唤醒静止体不应使它弹跳 / 漂移";
+    EXPECT_LT(std::fabs(after.linearVelocity.y), 1.0F);
 }

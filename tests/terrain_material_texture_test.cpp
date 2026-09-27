@@ -20,6 +20,7 @@ namespace {
 using vx::GenerateMaterialTextures;
 using vx::kMaterialMacroLayerCount;
 using vx::kMaterialSlotCount;
+using vx::MaterialTextureBuilder;
 using vx::MaterialTextureSet;
 
 constexpr std::uint64_t kSeed     = 0x5EED0019ULL;
@@ -248,4 +249,36 @@ TEST(TerrainMaterialTexture, AlbedoMultiScaleAddsHighFrequencyEnergy) {
         EXPECT_GT(highFrequency, lowFrequencyBase * 2.0)
             << "layer=" << layer << " 多尺度叠加后的高频能量必须显著大于纯低频结构（叠加前）";
     }
+}
+
+// T36 / SKILL「不冻结画面」：**分步**生成必须与一次性生成**逐字节相同** —— 分帧只允许改变
+// "何时可见"，不得改变结果（红线 7）。这条是启动加载"每帧只算几个像素行"的正确性凭据。
+TEST(TerrainMaterialTexture, SteppedBuilderMatchesOneShotByteForByte) {
+    const MaterialTextureSet oneShot = GenerateMaterialTextures(kSeed, kTestSize);
+
+    MaterialTextureBuilder builder(kSeed, kTestSize);
+    EXPECT_FALSE(builder.Done()) << "刚构造时不应视为已完成";
+
+    // 每批只走 1 行（最细分帧）：进度必须单调不减，且未完成时严格小于 100%。
+    float previous = builder.Progress();
+    EXPECT_GE(previous, 0.0F);
+    int steps = 0;
+    while (!builder.Step(1)) {
+        const float progress = builder.Progress();
+        EXPECT_GE(progress, previous);
+        EXPECT_LT(progress, 1.0F);
+        previous = progress;
+        ASSERT_LT(++steps, 100000) << "分步生成未在合理步数内结束";
+    }
+    EXPECT_TRUE(builder.Done());
+    EXPECT_FLOAT_EQ(builder.Progress(), 1.0F);
+
+    const MaterialTextureSet stepped = builder.Take();
+    EXPECT_EQ(stepped.size, oneShot.size);
+    EXPECT_EQ(stepped.layerCount, oneShot.layerCount);
+    EXPECT_EQ(stepped.albedoRgba, oneShot.albedoRgba);
+    EXPECT_EQ(stepped.normalRgba, oneShot.normalRgba);
+    EXPECT_EQ(stepped.roughnessRgba, oneShot.roughnessRgba);
+    EXPECT_EQ(stepped.aoRgba, oneShot.aoRgba);
+    EXPECT_EQ(stepped.macroRgba, oneShot.macroRgba);
 }

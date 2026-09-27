@@ -25,58 +25,68 @@ constexpr int kCellEdges[12][2] = {
 constexpr int kAxisU[3] = { 1, 2, 0 };
 constexpr int kAxisV[3] = { 2, 0, 1 };
 
-/// 采样索引范围 `[-1, kVolumeBlockSize]` ⇒ 每轴 `kVolumeBlockSize + 2` 个。
-constexpr int kSampleExtent = kVolumeBlockSize + 2;  // 34
-
-/// cell 索引范围 `[-1, kVolumeBlockSize - 1]` ⇒ 每轴 `kVolumeBlockSize + 1` 个。
-/// 之所以往外多一圈：每条网格棱由"u/v 下侧"的 cell 发射，该 cell 可能落在本块之外（围裙）。
-constexpr int kCellExtent = kVolumeBlockSize + 1;  // 33
-
-/// `(i, j, k)` → 扁平下标；索引可为 `-1`，故统一加 1 平移。
-[[nodiscard]] inline std::size_t FlatIndex(int i, int j, int k, int extent) noexcept {
-    const std::size_t extentSize = static_cast<std::size_t>(extent);
+/// `(i, j, k)` → 扁平下标；索引可为 `-1`，故统一加 1 平移。extent 为**每轴**的步长（T42 起任意尺寸）。
+[[nodiscard]] inline std::size_t FlatIndex(int i, int j, int k, int extentX, int extentY) noexcept {
     return static_cast<std::size_t>(i + 1) +
-           extentSize * (static_cast<std::size_t>(j + 1) + extentSize * static_cast<std::size_t>(k + 1));
+           static_cast<std::size_t>(extentX) *
+               (static_cast<std::size_t>(j + 1) + static_cast<std::size_t>(extentY) * static_cast<std::size_t>(k + 1));
 }
 
 }  // namespace
 
-MeshData BuildVolumeMesh(const IVolumeSampler& sampler) {
-    const std::size_t sampleCount = static_cast<std::size_t>(kSampleExtent) *
-                                    static_cast<std::size_t>(kSampleExtent) * static_cast<std::size_t>(kSampleExtent);
-    const std::size_t cellCount =
-        static_cast<std::size_t>(kCellExtent) * static_cast<std::size_t>(kCellExtent) * static_cast<std::size_t>(kCellExtent);
+MeshData BuildRegionMesh(const IVolumeSampler& sampler, int sizeX, int sizeY, int sizeZ) {
+    MeshData mesh;
+    if (sizeX < 1 || sizeY < 1 || sizeZ < 1) {
+        return mesh;
+    }
 
-    // 采样缓存：多取一圈（索引 -1 与 kVolumeBlockSize），使块边界处的顶点与邻块逐位一致。
+    // 采样索引范围 `[-1, size]` ⇒ 每轴 `size + 2` 个。
+    const int sampleExtentX = sizeX + 2;
+    const int sampleExtentY = sizeY + 2;
+    const int sampleExtentZ = sizeZ + 2;
+
+    // cell 索引范围 `[-1, size - 1]` ⇒ 每轴 `size + 1` 个。
+    // 之所以往外多一圈：每条网格棱由"u/v 下侧"的 cell 发射，该 cell 可能落在本区域之外（围裙）。
+    const int cellExtentX = sizeX + 1;
+    const int cellExtentY = sizeY + 1;
+    const int cellExtentZ = sizeZ + 1;
+
+    const std::size_t sampleCount = static_cast<std::size_t>(sampleExtentX) *
+                                    static_cast<std::size_t>(sampleExtentY) *
+                                    static_cast<std::size_t>(sampleExtentZ);
+    const std::size_t cellCount = static_cast<std::size_t>(cellExtentX) * static_cast<std::size_t>(cellExtentY) *
+                                  static_cast<std::size_t>(cellExtentZ);
+
+    // 采样缓存：多取一圈（索引 -1 与 size），使区域边界处的顶点与邻块逐位一致。
     std::vector<float> samples(sampleCount, 0.0F);
-    for (int k = -1; k <= kVolumeBlockSize; ++k) {
-        for (int j = -1; j <= kVolumeBlockSize; ++j) {
-            for (int i = -1; i <= kVolumeBlockSize; ++i) {
-                samples[FlatIndex(i, j, k, kSampleExtent)] = sampler.Sample(i, j, k);
+    for (int k = -1; k <= sizeZ; ++k) {
+        for (int j = -1; j <= sizeY; ++j) {
+            for (int i = -1; i <= sizeX; ++i) {
+                samples[FlatIndex(i, j, k, sampleExtentX, sampleExtentY)] = sampler.Sample(i, j, k);
             }
         }
     }
 
-    MeshData mesh;
     std::vector<std::int32_t> cellVertex(cellCount, -1);  ///< cell → 顶点下标（`-1` = 无顶点）
     std::vector<std::uint8_t> cellSign(cellCount, 0);     ///< cell → 角符号掩码（位 n 置 1 = 角 n 实心）
 
     // ---- 顶点：每个跨越表面的 cell 至多 1 个，位置 = 各棱交点平均 ----
-    for (int k = -1; k < kVolumeBlockSize; ++k) {
-        for (int j = -1; j < kVolumeBlockSize; ++j) {
-            for (int i = -1; i < kVolumeBlockSize; ++i) {
+    for (int k = -1; k < sizeZ; ++k) {
+        for (int j = -1; j < sizeY; ++j) {
+            for (int i = -1; i < sizeX; ++i) {
                 float        corner[8] = {};
                 std::uint8_t signMask  = 0;
                 for (int n = 0; n < 8; ++n) {
-                    const float value = samples[FlatIndex(i + kCornerOffsets[n][0], j + kCornerOffsets[n][1],
-                                                         k + kCornerOffsets[n][2], kSampleExtent)];
-                    corner[n]         = value;
+                    const float value =
+                        samples[FlatIndex(i + kCornerOffsets[n][0], j + kCornerOffsets[n][1],
+                                          k + kCornerOffsets[n][2], sampleExtentX, sampleExtentY)];
+                    corner[n] = value;
                     if (value < 0.0F) {
                         signMask |= static_cast<std::uint8_t>(1U << n);
                     }
                 }
 
-                const std::size_t cellIndex = FlatIndex(i, j, k, kCellExtent);
+                const std::size_t cellIndex = FlatIndex(i, j, k, cellExtentX, cellExtentY);
                 cellSign[cellIndex]         = signMask;
                 if (signMask == 0U || signMask == 0xFFU) {
                     continue;  // 全空 / 全实心：该 cell 不产生顶点
@@ -181,12 +191,12 @@ MeshData BuildVolumeMesh(const IVolumeSampler& sampler) {
         }
     }
 
-    // ---- 四边形：只遍历本块的 core cell；每条网格棱由"u/v 下侧"的那个 cell 发射一次 ----
-    // 这样每条棱的四边形**恰好发射一次**，且跨块的棱由拥有该 cell 的块负责 ⇒ 不会重复、不会漏。
-    for (int k = 0; k < kVolumeBlockSize; ++k) {
-        for (int j = 0; j < kVolumeBlockSize; ++j) {
-            for (int i = 0; i < kVolumeBlockSize; ++i) {
-                const std::uint8_t signMask = cellSign[FlatIndex(i, j, k, kCellExtent)];
+    // ---- 四边形：只遍历本区域的 core cell；每条网格棱由"u/v 下侧"的那个 cell 发射一次 ----
+    // 这样每条棱的四边形**恰好发射一次**，且跨区域的棱由拥有该 cell 的调用方负责 ⇒ 不会重复、不会漏。
+    for (int k = 0; k < sizeZ; ++k) {
+        for (int j = 0; j < sizeY; ++j) {
+            for (int i = 0; i < sizeX; ++i) {
+                const std::uint8_t signMask = cellSign[FlatIndex(i, j, k, cellExtentX, cellExtentY)];
                 if (signMask == 0U || signMask == 0xFFU) {
                     continue;
                 }
@@ -212,10 +222,14 @@ MeshData BuildVolumeMesh(const IVolumeSampler& sampler) {
                     coordD[u] -= 1;
                     coordD[v] -= 1;
 
-                    const std::int32_t indexA = cellVertex[FlatIndex(i, j, k, kCellExtent)];
-                    const std::int32_t indexB = cellVertex[FlatIndex(coordB[0], coordB[1], coordB[2], kCellExtent)];
-                    const std::int32_t indexC = cellVertex[FlatIndex(coordC[0], coordC[1], coordC[2], kCellExtent)];
-                    const std::int32_t indexD = cellVertex[FlatIndex(coordD[0], coordD[1], coordD[2], kCellExtent)];
+                    const std::int32_t indexA =
+                        cellVertex[FlatIndex(i, j, k, cellExtentX, cellExtentY)];
+                    const std::int32_t indexB =
+                        cellVertex[FlatIndex(coordB[0], coordB[1], coordB[2], cellExtentX, cellExtentY)];
+                    const std::int32_t indexC =
+                        cellVertex[FlatIndex(coordC[0], coordC[1], coordC[2], cellExtentX, cellExtentY)];
+                    const std::int32_t indexD =
+                        cellVertex[FlatIndex(coordD[0], coordD[1], coordD[2], cellExtentX, cellExtentY)];
                     if (indexA < 0 || indexB < 0 || indexC < 0 || indexD < 0) {
                         continue;  // 防御：该棱两端异侧时 4 个 cell 必然都有顶点，正常不可达
                     }
@@ -237,6 +251,10 @@ MeshData BuildVolumeMesh(const IVolumeSampler& sampler) {
     }
 
     return mesh;
+}
+
+MeshData BuildVolumeMesh(const IVolumeSampler& sampler) {
+    return BuildRegionMesh(sampler, kVolumeBlockSize, kVolumeBlockSize, kVolumeBlockSize);
 }
 
 }  // namespace vx
