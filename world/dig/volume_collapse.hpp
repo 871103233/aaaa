@@ -45,7 +45,8 @@ struct CollapseUnit {
     VoxelBounds        bounds;      ///< 体素范围（闭区间）
     glm::dvec3         centroid { 0.0 };  ///< 体素中心均值 ⇒ 刚体**局部原点**与渲染顶点基准
     std::vector<float> hullPoints;  ///< `3 * N` 个**局部坐标**（相对 `centroid`）——`ConvexHullDesc` 用
-    /// `hullPoints` 的**局部 AABB**（T46）：光球命中判定用的盒（随姿态旋转 = OBB），见 `LocalAabbContainsPoint`。
+    /// `hullPoints` 的**局部 AABB**（T46）：保留残骸的"唤醒判据"用的盒（见 `UnitWorldAabb`）。
+    /// T48 起**不再**用于命中判定（命中改由物理引擎回答，见 [ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策三）。
     glm::vec3          hullMinLocal { 0.0F };
     glm::vec3          hullMaxLocal { 0.0F };
     /// ---- T42：**体素补丁**（抽出前抓取；供"与地形同源"的区域网格化）----
@@ -82,14 +83,16 @@ struct CollapseUnit {
     /// **刚性碎块**：true ⇒ 落定后**保留几何体**（不回写、形状不变），false ⇒ 落定后体素化回写并与地面融合
     /// （**接地沉降**，不允许悬空）。
     ///
-    /// **判据 = 碎块「露在外面的皮」上是否出现刚性材质**（见 `surfaceMaterialCounts`），
-    /// 而**不是**全体体素的多数材质 —— 后者会被"派生材质"带偏：一处陡壁的内部体素按该列地表派生出来
-    /// 往往是土，于是"看着是白岩的一片"会被判成散体、落地后被量化融合（项目所有者实测的缺陷）。
-    /// "岩石落地后不允许发生任何形状变化"是**硬约束**，故取"表面含刚性即保持形状"。
+    /// **判据（T50 / [ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策四）= 该子块自己的材质**
+    /// （`materials.toml` 的 `rigid_debris`）：抽出的连通分量会先按**材质一致性**切成子块，
+    /// 每个子块只有一种材质 ⇒ 岩子块保持形状、土 / 草 / 沙子块回写融合（"一条长条里岩土共存"因此各自正确）。
+    /// T46 曾用"**露在外面的皮**上是否出现刚性材质"来判（见 `surfaceMaterialCounts`）——
+    /// 那是在"整块一个 bool"的前提下最接近的近似；按材质拆子块后不再需要它来折中。
     bool        rigidDebris = false;
     /// 该整体**表面 cell**（会生成渲染网格顶点的那些 cell）的材质直方图 —— 与渲染口径**同源**：
     /// 对每个"8 角有实有空的 cell"取实体侧各角材质的众数，再统计全体表面 cell。
-    /// 语义 = "这块碎块**露在外面的皮**是用什么材质做的"（= 玩家真正看到的东西）。用于判 `rigidDebris`。
+    /// 语义 = "这块碎块**露在外面的皮**是用什么材质做的"（= 玩家真正看到的东西）。
+    /// **T50 起只作诊断**（刚体化日志里如实报出），不再参与 `rigidDebris` 的判定（见上）。
     int         surfaceMaterialCounts[kMaterialSlotCount] = {};
     /// 体素总数（= `voxels.size()`；单独留着便于日志 / 判据阅读）。
     [[nodiscard]] std::size_t VoxelCount() const noexcept { return voxels.size(); }
@@ -102,6 +105,33 @@ struct CollapseUnit {
 /// ⇒ 渲染与物理同源，可由同一个 `mat4` 变换驱动）。补丁为空时返回空网格。
 [[nodiscard]] MeshData BuildCollapseUnitMesh(const CollapseUnit& unit);
 
+/// ---- T50 / [ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策二：
+/// **破坏时不切换表示** —— 在碎块**自身补丁**上雕刻并重网格 ----
+
+/// 在`unit`自身的 `patchDensity` 上做一次**与地形同口径的球体平滑挖除**（T50）。
+///
+/// 口径（复用 `DigVolumeWorld::RasterizeBall` 的数学，一字不改）：对"距球心 < 半径 + 过渡带"的采样，
+/// 按 `clamp(round((半径 − 距离) × 每格单位))` 抬高密度（只抬不降）；**不可破坏材质保持原状**。
+/// 只写 `patchIsUnit != 0` 的采样（非本整体的采样在网格化时本就当空气，不该被改）。
+///
+/// 为什么不能沿用"惰性体素化回写"（缺陷 BUG2）：体素化是**中心 → 最近整数格**的硬量化 + 找空位落格，
+/// 会把整块轮廓改掉 —— 而"岩石不允许任何形状变化"是硬约束。改在补丁上雕刻后，
+/// 等值面是补丁采样的**纯函数** ⇒ **未被挖到的区域顶点逐位不变**（可证伪的不变量，见判据）。
+///
+/// 返回 false 表示没有任何采样被改动（球没碰到这块碎块）。
+bool CarveCollapseUnitPatch(CollapseUnit& unit, const glm::dvec3& center, float radiusBlocks,
+                            const TerrainMaterialTable& materials);
+
+/// 由**补丁**重算该整体的体素清单 / 包围盒 / 凸包点集 / 刚体属性（T50：雕刻后必须执行）。
+///
+/// **质心保持不变**（局部坐标系不变）⇒ 刚体与渲染网格**原地不动**，只有被挖掉的部分消失。
+/// 返回 false 表示**剩余体素为空**（整块被挖光）⇒ 调用方应删除该整体。
+///
+/// **划分口径**（T50 / ADR 0018 决策四）：`rigidDebris` 由该整体（子块）的**材质**决定
+/// （`materials.toml` 的 `rigid_debris`）—— 每个子块只有一种材质，故不再需要"表面直方图"来折中；
+/// `surfaceMaterialCounts` 退化为**诊断**（日志里"玩家看到的皮是什么材质"）。
+[[nodiscard]] bool RefreshCollapseUnitFromPatch(CollapseUnit& unit, const TerrainMaterialTable& materials);
+
 /// 一次"整体倒塌"规划的产物（T33）。
 struct CollapsePlan {
     std::vector<CollapseUnit> units;    ///< 各失支撑的连通分量（**已从体积中抽出**）
@@ -113,6 +143,9 @@ struct CollapsePlan {
     std::size_t deletedUnits      = 0;
     std::size_t deletedVoxels     = 0;
     std::size_t regionSamples     = 0;  ///< 支撑检查邻域的采样数（T30 / T38 计时口径）
+    /// ---- T49 / [ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策一：连通域 ----
+    std::size_t domainVoxels   = 0;      ///< 本次**连通域**的体素数（= 可能受影响的整个结构，诊断用）
+    bool        domainNarrowed = false;  ///< 是否真的按连通域收窄（false = 超界**保守回退固定窗口**）
 };
 
 /// 塌落的**种子**（T30 / T43）：本次挖除改动过的采样范围 + （可选）**爆心**。
@@ -152,9 +185,12 @@ struct CollapseSeed {
 ///      算出质心与"逐列 8 个角点"的凸包点集，登记材质槽位，并**立即从体积中清空**这些体素
 ///      （⇒ 返回的 `units` 即可交给物理层转成动态刚体，见 `PhysicsWorld::AddDynamicConvexHull`）。
 ///
-/// 邻域（T30）：**水平** = 被改动采样的世界范围外扩 (悬挑 + 1) 格 —— 悬挑最多跨
-/// `maxCantileverBlocks` 步，更远的列不可能被本次挖除影响；
-/// **竖直** = 自种子块向下到"最低的非全实心块"、向上到"最高的非全空块"。
+/// 邻域（T49 / [ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策一）：
+/// **scope = 以被改动采样为起点的实心连通域**（洪泛至结构边界），不再用固定窗口截断 ——
+/// 固定窗口下"距破坏点超过窗口的远端中段"从不进入任何一次求解，于是长条被炸断两端后**中段永远悬空**。
+/// 窗口从「被改动采样 ± (悬挑 + 1) 格」开始，连通域触到窗口边界就**翻倍扩张**；
+/// 采样数一旦超过 `kMaxRegionSamples`（或扩张次数用尽）⇒ **告警 + 保守回退固定窗口**（显式例外，
+/// 切换条件 = 持久结构图落地）。竖直范围仍按块级填充分类（T30 口径不变）。
 ///
 /// **不做连锁**（单次判定、不迭代）：迭代到稳定会让山体里一条 12 格宽的隧道把整座山连锁塌掉，
 /// 与真实不符；代价是"本次未判定的部分保持原状"，已登记为后续项（ADR 0015「后果」）。
@@ -179,17 +215,13 @@ struct CollapsePose {
     [[nodiscard]] float TiltDegrees() const noexcept;
 };
 
-/// 该世界点是否落在「`unit` 的局部 AABB 按 `pose` 旋转后的盒」内（T46 / [ADR 0017](../../docs/adr/0017-landing-by-material-rigid-vs-granular.md)）。
-///
-/// 用途：**保留中的刚性残骸**不在体素里（落定后不回写）⇒ 必须让"光球打得到它"（否则会穿过看着是实心的岩石）。
-/// 判据是**局部 AABB 的 OBB**（不是凸包本身）：凸包的真实边界比它小 ⇒ 可能"早一点"命中（ADR 0017 后果 5）。
-/// 纯函数、无 GPU / Jolt 依赖 ⇒ 可单测。
-[[nodiscard]] bool LocalAabbContainsPoint(const CollapseUnit& unit, const CollapsePose& pose,
-                                          const glm::dvec3& point) noexcept;
-
 /// `unit` 在 `pose` 下的**世界 AABB**（= 局部 AABB 的 8 角旋转后取包围盒）—— **保守**包含真实 OBB。
 /// 用途（T46）：某体积块的碰撞体被重建后"唤醒与它相交的保留残骸"（宁可多唤醒一次，也不漏唤醒）。
 /// 纯函数、无 GPU / Jolt 依赖 ⇒ 可单测。
+///
+/// **不再承担命中判定**（T48 / [ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策三）：
+/// 光球是否打到某个整体已改由物理引擎回答（`PhysicsWorld::RayCastDynamic`，落在真实凸包表面），
+/// 原先的手工 OBB 判据（`LocalAabbContainsPoint`）因此**已下线**。
 void UnitWorldAabb(const CollapseUnit& unit, const CollapsePose& pose, glm::dvec3& outMin,
                    glm::dvec3& outMax) noexcept;
 
@@ -201,10 +233,13 @@ struct CollapseWriteback {
     /// 仍可能少量丢弃 —— 与 T29 的"严格质量守恒"口径不同（ADR 0015 后果 3 已登记）。
     std::size_t             droppedVoxels = 0;
     /// **接地沉降**（T46 / [ADR 0017](../../docs/adr/0017-landing-by-material-rigid-vs-granular.md) 决策三）：
-    /// 散体分量回写后把"下方为空"的体素沿本列下落所移动的体素数 / 达到下落上限仍未接地的体素数。
-    /// 刚性分量不做沉降（保持形状）⇒ 恒为 0。
+    /// 散体分量回写后把"下方为空"的体素沿本列下落所移动的体素数（刚性分量不做沉降 ⇒ 恒为 0）。
     std::size_t             settledVoxels = 0;
-    std::size_t             stuckVoxels   = 0;
+    /// **回写后仍悬空、已清除**的体素数（T51，2026-09-28）：散体沉降有 32 格上限，降不到支撑的残留体素
+    /// 一律**直接从回写结果里去掉**（所有者指定："悬空的小土块可以直接删除或者降落到地上"）⇒
+    /// 回写后**区域内不存在"下方为空"的实心体素**（区域底面除外）。刚性分量不做这一步（形状不变）。
+    /// 名字曾为 `stuckVoxels` —— 改名的原因：旧实现只**计数 + 告警**、体素仍留在空中，与"不悬空"的契约不符。
+    std::size_t             removedFloatingVoxels = 0;
     VoxelBounds bounds;                         ///< 回写涉及的体素范围（诊断）
 };
 

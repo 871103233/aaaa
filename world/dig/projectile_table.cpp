@@ -109,6 +109,8 @@ ProjectileTable ProjectileTable::LoadFromFile(const std::filesystem::path& path)
         spec.explosionDepthBlocks  = RequireFloat(*source, path, spec.id, "explosion_depth");
         spec.explosionRimBlocks    = RequireFloat(*source, path, spec.id, "explosion_rim");
         spec.explosionFalloff      = RequireFloat(*source, path, spec.id, "explosion_falloff");
+        // T31 / ADR 0013：伤害点数（**必填**；破坏预算的输入）。
+        spec.damage                = RequireFloat(*source, path, spec.id, "damage");
         const std::array<float, 3> emissive = RequireFloat3(*source, path, spec.id, "emissive");
         for (std::size_t channel = 0; channel < emissive.size(); ++channel) {
             spec.emissiveRgb[channel] = emissive[channel];
@@ -140,6 +142,9 @@ ProjectileTable ProjectileTable::LoadFromFile(const std::filesystem::path& path)
         }
         if (!(spec.explosionFalloff > 0.0F) || spec.explosionFalloff > 1.0F) {
             throw std::runtime_error(DescribeField(path, spec.id, "explosion_falloff") + "必须落在 (0, 1]");
+        }
+        if (spec.damage < 0.0F) {
+            throw std::runtime_error(DescribeField(path, spec.id, "damage") + "不能为负（点；0 = 不造成破坏）");
         }
         for (std::size_t channel = 0; channel < 3U; ++channel) {
             if (spec.emissiveRgb[channel] < 0.0F) {

@@ -39,6 +39,7 @@
 #include "terrain/world_bounds.hpp"
 #include "ui_text.hpp"
 #include "dig/collapse_table.hpp"
+#include "dig/destruction_table.hpp"
 #include "dig/dig_region.hpp"
 #include "dig/dig_volume.hpp"
 #include "dig/projectile_table.hpp"
@@ -322,8 +323,13 @@ void UpdateOrbRenderVertices(std::vector<vx::MeshVertex>& vertices, const vx::Me
 ///
 /// T12 飞行模式：关闭重力（`gravity = 0`）并直接给竖直速度，使角色可自由升 / 降、悬停；
 /// 切回普通模式时由调用方清零速度，故不会残留速度、也不会穿过地形（碰撞仍在生效）。
+///
+/// T54：起跳门槛 = **可行走地面**（`CharacterState::walkableGround`，不含"站在过陡坡上"）——
+/// 缺陷"贴着垂直岩壁能一直跳"的机制就是此前用了语义更宽的 `onGround`。同时按业内规范补上
+/// **土狼时间**与**跳跃缓冲**两个容差窗口（口径与实现见 `vx::AdvanceJumpAssist`）。
 void StepCharacter(vx::PhysicsWorld& physics, vx::PhysicsWorld::CharacterHandle character,
-                   vx::ThirdPersonCamera& camera, const MoveCommand& command, bool flying) {
+                   vx::ThirdPersonCamera& camera, const MoveCommand& command, bool flying,
+                   vx::JumpAssist& jumpAssist) {
     const vx::PhysicsWorld::CharacterState state = physics.GetCharacterState(character);
 
     // 移动方向由**纯函数**给出，基向量语义（W = 相机前、D = 相机右）由单测锁定：
@@ -345,12 +351,15 @@ void StepCharacter(vx::PhysicsWorld& physics, vx::PhysicsWorld::CharacterHandle 
         velocity.y        = command.vertical * command.flySpeed;
         physics.SetCharacterVelocity(character, velocity);
         physics.MoveCharacter(character, static_cast<float>(vx::kFixedDt), glm::vec3(0.0F));  // 无重力
+        jumpAssist.Reset();  // 飞行中不积累容差 ⇒ 切回普通模式的瞬间不会凭空起跳
     } else {
         if (lengthSq > 0.0F) {
             velocity.x = direction.x * command.speed;
             velocity.z = direction.z * command.speed;
         }
-        if (command.jump && state.onGround) {
+        // T54：土狼时间 + 跳跃缓冲（固定步推进）。门槛是 `walkableGround`，**不是** `onGround`。
+        if (vx::AdvanceJumpAssist(jumpAssist, state.walkableGround, command.jump,
+                                  static_cast<float>(vx::kFixedDt))) {
             velocity.y = kJumpSpeed;  // 竖直分量由玩法层给冲量，重力由物理层在步内累加
         }
         physics.SetCharacterVelocity(character, velocity);
@@ -387,18 +396,19 @@ constexpr float kMuzzleHeightRatio = 0.75F;
 /// 分流规则与爆炸一致：**区域内以体积为准**（已挖掉的地方就是空的 ⇒ 光球能飞进洞里），
 /// 区域外以地表高度场为准（`y <= 地表高度` 即实心）。
 ///
-/// T46（[ADR 0017](../../docs/adr/0017-landing-by-material-rigid-vs-granular.md)）：**保留中的岩石残骸**也参与判定
-/// —— 它们不在体素里（落定后不回写），若不在这里挡住，光球会**穿过"看着是实心"的岩石**（世界不自洽）。
+/// T46（[ADR 0017](../../docs/adr/0017-landing-by-material-rigid-vs-granular.md)）的"保留残骸也要挡光球"由本类承担；
+/// T48（[ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策三）：
+/// **动态刚体**（倒塌中的整体，含"掉落中"与"保留中"两态）一律走**物理场景查询** ——
+/// 它们的体素已被抽出（体积里是空的），只按密度判定会被误判为空气 ⇒ 光球穿过去（BUG4）。
 class GameOrbWorldQuery final : public vx::IOrbWorldQuery {
 public:
     GameOrbWorldQuery(const vx::TerrainWorld& terrain, const vx::DigVolumeWorld& volumes,
-                      const vx::RigidCollapseRuntime& collapse) noexcept
-        : m_terrain(terrain), m_volumes(volumes), m_collapse(collapse) {}
+                      const vx::PhysicsWorld& physics) noexcept
+        : m_terrain(terrain), m_volumes(volumes), m_physics(physics) {}
 
     [[nodiscard]] bool IsSolid(double x, double y, double z) const override {
-        if (m_collapse.ContainsRetainedPoint(glm::dvec3(x, y, z))) {
-            return true;  // 保留中的岩石残骸（T46）—— 命中后由调用方先把它惰性体素化
-        }
+        // 地形与体积按现行"谁画谁挡同源"的口径（ADR 0011 / 0012）。
+        // T48 起**不再**在这里手工判定保留残骸 —— 那由 `SegmentHitsDynamic` 的物理查询负责。
         if (m_volumes.IsInsideRegion(x, y, z)) {
             return m_volumes.IsSolid(x, y, z);
         }
@@ -409,10 +419,23 @@ public:
         return y <= static_cast<double>(surface);
     }
 
+    /// T48：动态刚体走物理查询 —— 命中点落在**真实凸包表面**（不再是手工 OBB 近似），
+    /// 且**覆盖"飞行中"这一态**（无需任何状态记账）。`outBody` 让玩法层知道"是哪个整体被击中"。
+    [[nodiscard]] bool SegmentHitsDynamic(const glm::dvec3& from, const glm::dvec3& to, glm::dvec3& outPoint,
+                                          std::uint32_t& outBody) const override {
+        const vx::PhysicsWorld::RayCastHit hit = m_physics.RayCastDynamic(from, to);
+        if (!hit.hit) {
+            return false;
+        }
+        outPoint = hit.point;
+        outBody  = hit.body;
+        return true;
+    }
+
 private:
-    const vx::TerrainWorld&          m_terrain;
-    const vx::DigVolumeWorld&        m_volumes;
-    const vx::RigidCollapseRuntime&  m_collapse;
+    const vx::TerrainWorld&   m_terrain;
+    const vx::DigVolumeWorld& m_volumes;
+    const vx::PhysicsWorld&   m_physics;
 };
 
 /// 相机避障 / 安全网的采样步长（格）：固定步长 ⇒ 结果确定（红线 7），无分配。
@@ -511,6 +534,7 @@ struct WorldEditContext {
     vx::TerrainCollision&              collision;
     vx::VolumeCollision&               volumeCollision;  ///< T28：体积块的三角网碰撞体提供者
     const vx::CollapseSpec&            collapse;         ///< T29：塌落规则（来自 `collapse.toml`）
+    const vx::DestructionSpec&         destruction;      ///< T31：伤害预算的换算系数（来自 `destruction.toml`）
     vx::MeshRenderer&                  renderer;
     const std::vector<vx::TileCoord>&  tileCoords;
     std::vector<vx::MeshHandle>&       tileHandles;
@@ -549,8 +573,13 @@ DetonationOutcome Detonate(WorldEditContext& context, const glm::dvec3& point, c
         carveTimer.Begin();
         std::vector<vx::BlockCoord> dirty;
         vx::VoxelBounds              carved;  // T30：被改动采样的世界范围 —— 塌落邻域只围绕它展开
-        if (!context.volumes.CarveSphere(point, spec.explosionRadiusBlocks, dirty, &carved)) {
-            return outcome;  // 球体范围内没有可挖的实心 ⇒ 无改动（例如打进空气）
+        // T31（ADR 0013 §二）：区域内的破坏改为**伤害预算**驱动 —— 预算 = damage × 换算系数（点），
+        // 自爆心向外逐格³ 扣减该格材质的 toughness（软的先被挖掉、硬的留在原地）；
+        // `explosionRadiusBlocks` 退化为**候选范围上界**（真正的挖除范围由预算决定）。
+        const int budgetPoints = static_cast<int>(std::lround(
+            static_cast<double>(spec.damage) * static_cast<double>(context.destruction.pointsPerCubicBlock)));
+        if (!context.volumes.CarveByDamage(point, spec.explosionRadiusBlocks, budgetPoints, dirty, &carved)) {
+            return outcome;  // 预算耗尽 / 范围内无可挖实心（空气或全不可破坏材质）⇒ 无改动
         }
         const double carveMs = carveTimer.EndMs();
 
@@ -583,7 +612,8 @@ DetonationOutcome Detonate(WorldEditContext& context, const glm::dvec3& point, c
         std::size_t spawnedUnits = 0;
         for (vx::CollapseUnit& unit : collapsePlan.units) {
             const std::size_t voxelCount = unit.voxels.size();
-            // T46 修订：把**落地口径**与"表面材质直方图"一起记下来（`Spawn` 会 move 走 `unit`，故先取）。
+            // T46 起记录落地口径；T50 起每个整体都是**材质一致**的子块（判据 = 该子块的材质），
+            // 表面材质直方图自此**只作诊断**（"玩家看到的皮是什么材质"），不再参与判定。
             const bool rigidDebris   = unit.rigidDebris;
             const int  shownRock     = unit.surfaceMaterialCounts[2];
             const int  shownDirt     = unit.surfaceMaterialCounts[1];
@@ -592,8 +622,8 @@ DetonationOutcome Detonate(WorldEditContext& context, const glm::dvec3& point, c
             if (context.rigidCollapse.Spawn(context.physics, context.volumes, context.renderer, context.collapse,
                                             std::move(unit))) {
                 ++spawnedUnits;
-                VX_LOG_INFO("倒塌整体已刚体化（T33）：体素 %zu 个 ⇒ 交给 Jolt 求解倾斜 / 旋转 / 碰撞；"
-                            "落地口径 = %s（**表面**材质 cell 数：岩 %d / 土 %d / 草 %d / 沙 %d）",
+                VX_LOG_INFO("倒塌整体已刚体化（T33 / T50 子块）：体素 %zu 个 ⇒ 交给 Jolt 求解倾斜 / 旋转 / 碰撞；"
+                            "落地口径 = %s（诊断：**表面**材质 cell 数 岩 %d / 土 %d / 草 %d / 沙 %d）",
                             voxelCount, rigidDebris ? "**保留几何体**（不回写，T46）" : "回写并与地面融合（T46）",
                             shownRock, shownDirt, shownGrass, shownSand);
             }
@@ -611,16 +641,57 @@ DetonationOutcome Detonate(WorldEditContext& context, const glm::dvec3& point, c
         outcome.remeshed = dirty.size();
         context.pending.MergeVolumeBlocks(dirty);
 
-        VX_LOG_INFO("爆炸（当帧 = 挖除 + 抽出 + 刚体化）：中心 (%.1f, %.1f, %.1f) 半径 %.1f 格；挖除 %.2f ms / 倒塌 %.2f ms"
-                    "（邻域 %zu 采样、失去支撑 %zu 体素、整体 %zu 个、已刚体化 %zu 个、因上限跳过 %zu 个、"
+        VX_LOG_INFO("爆炸（当帧 = 挖除 + 抽出 + 刚体化）：中心 (%.1f, %.1f, %.1f) 半径 %.1f 格"
+                    "（伤害 %.0f 点 ⇒ 预算 %d 点）；挖除 %.2f ms / 倒塌 %.2f ms"
+                    "（邻域 %zu 采样 / 连通域 %zu 体素%s、失去支撑 %zu 体素、整体 %zu 个、已刚体化 %zu 个、因上限跳过 %zu 个、"
                     "清除小碎片 %zu 个 / %zu 体素；**保留中岩石残骸 %zu 个 / 自由槽位 %zu**）"
                     "⇒ 入队 %zu 个块的延后工作（重网格 + 碰撞体；队内现共 %zu 个单位）",
-                    point.x, point.y, point.z, static_cast<double>(spec.explosionRadiusBlocks), carveMs, collapseMs,
-                    collapsePlan.regionSamples, collapsePlan.unsupportedVoxels, collapsePlan.units.size(),
+                    point.x, point.y, point.z, static_cast<double>(spec.explosionRadiusBlocks),
+                    static_cast<double>(spec.damage), budgetPoints, carveMs, collapseMs,
+                    collapsePlan.regionSamples, collapsePlan.domainVoxels,
+                    collapsePlan.domainNarrowed ? "（已按连通域收窄，T49）" : "（**回退固定窗口**）",
+                    collapsePlan.unsupportedVoxels, collapsePlan.units.size(),
                     spawnedUnits, collapsePlan.skippedUnits, collapsePlan.deletedUnits, collapsePlan.deletedVoxels,
                     context.rigidCollapse.RetainedUnits(), context.rigidCollapse.FreeSlots(),
                     dirty.size(), context.pending.PendingUnits());
         return outcome;
+    }
+
+    // T52（2026-09-28，项目所有者指定"岩石完全无法挖洞"）：**整片地表都是不可破坏材质 ⇒ 整坑不挖**。
+    // 口径：区域内的不可破坏由体积侧的 `CarveByDamage` / 碎块补丁雕刻保证；区域外只有高度场，
+    // 无法表达"只挖土不挖岩"，故这里做**整片判定**（坑覆盖到的每一列都不可破坏 ⇒ 不挖），
+    // 而不是逐列过滤 —— 逐列过滤会在坑面上留下"柱子"、破坏 [ADR 0013](../docs/adr/0013-destructible-elements.md)
+    // §二.5 的"边界一阶连续"。查不到材质的列（未覆盖 / 无地表）**不算**不可破坏（不替它做判定）。
+    {
+        const int radius = static_cast<int>(std::ceil(static_cast<double>(spec.explosionRadiusBlocks)));
+        bool      anyDiggable = false;
+        for (int dz = -radius; dz <= radius && !anyDiggable; ++dz) {
+            for (int dx = -radius; dx <= radius && !anyDiggable; ++dx) {
+                const double ox = static_cast<double>(dx) + 0.5;
+                const double oz = static_cast<double>(dz) + 0.5;
+                if (ox * ox + oz * oz > static_cast<double>(radius) * static_cast<double>(radius)) {
+                    continue;  // 圆盘之外
+                }
+                std::uint8_t slot = vx::kNoMaterialSlot;
+                if (!context.world.QueryDigMaterialSlot(static_cast<float>(point.x + dx),
+                                                        static_cast<float>(point.z + dz), slot)) {
+                    anyDiggable = true;
+                    continue;
+                }
+                const bool indestructible =
+                    context.volumes.Materials().Layer((slot == vx::kNoMaterialSlot) ? 0 : static_cast<int>(slot))
+                        .indestructible;
+                if (!indestructible) {
+                    anyDiggable = true;
+                }
+            }
+        }
+        if (!anyDiggable) {
+            VX_LOG_DEBUG("光球爆炸（地表爆破）：该片地表全是**不可破坏材质**（T52：岩石无法挖洞）⇒ 不挖；"
+                         "中心 (%.1f, %.1f, %.1f)",
+                         point.x, point.y, point.z);
+            return outcome;
+        }
     }
 
     vx::BrushPose brush;
@@ -991,6 +1062,18 @@ int main(int argc, char** argv) {
                     static_cast<double>(collapseSpec.settleAngularSpeed), collapseSpec.settleSteps,
                     static_cast<double>(collapseSpec.impulseSpeed), static_cast<double>(collapseSpec.initialTiltSpeed),
                     collapseSpec.debrisDeleteMaxVoxels, collapseSpec.maxActiveUnits);
+
+        // T31：全局破坏表（伤害预算的换算系数；器物字段待层 ③ 消费，见 ADR 0013）。
+        const vx::DestructionTable destructionTable =
+            vx::DestructionTable::LoadFromFile(SourceAssetPath("assets/config/destruction.toml"));
+        const vx::DestructionSpec& destructionSpec = destructionTable.Spec();
+        VX_LOG_INFO("破坏表已加载（schema_version=%d，T31 / ADR 0013）：换算系数 %.1f（预算 = 弹丸 damage × 本值，点）；"
+                    "器物阈值 %.1f 点 / 破坏占位色 (%.2f, %.2f, %.2f)（**待层 ③ 消费**）",
+                    destructionTable.SchemaVersion(), static_cast<double>(destructionSpec.pointsPerCubicBlock),
+                    static_cast<double>(destructionSpec.propDamageThreshold),
+                    static_cast<double>(destructionSpec.propBrokenTint[0]),
+                    static_cast<double>(destructionSpec.propBrokenTint[1]),
+                    static_cast<double>(destructionSpec.propBrokenTint[2]));
 
         // T11：从预设地图构建世界（种子 / 范围 / 地形编辑全部来自文件，不再硬编码）。
         const std::filesystem::path mapPath = SourceAssetPath(kDefaultMapFile);
@@ -1440,7 +1523,7 @@ int main(int argc, char** argv) {
 
         // T27：弹道世界查询 + 爆炸写回上下文（两者都只在固定步内使用）。
         // T41 起上传不再依赖渲染原点（顶点是网格局部坐标），故上下文不含 `renderOrigin`。
-        const GameOrbWorldQuery orbQuery(world, digVolumes, rigidCollapse);
+        const GameOrbWorldQuery orbQuery(world, digVolumes, physics);
         // 缺陷修复（人工实测第 7 轮）：相机的地形查询必须**包含可挖体积**（否则站在洞里的角色会把相机顶出洞外）。
         const GameCameraQuery   cameraQuery(world, digVolumes);
         WorldEditContext        editContext { world,
@@ -1448,6 +1531,7 @@ int main(int argc, char** argv) {
                                               terrainCollision,
                                               volumeCollision,
                                               collapseSpec,
+                                              destructionSpec,
                                               renderer,
                                               tileCoords,
                                               tileHandles,
@@ -1474,6 +1558,14 @@ int main(int argc, char** argv) {
         PhaseTimer   logicTimer;
         PhaseTimer   uiTimer;
         PhaseTimer   renderTimer;
+        // T45：把原先落在"未计时区"的三段显式量出来 —— **动态顶点上传 / uniform 构建 / 限帧与呈现**。
+        // 起因：一次 61.4 ms 尖峰里三相 CPU 只占 22.2 ms（≈39 ms 归属不明）⇒ 现有日志给出的
+        // "主要受限在谁"可能是误判（SKILL 第四节「观测先于结论」）。
+        PhaseTimer   dynamicUploadTimer;
+        PhaseTimer   uniformTimer;
+        PhaseTimer   throttleTimer;
+        /// T45：上一帧的**限帧**耗时（本帧日志在限帧之前打印，故读上一帧的值；与 `cpuCost` 同一处理方式）。
+        double       throttleMs = 0.0;
         CpuFrameCost cpuCost;  // 上一帧的值（面板早于本帧渲染构建，与 frameSeconds 同源）
 
         // ---- 加载结束（T36）：恢复玩家设置的帧率上限 / 呈现模式，并撤下加载画面。----
@@ -1501,6 +1593,9 @@ int main(int argc, char** argv) {
 
         // T27：光球连发冷却（秒）。只在**固定步**内递减（红线 11：不用可变帧间隔驱动玩法节奏）。
         float fireCooldown = 0.0F;
+
+        // T54：土狼时间 / 跳跃缓冲（跨固定步持有；只在**固定步**内推进，红线 11）。
+        vx::JumpAssist jumpAssist;
 
         // T28 自检（一次性）：把地面碰撞换成**体积三角网**之后，"角色真的站在体积面上"必须可观测 ——
         // 启动后 2 秒打一行日志（脚底高度 / 是否着地），否则"掉进地下"这类失败只会表现为画面异常。
@@ -1685,7 +1780,7 @@ int main(int argc, char** argv) {
             bool                 terrainExplosionSeen  = false;
             settledCollapseUnits.clear();
             for (int step = 0; step < plan.steps; ++step) {
-                StepCharacter(physics, character, camera, command, flying);
+                StepCharacter(physics, character, camera, command, flying, jumpAssist);
 
                 // T33：推进**动态刚体**（倒塌整体）—— 重力已在启动时设为 `-kGravity`（与角色同一口径）。
                 // 随后做落定检测：连续 `settle_steps` 个固定步低于阈值 ⇒ 转为"待回写"（本帧末体素化回写）。
@@ -1710,6 +1805,7 @@ int main(int argc, char** argv) {
                 if (vx::IsCharacterOutOfBounds(physics.GetCharacterState(character).position, bounds,
                                                vx::kOutOfBoundsMargin)) {
                     physics.SetCharacterPosition(character, spawnPosition);
+                    jumpAssist.Reset();  // T54：瞬移不该把"土狼时间 / 跳跃缓冲"带过去
                     camera.SnapTo(glm::vec3(static_cast<float>(spawnPosition.x),
                                             static_cast<float>(spawnPosition.y),
                                             static_cast<float>(spawnPosition.z)));
@@ -1732,16 +1828,20 @@ int main(int argc, char** argv) {
                 for (vx::Orb& orb : orbPool.Orbs()) {
                     vx::OrbHit hit;
                     if (vx::StepOrb(orb, orbQuery, kGravity, orbSpec.gravityScale, static_cast<float>(vx::kFixedDt), hit)) {
-                        // T46（ADR 0017 决策二）：命中的若是**保留中的岩石残骸**（光球被它的 OBB 挡住），
-                        // 先把它**惰性体素化**回写 —— 它这才"变回可挖的地形"，随后按常规被这次爆炸挖除。
-                        // ⇒ 岩石平时保持形状，**仍然可挖**，光球也不会穿过去。
-                        vx::CollapseWriteback retired;
-                        if (rigidCollapse.RetireRetainedAt(physics, digVolumes, renderer, hit.point, retired)) {
-                            pendingDestruction.MergeVolumeBlocks(retired.dirty);
-                            VX_LOG_INFO("光球命中岩石残骸 ⇒ 惰性体素化（T46）：回写 %zu 个（丢弃 %zu、接地沉降 %zu）；"
-                                        "入队 %zu 个块重建",
-                                        retired.writtenVoxels, retired.droppedVoxels, retired.settledVoxels,
-                                        retired.dirty.size());
+                        // T50（ADR 0018 决策二）：命中的若是**动态刚体**（掉落中的整体 **或** 保留中的岩石残骸），
+                        // 就**在它自己的补丁上雕刻** —— 球体挖除 + 同一份 Surface Nets 重网格 + 按剩余体素
+                        // **原地重建刚体**，全程**不切换表示**。
+                        // 为什么不再体素化回写（T46/T48 的旧路径）：体素化是"中心 → 最近整数格"的硬量化 + 找空位，
+                        // 会把整块轮廓改掉 —— 而"岩石不允许任何形状变化"是硬约束（项目所有者实测的 BUG2）。
+                        // 等值面是补丁采样的**纯函数** ⇒ 未被挖到的区域顶点逐位不变。
+                        vx::CollapseCarveResult carved;
+                        if (rigidCollapse.CarveBody(hit.body, hit.point, orbSpec.explosionRadiusBlocks, collapseSpec,
+                                                    materials, physics, renderer, carved)) {
+                            VX_LOG_INFO("光球命中整体 ⇒ **就地雕刻**（T50）：打掉 %zu 个、剩余 %zu 个体素%s"
+                                        "（累计雕刻 %zu 次 / %zu 体素）",
+                                        carved.removedVoxels, carved.leftVoxels,
+                                        carved.deleted ? "；**剩余过少 ⇒ 整体删除**（不留下凸包残影）" : "",
+                                        rigidCollapse.TotalCarved(), rigidCollapse.TotalCarvedVoxels());
                         }
                         const DetonationOutcome outcome = Detonate(editContext, hit.point, orbSpec);
                         terrainExplosionSeen = terrainExplosionSeen || outcome.terrainChanged;
@@ -1760,15 +1860,19 @@ int main(int argc, char** argv) {
                 pendingDestruction.MergeVolumeBlocks(writeback.dirty);
                 editContext.totalCollapseVoxels += writeback.writtenVoxels;
                 const vx::CollapsePose restPose { settled.posePosition, settled.poseRotation };
-                VX_LOG_INFO("倒塌落定（T33）：回写体素 %zu 个（丢弃 %zu 个、**接地沉降 %zu 个**）；倾角 %.0f°、"
+                VX_LOG_INFO("倒塌落定（T33）：回写体素 %zu 个（丢弃 %zu 个、**接地沉降 %zu 个**、"
+                            "**悬空已清除 %zu 个**）；倾角 %.0f°、"
                             "落点 (%.1f, %.1f, %.1f)；入队 %zu 个块重建；**体素材质**共 %.2f MB（T42，懒分配）",
                             writeback.writtenVoxels, writeback.droppedVoxels, writeback.settledVoxels,
+                            writeback.removedFloatingVoxels,
                             static_cast<double>(restPose.TiltDegrees()), settled.posePosition.x,
                             settled.posePosition.y, settled.posePosition.z, writeback.dirty.size(),
                             static_cast<double>(digVolumes.MaterialBytes()) / (1024.0 * 1024.0));
-                if (writeback.stuckVoxels > 0) {
-                    // T46：沉降走满上限仍未接地 ⇒ 仍会有悬空体素。**不静默**（判据要求"泥土不能悬空"）。
-                    VX_LOG_WARN("散体接地沉降达上限：%zu 个体素仍未接地（T46 / ADR 0017 后果 6）", writeback.stuckVoxels);
+                if (writeback.removedFloatingVoxels > 0) {
+                    // T51（2026-09-28）：降不到支撑的残留体素**已被清除**（所有者指定"悬空的小土块可以直接删除"）
+                    // ⇒ 场景里不会再出现悬空的泥土。仍打 WARN：这说明落点与真实支撑差了 32 格以上，值得留意。
+                    VX_LOG_WARN("散体回写后仍有悬空体素 ⇒ **已清除** %zu 个（T51：落点下方 32 格内没有支撑）",
+                                writeback.removedFloatingVoxels);
                 }
             }
             settledCollapseUnits.clear();
@@ -1801,6 +1905,8 @@ int main(int argc, char** argv) {
             // T13：每帧把主角胶囊改写为**渲染相对**顶点并就地刷新。位置取相机目标的插值位置，
             // 与渲染插值一致（alpha 只用于渲染，绝不回写模拟状态，红线 11）；装饰用，不影响碰撞。
             // T41：顶点按当前渲染原点烘焙 ⇒ 原点也传当前渲染原点（偏移恒 0），重定基后二者一起跟着变。
+            // T45：**动态顶点上传**独立计时（原先落在未计时区）。
+            dynamicUploadTimer.Begin();
             if (characterMesh.IsValid()) {
                 const glm::vec3 feetRender =
                     glm::mix(camera.TargetPrevious(), camera.TargetCurrent(), static_cast<float>(plan.alpha));
@@ -1822,6 +1928,7 @@ int main(int argc, char** argv) {
                                         renderOrigin);
                 (void)renderer.UpdateMeshVertices(orbHandles[i], orbVertices[i], renderOrigin);
             }
+            const double dynamicUploadMs = dynamicUploadTimer.EndMs();
 
             // 渲染：alpha 只用于在上一 / 当前逻辑状态之间插值，绝不回写模拟状态（红线 11）。
             const vx::CameraView view = camera.Evaluate(plan.alpha, &cameraQuery);
@@ -1964,6 +2071,8 @@ int main(int argc, char** argv) {
                 break;
             }
 
+            // T45：**uniform 构建**独立计时（材质 / 光照 / 相机 / 渲染原点 / 阴影级联，原先落在未计时区）。
+            uniformTimer.Begin();
             // 材质参数（高度带 / 坡度带 / UV 尺度 / 层色）来自与 TerrainWorld **同一份**材质表；
             // 渲染原点每次重定基后都要刷新（原点进 uniform，片元据此把渲染相对坐标还原为世界坐标）。
             const vx::MaterialUniform materialUniform =
@@ -1999,6 +2108,7 @@ int main(int argc, char** argv) {
                 cameraSettings.nearPlane, cameraSettings.farPlane, casterTopRelative);
             renderer.SetShadowCascades(shadowUniform, static_cast<std::uint32_t>(lighting.Shadow().cascadeCount),
                                        static_cast<std::uint32_t>(lighting.Shadow().resolution));
+            const double uniformMs = uniformTimer.EndMs();
             // T24：渲染提交相位（RenderFrame 内含相机常量与动态顶点等内部上传）。
             renderTimer.Begin();
             if (!renderer.RenderFrame(frameHandles.data(), frameHandles.size(), clearColor, &debugOverlay)) {
@@ -2008,17 +2118,27 @@ int main(int argc, char** argv) {
             cpuCost = CpuFrameCost { logicMs, uiMs, renderMs };  // 供下一帧面板显示
             submittedMeshCount = submittedThisFrame;             // T38：同上，供下一帧尖峰日志使用
 
-            // ---- T38 帧尖峰打点（`references/performance-and-hitches.md` §2 的第一步）----
+            // ---- T38 / T45 帧尖峰打点（`references/performance-and-hitches.md` §2 的第一步）----
             // 与面板同源：`stats.frameSeconds` / `cpuCost` / `renderStats` 都取"最近一次"的实测值。
-            // 一条日志里同时给出"三相 CPU + draw call + 提交网格数 + 等交换链耗时"，据此可立刻区分
+            // 一条日志里同时给出各段 CPU + draw call + 提交网格数 + 等交换链耗时，据此可立刻区分
             // 「CPU 忙 / GPU 忙 / 在空等」——这正是本轮之前缺失、导致误判（把 GPU 侧成本判到 CPU）的那一步。
+            //
+            // T45：**必须给出"未计时合计"** —— 各段之和与帧时间之差就是"还没有归属的那部分"，
+            // 原先它被无声吞掉（61.4 ms 的尖峰里 ≈39 ms 由此漏掉）。`stats.frameSeconds` 由面板的帧计时器
+            // 在 `BeginFrame` 时喂入（≈本帧的循环周期），故各段和与它可能相差一次限帧时长；因此下面把
+            // **限帧**也单独计量，并显式打印 `未计时`（钳到 ≥ 0，不假装它是 0）。
             const double frameMs = stats.frameSeconds * 1000.0;
             if (frameMs > kHitchThresholdMs && hitchLogClock.Tick() * 1000.0 >= kHitchLogMinIntervalMs) {
-                (void)hitchLogClock.Tick();  // 重置节流窗口
-                VX_LOG_WARN("帧尖峰 %.1f ms（阈值 %.0f ms）：逻辑 %.2f + UI %.2f + 渲染提交 %.2f ms；"
+                (void)hitchLogClock.Tick();  // 重置节流窗口（节流口径不变，观测本身不制造新卡顿）
+                const double measuredMs = cpuCost.logicMs + cpuCost.uiMs + cpuCost.renderMs + dynamicUploadMs +
+                                          uniformMs + throttleMs;
+                const double untimedMs = std::max(0.0, frameMs - measuredMs);
+                VX_LOG_WARN("帧尖峰 %.1f ms（阈值 %.0f ms）：逻辑 %.2f + UI %.2f + 渲染提交 %.2f + 动态上传 %.2f + "
+                            "uniform %.2f + 限帧 %.2f = %.2f，**未计时 %.2f** ms；"
                             "draw call %u、提交网格 %zu、固定步 %d、等交换链 %.2f ms ⇒ 主要受限在 %s",
                             frameMs, kHitchThresholdMs, cpuCost.logicMs, cpuCost.uiMs, cpuCost.renderMs,
-                            renderStats.drawCalls, submittedMeshCount, plan.steps, renderStats.swapchainWaitMs,
+                            dynamicUploadMs, uniformMs, throttleMs, measuredMs, untimedMs, renderStats.drawCalls,
+                            submittedMeshCount, plan.steps, renderStats.swapchainWaitMs,
                             (renderStats.swapchainWaitMs > cpuCost.renderMs * 0.5)
                                 ? "等交换链（GPU / 呈现）"
                                 : "CPU 侧（逻辑 / UI / 提交）");
@@ -2026,7 +2146,10 @@ int main(int argc, char** argv) {
 
             // T17：帧末补睡到目标间隔，限制帧率。垂直同步档 `TargetFps() == 0`，本调用立即返回。
             // 只用睡眠、绝不忙等（见 FrameLimiter 注释）。
+            // T45：**限帧与呈现**独立计时（原先落在未计时区，也是"帧率掉但三相都不高"的常见解释）。
+            throttleTimer.Begin();
             (void)frameLimiter.Throttle();
+            throttleMs = throttleTimer.EndMs();
         }
 
         // 设置落盘：正常退出、窗口关闭、面板退出游戏都走这里（落盘失败只告警，不阻断退出）。

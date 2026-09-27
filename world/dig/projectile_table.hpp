@@ -27,6 +27,11 @@ struct ProjectileSpec {
     float explosionDepthBlocks   = 6.0F;   ///< **地表**爆破的坑心下挖深度（格），必须 > 0
     float explosionRimBlocks     = 2.0F;   ///< **地表**爆破的外环隆起（格），必须 ≥ 0
     float explosionFalloff       = 0.6F;   ///< 衰减带占半径的比例，必须 ∈ (0, 1]
+    /// **伤害**（点，必须 ≥ 0）—— T31 / [ADR 0013](../../docs/adr/0013-destructible-elements.md)：
+    /// 命中时的破坏预算是 `damage × destruction.toml 的 points_per_cubic_block`（点），
+    /// 由 `DigVolumeWorld::CarveByDamage` **逐格³ 扣减**该格材质的 `toughness`。
+    /// 地表爆破路径（区域外）仍按半径剖面（见 ADR 0013 §二.5 的范围界定）。
+    float damage                 = 10.0F;
     float emissiveRgb[3] = { 1.60F, 1.25F, 0.65F };  ///< 自发光颜色（线性光），每通道 ≥ 0
 };
 
@@ -37,7 +42,10 @@ struct ProjectileSpec {
 class ProjectileTable {
 public:
     /// 当前表格式版本；写入配置文件的 `schema_version` 必须与之相等。
-    static constexpr int kSchemaVersion = 1;
+    /// 1：首版（T27，光球）。
+    /// 2：每条 `[[projectile]]` 新增**必填**的 `damage`（T31 / [ADR 0013](../../docs/adr/0013-destructible-elements.md)
+    ///    的伤害点数）。**必填 ⇒ 破坏性变更 ⇒ 升版**。
+    static constexpr int kSchemaVersion = 2;
 
     /// 同时存在的弹丸数上限（`max_active` 的合法上界；池容量按此分配，运行期不再分配）。
     static constexpr int kMaxActiveLimit = 64;

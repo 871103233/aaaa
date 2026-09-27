@@ -16,7 +16,11 @@
 #include <Jolt/Physics/Body/BodyInterface.h>
 #include <Jolt/Physics/Character/CharacterVirtual.h>
 #include <Jolt/Physics/Collision/BroadPhase/BroadPhaseLayer.h>
+#include <Jolt/Physics/Body/BodyFilter.h>
+#include <Jolt/Physics/Collision/CastResult.h>
+#include <Jolt/Physics/Collision/NarrowPhaseQuery.h>
 #include <Jolt/Physics/Collision/ObjectLayer.h>
+#include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
@@ -285,6 +289,16 @@ struct PhysicsWorld::Impl {
     }
 };
 
+/// T48：只让**动态刚体**参与查询（静态地形 / 体积 / 角色由玩法层按"谁画谁挡同源"的现行口径自行判定）。
+class DynamicOnlyBodyFilter final : public JPH::BodyFilter {
+public:
+    [[nodiscard]] bool ShouldCollide(const JPH::BodyID&) const override { return true; }
+
+    [[nodiscard]] bool ShouldCollideLocked(const JPH::Body& body) const override {
+        return body.GetMotionType() == JPH::EMotionType::Dynamic;
+    }
+};
+
 PhysicsWorld::PhysicsWorld() : m_impl(std::make_unique<Impl>()) {
     acquire_jolt();
 
@@ -429,15 +443,18 @@ PhysicsWorld::BodyHandle PhysicsWorld::AddDynamicConvexHull(const ConvexHullDesc
     }
 
     // Jolt 的刚体位置 = **质心**；本类对外以**局部原点**为准（`ConvexHullDesc::origin*`）⇒
-    // 这里把质心偏移补上。创建时旋转为单位四元数，故质心偏移无需旋转。
-    const JPH::Vec3 comLocal = shape->GetCenterOfMass();
+    // 这里把质心偏移补上。T50 起可带**初始姿态**（`desc.rotation`）⇒ 质心偏移必须先旋转到世界方向
+    // （T50 的"雕刻后原地重建刚体"用它：已经倒下的岩石不该因为重建而回正）。
+    const JPH::Quat  rotation = JPH::Quat(desc.rotation.x, desc.rotation.y, desc.rotation.z, desc.rotation.w);
+    const JPH::Vec3  comLocal = shape->GetCenterOfMass();
+    const JPH::Vec3  comWorld = rotation * comLocal;
 
     JPH::BodyCreationSettings bodySettings(
         shape,
-        JPH::RVec3(static_cast<JPH::Real>(desc.originX) + comLocal.GetX(),
-                   static_cast<JPH::Real>(desc.originY) + comLocal.GetY(),
-                   static_cast<JPH::Real>(desc.originZ) + comLocal.GetZ()),
-        JPH::Quat::sIdentity(), JPH::EMotionType::Dynamic, kObjectLayerStatic);
+        JPH::RVec3(static_cast<JPH::Real>(desc.originX) + comWorld.GetX(),
+                   static_cast<JPH::Real>(desc.originY) + comWorld.GetY(),
+                   static_cast<JPH::Real>(desc.originZ) + comWorld.GetZ()),
+        rotation, JPH::EMotionType::Dynamic, kObjectLayerStatic);
     bodySettings.mAllowSleeping              = true;  // 落定后由 Jolt 休眠（省 CPU）
     bodySettings.mFriction                   = desc.friction;
     bodySettings.mRestitution                = desc.restitution;  // 来自材质表（T43 / ADR 0016）
@@ -483,6 +500,42 @@ PhysicsWorld::RigidBodyState PhysicsWorld::GetRigidBodyState(BodyHandle handle) 
     state.linearVelocity  = glm::vec3(linear.GetX(), linear.GetY(), linear.GetZ());
     state.angularVelocity = glm::vec3(angular.GetX(), angular.GetY(), angular.GetZ());
     return state;
+}
+
+PhysicsWorld::RayCastHit PhysicsWorld::RayCastDynamic(const glm::dvec3& from, const glm::dvec3& to) const {
+    RayCastHit result;
+    if (m_impl == nullptr || m_impl->system == nullptr) {
+        return result;
+    }
+    const double dx = to.x - from.x;
+    const double dy = to.y - from.y;
+    const double dz = to.z - from.z;
+    if (dx * dx + dy * dy + dz * dz <= 0.0) {
+        return result;  // 退化线段
+    }
+
+    // Jolt 的 `RRayCast` 约定：`inDirection` 是"起点 → 终点"的**非单位**向量 ⇒ `mFraction ∈ [0, 1]`。
+    const JPH::RRayCast ray { JPH::RVec3(static_cast<JPH::Real>(from.x), static_cast<JPH::Real>(from.y),
+                                         static_cast<JPH::Real>(from.z)),
+                              JPH::Vec3(static_cast<JPH::Real>(dx), static_cast<JPH::Real>(dy),
+                                        static_cast<JPH::Real>(dz)) };
+    JPH::RayCastResult       hit;
+    const DynamicOnlyBodyFilter filter;
+    if (!m_impl->system->GetNarrowPhaseQuery().CastRay(ray, hit, {}, {}, filter)) {
+        return result;
+    }
+    const JPH::RVec3 point = ray.GetPointOnRay(hit.mFraction);
+    result.hit             = true;
+    result.point = glm::dvec3(static_cast<double>(point.GetX()), static_cast<double>(point.GetY()),
+                              static_cast<double>(point.GetZ()));
+    // BodyID → 句柄（槽位表很小，线性扫描即可；与 `RegisterBody` 的 `slot + 1` 约定一致）。
+    for (std::size_t slot = 0; slot < m_impl->bodies.size(); ++slot) {
+        if (m_impl->bodies[slot] == hit.mBodyID) {
+            result.body = static_cast<BodyHandle>(slot + 1U);
+            break;
+        }
+    }
+    return result;
 }
 
 void PhysicsWorld::ActivateBody(BodyHandle handle) noexcept {
@@ -635,9 +688,20 @@ PhysicsWorld::CharacterState PhysicsWorld::GetCharacterState(CharacterHandle han
     state.position = glm::dvec3(position.GetX(), position.GetY(), position.GetZ());
     state.velocity = glm::vec3(velocity.GetX(), velocity.GetY(), velocity.GetZ());
 
+    // T54：把 Jolt 的**三态**如实映射出来 —— 不能把 `OnSteepGround` 与 `OnGround` 合成一个布尔。
+    //   `onGround`       = 被支撑（含"贴着过陡坡 / 垂直壁"）—— 供"落地自检 / 是否与地面接触"使用；
+    //   `walkableGround` = 站在可行走地面（**只有** `OnGround`）—— 玩法层的**起跳门槛**只能用这个，
+    //                      否则贴着垂直岩壁下滑时每一步都满足起跳条件 ⇒ 无限爬墙（缺陷 T54）。
+    //   地面法线一并给出：它是"可行走"的几何依据（`maxSlopeAngleDeg` 由 Jolt 在 `ExtendedUpdate` 内判定），
+    //   调用方（相机 / 手感）需要时可直接读，不必再自己投射射线。
     const JPH::CharacterBase::EGroundState groundState = character->GetGroundState();
-    state.onGround = (groundState == JPH::CharacterBase::EGroundState::OnGround ||
+    state.onGround       = (groundState == JPH::CharacterBase::EGroundState::OnGround ||
                       groundState == JPH::CharacterBase::EGroundState::OnSteepGround);
+    state.walkableGround = (groundState == JPH::CharacterBase::EGroundState::OnGround);
+    if (groundState != JPH::CharacterBase::EGroundState::InAir) {
+        const JPH::Vec3 normal = character->GetGroundNormal();
+        state.groundNormal     = glm::vec3(normal.GetX(), normal.GetY(), normal.GetZ());
+    }
     return state;
 }
 

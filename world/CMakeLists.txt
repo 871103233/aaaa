@@ -12,6 +12,7 @@ find_package(tomlplusplus CONFIG REQUIRED)
 
 add_library(voxel_world STATIC
     dig/collapse_table.cpp
+    dig/destruction_table.cpp
     dig/dig_region.cpp
     dig/dig_volume.cpp
     dig/projectile_table.cpp

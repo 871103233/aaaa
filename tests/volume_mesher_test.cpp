@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -136,6 +137,36 @@ private:
 constexpr float       kSphereRadius = 12.0F;
 const     glm::vec3   kSphereCenter(16.0F, 16.0F, 16.0F);
 
+/// T55 探针判据：**绕序反转**（正面朝向实体侧）的三角形数 —— 几何法线与三个顶点法线（密度梯度，
+/// 指向**空侧**）之均值的点积 < 0。
+///
+/// 为什么另两条判据量不到它：`CountDegenerateTriangles` 量"零面积 ⇒ 画不出片元"、
+/// `CountBoundaryEdges` 量"面缺失 ⇒ 留下洞"。而 Surface Nets 在**歧义 cell**（例：两个对角实心角）
+/// 里只能放**一个**顶点，四个邻 cell 的四边形可能自交 ⇒ 其中某个三角形绕序**翻转**：
+/// 面在、边闭合、面积也不为零，但正面朝向实体侧 ⇒ 被背面剔除 ⇒ 屏幕表现**与"面消失 / 透明"一致**。
+[[nodiscard]] std::size_t CountBackwardTriangles(const MeshData& mesh) {
+    std::size_t backward = 0;
+    for (std::size_t triangle = 0; triangle + 2U < mesh.indices.size(); triangle += 3U) {
+        const std::uint32_t ia = mesh.indices[triangle];
+        const std::uint32_t ib = mesh.indices[triangle + 1U];
+        const std::uint32_t ic = mesh.indices[triangle + 2U];
+        if (ia >= mesh.vertices.size() || ib >= mesh.vertices.size() || ic >= mesh.vertices.size()) {
+            continue;
+        }
+        const glm::vec3 a    = Position(mesh, ia);
+        const glm::vec3 b    = Position(mesh, ib);
+        const glm::vec3 c    = Position(mesh, ic);
+        const glm::vec3 face = glm::cross(b - a, c - a);
+        if (glm::dot(face, face) <= 1.0e-12F) {
+            continue;  // 退化：由 `CountDegenerateTriangles` 负责
+        }
+        if (glm::dot(face, Normal(mesh, ia) + Normal(mesh, ib) + Normal(mesh, ic)) < 0.0F) {
+            ++backward;
+        }
+    }
+    return backward;
+}
+
 }  // namespace
 
 // 水平面（`z = 16.5`）：每个 z 棱恰发射一次 ⇒ 32×32 = 1024 个四边形、总面积 ≈ 1024 格²。
@@ -171,6 +202,21 @@ TEST(VolumeMesher, SphereVerticesLieOnSurface) {
         maxError                 = std::max(maxError, std::abs(distance - kSphereRadius));
     }
     EXPECT_LT(maxError, 1.0F) << "顶点到球面的偏差应小于 1 个体素（实测 " << maxError << "）";
+}
+
+// T47（[ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策五）：
+// `CountBoundaryEdges` 是"外观网格是否闭合"这条判据的实现，必须**有区分度** ——
+// 闭合曲面（球）判 0；人为**删掉一个三角形**（打一个洞）后必须 > 0，否则它证明不了任何东西。
+TEST(VolumeMesher, CountBoundaryEdgesDetectsOpenMesh) {
+    const SphereSampler sampler(kSphereRadius);
+    const MeshData      closed = vx::BuildVolumeMesh(sampler);
+
+    ASSERT_FALSE(closed.indices.empty());
+    EXPECT_EQ(vx::CountBoundaryEdges(closed), 0U) << "球面 SDF 的等值面应闭合（每条无向边恰被 2 个三角形共用）";
+
+    MeshData pierced = closed;
+    pierced.indices.resize(pierced.indices.size() - 3U);  // 删掉一个三角形 ⇒ 洞的三条边只被用到 1 次
+    EXPECT_GT(vx::CountBoundaryEdges(pierced), 0U) << "打洞后必须报出边界边（判据的区分度）";
 }
 
 // 球面：法线朝外（密度梯度指向空侧），且为单位向量。
@@ -213,6 +259,34 @@ TEST(VolumeMesher, SphereTrianglesAreValidAndOutwardFacing) {
             << "逆时针绕序的正面必须朝向球外（与背面剔除口径一致）";
     }
 }
+
+/// **整数密度**球面采样器（T55 探针用）：模拟真实存储 —— `clamp(lround((dist − radius) × 127))`。
+///
+/// 与 `SphereSampler` 的唯一区别是**取整**：真实挖除写入的是 `int8`，故密度是整数；
+/// 当球面正好穿过格点（圆心 / 半径取整数值）时会出现**恰好为 0** 的采样 —— 这正是
+/// "偶发透明面"的怀疑成因（0 采样会让相邻 cell 的插值顶点落在同一格点上 ⇒ 面退化 ⇒ 画不出来）。
+class QuantizedSphereSampler final : public IVolumeSampler {
+public:
+    QuantizedSphereSampler(double centerX, double centerY, double centerZ, double radius) noexcept
+        : m_cx(centerX), m_cy(centerY), m_cz(centerZ), m_radius(radius) {}
+
+    [[nodiscard]] float Sample(int i, int j, int k) const override {
+        const double dx = static_cast<double>(i) - m_cx;
+        const double dy = static_cast<double>(j) - m_cy;
+        const double dz = static_cast<double>(k) - m_cz;
+        const double distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const double value =
+            std::lround((distance - m_radius) * static_cast<double>(kDensityUnitsPerBlock));
+        return static_cast<float>(
+            std::clamp(value, static_cast<double>(kDensityMin), static_cast<double>(kDensityMax)));
+    }
+
+private:
+    double m_cx = 0.0;
+    double m_cy = 0.0;
+    double m_cz = 0.0;
+    double m_radius = 0.0;
+};
 
 // 全实心 / 全空的块：不产生任何顶点与索引（等值面不存在）。
 TEST(VolumeMesher, UniformBlocksProduceNoGeometry) {
@@ -368,4 +442,35 @@ TEST(VolumeMesher, RegionEntryFallsBackToNoMaterialOverride) {
     for (const vx::MeshVertex& vertex : region.vertices) {
         EXPECT_FLOAT_EQ(vertex.material, vx::kNoMaterialOverride);
     }
+}
+
+// ---------------------------------------------------------------------------
+// T55 探针（**临时诊断**，定案后改成回归判据）：整数密度 + 球面正好穿过格点时的
+// "退化三角形 / 边界边"统计 —— 用来把"某个面透明"钉到一个可测量上（观测先于结论）。
+// ---------------------------------------------------------------------------
+TEST(VolumeMesherProbe, LatticeAlignedQuantaReport) {
+    struct Config {
+        const char* name;
+        double      cx;
+        double      cy;
+        double      cz;
+        double      radius;
+    };
+    const Config configs[] = {
+        { "整数心 / r=6", 16.0, 16.0, 16.0, 6.0 },        { "整数心 / r=6.5", 16.0, 16.0, 16.0, 6.5 },
+        { "整数心 / r=8", 16.0, 16.0, 16.0, 8.0 },        { "整数心 / r=12", 16.0, 16.0, 16.0, 12.0 },
+        { "半格心 / r=6", 16.5, 16.5, 16.5, 6.0 },        { "半格心 / r=7.5", 16.5, 16.5, 16.5, 7.5 },
+        { "偏移心 / r=7.25", 16.25, 16.5, 16.75, 7.25 },  { "偏移心 / r=5.5", 16.5, 16.0, 16.5, 5.5 },
+        { "偏移心 / r=8.75", 15.5, 16.25, 16.75, 8.75 },  { "偏移心 / r=9.5", 16.5, 15.75, 16.25, 9.5 },
+        { "偏移心 / r=10.25", 16.75, 16.5, 15.5, 10.25 }, { "整数心 / r=9", 16.0, 16.0, 16.0, 9.0 },
+    };
+
+    for (const Config& config : configs) {
+        const QuantizedSphereSampler sampler(config.cx, config.cy, config.cz, config.radius);
+        const MeshData               mesh = vx::BuildVolumeMesh(sampler);
+        std::printf("[T55 探针] %-16s 顶点 %5zu 三角 %5zu **退化 %3zu** 边界边 %3zu **绕序反转 %3zu**\n",
+                    config.name, mesh.vertices.size(), mesh.indices.size() / 3U, vx::CountDegenerateTriangles(mesh),
+                    vx::CountBoundaryEdges(mesh), CountBackwardTriangles(mesh));
+    }
+    std::fflush(stdout);
 }

@@ -420,6 +420,51 @@ TEST(PhysicsBody, DynamicConvexHullRotatesFromInitialAngularVelocity) {
     EXPECT_NEAR(state.linearVelocity.y, -kGravity, 1.0F);  // 同上：含阻尼（实测 ≈ -23.4）
 }
 
+// T48 / [ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策三：
+// **动态刚体**必须能被**线段查询**命中 —— 这是 BUG4（"掉落中的整体打不中"）的判据：
+// 倒塌中的整体**体素已被抽出**（体积里是空的），只有物理查询能看见它；
+// 命中点必须落在**真实凸包表面**上（不再是手工 OBB 边界），并回报**是哪个刚体**。
+TEST(PhysicsBody, RayCastDynamicHitsMovingHull) {
+    PhysicsWorld physics;
+    physics.SetGravity(glm::vec3(0.0F, -kGravity, 0.0F));
+
+    // 不放地形：刚体自由下落 ⇒ 查询期间它**仍在运动**（T48 要覆盖的正是"飞行中"这一态）。
+    const std::vector<float> points = MakeBoxHullPoints(1.0F, 1.0F, 1.0F);
+
+    PhysicsWorld::ConvexHullDesc desc;
+    desc.positions  = points.data();
+    desc.pointCount = points.size() / 3;
+    desc.originX    = 0.0;
+    desc.originY    = 100.0;
+    desc.originZ    = 0.0;
+    desc.mass       = 100.0F;
+
+    const PhysicsWorld::BodyHandle body = physics.AddDynamicConvexHull(desc);
+    ASSERT_NE(body, 0u);
+
+    for (int i = 0; i < 30; ++i) {  // 0.5 秒：仍在空中
+        physics.Update(kFixedDt);
+    }
+    const PhysicsWorld::RigidBodyState falling = physics.GetRigidBodyState(body);
+    ASSERT_LT(falling.linearVelocity.y, -1.0F) << "前置：整体仍在**运动中**（不是落定态）";
+
+    const glm::dvec3 center = falling.position;
+    const PhysicsWorld::RayCastHit hit =
+        physics.RayCastDynamic(center - glm::dvec3(0.0, 5.0, 0.0), center + glm::dvec3(0.0, 5.0, 0.0));
+    ASSERT_TRUE(hit.hit) << "运动中的动态刚体必须可被查询命中（BUG4 的判据）";
+    EXPECT_EQ(hit.body, body) << "必须回报命中的是哪个刚体（玩法层据此定位「是哪个整体」）";
+    // 盒半长 1 ⇒ 命中点应在盒心下方 1 格附近的**凸包表面**上（而不是盒心 / OBB 外的早命中点）。
+    EXPECT_NEAR(hit.point.y, center.y - 1.0, 0.2) << "命中点应落在真实凸包表面";
+    EXPECT_NEAR(hit.point.x, center.x, 0.2);
+    EXPECT_NEAR(hit.point.z, center.z, 0.2);
+
+    // 反例：擦不到刚体的射线必须 miss（否则"命中"没有区分度）。
+    const PhysicsWorld::RayCastHit miss = physics.RayCastDynamic(center + glm::dvec3(10.0, -5.0, 0.0),
+                                                                  center + glm::dvec3(10.0, 5.0, 0.0));
+    EXPECT_FALSE(miss.hit) << "远处射线不得命中";
+    EXPECT_FALSE(physics.RayCastDynamic(center, center).hit) << "退化线段不得命中";
+}
+
 // 非法凸包参数（点数不足 / 质量非正 / 空指针）必须拒绝并返回无效句柄，不得静默创建退化刚体。
 TEST(PhysicsBody, DynamicConvexHullValidatesInput) {
     PhysicsWorld physics;

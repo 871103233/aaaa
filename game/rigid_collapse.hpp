@@ -26,12 +26,25 @@ struct ActiveCollapseUnit {
     /// ---- T46 / [ADR 0017](../../docs/adr/0017-landing-by-material-rigid-vs-granular.md)：保留中的刚性残骸 ----
     ///
     /// `true` = 该整体是**刚性**（`unit.rigidDebris`）且**已落定** ⇒ **不回写**、形状与外观保持不变，
-    /// 直到"光球命中"或"池满腾位"时才**惰性体素化**（见 `RetireRetainedAt` / `RetireOldestRetained`）。
+    /// 直到"光球命中"（T50：`CarveBody` 就地雕刻，**仍不回写**）或"池满腾位"（`RetireOldestRetained`）为止。
     bool       retained = false;
+    /// ---- T47 / [ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策五：外观网格闭合自检 ----
+    ///
+    /// `Spawn` 时记录**实际上传的那份外观网格**的边界边数（0 = 闭合）；`RetireRetained` 时据此回报
+    /// "玩家在它保留期间看到的缺面来自这里"。`meshTruncated` = 该网格是否被**网格池容量**按四边形截断。
+    std::size_t meshBoundaryEdges = 0;
+    bool        meshTruncated     = false;
 };
 
 /// **体素化回写**的结果见 `vx::CollapseWriteback`（world 层 `volume_collapse.hpp`）——
 /// "体素 ↔ 刚体转换"的核心数学放在 world 层（可脱离 GPU / Jolt 单测），本类只负责与物理 / 渲染的接线。
+
+/// 一次"**在整体自身补丁上雕刻**"的结果（T50 / [ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策二）。
+struct CollapseCarveResult {
+    std::size_t removedVoxels = 0;      ///< 被这次雕刻打掉的体素数
+    std::size_t leftVoxels    = 0;      ///< 剩余体素数（重建后的刚体就由它们构成）
+    bool        deleted       = false;  ///< 剩余过少 / 无法重建 ⇒ 整体已删除（刚体与网格槽位已释放）
+};
 
 /// 倒塌整体（T33）的运行时：活跃刚体 + **预分配**的渲染网格池。
 ///
@@ -59,6 +72,9 @@ public:
     [[nodiscard]] std::size_t TotalDroppedVoxels() const noexcept { return m_droppedVoxels; }
     /// T46：已被**惰性回写**（光球命中 / 池满腾位）的保留残骸数。
     [[nodiscard]] std::size_t TotalRetired() const noexcept { return m_retired; }
+    /// T50：已被**就地雕刻**（光球命中 ⇒ 在自身补丁上挖掉一块后原地重建）的次数与打掉的体素总数。
+    [[nodiscard]] std::size_t TotalCarved() const noexcept { return m_carved; }
+    [[nodiscard]] std::size_t TotalCarvedVoxels() const noexcept { return m_carvedVoxels; }
     /// T46：当前**保留中**的刚性残骸数（= 占用中的槽位里"不回写"的那部分）。
     [[nodiscard]] std::size_t RetainedUnits() const noexcept;
     [[nodiscard]] const std::vector<ActiveCollapseUnit>& Active() const noexcept { return m_active; }
@@ -86,23 +102,30 @@ public:
 
     /// ---- T46 / [ADR 0017](../../docs/adr/0017-landing-by-material-rigid-vs-granular.md)：保留中的刚性残骸 ----
 
-    /// 该点是否落在**某个保留中的刚性残骸**内（光球命中判定用）。
-    ///
-    /// 判据 = 该整体**局部 AABB**（随姿态旋转 ⇒ OBB）包含该点；凸包的真实边界比它小 ⇒ 可能"早一点"命中
-    /// （[ADR 0017](../../docs/adr/0017-landing-by-material-rigid-vs-granular.md) 后果 5）。
-    /// 用途：让"看着是实心"的岩石残骸**挡住光球** —— 否则光球会穿过去（世界不自洽）。
-    [[nodiscard]] bool ContainsRetainedPoint(const glm::dvec3& point) const noexcept;
-
-    /// **惰性回写**：把 `point` 所在的保留残骸体素化回写为地形，并释放它的刚体与网格槽位。
-    /// 返回 false 表示该点不在任何保留残骸内（无操作）。
-    /// 用途（项目所有者选中）：**光球撞上岩石残骸 ⇒ 它才被体素化**，随后按常规被这次爆炸挖除 ⇒ 仍可挖。
-    [[nodiscard]] bool RetireRetainedAt(PhysicsWorld& physics, DigVolumeWorld& volumes, MeshRenderer& renderer,
-                                        const glm::dvec3& point, CollapseWriteback& out);
-
     /// **腾位**：把**最旧**的保留残骸惰性回写（网格池满时的兜底 —— 否则"新结构不再倒塌"）。
     /// 返回 false 表示当前没有保留中的残骸（无操作）。顺序确定：`m_active` 即生成序。
+    ///
+    /// 注意（T50）：这是**唯一的**"惰性体素化"入口 —— 光球命中已改走 `CarveBody`
+    /// （在自身补丁上雕刻，不切换表示）。腾位不是破坏事件，而是"把位置让给新倒塌"，
+    /// 故仍按体素化回写处理（回到可挖地形）。
     [[nodiscard]] bool RetireOldestRetained(PhysicsWorld& physics, DigVolumeWorld& volumes, MeshRenderer& renderer,
                                             CollapseWriteback& out);
+
+    /// ---- T50 / [ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策二：
+    /// **破坏时不切换表示** —— 在整体**自身补丁**上雕刻、重网格、原地重建刚体 ----
+
+    /// 光球命中一个**活跃整体**（掉落中或保留中）时，**不体素化回写**，而是在它的 `patchDensity` 上
+    /// 做**与地形同口径的球体挖除**（`CarveCollapseUnitPatch`）、用**同一份 Surface Nets** 重网格，
+    /// 再按剩余体素**在当前姿态下**重建刚体（复用同一网格槽位与同一渲染帧）。
+    ///
+    /// 不变量：等值面是补丁采样的**纯函数** ⇒ **未被挖到的区域，顶点逐位不变**（"岩石始终不变形"可证伪）。
+    /// 剩余体素 ≤ `spec.debrisDeleteMaxVoxels`（或凸包点数不足 / 重建失败）⇒ **删除整个整体**兜底
+    /// （绝不留下"看着实心却没有刚体"的东西）。
+    ///
+    /// 返回 false = 该句柄不是活跃整体，或球没碰到它的任何体素（无操作）。
+    [[nodiscard]] bool CarveBody(PhysicsWorld::BodyHandle body, const glm::dvec3& center, float radiusBlocks,
+                                 const CollapseSpec& spec, const TerrainMaterialTable& materials,
+                                 PhysicsWorld& physics, MeshRenderer& renderer, CollapseCarveResult& out);
 
     /// 某体积块的**碰撞体被重建**（被挖 / 塌落）后，唤醒与它相交的保留刚性残骸。
     ///
@@ -126,10 +149,21 @@ private:
     std::size_t m_writtenVoxels  = 0;
     std::size_t m_droppedVoxels  = 0;
     std::size_t m_retired        = 0;   ///< T46：已被惰性回写的保留残骸数
+    std::size_t m_carved         = 0;   ///< T50：已就地雕刻的次数
+    std::size_t m_carvedVoxels   = 0;   ///< T50：就地雕刻累计打掉的体素数
 
     /// 把一个整体网格化成**与地形同源的等值面**（`BuildCollapseUnitMesh`），并在超出槽位容量时
     /// **按整个四边形**截断（只影响外观；物理与回写不受影响）。
-    [[nodiscard]] MeshData BuildUnitMesh(const CollapseUnit& unit) const;
+    ///
+    /// T47 起同时给出**闭合自检**（[ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策五）：
+    /// **截断前**与**截断后**分别数边界边 ⇒ 能把"洞"归因到候选①（容量截断）还是候选②/③（网格生成本身）。
+    struct UnitMeshBuild {
+        MeshData    mesh;                            ///< 实际要上传的几何（可能已被容量截断）
+        std::size_t boundaryEdgesFull  = 0;          ///< **截断前**的边界边数（0 = 网格生成本身闭合）
+        std::size_t boundaryEdgesFinal = 0;          ///< **实际上传**网格的边界边数（0 = 玩家看不到洞）
+        bool        truncatedByCapacity = false;     ///< 是否被网格池容量按四边形截断（候选①）
+    };
+    [[nodiscard]] UnitMeshBuild BuildUnitMesh(const CollapseUnit& unit) const;
 
     /// 找一个空闲槽位；没有则返回 false。
     [[nodiscard]] bool AcquireSlot(MeshHandle& meshOut);
@@ -137,6 +171,10 @@ private:
     /// T46：把第 `index` 个（必须 `retained`）保留残骸惰性体素化回写，并释放刚体与槽位。
     [[nodiscard]] bool RetireRetained(std::size_t index, PhysicsWorld& physics, DigVolumeWorld& volumes,
                                       MeshRenderer& renderer, CollapseWriteback& out);
+
+    /// T50：**删除**第 `index` 个活跃整体（释放刚体与网格槽位，**不回写**）——
+    /// 用于"雕刻后剩余太少 / 无法重建"这一兜底路径（体素就此消失，与 `debris_delete_max_voxels` 同源）。
+    void RetireCarved(std::size_t index, PhysicsWorld& physics, MeshRenderer& renderer);
 };
 
 }  // namespace vx

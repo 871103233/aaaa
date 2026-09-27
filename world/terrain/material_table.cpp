@@ -100,6 +100,9 @@ void ValidateLayer(const MaterialLayer& layer, const std::filesystem::path& path
     if (layer.heightBlend < 0.0F || layer.slopeBlend < 0.0F) {
         throw std::runtime_error(Describe(path, slot, "height_blend/slope_blend") + "不能为负");
     }
+    if (layer.toughness < 0.0F) {
+        throw std::runtime_error(Describe(path, slot, "toughness") + "不能为负（点/格³；0 = 不可破坏）");
+    }
     if (!(layer.uvScale > 0.0F)) {
         throw std::runtime_error(Describe(path, slot, "uv_scale") + "必须大于 0");
     }
@@ -200,6 +203,8 @@ TerrainMaterialTable TerrainMaterialTable::LoadFromFile(const std::filesystem::p
         parsed.indestructible = ReadOptionalBool(*layer, path, slot, "indestructible", parsed.indestructible);
         // T46 / ADR 0017：落地后的表示（可选，缺省 = 散体 ⇒ 旧文件行为不变）。
         parsed.rigidDebris = ReadOptionalBool(*layer, path, slot, "rigid_debris", parsed.rigidDebris);
+        // T31 / ADR 0013：伤害模型的坚固度（**必填** —— 缺失 / 非数即抛，见 TOML 头部口径）。
+        parsed.toughness = ReadFloat(*layer, path, slot, "toughness");
 
         ValidateLayer(parsed, path, slot);
         table.m_layers[slot] = std::move(parsed);
@@ -279,7 +284,9 @@ TerrainMaterialTable TerrainMaterialTable::Default() {
     table.m_layers[2].density        = 2.6F;   // rock
     table.m_layers[2].friction       = 0.70F;
     table.m_layers[2].restitution    = 0.12F;
-    table.m_layers[2].indestructible = false;
+    // T52（2026-09-28，项目所有者指定）：**岩 = 完全不可破坏**（"无法击毁无法挖洞，但仍能被光球打到"）。
+    // 与 materials.toml 逐值一致；`toughness = 5.0` 保留，改回 false 即恢复"可挖的硬岩"。
+    table.m_layers[2].indestructible = true;
     table.m_layers[3].density        = 1.6F;   // sand
     table.m_layers[3].friction       = 0.50F;
     table.m_layers[3].restitution    = 0.05F;
@@ -291,6 +298,14 @@ TerrainMaterialTable TerrainMaterialTable::Default() {
     table.m_layers[1].rigidDebris = false;  // dirt
     table.m_layers[2].rigidDebris = true;   // rock
     table.m_layers[3].rigidDebris = false;  // sand
+
+    // T31 / ADR 0013：坚固度（点/格³；与 materials.toml 逐值一致）。
+    // 锚点来自项目所有者：泥土 3、岩石 5（配合 destruction.toml 的换算系数 271 ⇒ 泥 r≈6、岩 r≈5.06）。
+    // 草 / 沙 由本实现补齐为 2（真实世界：松散表层 / 砂比黏土更易挖）。
+    table.m_layers[0].toughness = 2.0F;  // grass
+    table.m_layers[1].toughness = 3.0F;  // dirt
+    table.m_layers[2].toughness = 5.0F;  // rock
+    table.m_layers[3].toughness = 2.0F;  // sand
 
     // C 项：三平面参数（默认值即 TriplanarSettings 的成员初值，与 assets/config/materials.toml 的 [triplanar] 一致）。
     table.m_triplanar = TriplanarSettings {};

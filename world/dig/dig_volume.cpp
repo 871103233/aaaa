@@ -1,5 +1,6 @@
 #include "dig/dig_volume.hpp"
 
+#include "terrain/material_table.hpp"
 #include "terrain/terrain_world.hpp"
 
 #include <algorithm>
@@ -13,7 +14,8 @@ namespace {
 
 /// 挖除时把 CSG 距离场"铺开"的过渡带宽度（格）：球外这一圈内也写一次 `max`，使墙面附近的
 /// 密度成为**真实距离**而不是饱和值，Surface Nets 的顶点插值才落在正确位置（否则墙面会整体偏厚）。
-constexpr double kCarveSdfBandBlocks = 1.5;
+/// 取值与**唯一口径** `vx::kCarveSdfBandBlocks`（`dig_volume.hpp`，T50 的碎块补丁雕刻共用）一致。
+constexpr double kCarveBandBlocks = kCarveSdfBandBlocks;
 
 /// 向下取整的整数除法（负数也正确）。
 [[nodiscard]] int FloorDiv(int value, int divisor) noexcept {
@@ -353,8 +355,8 @@ float DigVolumeWorld::SampleDensity(double x, double y, double z) const noexcept
     return TerrainDerivedDensity(x, y, z);
 }
 
-bool DigVolumeWorld::CarveSphere(const glm::dvec3& center, float radiusBlocks, std::vector<BlockCoord>& dirtyOut,
-                                 VoxelBounds* boundsOut) {
+bool DigVolumeWorld::RasterizeBall(const glm::dvec3& center, float radiusBlocks, bool skipIndestructible,
+                                   const BlastMask* mask, std::vector<BlockCoord>& dirtyOut, VoxelBounds* boundsOut) {
     if (boundsOut != nullptr) {
         *boundsOut = VoxelBounds {};  // 先视为空；有改动时才写出范围
     }
@@ -363,7 +365,7 @@ bool DigVolumeWorld::CarveSphere(const glm::dvec3& center, float radiusBlocks, s
     }
 
     const double radius     = static_cast<double>(radiusBlocks);
-    const double outer      = radius + kCarveSdfBandBlocks;
+    const double outer      = radius + kCarveBandBlocks;
     const double outerSq    = outer * outer;
     bool         changedAny = false;
 
@@ -399,6 +401,14 @@ bool DigVolumeWorld::CarveSphere(const glm::dvec3& center, float radiusBlocks, s
                     const int    carved = std::clamp(static_cast<int>(std::lround(signedDistance *
                                                                                  static_cast<double>(kDensityUnitsPerBlock))),
                                                      kDensityMin, kDensityMax);
+                    // T31：**不可破坏材质**的采样保持原状（它永不参与挖除；`CarveSphere` 不启用该开关）。
+                    if (skipIndestructible && IsIndestructibleSample(originX + i, originY + j, originZ + k)) {
+                        continue;
+                    }
+                    // T53：**爆炸波到不了**的采样保持原状（岩后的东西不受破坏）—— 只有 `CarveByDamage` 传掩码。
+                    if (mask != nullptr && !mask->Reachable(originX + i, originY + j, originZ + k)) {
+                        continue;
+                    }
                     std::int8_t& density = block.density[DensityIndex(i, j, k)];
                     if (carved > static_cast<int>(density)) {
                         density      = static_cast<std::int8_t>(carved);
@@ -430,6 +440,200 @@ bool DigVolumeWorld::CarveSphere(const glm::dvec3& center, float radiusBlocks, s
     }
 
     return changedAny;
+}
+
+bool DigVolumeWorld::IsIndestructibleSample(int worldX, int worldY, int worldZ) const noexcept {
+    const std::uint8_t slot = SampleMaterialSlot(worldX, worldY, worldZ);
+    if (slot == kNoMaterialSlot) {
+        return true;  // 不属于可挖体积（无块）⇒ 不参与挖除
+    }
+    const MaterialLayer& layer = Materials().Layer(static_cast<int>(slot));
+    return layer.indestructible || !(layer.toughness > 0.0F);
+}
+
+bool DigVolumeWorld::CarveSphere(const glm::dvec3& center, float radiusBlocks, std::vector<BlockCoord>& dirtyOut,
+                                 VoxelBounds* boundsOut) {
+    // 半径驱动的挖除（测试 / 工具用；**不**咨询材质）：等价于 T31 引入伤害模型之前的判据。
+    // 不传掩码 ⇒ 不做爆炸波遮挡（这是"工具"语义，与玩家爆炸的 `CarveByDamage` 不同）。
+    return RasterizeBall(center, radiusBlocks, /*skipIndestructible*/false, /*mask*/nullptr, dirtyOut, boundsOut);
+}
+
+bool DigVolumeWorld::CarveByDamage(const glm::dvec3& center, float radiusBlocks, int budgetPoints,
+                                   std::vector<BlockCoord>& dirtyOut, VoxelBounds* boundsOut) {
+    if (boundsOut != nullptr) {
+        *boundsOut = VoxelBounds {};
+    }
+    if (!(radiusBlocks > 0.0F) || budgetPoints <= 0 || m_blocks.empty()) {
+        return false;
+    }
+
+    // ① 候选格³：格心距球心 ≤ radius（格心 = 整数格坐标 + 0.5）。
+    struct CandidateCell {
+        double distance = 0.0;
+        int    x = 0;
+        int    y = 0;
+        int    z = 0;
+    };
+    const double radius  = static_cast<double>(radiusBlocks);
+    const double radiusSq = radius * radius;
+    std::vector<CandidateCell> cells;
+    const int loX = static_cast<int>(std::floor(center.x - radius));
+    const int hiX = static_cast<int>(std::ceil(center.x + radius));
+    const int loY = static_cast<int>(std::floor(center.y - radius));
+    const int hiY = static_cast<int>(std::ceil(center.y + radius));
+    const int loZ = static_cast<int>(std::floor(center.z - radius));
+    const int hiZ = static_cast<int>(std::ceil(center.z + radius));
+    for (int z = loZ; z <= hiZ; ++z) {
+        for (int y = loY; y <= hiY; ++y) {
+            for (int x = loX; x <= hiX; ++x) {
+                const double dx = static_cast<double>(x) + 0.5 - center.x;
+                const double dy = static_cast<double>(y) + 0.5 - center.y;
+                const double dz = static_cast<double>(z) + 0.5 - center.z;
+                const double distanceSq = dx * dx + dy * dy + dz * dz;
+                if (distanceSq > radiusSq) {
+                    continue;
+                }
+                cells.push_back(CandidateCell { std::sqrt(distanceSq), x, y, z });
+            }
+        }
+    }
+    // 确定序（红线 7）：距离升序 → (x, y, z) 升序 ⇒ 同输入永远同一结果。
+    std::sort(cells.begin(), cells.end(), [](const CandidateCell& a, const CandidateCell& b) {
+        if (a.distance != b.distance) {
+            return a.distance < b.distance;
+        }
+        if (a.x != b.x) {
+            return a.x < b.x;
+        }
+        if (a.y != b.y) {
+            return a.y < b.y;
+        }
+        return a.z < b.z;
+    });
+
+    // ② **爆炸波可达性洪泛**（T53）：爆炸波是标量扩散，**不可破坏材质（岩）= 遮挡体**，
+    //    波到不了岩后面 ⇒ 那些格既不参与预算结算、也不被栅格化（④ 传掩码）。
+    //
+    //    掩码定义在**球 + 过渡带**的球体内（`RasterizeBall` 会写到球面外 `kCarveBandBlocks` 一圈，
+    //    那一圈的格也必须判可达；球体之外的格一律视为**不可达** —— 它们既不可能被栅格化，
+    //    也不该被当成"波的绕行通道"）。同时把每格的**材质槽位 / 实心性**缓存下来，
+    //    洪泛与预算结算共用**一次**采样（改前预算循环还要再采一轮材质 + 密度）。
+    BlastMask mask;
+    const double blastReach    = radius + kCarveBandBlocks;
+    const double blastReachSq  = blastReach * blastReach;
+    mask.minX  = static_cast<int>(std::floor(center.x - blastReach));
+    mask.minY  = static_cast<int>(std::floor(center.y - blastReach));
+    mask.minZ  = static_cast<int>(std::floor(center.z - blastReach));
+    mask.sizeX = static_cast<int>(std::ceil(center.x + blastReach)) - mask.minX + 1;
+    mask.sizeY = static_cast<int>(std::ceil(center.y + blastReach)) - mask.minY + 1;
+    mask.sizeZ = static_cast<int>(std::ceil(center.z + blastReach)) - mask.minZ + 1;
+    const std::size_t maskCells = static_cast<std::size_t>(mask.sizeX) * static_cast<std::size_t>(mask.sizeY) *
+                                  static_cast<std::size_t>(mask.sizeZ);
+    mask.reachable.assign(maskCells, 0U);
+    std::vector<std::uint8_t> slotOf(maskCells, static_cast<std::uint8_t>(kNoMaterialSlot));
+    std::vector<std::uint8_t> solidOf(maskCells, 0U);
+    std::vector<std::uint8_t> blockerOf(maskCells, 1U);  // 先全部视为遮挡体（球体之外不采样、也不通行）
+    for (int z = mask.minZ; z < mask.minZ + mask.sizeZ; ++z) {
+        for (int y = mask.minY; y < mask.minY + mask.sizeY; ++y) {
+            for (int x = mask.minX; x < mask.minX + mask.sizeX; ++x) {
+                const double dx = static_cast<double>(x) - center.x;
+                const double dy = static_cast<double>(y) - center.y;
+                const double dz = static_cast<double>(z) - center.z;
+                if (dx * dx + dy * dy + dz * dz > blastReachSq) {
+                    continue;  // 球体之外：保持"遮挡体"（不可通行、也不参与结算）
+                }
+                const std::size_t  index = mask.Index(x, y, z);
+                const std::uint8_t slot  = SampleMaterialSlot(x, y, z);
+                const bool solid = SampleDensity(static_cast<double>(x), static_cast<double>(y),
+                                                 static_cast<double>(z)) < 0.0F;
+                // 不可破坏的判据与 `IsIndestructibleSample` 同口径（`kNoMaterialSlot` = 不属于可挖体积）。
+                bool indestructible = true;
+                if (slot != kNoMaterialSlot) {
+                    const MaterialLayer& layer = Materials().Layer(static_cast<int>(slot));
+                    indestructible             = layer.indestructible || !(layer.toughness > 0.0F);
+                }
+                slotOf[index]    = slot;
+                solidOf[index]   = solid ? 1U : 0U;
+                blockerOf[index] = (solid && indestructible) ? 1U : 0U;
+            }
+        }
+    }
+
+    // 洪泛：从爆心所在格出发做 6 邻域扩散（**不用对角** —— 对角会让波从两块岩的角缝里漏过去）。
+    // 用显式栈而不是递归：深度可达数万格，递归会爆栈且不确定。可达集合与遍历次序无关（确定性）。
+    {
+        const int        originX = static_cast<int>(std::floor(center.x));
+        const int        originY = static_cast<int>(std::floor(center.y));
+        const int        originZ = static_cast<int>(std::floor(center.z));
+        std::vector<int> stack;
+        if (mask.Contains(originX, originY, originZ)) {
+            const std::size_t originIndex = mask.Index(originX, originY, originZ);
+            if (blockerOf[originIndex] == 0U) {  // 爆心落在岩体内 ⇒ 一格都进不去（波不外泄）
+                mask.reachable[originIndex] = 1U;
+                stack.push_back(static_cast<int>(originIndex));
+            }
+        }
+        const int planeStride = mask.sizeX * mask.sizeY;
+        while (!stack.empty()) {
+            const int index = stack.back();
+            stack.pop_back();
+            // 解码必须**加回掩码原点**（`Index` 存的是相对 `min*` 的偏移，漏掉这一步会让整条洪泛停在盒子角落）。
+            const int x = mask.minX + index % mask.sizeX;
+            const int y = mask.minY + (index / mask.sizeX) % mask.sizeY;
+            const int z = mask.minZ + index / planeStride;
+            const int neighbours[6][3] = { { x - 1, y, z }, { x + 1, y, z }, { x, y - 1, z },
+                                           { x, y + 1, z }, { x, y, z - 1 }, { x, y, z + 1 } };
+            for (const int(&next)[3] : neighbours) {
+                if (!mask.Contains(next[0], next[1], next[2])) {
+                    continue;
+                }
+                const std::size_t nextIndex = mask.Index(next[0], next[1], next[2]);
+                if (mask.reachable[nextIndex] != 0U || blockerOf[nextIndex] != 0U) {
+                    continue;
+                }
+                mask.reachable[nextIndex] = 1U;
+                stack.push_back(static_cast<int>(nextIndex));
+            }
+        }
+    }
+
+    // ③ 自爆心向外逐格³ 扣减（**整数点**），**只结算可达的格**；余额不足以破坏下一格 ⇒ 立即停止。
+    int         remaining  = budgetPoints;
+    double      stopRadius = 0.0;
+    std::size_t destroyed  = 0;
+    for (const CandidateCell& cell : cells) {
+        // 候选格的**格心**距球心 ≤ radius，故它的**采样点**距球心 ≤ radius + √3/2 < radius + 1.5
+        // ⇒ 一定落在掩码球内，`Index` 不会越界（掩码球半径 = radius + `kCarveBandBlocks`）。
+        const std::size_t index = mask.Index(cell.x, cell.y, cell.z);
+        // T53：**被岩石遮挡**的格 ⇒ 跳过，且**不消耗预算**（近侧该挖多少还是多少）。
+        // 「不可达」已包含「实心 ∧ 不可破坏」这一整类（它们正是洪泛的遮挡体），故此处不再另判不可破坏。
+        if (mask.reachable[index] == 0U) {
+            continue;
+        }
+        const std::uint8_t slot = slotOf[index];
+        if (slot == kNoMaterialSlot) {
+            continue;  // 不属于可挖体积
+        }
+        if (solidOf[index] == 0U) {
+            continue;  // 已经是空（空气）：无物可破坏 ⇒ **不消耗**预算（否则在空气中爆炸会"空烧"预算、把腔体算大）
+        }
+        const MaterialLayer& layer = Materials().Layer(static_cast<int>(slot));
+        const int            cost  = static_cast<int>(std::lround(layer.toughness));  // 点 / 格³ → 整数点
+        if (cost > remaining) {
+            break;  // 该格及其更远者保留
+        }
+        remaining -= cost;
+        stopRadius = cell.distance;
+        ++destroyed;
+    }
+    if (destroyed == 0) {
+        return false;  // 一格都挖不动（例如全落在不可破坏材质里 / 爆心在岩体内）⇒ 无改动是正确结果
+    }
+
+    // ④ 以"最后一个被破坏的格"的半径为**光滑球面半径**按掩码栅格化：
+    //    不可破坏材质（T31）与**爆炸波到不了**的采样（T53）都保持原状。
+    return RasterizeBall(center, static_cast<float>(stopRadius), /*skipIndestructible*/true, &mask, dirtyOut,
+                         boundsOut);
 }
 
 bool DigVolumeWorld::RemeshBlock(const BlockCoord& coord) {

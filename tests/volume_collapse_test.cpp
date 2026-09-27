@@ -20,12 +20,14 @@
 #include "terrain/terrain_world.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <sstream>
 #include <stdexcept>
@@ -170,25 +172,150 @@ constexpr std::size_t kMaxUnitsInTest = 4;
     return region;
 }
 
-/// 统计网格里"**只被 1 个三角形用到**的无向边"条数（T46 修订的判据）：
-/// 闭合曲面里每条边恰好被 2 个三角形共用 ⇒ 计数为 0；有洞则洞的边界边只被 1 次用到 ⇒ 计数 > 0。
-[[nodiscard]] std::size_t CountBoundaryEdges(const vx::MeshData& mesh) {
-    std::map<std::pair<std::uint32_t, std::uint32_t>, int> uses;
-    for (std::size_t triangle = 0; triangle + 2 < mesh.indices.size(); triangle += 3) {
-        for (int edge = 0; edge < 3; ++edge) {
-            const std::uint32_t a   = mesh.indices[triangle + static_cast<std::size_t>(edge)];
-            const std::uint32_t b   = mesh.indices[triangle + static_cast<std::size_t>((edge + 1) % 3)];
-            const auto          key = std::minmax(a, b);
-            ++uses[{ key.first, key.second }];
+/// **长条**场景（T47 / BUG3 取证）：与项目所有者实测的"掉落中的长条"同形 —— 细而长的一块**悬空**体。
+///   地板 = 高度 < 105 全实心（区域底面起连续实心 ⇒ 接地）；
+///   长条 = x∈[1,31)、z∈[10,12)、y∈[109,111)（30 × 2 × 2 = 120 体素，长径比 15:1），四周为空腔。
+[[nodiscard]] DensityRegion BuildLongBarScene() {
+    DensityRegion region;
+    region.minX  = 0;
+    region.minY  = kSceneOriginY;
+    region.minZ  = 0;
+    region.sizeX = vx::kVolumeBlockSize + 1;
+    region.sizeY = 2 * vx::kVolumeBlockSize + 1;
+    region.sizeZ = vx::kVolumeBlockSize + 1;
+    region.values.assign(static_cast<std::size_t>(region.sizeX) * static_cast<std::size_t>(region.sizeY) *
+                             static_cast<std::size_t>(region.sizeZ),
+                         static_cast<std::int8_t>(vx::kDensityMax));
+
+    for (int k = 0; k < region.sizeZ; ++k) {
+        for (int j = 0; j < region.sizeY; ++j) {
+            for (int i = 0; i < region.sizeX; ++i) {
+                const int worldX = region.minX + i;
+                const int worldY = region.minY + j;
+                const int worldZ = region.minZ + k;
+
+                const bool floor = worldY < 105;
+                const bool bar   = (worldY >= 109) && (worldY < 111) && (worldX >= 1) && (worldX < 31) &&
+                                 (worldZ >= 10) && (worldZ < 12);
+                region.values[region.Index(i, j, k)] =
+                    (floor || bar) ? static_cast<std::int8_t>(vx::kDensityMin)
+                                   : static_cast<std::int8_t>(vx::kDensityMax);
+            }
         }
     }
-    std::size_t boundary = 0;
-    for (const auto& entry : uses) {
-        if (entry.second != 2) {
-            ++boundary;
+    return region;
+}
+
+/// 闭合判据（T46 修订的"每条无向边恰被 2 个三角形共用"）现由**生产代码里的同一份实现**承担：
+/// `vx::CountBoundaryEdges`（`world/dig/volume_mesher.*`）。测试与"整体外观网格插桩"（T47）共用一份口径，
+/// 不再各写一套。
+
+/// **T49 判据①** 的场景：30 格长条**只由两端立柱撑着**（两端接地 ⇒ 原样稳定）。
+///   地板 = 高度 < 105 全实心（自区域底面连续实心 ⇒ 接地）；
+///   两根立柱 = x∈[1,3) 与 x∈[29,31)、z∈[10,12)、y∈[105,110)（接地 ⇒ 有支撑）；
+///   长条 = x∈[1,31)、z∈[10,12)、y∈[110,112)（30 × 2 × 2 = 120 体素）。
+/// 两次爆破各炸一侧立柱的**根部** ⇒ 长条**整段**失去支撑 ⇒ 区域内不得再有"下方为空"的实心体素。
+[[nodiscard]] DensityRegion BuildTwoPillarBarScene() {
+    DensityRegion region;
+    region.minX  = 0;
+    region.minY  = kSceneOriginY;
+    region.minZ  = 0;
+    region.sizeX = vx::kVolumeBlockSize + 1;
+    region.sizeY = 2 * vx::kVolumeBlockSize + 1;
+    region.sizeZ = vx::kVolumeBlockSize + 1;
+    region.values.assign(static_cast<std::size_t>(region.sizeX) * static_cast<std::size_t>(region.sizeY) *
+                             static_cast<std::size_t>(region.sizeZ),
+                         static_cast<std::int8_t>(vx::kDensityMax));
+
+    for (int k = 0; k < region.sizeZ; ++k) {
+        for (int j = 0; j < region.sizeY; ++j) {
+            for (int i = 0; i < region.sizeX; ++i) {
+                const int worldX = region.minX + i;
+                const int worldY = region.minY + j;
+                const int worldZ = region.minZ + k;
+
+                const bool floor  = worldY < 105;
+                const bool pillar = (worldY >= 105) && (worldY < 110) && (worldZ >= 10) && (worldZ < 12) &&
+                                    ((worldX >= 1 && worldX < 3) || (worldX >= 29 && worldX < 31));
+                const bool bar = (worldY >= 110) && (worldY < 112) && (worldX >= 1) && (worldX < 31) &&
+                                 (worldZ >= 10) && (worldZ < 12);
+                region.values[region.Index(i, j, k)] =
+                    (floor || pillar || bar) ? static_cast<std::int8_t>(vx::kDensityMin)
+                                             : static_cast<std::int8_t>(vx::kDensityMax);
+            }
         }
     }
-    return boundary;
+    return region;
+}
+
+/// **T49 判据③**（超上限 ⇒ 回退固定窗口）的场景：**全长**横跨 `blockCountX` 个块的悬空长条。
+/// 它远长于任何固定窗口 ⇒ 爆破其一端后连通域一直延伸到另一端，窗口反复翻倍直到撞上
+/// `kMaxRegionSamples` ⇒ 走"告警 + 保守回退固定窗口"这条显式例外（ADR 0018 决策一）。
+///
+/// 竖直只占**一个块**（y 块 3 = [96, 128)）⇒ 窗口的竖直采样数从 65 降到 33，
+/// 让"翻倍到超上限"这一步在测试里仍然便宜（否则光是读窗口就要几十 MB）。
+[[nodiscard]] DensityRegion BuildLongSprawlSlabScene(int blockCountX) {
+    DensityRegion region;
+    region.minX  = 0;
+    region.minY  = 3 * vx::kVolumeBlockSize;  // 96
+    region.minZ  = 0;
+    region.sizeX = blockCountX * vx::kVolumeBlockSize + 1;
+    region.sizeY = vx::kVolumeBlockSize + 1;
+    region.sizeZ = vx::kVolumeBlockSize + 1;
+    region.values.assign(static_cast<std::size_t>(region.sizeX) * static_cast<std::size_t>(region.sizeY) *
+                             static_cast<std::size_t>(region.sizeZ),
+                         static_cast<std::int8_t>(vx::kDensityMax));
+
+    for (int k = 0; k < region.sizeZ; ++k) {
+        for (int j = 0; j < region.sizeY; ++j) {
+            for (int i = 0; i < region.sizeX; ++i) {
+                const int  worldY = region.minY + j;
+                const int  worldZ = region.minZ + k;
+                const bool floor  = worldY < 105;  // 区域底面 (96) 起连续实心 ⇒ 接地
+                const bool slab   = (worldY >= 109) && (worldY < 111) && (worldZ >= 10) && (worldZ < 12) &&
+                                  (region.minX + i < region.minX + region.sizeX - 1);
+                region.values[region.Index(i, j, k)] =
+                    (floor || slab) ? static_cast<std::int8_t>(vx::kDensityMin)
+                                    : static_cast<std::int8_t>(vx::kDensityMax);
+            }
+        }
+    }
+    return region;
+}
+
+/// **T51** 判据的场景：**深井**（地板只到 `worldY < 70`）+ 高空悬空石板（y ∈ [109, 111)、x/z ∈ [4, 12)）。
+///
+/// 用途：石板落在**下方 32 格内没有任何支撑**的地带 —— 接地沉降走满上限也接不到地
+/// ⇒ 必须走"仍悬空 ⇒ 清除"这条路（否则就会静默留下悬空的泥土，正是所有者实测到的现象）。
+[[nodiscard]] DensityRegion BuildDeepPitScene() {
+    DensityRegion region;
+    region.minX  = 0;
+    region.minY  = kSceneOriginY;
+    region.minZ  = 0;
+    region.sizeX = vx::kVolumeBlockSize + 1;
+    region.sizeY = 2 * vx::kVolumeBlockSize + 1;
+    region.sizeZ = vx::kVolumeBlockSize + 1;
+    region.values.assign(static_cast<std::size_t>(region.sizeX) * static_cast<std::size_t>(region.sizeY) *
+                             static_cast<std::size_t>(region.sizeZ),
+                         static_cast<std::int8_t>(vx::kDensityMax));
+
+    for (int k = 0; k < region.sizeZ; ++k) {
+        for (int j = 0; j < region.sizeY; ++j) {
+            for (int i = 0; i < region.sizeX; ++i) {
+                const int worldX = region.minX + i;
+                const int worldY = region.minY + j;
+                const int worldZ = region.minZ + k;
+
+                const bool floor = worldY < 70;  // 深井：地表比石板低 40 格
+                const bool slab  = (worldY >= 109) && (worldY < 111) && (worldX >= 4) && (worldX < 12) &&
+                                  (worldZ >= 4) && (worldZ < 12);
+                region.values[region.Index(i, j, k)] =
+                    (floor || slab) ? static_cast<std::int8_t>(vx::kDensityMin)
+                                    : static_cast<std::int8_t>(vx::kDensityMax);
+            }
+        }
+    }
+    return region;
 }
 
 [[nodiscard]] std::size_t CountSolidAtHeight(const DensityRegion& region, int worldY) {
@@ -294,7 +421,7 @@ void MarkSlabMaterialBy(DigVolumeWorld& volumes, Fn slotOf) {
     };
 
     std::ostringstream out;
-    out << "schema_version = 4\n";
+    out << "schema_version = 5\n";
     for (const Row& row : rows) {
         out << "[[layer]]\n"
             << "name = \"" << row.name << "\"\n"
@@ -316,6 +443,8 @@ void MarkSlabMaterialBy(DigVolumeWorld& volumes, Fn slotOf) {
             << "density = " << row.density << "\n"
             << "friction = " << row.friction << "\n"
             << "restitution = " << row.restitution << "\n";
+        // T31：材质表 v5 起 `toughness` 为**必填**（本用例只钉倒塌 / 清除逻辑，与破坏预算无关 ⇒ 统一给 1）。
+        out << "toughness = 1.0\n";
         if (rockIndestructible && std::string(row.name) == "rock") {
             out << "indestructible = true\n";
         }
@@ -401,7 +530,7 @@ TEST(VolumeCollapseRigid, WritebackAtOriginalPoseRestoresVoxels) {
     EXPECT_EQ(writeback.writtenVoxels, kSlabVoxels) << "原姿态回写应全部落回原位";
     EXPECT_EQ(writeback.droppedVoxels, 0U);
     EXPECT_EQ(writeback.settledVoxels, 0U) << "刚性不做沉降（形状不变）";
-    EXPECT_EQ(writeback.stuckVoxels, 0U);
+    EXPECT_EQ(writeback.removedFloatingVoxels, 0U);
     EXPECT_FALSE(writeback.dirty.empty());
 
     const DensityRegion after = ReadScene(scene.volumes);
@@ -870,34 +999,66 @@ TEST(VolumeCollapseMaterial, MassFrictionAndRestitutionFollowVoxelMaterial) {
     EXPECT_FLOAT_EQ(unit.restitution, materials.Layer(2).restitution);
 }
 
-// ⑯ 混合材质：摩擦 / 弹性取**多数材质**；同票时取**更小的槽位序号**（确定性）；
-//    而质量始终**逐体素**累加（不是"多数材质的密度 × 体素数"）。
-TEST(VolumeCollapseMaterial, MixedUnitTakesMajorityAndTieBreaksToLowerSlot) {
+// ⑯ 物理参数按**子块的材质**（T43 的质量 / T50 落地口径）：
+//    T50 起抽出的连通分量先按**材质一致性**拆成子块 ⇒ 一个子块只有一种材质，
+//    故"多数票 / 同票取更小槽位"这套折中**已不需要**（每个子块直接取自己材质的值）。
+//    质量仍然**逐体素**累加（= 该子块全体材质的密度之和）。
+TEST(VolumeCollapseMaterial, EachSubBlockTakesItsOwnMaterialParameters) {
     const MapPreset            preset    = FlatPreset();
     const TerrainMaterialTable materials = TerrainMaterialTable::Default();
     const CollapseSpec         spec;
 
-    // 多数票：x < 10 的 6 列（6 × 8 × 2 = 96 体素）= 沙（槽 3）、x ≥ 10 的 2 列（32 体素）= 土（槽 1）⇒ 取沙。
-    SlabScene majorityScene(preset, DigRegionTable::FromRegions({ MakeRegion(kSceneBlockMin, kSceneBlockMax) }), true);
-    MarkSlabMaterialBy(majorityScene.volumes, [](int x, int, int) -> std::uint8_t { return x < 10 ? 3U : 1U; });
-    const CollapsePlan majority = vx::ApplyCollapse(majorityScene.volumes,
-                                                    vx::CollapseSeed::FromBlocks(kSceneBlockMax, kSceneBlockMax), spec,
-                                                    kMaxUnitsInTest);
-    ASSERT_EQ(majority.units.size(), 1U);
-    EXPECT_FLOAT_EQ(majority.units.front().friction, materials.Layer(3).friction) << "多数材质（沙）的值";
-    EXPECT_FLOAT_EQ(majority.units.front().restitution, materials.Layer(3).restitution);
-    EXPECT_NEAR(majority.units.front().mass,
-                96.0F * materials.Layer(3).density + 32.0F * materials.Layer(1).density, 0.05F)
-        << "质量逐体素累加 ⇒ 混合材质的质量正确";
+    // 沙（槽 3）x < 10 的 6 列 = 96 体素、土（槽 1）x ≥ 10 的 2 列 = 32 体素 ⇒ **两个子块**。
+    SlabScene scene(preset, DigRegionTable::FromRegions({ MakeRegion(kSceneBlockMin, kSceneBlockMax) }), true);
+    MarkSlabMaterialBy(scene.volumes, [](int x, int, int) -> std::uint8_t { return x < 10 ? 3U : 1U; });
+    const CollapsePlan plan = vx::ApplyCollapse(scene.volumes,
+                                                vx::CollapseSeed::FromBlocks(kSceneBlockMax, kSceneBlockMax), spec,
+                                                kMaxUnitsInTest);
+    ASSERT_EQ(plan.units.size(), 2U) << "两种材质 ⇒ **两个子块**（T50 / ADR 0018 决策四）";
 
-    // 同票：y = 109 层（64 体素）= 土（槽 1）、y = 110 层（64 体素）= 沙（槽 3）⇒ 取更小的槽位（土）。
-    SlabScene tieScene(preset, DigRegionTable::FromRegions({ MakeRegion(kSceneBlockMin, kSceneBlockMax) }), true);
-    MarkSlabMaterialBy(tieScene.volumes, [](int, int y, int) -> std::uint8_t { return y == 109 ? 1U : 3U; });
-    const CollapsePlan tie = vx::ApplyCollapse(tieScene.volumes,
-                                               vx::CollapseSeed::FromBlocks(kSceneBlockMax, kSceneBlockMax), spec,
-                                               kMaxUnitsInTest);
-    ASSERT_EQ(tie.units.size(), 1U);
-    EXPECT_FLOAT_EQ(tie.units.front().friction, materials.Layer(1).friction) << "同票 ⇒ 更小槽位（确定性）";
+    // 确定序：体素数降序 ⇒ 沙（96）在前、土（32）在后。
+    const vx::CollapseUnit& sand = plan.units[0];
+    const vx::CollapseUnit& dirt = plan.units[1];
+    EXPECT_EQ(sand.voxels.size(), 96U);
+    EXPECT_EQ(dirt.voxels.size(), 32U);
+    EXPECT_FLOAT_EQ(sand.friction, materials.Layer(3).friction) << "沙子块取自己的摩擦";
+    EXPECT_FLOAT_EQ(dirt.friction, materials.Layer(1).friction) << "土子块取自己的摩擦";
+    EXPECT_FLOAT_EQ(sand.restitution, materials.Layer(3).restitution);
+    EXPECT_FLOAT_EQ(dirt.restitution, materials.Layer(1).restitution);
+    EXPECT_NEAR(sand.mass, 96.0F * materials.Layer(3).density, 0.05F) << "质量逐体素累加";
+    EXPECT_NEAR(dirt.mass, 32.0F * materials.Layer(1).density, 0.05F);
+    for (const vx::CollapseUnit::Voxel& voxel : sand.voxels) {
+        EXPECT_LT(voxel.x, 10) << "划分必须严格按材质边界（不许把土并进沙子块）";
+    }
+    for (const vx::CollapseUnit::Voxel& voxel : dirt.voxels) {
+        EXPECT_GE(voxel.x, 10);
+    }
+
+    // 分层场景（y = 109 土 / y = 110 沙）⇒ 同样是两个子块：划分只看"材质 + 6 邻域连通"，与"层"无关。
+    SlabScene layered(preset, DigRegionTable::FromRegions({ MakeRegion(kSceneBlockMin, kSceneBlockMax) }), true);
+    MarkSlabMaterialBy(layered.volumes, [](int, int y, int) -> std::uint8_t { return y == 109 ? 1U : 3U; });
+    const CollapsePlan layeredPlan = vx::ApplyCollapse(
+        layered.volumes, vx::CollapseSeed::FromBlocks(kSceneBlockMax, kSceneBlockMax), spec, kMaxUnitsInTest);
+    ASSERT_EQ(layeredPlan.units.size(), 2U);
+    for (const vx::CollapseUnit& unit : layeredPlan.units) {
+        EXPECT_EQ(unit.voxels.size(), 64U) << "每层 8 × 8 列 = 64 体素";
+    }
+
+    // 划分**确定性**（红线 7）：同输入两次 ⇒ 子块数、体素数、质心逐位相同。
+    SlabScene second(preset, DigRegionTable::FromRegions({ MakeRegion(kSceneBlockMin, kSceneBlockMax) }), true);
+    MarkSlabMaterialBy(second.volumes, [](int x, int, int) -> std::uint8_t { return x < 10 ? 3U : 1U; });
+    const CollapsePlan repeated = vx::ApplyCollapse(second.volumes,
+                                                    vx::CollapseSeed::FromBlocks(kSceneBlockMax, kSceneBlockMax),
+                                                    spec, kMaxUnitsInTest);
+    ASSERT_EQ(repeated.units.size(), plan.units.size());
+    for (std::size_t i = 0; i < plan.units.size(); ++i) {
+        EXPECT_EQ(repeated.units[i].voxels.size(), plan.units[i].voxels.size());
+        EXPECT_TRUE(repeated.units[i].voxels.front() == plan.units[i].voxels.front());
+        EXPECT_TRUE(repeated.units[i].voxels.back() == plan.units[i].voxels.back());
+        EXPECT_NEAR(repeated.units[i].centroid.x, plan.units[i].centroid.x, 1.0e-9);
+        EXPECT_NEAR(repeated.units[i].centroid.y, plan.units[i].centroid.y, 1.0e-9);
+        EXPECT_NEAR(repeated.units[i].centroid.z, plan.units[i].centroid.z, 1.0e-9);
+    }
 }
 
 // ⑰ 小碎片清除（ADR 0016 决策三）：体素数 ≤ 阈值的分量**直接清除**（"当炸没了"）——
@@ -963,11 +1124,14 @@ TEST(VolumeCollapseDebris, IndestructibleDebrisIsNotDeleted) {
 // T46 / ADR 0017：落地后的表示按材质分流（刚性保留几何体 / 散体回写融合并**接地沉降**）
 // ---------------------------------------------------------------------------
 
-// ⑲ 分流判据（T46 修订 / ADR 0017）= 碎块**露在外面的那层皮**（= 渲染网格会生成顶点的那些 cell）里
-//    **是否出现刚性材质**：出现 ⇒ 保留几何体（形状不变）；一个都没有 ⇒ 回写并与地面融合。
-//    为什么不是"全体体素的多数材质"：内部体素是按该列地表派生的，陡壁内部往往是土 ⇒
-//    "看着是白岩的一片"会被判成散体（项目所有者实测的缺陷：白岩掉下来跟泥土一样）。
-TEST(VolumeCollapseLanding, RigidityFollowsTheShownSurface) {
+// ⑲ 落地口径（T50 / [ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策四）
+//    = **该子块自己的材质**（`materials.toml` 的 `rigid_debris`）。
+//    T46 曾用"露在外面的**皮**上是否出现刚性材质"来判（在"整块一个 bool"的前提下最接近的近似）；
+//    T50 起抽出的分量**按材质拆成子块** ⇒ 每个子块只有一种材质，直接取该材质的 `rigid_debris`。
+//    这同时满足项目所有者实测的两条口径："**岩石始终不变**" + "**泥土下坠到有支撑为止**"：
+//      · 岩子块 ⇒ 保留几何体（不回写 ⇒ 形状与掉落中一致）；
+//      · 土 / 草 / 沙子块 ⇒ 回写并与地面融合（且接地沉降）。
+TEST(VolumeCollapseLanding, RigidityFollowsEachSubBlockMaterial) {
     const MapPreset            preset    = FlatPreset();
     const CollapseSpec         spec;
     const TerrainMaterialTable materials = TerrainMaterialTable::Default();
@@ -976,48 +1140,51 @@ TEST(VolumeCollapseLanding, RigidityFollowsTheShownSurface) {
     const vx::CollapseSeed seed = vx::CollapseSeed::FromBlocks(kSceneBlockMax, kSceneBlockMax);
     const auto regions = []() { return DigRegionTable::FromRegions({ MakeRegion(kSceneBlockMin, kSceneBlockMax) }); };
 
-    // ① 整块岩 ⇒ 表面上全是岩 ⇒ 刚性（落定后保留几何体）。
+    // ① 整块岩 ⇒ 单子块 ⇒ 刚性（落定后保留几何体）。
     {
         SlabScene scene(preset, regions(), true);
         MarkSlabMaterial(scene.volumes, 2U);
         const CollapsePlan plan = vx::ApplyCollapse(scene.volumes, seed, spec, kMaxUnitsInTest);
         ASSERT_EQ(plan.units.size(), 1U);
         EXPECT_TRUE(plan.units.front().rigidDebris);
-        EXPECT_GT(plan.units.front().surfaceMaterialCounts[2], 0) << "表面确实统计到了岩";
     }
-    // ② 整块土 ⇒ 表面一个刚性材质都没有 ⇒ 散体（落定后回写、与地面融合）。
+    // ② 整块土 ⇒ 单子块 ⇒ 散体（落定后回写、与地面融合）。
     {
         SlabScene scene(preset, regions(), true);
         MarkSlabMaterial(scene.volumes, 1U);
         const CollapsePlan plan = vx::ApplyCollapse(scene.volumes, seed, spec, kMaxUnitsInTest);
         ASSERT_EQ(plan.units.size(), 1U);
         EXPECT_FALSE(plan.units.front().rigidDebris);
-        EXPECT_EQ(plan.units.front().surfaceMaterialCounts[2], 0) << "表面上没有岩";
     }
-    // ③ **回归用例（项目所有者实测的缺陷）**：体积上土是多数（6 列土 = 96 体素 vs 2 列岩 = 32 体素），
-    //    但露在外面的那层皮上有岩 ⇒ 必须按**刚性**处理（旧口径"按体积多数"会判成散体 ⇒ 落地后被量化融合）。
+    // ③ **实测场景（BUG2 / "长条里岩石与泥土同时存在"）**：同一块里土 / 岩各半 ⇒ 拆成两个子块，
+    //    岩子块刚性（形状不变）、土子块散体（下坠融合）—— 一个整体一个 bool 做不到这件事。
     {
         SlabScene scene(preset, regions(), true);
         MarkSlabMaterialBy(scene.volumes, [](int x, int, int) -> std::uint8_t { return x < 10 ? 1U : 2U; });
         const CollapsePlan plan = vx::ApplyCollapse(scene.volumes, seed, spec, kMaxUnitsInTest);
-        ASSERT_EQ(plan.units.size(), 1U);
-        EXPECT_TRUE(plan.units.front().rigidDebris) << "皮上有岩 ⇒ 保持形状（哪怕体积多数是土）";
+        ASSERT_EQ(plan.units.size(), 2U) << "土 / 岩各半 ⇒ 两个子块";
+        // 确定序：体素数降序 ⇒ 土（6 列 = 96）/ 岩（2 列 = 32）
+        EXPECT_FALSE(plan.units[0].rigidDebris) << "土子块 = 散体（回写融合 + 接地沉降）";
+        EXPECT_TRUE(plan.units[1].rigidDebris) << "岩子块 = 刚性（形状不变）";
+        EXPECT_EQ(plan.units[1].voxels.size(), 32U);
     }
-    // ④ 与 ③ 互补：体积上岩是多数（6 列岩 = 96 vs 2 列土 = 32）⇒ 同样刚性（新旧口径一致）。
+    // ④ 与 ③ 互补：岩占多数（6 列）/ 土占少数（2 列）⇒ 岩子块同样刚性、土子块同样散体。
     {
         SlabScene scene(preset, regions(), true);
         MarkSlabMaterialBy(scene.volumes, [](int x, int, int) -> std::uint8_t { return x < 10 ? 2U : 1U; });
         const CollapsePlan plan = vx::ApplyCollapse(scene.volumes, seed, spec, kMaxUnitsInTest);
-        ASSERT_EQ(plan.units.size(), 1U);
-        EXPECT_TRUE(plan.units.front().rigidDebris) << "多数材质是岩";
+        ASSERT_EQ(plan.units.size(), 2U);
+        EXPECT_TRUE(plan.units[0].rigidDebris);
+        EXPECT_FALSE(plan.units[1].rigidDebris);
     }
-    // ⑤ 混在一起但**皮上无岩**：y = 109 层土、y = 110 层草（两个非刚性槽位，同票取更小槽位）⇒ 散体。
+    // ⑤ 土（y = 109）与草（y = 110）**都不是刚性** ⇒ 拆成两个子块，但**两个都是散体**（都要融合 + 沉降）。
     {
         SlabScene scene(preset, regions(), true);
         MarkSlabMaterialBy(scene.volumes, [](int, int y, int) -> std::uint8_t { return y == 109 ? 1U : 0U; });
         const CollapsePlan plan = vx::ApplyCollapse(scene.volumes, seed, spec, kMaxUnitsInTest);
-        ASSERT_EQ(plan.units.size(), 1U);
-        EXPECT_FALSE(plan.units.front().rigidDebris) << "皮上只有土 / 草 ⇒ 融合";
+        ASSERT_EQ(plan.units.size(), 2U);
+        EXPECT_FALSE(plan.units[0].rigidDebris);
+        EXPECT_FALSE(plan.units[1].rigidDebris);
     }
 }
 
@@ -1037,7 +1204,7 @@ TEST(VolumeCollapseLanding, DetachedUnitMeshIsWatertight) {
     ASSERT_EQ(plan.units.size(), 1U);
     const vx::MeshData mesh = vx::BuildCollapseUnitMesh(plan.units.front());
     ASSERT_FALSE(mesh.indices.empty());
-    EXPECT_EQ(CountBoundaryEdges(mesh), 0U) << "独立碎块的外观网格也必须闭合（不许看穿）";
+    EXPECT_EQ(vx::CountBoundaryEdges(mesh), 0U) << "独立碎块的外观网格也必须闭合（不许看穿）";
 }
 
 // ⑲b（T46 修订 / 断口闭合）**仍连在未塌岩体上**的碎块，其外观网格必须**闭合**。
@@ -1081,8 +1248,29 @@ TEST(VolumeCollapseLanding, AttachedUnitMeshIsWatertight) {
 
     const vx::MeshData unitMesh = vx::BuildCollapseUnitMesh(unit);
     ASSERT_FALSE(unitMesh.indices.empty());
-    EXPECT_EQ(CountBoundaryEdges(unitMesh), 0U)
+    EXPECT_EQ(vx::CountBoundaryEdges(unitMesh), 0U)
         << "碎块外观网格必须闭合：断口处也要生成等值面，否则掉落中能看穿它";
+}
+
+// ⑲c（T47 / BUG3 取证）**长条**碎块的等值面也必须闭合。
+//    项目所有者实测"掉落中的长条 / 落地后的长条上有些面直接透明"，故把该形状钉成**可复现判据**：
+//    若长条的等值面本身有洞，该用例（与游戏内 T47 插桩的 WARN）会一起报出 ⇒ 命中候选②。
+//    反之（本用例 0 条边界边）则说明"长条"的缺面不在整体网格里 ⇒ 指向候选③（地形↔体积交界缝）。
+TEST(VolumeCollapseLanding, LongBarUnitMeshIsWatertight) {
+    const MapPreset preset = FlatPreset();
+    SlabScene       scene(preset, DigRegionTable::FromRegions({ MakeRegion(kSceneBlockMin, kSceneBlockMax) }), true,
+                          TerrainMaterialTable::Default(), BuildLongBarScene());
+
+    const CollapseSpec spec;
+    const CollapsePlan plan = vx::ApplyCollapse(scene.volumes,
+                                                vx::CollapseSeed::FromBlocks(kSceneBlockMax, kSceneBlockMax), spec,
+                                                kMaxUnitsInTest);
+    ASSERT_EQ(plan.units.size(), 1U) << "细长悬空体应成为**一个**连通分量（一个整体）";
+    EXPECT_EQ(plan.units.front().voxels.size(), 30U * 2U * 2U) << "长条 = 30 × 2 × 2 个体素";
+
+    const vx::MeshData mesh = vx::BuildCollapseUnitMesh(plan.units.front());
+    ASSERT_FALSE(mesh.indices.empty());
+    EXPECT_EQ(vx::CountBoundaryEdges(mesh), 0U) << "长条外观网格必须闭合（不许从任何角度看穿）";
 }
 
 // ⑳ 散体回写后**必须接地**（"泥土不能悬空"）：悬空石板（土）按原姿态回写 ⇒ 体素沿本列下落到地板顶面，
@@ -1104,7 +1292,8 @@ TEST(VolumeCollapseLanding, GranularWritebackSinksVoxelsOntoSupport) {
     const vx::CollapseWriteback writeback = vx::WritebackCollapseUnit(scene.volumes, plan.units.front(), pose);
     EXPECT_EQ(writeback.writtenVoxels, kSlabVoxels);
     EXPECT_EQ(writeback.settledVoxels, kSlabVoxels) << "每一个体素都从悬空处落到了支撑面上";
-    EXPECT_EQ(writeback.stuckVoxels, 0U);
+    EXPECT_EQ(writeback.removedFloatingVoxels, 0U)
+        << "能降到支撑面的体素**不该被清除**（T51 只在「降不到支撑」时才删）";
 
     const DensityRegion after = ReadScene(scene.volumes);
     EXPECT_EQ(CountSolidAtHeight(after, 109), 0U) << "不该留在原来的悬空高度";
@@ -1133,15 +1322,17 @@ TEST(VolumeCollapseLanding, RigidWritebackKeepsVoxelsInPlace) {
     const vx::CollapseWriteback writeback = vx::WritebackCollapseUnit(scene.volumes, plan.units.front(), pose);
     EXPECT_EQ(writeback.writtenVoxels, kSlabVoxels);
     EXPECT_EQ(writeback.settledVoxels, 0U) << "刚性不做接地沉降";
-    EXPECT_EQ(writeback.stuckVoxels, 0U);
+    EXPECT_EQ(writeback.removedFloatingVoxels, 0U);
 
     const DensityRegion after = ReadScene(scene.volumes);
     EXPECT_EQ(CountSolidAtHeight(after, 109), 8U * 8U) << "刚性：体素留在原位（形状不变）";
     EXPECT_EQ(CountSolidAtHeight(after, 110), 8U * 8U);
 }
 
-// ㉒ 光球命中保留残骸的判据（`LocalAabbContainsPoint` / `UnitWorldAabb`）：盒**随姿态旋转**（= OBB）。
-TEST(VolumeCollapseLanding, RetainedPointTestFollowsPose) {
+// ㉒ 保留残骸的**世界 AABB**（`UnitWorldAabb`）：用于"某体积块碰撞体重建后唤醒相交残骸"，
+//    盒**随姿态旋转**。T48 起光球命中改由物理引擎回答（真实凸包表面）⇒
+//    原先的手工 OBB 判据 `LocalAabbContainsPoint` **已下线**（ADR 0018 决策三）。
+TEST(VolumeCollapseLanding, UnitWorldAabbFollowsPose) {
     const MapPreset preset = FlatPreset();
     SlabScene       scene(preset, DigRegionTable::FromRegions({ MakeRegion(kSceneBlockMin, kSceneBlockMax) }), true);
 
@@ -1157,18 +1348,6 @@ TEST(VolumeCollapseLanding, RetainedPointTestFollowsPose) {
     EXPECT_FLOAT_EQ(unit.hullMaxLocal.x - unit.hullMinLocal.x, 8.0F);
 
     const vx::CollapsePose identity { unit.centroid, glm::quat(1.0F, 0.0F, 0.0F, 0.0F) };
-    EXPECT_TRUE(vx::LocalAabbContainsPoint(unit, identity, unit.centroid)) << "质心必在盒内";
-    EXPECT_TRUE(vx::LocalAabbContainsPoint(unit, identity, unit.centroid + glm::dvec3(0.0, 0.5, 0.0)));
-    EXPECT_FALSE(vx::LocalAabbContainsPoint(unit, identity, unit.centroid + glm::dvec3(0.0, 1.5, 0.0)))
-        << "薄轴外 → 不含";
-    EXPECT_FALSE(vx::LocalAabbContainsPoint(unit, identity, unit.centroid + glm::dvec3(9.0, 0.0, 0.0))) << "远处 → 不含";
-
-    // 绕 Z 转 90°：世界 +x 方向 2 格处由"**在盒内**"变为"**在盒外**" —— 证明判据**随姿态旋转**。
-    const vx::CollapsePose quarterTurn { unit.centroid,
-                                         glm::angleAxis(glm::radians(90.0F), glm::vec3(0.0F, 0.0F, 1.0F)) };
-    const glm::dvec3      sideways = unit.centroid + glm::dvec3(2.0, 0.0, 0.0);
-    EXPECT_TRUE(vx::LocalAabbContainsPoint(unit, identity, sideways));
-    EXPECT_FALSE(vx::LocalAabbContainsPoint(unit, quarterTurn, sideways));
 
     // `UnitWorldAabb`：单位姿 ≡ 质心 + 局部 AABB；绕 Z 转 45° 后**半长按旋转后的包围盒增长**。
     glm::dvec3 low(0.0);
@@ -1185,4 +1364,322 @@ TEST(VolumeCollapseLanding, RetainedPointTestFollowsPose) {
                                  std::cos(glm::radians(45.0)) ;
     EXPECT_NEAR(high.y - unit.centroid.y, expectedHalfY, 1.0e-3)
         << "45° 下世界 AABB 半长 = |max.x|·cos45 + |max.y|·sin45";
+}
+
+// ---------------------------------------------------------------------------
+// T49 / [ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策一：
+// 支撑求解 **连通域化**（scope = 以被改动采样为起点的实心连通域，而不是固定窗口）
+// ---------------------------------------------------------------------------
+
+// ㉓ 判据①（BUG1 的回归判据）：**30 格长条只由两端立柱撑着**，两次爆破各炸一侧立柱的**根部**
+//    ⇒ 长条**整段**失去支撑 ⇒ 区域内不得再有"下方为空"的实心体素。
+//    固定窗口（被改动采样 ± (悬挑 + 1) 格）下，距任何破坏点都超过窗口的**中段从不进入任何一次求解**
+//    ⇒ 永远悬空（这正是实测的 BUG1）；连通域化后中段也在域内 ⇒ 必须一并落下。
+//    判据②（确定性）在本用例内一并核对：同一串输入在另一个同样的场景上跑，域与整体逐位相同。
+TEST(VolumeCollapseConnectedDomain, LongBarLosesBothPillarsAndFallsEntirely) {
+    const MapPreset preset = FlatPreset();
+    // 悬挑上限取 15：30 格长条（两端立柱的净跨度 26 格）**两端都有立柱时确实稳定** —— 两端各 15 步的
+    // 悬挑把全段覆盖；否则"前提"就不成立，这个用例也证明不了"是这次破坏造成的"。
+    // 破坏一侧后只剩一端撑着（另一侧那截必须落）；**第二次破坏后**整段都必须落。
+    CollapseSpec spec;
+    spec.maxCantileverBlocks = 15.0F;
+    const auto build = [&preset]() {
+        return SlabScene(preset, DigRegionTable::FromRegions({ MakeRegion(kSceneBlockMin, kSceneBlockMax) }), true,
+                         TerrainMaterialTable::Default(), BuildTwoPillarBarScene());
+    };
+
+    // 前置：两端立柱都在 ⇒ 长条有支撑，一个整体都不该有（否则本用例证明不了"是这次破坏造成的"）。
+    {
+        SlabScene          pristine = build();
+        const CollapsePlan none     = vx::ApplyCollapse(
+            pristine.volumes, vx::CollapseSeed::FromBlocks(kSceneBlockMax, kSceneBlockMax), spec, kMaxUnitsInTest);
+        EXPECT_TRUE(none.units.empty()) << "前提：两端立柱都在时长条稳定";
+    }
+
+    // 左端爆破 → 抽取；右端爆破 → 剩下的中段必须整段落下。
+    std::vector<BlockCoord> dirty;
+    vx::VoxelBounds         leftBounds;
+    vx::VoxelBounds         rightBounds;
+
+    SlabScene scene = build();
+    vx::Clock clock;
+    (void)clock.Tick();
+    ASSERT_TRUE(scene.volumes.CarveSphere(glm::dvec3(2.0, 106.0, 11.0), 3.0F, dirty, &leftBounds))
+        << "第一次爆破必须真的炸到左立柱根部";
+    const CollapsePlan first = vx::ApplyCollapse(scene.volumes, vx::CollapseSeed { leftBounds }, spec, kMaxUnitsInTest);
+    const double        firstMs = clock.Tick() * 1000.0;
+    EXPECT_TRUE(first.domainNarrowed) << "T49：按连通域收窄（不是回退固定窗口）";
+    ASSERT_FALSE(first.units.empty()) << "左端支点被炸断 ⇒ 长条该失去支撑";
+
+    ASSERT_TRUE(scene.volumes.CarveSphere(glm::dvec3(30.0, 106.0, 11.0), 3.0F, dirty, &rightBounds));
+    const CollapsePlan second = vx::ApplyCollapse(scene.volumes, vx::CollapseSeed { rightBounds }, spec, kMaxUnitsInTest);
+    const double        secondMs = clock.Tick() * 1000.0;
+    EXPECT_TRUE(second.domainNarrowed);
+    ASSERT_FALSE(second.units.empty()) << "右端支点也被炸断 ⇒ 剩下的中段必须落（BUG1 的判据）";
+
+    const DensityRegion after = ReadScene(scene.volumes);
+    EXPECT_EQ(CountFloatingSolid(after), 0U)
+        << "两次爆破各炸一侧支点后，区域内**不得**再有'下方为空'的实心体素（悬空的中段 = BUG1）";
+    std::printf("[T49 基准] 长条两次爆破（连通域收窄）：域 %zu / %zu 体素、窗口 %zu 采样；"
+                "主线程上本次最贵一步 = 支撑求解，%.2f ms + %.2f ms（debug）\n",
+                first.domainVoxels, second.domainVoxels, second.regionSamples, firstMs, secondMs);
+    std::fflush(stdout);
+
+    // 判据②：洪泛**确定性**（红线 7）—— 同一串输入在另一个同样构造的场景上跑，域与整体逐位相同。
+    SlabScene               twin = build();
+    std::vector<BlockCoord> twinDirty;
+    vx::VoxelBounds         twinLeft;
+    vx::VoxelBounds         twinRight;
+    ASSERT_TRUE(twin.volumes.CarveSphere(glm::dvec3(2.0, 106.0, 11.0), 3.0F, twinDirty, &twinLeft));
+    (void)vx::ApplyCollapse(twin.volumes, vx::CollapseSeed { twinLeft }, spec, kMaxUnitsInTest);
+    ASSERT_TRUE(twin.volumes.CarveSphere(glm::dvec3(30.0, 106.0, 11.0), 3.0F, twinDirty, &twinRight));
+    const CollapsePlan twinSecond = vx::ApplyCollapse(twin.volumes, vx::CollapseSeed { twinRight }, spec, kMaxUnitsInTest);
+    EXPECT_EQ(twinSecond.domainVoxels, second.domainVoxels) << "同输入 ⇒ 同一连通域";
+    ASSERT_EQ(twinSecond.units.size(), second.units.size());
+    for (std::size_t i = 0; i < second.units.size(); ++i) {
+        EXPECT_EQ(twinSecond.units[i].voxels.size(), second.units[i].voxels.size());
+        EXPECT_TRUE(twinSecond.units[i].voxels.front() == second.units[i].voxels.front());
+        EXPECT_TRUE(twinSecond.units[i].voxels.back() == second.units[i].voxels.back());
+        EXPECT_NEAR(twinSecond.units[i].centroid.x, second.units[i].centroid.x, 1.0e-9);
+    }
+}
+
+// ㉔ 判据③：连通域**超出上限** ⇒ **告警 + 保守回退固定窗口**（ADR 0018 决策一登记的显式例外）。
+//    窗口的采样数 = `sizeX × sizeY × sizeZ`；扩张**只发生在触界的那些侧**（细长结构因此很便宜），
+//    所以要让"超界"真的发生，就得让**两个方向**都很宽。这里用一条 512 格长的悬空长条 +
+//    一个**刻意的宽 z 种子**（现实中对应"一次波及很宽的破坏"）把两个方向的宽度都做出来 ——
+//    16 个块的场景即可走到这条例外，不必构造几百个块的地图。
+//    可判定判据 = `plan.domainNarrowed == false`（日志里同时有一条 WARN）；耗时打进输出供人工核对**不冻结**。
+TEST(VolumeCollapseConnectedDomain, OversizedDomainFallsBackToFixedWindow) {
+    constexpr int      kBlocksX = 16;  // 16 × 32 = 512 格
+    const MapPreset    preset   = FlatPreset();
+    const CollapseSpec spec;
+
+    TerrainWorld world(preset.seed, TerrainMaterialTable::Default());
+    world.SetMapPreset(preset);
+    world.LoadTile(0, 0);
+    DigRegionTable regions = DigRegionTable::FromRegions(
+        { MakeRegion(BlockCoord { 0, 3, 0 }, BlockCoord { kBlocksX - 1, 3, 0 }) });
+    DigVolumeWorld volumes(world, regions);
+    volumes.InitFromHeightField();
+    volumes.WriteDensityRegion(BuildLongSprawlSlabScene(kBlocksX));
+
+    // 种子 = "被改动采样"的 AABB：x 很窄、**z 很宽**（490 格）、y 覆盖地表块。
+    vx::CollapseSeed seed;
+    seed.bounds = vx::VoxelBounds { 0, 105, -230, 20, 112, 260 };
+
+    vx::Clock clock;
+    (void)clock.Tick();
+    const CollapsePlan plan = vx::ApplyCollapse(volumes, seed, spec, kMaxUnitsInTest);
+    const double       ms   = clock.Tick() * 1000.0;
+
+    EXPECT_FALSE(plan.domainNarrowed)
+        << "连通域超出上限 ⇒ 必须走'告警 + 保守回退固定窗口'（否则就是偷偷把上限放开了）";
+    EXPECT_GT(plan.regionSamples, 0U);
+    EXPECT_LE(plan.regionSamples, 8U * 1024U * 1024U) << "回退后的窗口仍必须在上限之内（不冻结画面的前提）";
+    EXPECT_FALSE(plan.units.empty()) << "回退后仍按固定窗口抽出失去支撑的部分（'这次没倒'不该变成'什么都不做'）";
+    std::printf("[T49 基准] 连通域超上限 ⇒ 回退固定窗口：窗口 %zu 采样、域 %zu 体素、整体 %zu 个；"
+                "主线程上本次最贵一步 = 支撑求解，%.2f ms（debug）\n",
+                plan.regionSamples, plan.domainVoxels, plan.units.size(), ms);
+    std::fflush(stdout);
+}
+
+// ---------------------------------------------------------------------------
+// T50 / ADR 0018 决策二：破坏时**不切换表示**（在碎块自身补丁上雕刻 + 同一份 Surface Nets 重网格）
+// ---------------------------------------------------------------------------
+
+// ㉕ 判据①（可证伪的不变量）：在补丁上雕刻后，**未被触及的区域顶点逐位不变** ——
+//    两次网格化的顶点差集（两个方向）都必须落在球内（+ 一个 cell 的余量）。
+//    这条把"岩石始终不变形"从"靠自觉"变成可测的判据。
+TEST(VolumeCollapseCarve, CarveKeepsUntouchedVerticesBitIdentical) {
+    const MapPreset            preset    = FlatPreset();
+    const TerrainMaterialTable materials = TerrainMaterialTable::Default();
+    const CollapseSpec         spec;
+
+    SlabScene scene(preset, DigRegionTable::FromRegions({ MakeRegion(kSceneBlockMin, kSceneBlockMax) }), true);
+    // **T52 起岩不可破坏**（`indestructible = true`）⇒ 在岩上雕刻是**零改动**（另有用例专门钉这条），
+    // 故这里用**土**（可破坏）验证"雕刻 + 重网格"这条数学：任一可破坏材质的补丁口径完全相同。
+    MarkSlabMaterial(scene.volumes, 1U);
+    CollapsePlan plan = vx::ApplyCollapse(scene.volumes, vx::CollapseSeed::FromBlocks(kSceneBlockMax, kSceneBlockMax),
+                                          spec, kMaxUnitsInTest);
+    ASSERT_EQ(plan.units.size(), 1U);
+    vx::CollapseUnit& unit = plan.units.front();
+    ASSERT_EQ(unit.voxels.size(), kSlabVoxels);
+    ASSERT_FALSE(materials.Layer(1).indestructible) << "前提：土可破坏（不可破坏的材质根本挖不动）";
+
+    const auto vertexSet = [](const vx::MeshData& mesh) {
+        std::vector<std::array<float, 3>> out;
+        out.reserve(mesh.vertices.size());
+        for (const vx::MeshVertex& vertex : mesh.vertices) {
+            out.push_back({ vertex.position[0], vertex.position[1], vertex.position[2] });
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+
+    const vx::MeshData               before = vx::BuildCollapseUnitMesh(unit);
+    const std::vector<std::array<float, 3>> beforeVerts = vertexSet(before);
+    ASSERT_FALSE(beforeVerts.empty());
+
+    // 球心放在石板的**一个上角**（世界坐标；网格顶点是"相对质心"的局部坐标，下面换算回来比较）。
+    const double     radius = 1.0;
+    const glm::dvec3 center(unit.centroid.x + 3.0, unit.centroid.y + 0.5, unit.centroid.z + 3.0);
+    ASSERT_TRUE(vx::CarveCollapseUnitPatch(unit, center, static_cast<float>(radius), materials))
+        << "前置：球必须真的碰到这块碎块（否则本用例证明不了什么）";
+
+    const vx::MeshData                      after = vx::BuildCollapseUnitMesh(unit);
+    const std::vector<std::array<float, 3>> afterVerts = vertexSet(after);
+    ASSERT_FALSE(afterVerts.empty()) << "挖一个小角不该把整块挖光";
+
+    std::vector<std::array<float, 3>> onlyAfter;
+    std::vector<std::array<float, 3>> onlyBefore;
+    std::set_difference(afterVerts.begin(), afterVerts.end(), beforeVerts.begin(), beforeVerts.end(),
+                        std::back_inserter(onlyAfter));
+    std::set_difference(beforeVerts.begin(), beforeVerts.end(), afterVerts.begin(), afterVerts.end(),
+                        std::back_inserter(onlyBefore));
+
+    // 顶点是"相对质心"的局部坐标 ⇒ 加回质心即世界坐标。
+    const auto insideBall = [&](const std::array<float, 3>& local) {
+        const glm::dvec3 world(unit.centroid.x + static_cast<double>(local[0]),
+                               unit.centroid.y + static_cast<double>(local[1]),
+                               unit.centroid.z + static_cast<double>(local[2]));
+        // 球内 + 过渡带 + **一个 cell 的对角**（顶点属于 cell，cell 的任一采样被改就可能带动它）。
+        return glm::distance(world, center) <= radius + vx::kCarveSdfBandBlocks + 2.0;
+    };
+    ASSERT_FALSE(onlyBefore.empty()) << "雕刻必须真的改动了网格（否则判据没有区分度）";
+    for (const std::array<float, 3>& vertex : onlyAfter) {
+        EXPECT_TRUE(insideBall(vertex)) << "新增顶点只允许出现在球附近";
+    }
+    for (const std::array<float, 3>& vertex : onlyBefore) {
+        EXPECT_TRUE(insideBall(vertex))
+            << "消失顶点只允许出现在球附近 ⇒ **未被触及的区域顶点逐位不变**（T50 的不变量）";
+    }
+}
+
+// ㉖ 判据②：由**补丁**重算（`RefreshCollapseUnitFromPatch`）必须
+//    ① **质心逐位不变**（局部坐标系不变 ⇒ 刚体与网格原地不动，碎块不会因为被雕刻而"跳一下"）；
+//    ② 体素清单 = 补丁里"仍实心且属于本整体"的采样 —— 有减少，且被移除的只落在球附近；
+//    ③ 质量随剩余体素减小（仍是逐体素累加）；凸包点集仍可用（≥ 4 点）。
+TEST(VolumeCollapseCarve, RefreshKeepsCentroidAndShrinksVoxelsToTheCarvedPatch) {
+    const MapPreset            preset    = FlatPreset();
+    const TerrainMaterialTable materials = TerrainMaterialTable::Default();
+    const CollapseSpec         spec;
+
+    SlabScene scene(preset, DigRegionTable::FromRegions({ MakeRegion(kSceneBlockMin, kSceneBlockMax) }), true);
+    MarkSlabMaterial(scene.volumes, 1U);  // 土（T52 起岩不可破坏 ⇒ 雕刻用例改用可破坏材质；见上一个用例）
+    CollapsePlan plan = vx::ApplyCollapse(scene.volumes, vx::CollapseSeed::FromBlocks(kSceneBlockMax, kSceneBlockMax),
+                                          spec, kMaxUnitsInTest);
+    ASSERT_EQ(plan.units.size(), 1U);
+    vx::CollapseUnit& unit = plan.units.front();
+
+    const glm::dvec3   centroidBefore = unit.centroid;
+    const float        massBefore     = unit.mass;
+    const std::size_t  voxelsBefore   = unit.voxels.size();
+
+    const double     radius = 1.0;
+    const glm::dvec3 center(unit.centroid.x + 3.0, unit.centroid.y + 0.5, unit.centroid.z + 3.0);
+    ASSERT_TRUE(vx::CarveCollapseUnitPatch(unit, center, static_cast<float>(radius), materials));
+    ASSERT_TRUE(vx::RefreshCollapseUnitFromPatch(unit, materials));
+
+    EXPECT_EQ(unit.centroid.x, centroidBefore.x) << "质心必须**逐位不变**（局部坐标系不变）";
+    EXPECT_EQ(unit.centroid.y, centroidBefore.y);
+    EXPECT_EQ(unit.centroid.z, centroidBefore.z);
+    EXPECT_LT(unit.voxels.size(), voxelsBefore) << "确有体素被挖掉";
+    EXPECT_LT(unit.mass, massBefore) << "质量随剩余体素减小（逐体素累加）";
+    EXPECT_GE(unit.hullPoints.size() / 3U, 4U) << "剩余体素仍要能构成凸包（否则调用方会走删除兜底）";
+    EXPECT_FALSE(unit.rigidDebris) << "土 ⇒ 仍是散体（落地后回写融合；本用例只验证雕刻数学，与落地口径无关）";
+
+    // 被移除的体素只允许落在球附近（球半径 + 一个格 + 半个格的对角余量）。
+    std::map<std::array<int, 3>, int> remaining;
+    for (const vx::CollapseUnit::Voxel& voxel : unit.voxels) {
+        remaining[{ voxel.x, voxel.y, voxel.z }] = 1;
+    }
+    for (int x = 4; x < 12; ++x) {
+        for (int z = 4; z < 12; ++z) {
+            for (int y = 109; y < 111; ++y) {
+                if (remaining.count({ x, y, z }) != 0U) {
+                    continue;
+                }
+                const glm::dvec3 voxelCenter(static_cast<double>(x) + 0.5, static_cast<double>(y) + 0.5,
+                                             static_cast<double>(z) + 0.5);
+                EXPECT_LE(glm::distance(voxelCenter, center), radius + 2.0)
+                    << "被挖掉的体素必须落在球附近（x=" << x << ", y=" << y << ", z=" << z << "）";
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T52（2026-09-28，所有者指定）：**岩 = 完全不可破坏**（但仍挡光球、仍会倒塌）
+// ---------------------------------------------------------------------------
+
+// ㉚ 判据③：**岩石碎块不再被雕刻** —— 岩现在 `indestructible = true`，在它的补丁上挖球必须**零改动**：
+//    网格顶点（含顺序）**逐位相同**，且不走进"重算"那一步。于是"光球打中岩块"只会被挡住，
+//    不会把岩石打碎/变形（这正是所有者要的"完全无法击毁"）；而**命中判定与物理碰撞完全不变**
+//    （`CarveBody` 只会在"零改动"时返回 false ⇒ 光球按常规引爆，岩体纹丝不动）。
+TEST(VolumeCollapseCarve, IndestructibleRockDebrisIsNotCarvedAtAll) {
+    const MapPreset            preset    = FlatPreset();
+    const TerrainMaterialTable materials = TerrainMaterialTable::Default();
+    const CollapseSpec         spec;
+
+    SlabScene scene(preset, DigRegionTable::FromRegions({ MakeRegion(kSceneBlockMin, kSceneBlockMax) }), true);
+    MarkSlabMaterial(scene.volumes, 2U);  // 岩
+    CollapsePlan plan = vx::ApplyCollapse(scene.volumes, vx::CollapseSeed::FromBlocks(kSceneBlockMax, kSceneBlockMax),
+                                          spec, kMaxUnitsInTest);
+    ASSERT_EQ(plan.units.size(), 1U);
+    vx::CollapseUnit& unit = plan.units.front();
+    ASSERT_TRUE(materials.Layer(2).indestructible) << "前提：岩不可破坏（T52）";
+    ASSERT_TRUE(unit.rigidDebris) << "前提：岩是刚性碎块（保留几何体）";
+
+    const vx::MeshData before      = vx::BuildCollapseUnitMesh(unit);
+    const std::size_t  voxelBefore = unit.voxels.size();
+    const glm::dvec3   center(unit.centroid.x + 3.0, unit.centroid.y + 0.5, unit.centroid.z + 3.0);
+    ASSERT_FALSE(before.vertices.empty());
+
+    EXPECT_FALSE(vx::CarveCollapseUnitPatch(unit, center, 1.0F, materials))
+        << "岩不可破坏 ⇒ 球心就在岩里也必须**零改动**";
+
+    const vx::MeshData after = vx::BuildCollapseUnitMesh(unit);
+    ASSERT_EQ(after.vertices.size(), before.vertices.size());
+    for (std::size_t i = 0; i < before.vertices.size(); ++i) {
+        EXPECT_EQ(after.vertices[i].position[0], before.vertices[i].position[0]) << "顶点必须逐位相同（第 " << i << " 个）";
+        EXPECT_EQ(after.vertices[i].position[1], before.vertices[i].position[1]);
+        EXPECT_EQ(after.vertices[i].position[2], before.vertices[i].position[2]);
+    }
+    EXPECT_EQ(unit.voxels.size(), voxelBefore) << "体素清单不得变化（没走进 Refresh）";
+}
+
+// ---------------------------------------------------------------------------
+// T51（2026-09-28，所有者实测）：**降不到支撑的散体一律清除**
+// ---------------------------------------------------------------------------
+
+// ㉙ 判据：散体落在**下方 32 格内没有任何支撑**的地带（深井场景）⇒ 接地沉降走满上限也接不到地
+//    ⇒ 必须走"仍悬空 ⇒ 清除"这条路。旧实现只计数 + 告警、体素仍留在空中（"静默的悬空泥土"）；
+//    现在回写后区域内**不得**再有"下方为空"的实心体素（与 T46 的"泥土不能悬空"同一口径）。
+TEST(VolumeCollapseLanding, FloatingGranularVoxelsAreRemovedInsteadOfBeingLeftInTheAir) {
+    const MapPreset preset = FlatPreset();
+    SlabScene       scene(preset, DigRegionTable::FromRegions({ MakeRegion(kSceneBlockMin, kSceneBlockMax) }), true,
+                          TerrainMaterialTable::Default(), BuildDeepPitScene());
+    MarkSlabMaterial(scene.volumes, 1U);  // 土 = 散体（只有散体才做接地沉降）
+
+    const CollapseSpec spec;
+    CollapsePlan       plan = vx::ApplyCollapse(scene.volumes,
+                                                vx::CollapseSeed::FromBlocks(kSceneBlockMax, kSceneBlockMax), spec,
+                                                kMaxUnitsInTest);
+    ASSERT_EQ(plan.units.size(), 1U);
+    ASSERT_FALSE(plan.units.front().rigidDebris) << "前提：土 = 散体";
+
+    const CollapsePose pose { plan.units.front().centroid, glm::quat(1.0F, 0.0F, 0.0F, 0.0F) };
+    const vx::CollapseWriteback writeback = vx::WritebackCollapseUnit(scene.volumes, plan.units.front(), pose);
+
+    EXPECT_EQ(writeback.removedFloatingVoxels, kSlabVoxels)
+        << "下方 32 格内没有支撑 ⇒ 每个体素都降不到地 ⇒ **全部清除**（不许留在空中）";
+    EXPECT_EQ(writeback.writtenVoxels, 0U) << "被清除的体素不算写回成功";
+    EXPECT_EQ(writeback.droppedVoxels, 0U) << "落点本身在体积块覆盖内 ⇒ 不是「丢弃」，是「悬空被清除」";
+
+    const DensityRegion after = ReadScene(scene.volumes);
+    EXPECT_EQ(CountSolidAtHeight(after, 109), 0U) << "原处的石板必须已被抽出";
+    EXPECT_EQ(CountSolidAtHeight(after, 110), 0U);
+    EXPECT_EQ(CountFloatingSolid(after), 0U)
+        << "回写后区域内**不得**再有'下方为空'的实心体素（T51 的判据 = T46 的同一条不变量）";
 }

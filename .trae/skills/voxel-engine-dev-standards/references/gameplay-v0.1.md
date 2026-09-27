@@ -23,6 +23,15 @@
 
 - 角色碰撞体为**胶囊**，由 Jolt `CharacterVirtual` 驱动（ADR 0004）；**禁止**自研 swept AABB 与方块碰撞查询。
 - 必须支持：走、跳、上坡、上台阶（台阶高默认 1 格）。台阶抬升**必须**由角色控制器处理，**禁止**用缩小碰撞体改善手感。
+- **地面状态必须按 Jolt 的四态如实区分**（`CharacterState`）：`onGround` = **被支撑**（`OnGround` **或** `OnSteepGround`）；
+  `walkableGround` = **站在可行走地面上**（**只有** `OnGround`，不含"站在过陡坡上"）；另有 `groundNormal`。
+  **起跳门槛只能用 `walkableGround`** —— 业内口径一致（Unity `CharacterController.isGrounded` + `slopeLimit`、
+  Unreal `Walking` / `WalkableFloorZ`、Jolt 官方示例 `GetGroundState() == OnGround`）；
+  用 `onGround` 放行起跳会让"贴着垂直岩壁反复按跳"变成**无限爬墙**（缺陷 T54，2026-09-28 实测）。
+- **跳跃必须有两个容差窗口**（T54 起，实现 = `vx::AdvanceJumpAssist`，参数集中在 `game/character_movement.hpp`）：
+  **土狼时间**（刚离开可行走地面 0.10 s 内仍可跳）与**跳跃缓冲**（落地前 0.15 s 内按下的请求在落地那一步兑现）。
+  两者**只在固定步内推进**（红线 11）；起跳即清零两个计时器（不得二段跳）。
+  这两个窗口是**业界默认项**（不做就是可感知的"按了没跳 / 落地没跳"），不属于可选增强。
 - 位置一律整数与 `double`；上传 GPU 的顶点只承载**网格局部**坐标，位置由逐网格顶点 uniform 的"网格原点 − 渲染原点"补上（红线 6；T41）——**禁止**在重定基时重传整世界顶点。
 - **第三人称相机**：跟随角色，**必须**具备避障（不穿地形）；相机避障只在渲染侧做，**不得**影响角色逻辑状态。
 - 地形碰撞由**地表 tile 的 `HeightFieldShape`** 与**体积块的 `MeshShape`** 共同承担（方案 §5.1）。

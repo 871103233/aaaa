@@ -109,4 +109,22 @@ protected:
 /// 那一片等值面**（顶点与原地形网格在重叠处逐位一致），三态（静止 / 运动中 / 落定）外观连续。
 [[nodiscard]] MeshData BuildRegionMesh(const IVolumeSampler& sampler, int sizeX, int sizeY, int sizeZ);
 
+/// **闭合自检**（T47 / [ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策五）：
+/// 统计网格里"**不是恰被 2 个三角形共用**"的无向边条数。
+///
+/// 语义：闭合（水密）曲面里每条无向边恰被 2 个三角形共用 ⇒ 返回 0；有洞时洞的边界边只被用到 1 次 ⇒ > 0
+/// （被 3 个及以上共用 = 非流形退化，同样计入，便于发现坏输出）。
+/// 用途是**取证**：整体倒塌的**外观网格**若返回非 0，玩家就会看到"某个面没有颜色、直接透明"
+/// （片元 `o_color.a` 恒为 1 ⇒ 只可能是缺面）。纯函数、无 GPU 依赖 ⇒ 生产代码与单测**共用同一实现**，
+/// 口径不会漂移。
+[[nodiscard]] std::size_t CountBoundaryEdges(const MeshData& mesh);
+
+/// 统计 `mesh` 的**退化三角形**数（零面积 / 含重复顶点）。
+///
+/// 为什么需要（T55）：退化三角形面积为零 ⇒ 光栅化**不产生任何片元** ⇒ 在屏幕上表现为
+/// **这一小片"透明"、看得见后面**（"爆炸破坏处偶发透明面"的候选成因之一）。
+/// 它与 `CountBoundaryEdges` 互补：后者数"面缺了留下的洞"，前者数"画不出来的面"。
+/// 判据与 `volume_mesher_test.cpp` 的既有断言同口径（叉积长度 ≤ 1e-6 视为退化）。
+[[nodiscard]] std::size_t CountDegenerateTriangles(const MeshData& mesh);
+
 }  // namespace vx

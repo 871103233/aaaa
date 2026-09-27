@@ -29,6 +29,22 @@ public:
     /// 该点是否为**实心**（地形内部；或可挖体积内尚未挖掉的实心处）。
     [[nodiscard]] virtual bool IsSolid(double x, double y, double z) const = 0;
 
+    /// 线段 `from → to` 是否命中**动态刚体**（倒塌中的整体，T48 / [ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策三）。
+    ///
+    /// 为什么单列一个入口而不复用 `IsSolid`：倒塌中的整体**体素已被抽出**（体积里是空的）⇒ 按密度
+    /// 判定会把它误判为空气（BUG4：掉落中打不中）；而它作为 Jolt 动态刚体是**可以被射线查询**的。
+    /// `outPoint` = 命中点（落在**真实凸包表面**，不再是手工 OBB）、`outBody` = 该刚体的不透明句柄。
+    ///
+    /// **默认实现返回 false**：只关心地形 / 体积的测试桩因此无需改动。
+    [[nodiscard]] virtual bool SegmentHitsDynamic(const glm::dvec3& from, const glm::dvec3& to, glm::dvec3& outPoint,
+                                                  std::uint32_t& outBody) const {
+        static_cast<void>(from);
+        static_cast<void>(to);
+        static_cast<void>(outPoint);
+        static_cast<void>(outBody);
+        return false;
+    }
+
 protected:
     IOrbWorldQuery() = default;
 };
@@ -49,6 +65,10 @@ struct Orb {
 struct OrbHit {
     bool       hit = false;
     glm::dvec3 point { 0.0 };
+    /// T48：命中的是**动态刚体**时它的不透明句柄（`0` = 命中的是地形 / 体积）。
+    /// 玩法层据此把"打中的是哪一个整体"交给 `RigidCollapseRuntime::CarveBody`（T50：就地雕刻，
+    /// 无需再做点包含判定 —— 命中点是**真实凸包表面**，句柄由物理查询直接给出）。
+    std::uint32_t body = 0;
 };
 
 /// 线段命中检测（纯函数）：沿 `from → to` 以固定步长采样，返回**首次进入实心**的位置。
@@ -77,6 +97,28 @@ struct OrbHit {
             return result;
         }
         lastSafe = point;
+    }
+
+    // T48 / [ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策三：
+    // **动态刚体**（倒塌中的整体）单独走一次物理场景查询 —— 它的体素已被抽出，密度判定看不见它（BUG4）。
+    // 命中的是**真实凸包表面**；若它比地形命中更近，则以它为准（不再有手工 OBB 的"早一点命中"）。
+    glm::dvec3    dynamicPoint(0.0);
+    std::uint32_t dynamicBody = 0;
+    if (world.SegmentHitsDynamic(from, to, dynamicPoint, dynamicBody)) {
+        const glm::dvec3 dynamicDelta = dynamicPoint - from;
+        const double     dynamicSq    = dynamicDelta.x * dynamicDelta.x + dynamicDelta.y * dynamicDelta.y +
+                                    dynamicDelta.z * dynamicDelta.z;
+        double terrainSq = 0.0;
+        if (result.hit) {
+            const glm::dvec3 terrainDelta = result.point - from;
+            terrainSq = terrainDelta.x * terrainDelta.x + terrainDelta.y * terrainDelta.y +
+                        terrainDelta.z * terrainDelta.z;
+        }
+        if (!result.hit || dynamicSq < terrainSq) {
+            result.hit   = true;
+            result.point = dynamicPoint;
+            result.body  = dynamicBody;
+        }
     }
     return result;
 }

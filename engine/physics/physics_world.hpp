@@ -78,7 +78,17 @@ public:
     struct CharacterState {
         glm::dvec3 position { 0.0 };   ///< 脚底位置（世界，`double`）
         glm::vec3  velocity { 0.0F };  ///< 线速度（格 / 秒）
-        bool       onGround = false;   ///< 是否被支撑（着地或站在过陡坡上）
+        /// 是否**被支撑**（Jolt `OnGround` **或** `OnSteepGround`）。语义比 `walkableGround` 宽：
+        /// 贴着垂直岩壁下滑时它为 `true`（角色确实被墙面撑着），但那**不是**能起跳的地面。
+        bool       onGround = false;
+        /// 是否站在**可行走**地面上（Jolt `EGroundState::OnGround`，**不含** `OnSteepGround`）。
+        ///
+        /// T54：**起跳门槛只能用这个** —— 业内口径一致（Unity `CharacterController.isGrounded` +
+        /// `slopeLimit`、Unreal `Walking` / `WalkableFloorZ`、Jolt 官方示例 `GetGroundState() == OnGround`）。
+        /// 用 `onGround` 放行起跳会让"贴着垂直岩壁反复按跳"变成无限爬墙（缺陷 T54）。
+        bool       walkableGround = false;
+        /// 地面法线（世界空间，由 Jolt 给出；**未着地**时为 `+Y` 占位）。
+        glm::vec3  groundNormal { 0.0F, 1.0F, 0.0F };
     };
 
     /// 动态**凸包**刚体描述（T33「倒塌整体」）。
@@ -99,6 +109,11 @@ public:
         float        restitution = 0.0F;
         glm::vec3    linearVelocity { 0.0F };   ///< 初始线速度（格/秒）；用于"被炸飞"（T43 的爆心冲量）
         glm::vec3    angularVelocity { 0.0F };  ///< 初始角速度（rad/s）；用于模拟倒塌的**初始不对称**
+        /// **初始姿态**（T50 / [ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策二）。
+        ///
+        /// 默认单位四元数（= 与 T33 引入时逐位一致）。存在的唯一理由：T50 的"在碎块**自身补丁**上雕刻后
+        /// 重建刚体"必须**在当前姿态下原地重建** —— 否则一块已经倒下的岩石被打中时会突然回正。
+        glm::quat    rotation { 1.0F, 0.0F, 0.0F, 0.0F };
     };
 
     /// 动态刚体的位姿与速度。
@@ -162,6 +177,24 @@ public:
 
     /// 读取动态刚体的位姿（**局部原点**，见 `ConvexHullDesc`）与线 / 角速度；无效句柄返回默认（零）状态。
     [[nodiscard]] RigidBodyState GetRigidBodyState(BodyHandle handle) const noexcept;
+
+    /// **动态刚体**的线段查询结果（T48 / [ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策三）。
+    struct RayCastHit {
+        bool       hit = false;
+        glm::dvec3 point { 0.0 };  ///< 命中点（世界坐标；落在**真实凸包表面**上，不再是手工 OBB 边界）
+        BodyHandle body {};        ///< 命中刚体的句柄（`0` = 未命中）
+    };
+
+    /// 沿线段 `from → to` 查询**动态刚体**（倒塌中的整体）。
+    ///
+    /// 为什么需要（T48 / BUG4）：倒塌中的整体**体素已被抽出**（体积里是空的），只按密度判定会把
+    /// "看着是实心"的整体误判为空气 ⇒ 光球穿过去 ⇒ 掉落中打不中。改由物理引擎回答，
+    /// 命中点是**真实凸包表面**（不是手工 OBB 近似），且**覆盖"飞行中"这一态**（无需任何状态记账）。
+    ///
+    /// **静态地形 / 体积 / 角色不参与**（它们由玩法层按"谁画谁挡同源"的现行口径自行判定）。
+    /// 成本与活跃刚体数无关（Jolt 宽相位 + `NarrowPhaseQuery`，有界）。
+    /// 无命中 / 线段退化 / 无物理系统 ⇒ `hit = false`。
+    [[nodiscard]] RayCastHit RayCastDynamic(const glm::dvec3& from, const glm::dvec3& to) const;
 
     /// **唤醒**一个动态刚体（T46 / [ADR 0017](../../docs/adr/0017-landing-by-material-rigid-vs-granular.md)）。
     ///

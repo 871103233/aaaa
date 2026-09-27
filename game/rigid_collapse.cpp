@@ -51,6 +51,31 @@ void HideSlot(MeshRenderer& renderer, MeshHandle mesh) {
     (void)renderer.UpdateMeshGeometry(mesh, MeshData {}, glm::dvec3(0.0));
 }
 
+/// T47（[ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策五）：
+/// **外观网格不闭合时**打出可归因的 WARN —— 让"某些面透明"这条现象**指名**到候选 ①②③ 之一。
+///
+/// 判据（**靠"截断前 / 截断后"两组数字分开**，这是本插桩的全部意义）：
+///   · `full == 0` 且被截断 ⇒ 洞由**容量截断**造成（**候选①**）；
+///   · `full != 0` 且未截断 ⇒ 洞由**网格生成本身**造成（**候选②敞口场景 / 候选③地形↔体积交界缝**），
+///     与容量无关；
+///   · 两者都命中 ⇒ 两种成因并存（先修①再复测②/③）。
+///
+/// 闭合且未被截断时不打日志（稳态零噪声）。
+void WarnIfMeshOpen(const CollapseUnit& unit, std::size_t fullBoundary, std::size_t finalBoundary, bool truncated) {
+    if (fullBoundary == 0 && finalBoundary == 0) {
+        return;
+    }
+    const char* cause = "**网格生成本身**（候选②敞口场景 / 候选③地形↔体积交界缝）";
+    if (truncated) {
+        cause = fullBoundary == 0 ? "**网格池容量截断**（候选①）"
+                                  : "**容量截断 + 网格生成本身**（候选① 与 ②/③ 并存）";
+    }
+    VX_LOG_WARN("整体外观网格缺面（T47 自检）：体素 %zu 个、patch %d×%d×%d；"
+                "**截断前**边界边 %zu 条、**实际上传**网格边界边 %zu 条、容量截断 = %s ⇒ 成因 = %s",
+                unit.voxels.size(), unit.patchSizeX, unit.patchSizeY, unit.patchSizeZ, fullBoundary, finalBoundary,
+                truncated ? "是" : "否", cause);
+}
+
 }  // namespace
 
 void RigidCollapseRuntime::Init(MeshRenderer& renderer, std::size_t slotCount, std::size_t capacityVerts) {
@@ -101,22 +126,32 @@ bool RigidCollapseRuntime::AcquireSlot(MeshHandle& meshOut) {
     return false;
 }
 
-MeshData RigidCollapseRuntime::BuildUnitMesh(const CollapseUnit& unit) const {
-    MeshData mesh = BuildCollapseUnitMesh(unit);
-    if (mesh.indices.empty() || mesh.vertices.empty()) {
-        return mesh;  // 没有补丁 / 退化 ⇒ 由 `Spawn` 报错并回退
+RigidCollapseRuntime::UnitMeshBuild RigidCollapseRuntime::BuildUnitMesh(const CollapseUnit& unit) const {
+    UnitMeshBuild build;
+    build.mesh = BuildCollapseUnitMesh(unit);
+    if (build.mesh.indices.empty() || build.mesh.vertices.empty()) {
+        return build;  // 没有补丁 / 退化 ⇒ 由 `Spawn` 报错并回退
     }
-    if (mesh.vertices.size() <= m_capacityVerts && mesh.indices.size() <= m_capacityIndices) {
-        return mesh;  // 常规路径：容量足够（整座塔的外表面通常只有几千个四边形）
+
+    // T47：**截断前**先量一次 —— 这是归因的前提：容量截断**必然**制造边界边，
+    // 只有先把"网格生成本身是否闭合"量出来，才能把玩家看到的洞归到候选①还是候选②/③。
+    build.boundaryEdgesFull = CountBoundaryEdges(build.mesh);
+
+    if (build.mesh.vertices.size() <= m_capacityVerts && build.mesh.indices.size() <= m_capacityIndices) {
+        build.boundaryEdgesFinal = build.boundaryEdgesFull;
+        WarnIfMeshOpen(unit, build.boundaryEdgesFull, build.boundaryEdgesFinal, false);
+        return build;  // 常规路径：容量足够（整座塔的外表面通常只有几千个四边形）
     }
 
     // 超出容量：**按整个四边形**截断（索引每 6 个一个四边形），且只保留"引用顶点都在容量内"的四边形
     // ⇒ 顶点前缀上传即可覆盖全部被引用顶点。只影响外观，物理与回写不受影响（与 T33 的截断口径一致）。
+    const std::size_t fullQuads = build.mesh.indices.size() / 6U;
+    const std::size_t fullVerts = build.mesh.vertices.size();
     std::size_t quads = 0;
-    while ((quads + 1U) * 6U <= mesh.indices.size() && (quads + 1U) * 6U <= m_capacityIndices) {
+    while ((quads + 1U) * 6U <= build.mesh.indices.size() && (quads + 1U) * 6U <= m_capacityIndices) {
         bool fits = true;
         for (std::size_t index = quads * 6U; index < (quads + 1U) * 6U; ++index) {
-            if (static_cast<std::size_t>(mesh.indices[index]) >= m_capacityVerts) {
+            if (static_cast<std::size_t>(build.mesh.indices[index]) >= m_capacityVerts) {
                 fits = false;
                 break;
             }
@@ -126,14 +161,22 @@ MeshData RigidCollapseRuntime::BuildUnitMesh(const CollapseUnit& unit) const {
         }
         ++quads;
     }
-    mesh.indices.resize(quads * 6U);
-    if (mesh.vertices.size() > m_capacityVerts) {
-        mesh.vertices.resize(m_capacityVerts);
+    build.mesh.indices.resize(quads * 6U);
+    if (build.mesh.vertices.size() > m_capacityVerts) {
+        build.mesh.vertices.resize(m_capacityVerts);
     }
-    VX_LOG_WARN("倒塌整体的等值面超出网格池容量（%zu 个四边形 × 6 索引、%zu 顶点）⇒ 本次只渲染前 %zu 个四边形"
+    build.truncatedByCapacity = true;
+    build.boundaryEdgesFinal  = CountBoundaryEdges(build.mesh);
+
+    // T47：本条 WARN 补上**体素数**与 **patch 尺寸**（原先只报四边形 / 顶点数，且报的是**截断后**的值，
+    // 无法据此判断"到底超了多少"）；原始规模现在如实报出。
+    VX_LOG_WARN("倒塌整体的等值面超出网格池容量（T47）：体素 %zu 个、patch %d×%d×%d、原始 %zu 个四边形 / %zu 顶点"
+                "（每槽上限 %zu 顶点 + %zu 索引）⇒ 本次只渲染前 %zu 个四边形"
                 "（物理与回写不受影响）",
-                mesh.indices.size() / 6U, mesh.vertices.size(), quads);
-    return mesh;
+                unit.voxels.size(), unit.patchSizeX, unit.patchSizeY, unit.patchSizeZ, fullQuads, fullVerts,
+                m_capacityVerts, m_capacityIndices, quads);
+    WarnIfMeshOpen(unit, build.boundaryEdgesFull, build.boundaryEdgesFinal, true);
+    return build;
 }
 
 bool RigidCollapseRuntime::Spawn(PhysicsWorld& physics, DigVolumeWorld& volumes, MeshRenderer& renderer,
@@ -187,13 +230,13 @@ bool RigidCollapseRuntime::Spawn(PhysicsWorld& physics, DigVolumeWorld& volumes,
 
     // T42：几何 = **与地形同源的等值面**（`BuildCollapseUnitMesh`），只在上传时写一次；
     // 之后每帧只推 64 B 的模型变换（见 `SyncRender`）。局部顶点是"相对质心"的坐标，与凸包同源。
-    const MeshData meshData = BuildUnitMesh(unit);
-    if (meshData.indices.empty() ||
-        !renderer.UpdateMeshGeometry(mesh, meshData, unit.centroid)) {
+    const UnitMeshBuild build = BuildUnitMesh(unit);
+    if (build.mesh.indices.empty() ||
+        !renderer.UpdateMeshGeometry(mesh, build.mesh, unit.centroid)) {
         physics.RemoveBody(body);
         RestoreVoxels(volumes, unit);
         VX_LOG_ERROR("倒塌失败：渲染网格就地刷新失败（体素数 %zu、四边形 %zu）⇒ 体素已写回，本次不倒塌",
-                     unit.voxels.size(), meshData.indices.size() / 6U);
+                     unit.voxels.size(), build.mesh.indices.size() / 6U);
         return false;
     }
 
@@ -201,6 +244,9 @@ bool RigidCollapseRuntime::Spawn(PhysicsWorld& physics, DigVolumeWorld& volumes,
     active.body         = body;
     active.mesh         = mesh;
     active.unit         = std::move(unit);
+    // T47：记下**实际上传**那份外观网格的闭合自检结果，供 `RetireRetained` 回报。
+    active.meshBoundaryEdges = build.boundaryEdgesFinal;
+    active.meshTruncated     = build.truncatedByCapacity;
     active.posePosition = active.unit.centroid;
     active.poseRotation = glm::quat(1.0F, 0.0F, 0.0F, 0.0F);
     m_active.push_back(std::move(active));
@@ -277,31 +323,6 @@ std::size_t RigidCollapseRuntime::RetainedUnits() const noexcept {
                       [](const ActiveCollapseUnit& unit) { return unit.retained; }));
 }
 
-bool RigidCollapseRuntime::ContainsRetainedPoint(const glm::dvec3& point) const noexcept {
-    for (const ActiveCollapseUnit& unit : m_active) {
-        // 判据在 world 层（纯函数、可单测）：该整体局部 AABB 随姿态旋转后的盒是否含该点。
-        if (unit.retained && LocalAabbContainsPoint(unit.unit, CollapsePose { unit.posePosition, unit.poseRotation },
-                                                    point)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool RigidCollapseRuntime::RetireRetainedAt(PhysicsWorld& physics, DigVolumeWorld& volumes, MeshRenderer& renderer,
-                                            const glm::dvec3& point, CollapseWriteback& out) {
-    for (std::size_t index = 0; index < m_active.size(); ++index) {
-        const ActiveCollapseUnit& unit = m_active[index];
-        if (!unit.retained) {
-            continue;
-        }
-        if (LocalAabbContainsPoint(unit.unit, CollapsePose { unit.posePosition, unit.poseRotation }, point)) {
-            return RetireRetained(index, physics, volumes, renderer, out);
-        }
-    }
-    return false;
-}
-
 bool RigidCollapseRuntime::RetireOldestRetained(PhysicsWorld& physics, DigVolumeWorld& volumes,
                                                 MeshRenderer& renderer, CollapseWriteback& out) {
     for (std::size_t index = 0; index < m_active.size(); ++index) {
@@ -319,6 +340,16 @@ bool RigidCollapseRuntime::RetireRetained(std::size_t index, PhysicsWorld& physi
     }
     // 惰性回写 = 与"落定即回写"同一段数学（world 层可单测），差别只在**触发时机**（玩家动作 / 腾位）。
     const ActiveCollapseUnit& unit = m_active[index];
+
+    // T47：回报该残骸**保留期间**那份外观网格的闭合自检结果 —— 它正是玩家看到的"缺面"的来源。
+    // 只在当时确实不闭合时打（闭合残骸退役是稳态事件，不该刷日志）。
+    if (unit.meshBoundaryEdges != 0) {
+        VX_LOG_WARN("保留残骸退役自检（T47）：该整体外观网格有 %zu 条边界边%s（体素 %zu 个）"
+                    "⇒ 它在保留期间显示的缺面来自这里",
+                    unit.meshBoundaryEdges, unit.meshTruncated ? "（且当时被网格池容量截断）" : "",
+                    unit.unit.voxels.size());
+    }
+
     const CollapsePose        pose { unit.posePosition, unit.poseRotation };
     out = WritebackCollapseUnit(volumes, unit.unit, pose);
 
@@ -330,6 +361,100 @@ bool RigidCollapseRuntime::RetireRetained(std::size_t index, PhysicsWorld& physi
     ++m_retired;
     m_active.erase(m_active.begin() + static_cast<std::ptrdiff_t>(index));
     return true;
+}
+
+void RigidCollapseRuntime::RetireCarved(std::size_t index, PhysicsWorld& physics, MeshRenderer& renderer) {
+    if (index >= m_active.size()) {
+        return;
+    }
+    const ActiveCollapseUnit unit = m_active[index];  // 拷贝：下面要 erase
+    physics.RemoveBody(unit.body);
+    HideSlot(renderer, unit.mesh);
+    m_active.erase(m_active.begin() + static_cast<std::ptrdiff_t>(index));
+}
+
+bool RigidCollapseRuntime::CarveBody(PhysicsWorld::BodyHandle body, const glm::dvec3& center, float radiusBlocks,
+                                     const CollapseSpec& spec, const TerrainMaterialTable& materials,
+                                     PhysicsWorld& physics, MeshRenderer& renderer, CollapseCarveResult& out) {
+    if (body == 0) {
+        return false;
+    }
+    for (std::size_t index = 0; index < m_active.size(); ++index) {
+        ActiveCollapseUnit& active = m_active[index];
+        if (active.body != body) {
+            continue;
+        }
+
+        // ① 在**自身补丁**上挖一个球（与地形同口径的数学）。球没碰到它 ⇒ 无操作（不是错误）。
+        if (!CarveCollapseUnitPatch(active.unit, center, radiusBlocks, materials)) {
+            return false;
+        }
+
+        // ② 记住位姿与速度：雕刻**不该让碎块位移或顿一下**（同一帧内同源）。
+        const PhysicsWorld::RigidBodyState state = physics.GetRigidBodyState(body);
+        const std::size_t                 before = active.unit.voxels.size();
+
+        // ③ 由补丁重算体素清单 / 凸包 / 质量与落地口径（**质心不变** ⇒ 局部坐标系不变）。
+        const bool survives = RefreshCollapseUnitFromPatch(active.unit, materials);
+        out.removedVoxels   = (before > active.unit.voxels.size()) ? (before - active.unit.voxels.size()) : 0U;
+        out.leftVoxels      = active.unit.voxels.size();
+        out.deleted         = false;
+
+        // ④ 兜底：剩余太少 / 凸包点数不足 ⇒ **删除整个整体**（体素就此消失）。
+        //    与"小碎片清除"同源（ADR 0016 决策三）：被打碎的岩石本来就该碎掉，而不是留一个凸包在空气里。
+        const bool tooSmall = spec.debrisDeleteMaxVoxels > 0 &&
+                             out.leftVoxels <= static_cast<std::size_t>(spec.debrisDeleteMaxVoxels);
+        if (!survives || active.unit.hullPoints.size() / 3U < 4U || tooSmall) {
+            RetireCarved(index, physics, renderer);
+            out.deleted = true;
+            ++m_carved;
+            m_carvedVoxels += out.removedVoxels;
+            return true;
+        }
+
+        // ⑤ 按剩余体素在**当前姿态**下原地重建刚体（先建后删：不留一帧的"真空"）。
+        PhysicsWorld::ConvexHullDesc hull;
+        hull.positions       = active.unit.hullPoints.data();
+        hull.pointCount      = active.unit.hullPoints.size() / 3U;
+        hull.originX         = active.unit.centroid.x;
+        hull.originY         = active.unit.centroid.y;
+        hull.originZ         = active.unit.centroid.z;
+        hull.mass            = active.unit.mass;
+        hull.friction        = active.unit.friction;
+        hull.restitution     = active.unit.restitution;
+        hull.linearVelocity  = state.linearVelocity;
+        hull.angularVelocity = state.angularVelocity;
+        hull.rotation        = state.rotation;  // 已倒下的岩石不该因为被雕刻而回正
+
+        const PhysicsWorld::BodyHandle newBody  = physics.AddDynamicConvexHull(hull);
+        const UnitMeshBuild            build    = BuildUnitMesh(active.unit);
+        const bool meshOk = !build.mesh.indices.empty() &&
+                            renderer.UpdateMeshGeometry(active.mesh, build.mesh, active.unit.centroid);
+        if (newBody == 0 || !meshOk) {
+            // 重建失败 ⇒ 宁可整体删除，也不留下"看着实心却打不到 / 形状对不上"的东西。
+            VX_LOG_ERROR("雕刻后重建失败（体素 %zu 个、凸包点数 %zu）⇒ 整体删除（T50）", out.leftVoxels,
+                         hull.pointCount);
+            if (newBody != 0) {
+                physics.RemoveBody(newBody);
+            }
+            RetireCarved(index, physics, renderer);
+            out.deleted = true;
+            ++m_carved;
+            m_carvedVoxels += out.removedVoxels;
+            return true;
+        }
+
+        physics.RemoveBody(body);
+        active.body              = newBody;
+        active.meshBoundaryEdges = build.boundaryEdgesFinal;
+        active.meshTruncated     = build.truncatedByCapacity;
+        active.posePosition      = state.position;
+        active.poseRotation      = state.rotation;
+        ++m_carved;
+        m_carvedVoxels += out.removedVoxels;
+        return true;
+    }
+    return false;
 }
 
 void RigidCollapseRuntime::AwakenIntersecting(const BlockCoord& block, PhysicsWorld& physics) {

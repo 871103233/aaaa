@@ -118,6 +118,11 @@
 
 ## 修订记录
 
+- **2026-09-27（T48 回填）**：本文**后果 5**（"局部 AABB（OBB）判据可能比凸包**早一点**命中"）**已作废** ——
+  命中判定改由物理引擎回答（`PhysicsWorld::RayCastDynamic`，Jolt `NarrowPhaseQuery`，落在**真实凸包表面**），
+  手工 OBB 判据 `LocalAabbContainsPoint` / `ContainsRetainedPoint` 已下线，改为按**刚体句柄**定位
+  （`RigidCollapseRuntime::RetireBody`）。见 [ADR 0018](0018-structural-support-and-representation-preserving-destruction.md) 决策三。
+
 - **2026-09-27（初版）**：材质分流（`rigid_debris`）/ 刚性保留几何体 + 光球惰性回写 + 唤醒兜底 /
   散体回写 + 接地沉降 / 池 4 → 16 且永久保留（唯一兜底 = 最旧优先回写）。
   **口径来源**：项目所有者同日三问三答 —— ①"光球撞上就惰性回写"；②"永久保留 + 扩池到 16 槽"；

@@ -1,5 +1,6 @@
 #include "dig/volume_mesher.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -255,6 +256,65 @@ MeshData BuildRegionMesh(const IVolumeSampler& sampler, int sizeX, int sizeY, in
 
 MeshData BuildVolumeMesh(const IVolumeSampler& sampler) {
     return BuildRegionMesh(sampler, kVolumeBlockSize, kVolumeBlockSize, kVolumeBlockSize);
+}
+
+std::size_t CountBoundaryEdges(const MeshData& mesh) {
+    // 把每个三角形的三条**无向**边（较小下标在前）编码成一个 64 位键，排序后数每种键出现几次。
+    // 为什么不用 std::map：整体外观网格可达数万三角形，排序 + 线性扫描无节点分配、且结果与顺序无关
+    // （红线 7：确定性）。
+    std::vector<std::uint64_t> edges;
+    edges.reserve((mesh.indices.size() / 3U) * 3U);
+    for (std::size_t triangle = 0; triangle + 2U < mesh.indices.size(); triangle += 3U) {
+        for (std::size_t corner = 0; corner < 3U; ++corner) {
+            const std::uint32_t a  = mesh.indices[triangle + corner];
+            const std::uint32_t b  = mesh.indices[triangle + (corner + 1U) % 3U];
+            const std::uint32_t lo = a < b ? a : b;
+            const std::uint32_t hi = a < b ? b : a;
+            edges.push_back((static_cast<std::uint64_t>(lo) << 32U) | static_cast<std::uint64_t>(hi));
+        }
+    }
+    std::sort(edges.begin(), edges.end());
+    std::size_t boundary = 0;
+    for (std::size_t index = 0; index < edges.size();) {
+        std::size_t run = index + 1U;
+        while (run < edges.size() && edges[run] == edges[index]) {
+            ++run;
+        }
+        if (run - index != 2U) {
+            ++boundary;
+        }
+        index = run;
+    }
+    return boundary;
+}
+
+std::size_t CountDegenerateTriangles(const MeshData& mesh) {
+    std::size_t degenerate = 0;
+    for (std::size_t triangle = 0; triangle + 2U < mesh.indices.size(); triangle += 3U) {
+        const std::uint32_t ia = mesh.indices[triangle];
+        const std::uint32_t ib = mesh.indices[triangle + 1U];
+        const std::uint32_t ic = mesh.indices[triangle + 2U];
+        if (ia == ib || ib == ic || ia == ic) {
+            ++degenerate;  // 顶点索引重复 ⇒ 面积必然为 0
+            continue;
+        }
+        if (ia >= mesh.vertices.size() || ib >= mesh.vertices.size() || ic >= mesh.vertices.size()) {
+            continue;  // 索引越界（不该发生）：不计入本判据
+        }
+        // 叉积长度的平方 ≤ 1e-12（= 长度 ≤ 1e-6）视为退化 —— 与既有测试的断言同口径。
+        const float* a = mesh.vertices[ia].position;
+        const float* b = mesh.vertices[ib].position;
+        const float* c = mesh.vertices[ic].position;
+        const float  ab[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] };
+        const float  ac[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
+        const float  cx    = ab[1] * ac[2] - ab[2] * ac[1];
+        const float  cy    = ab[2] * ac[0] - ab[0] * ac[2];
+        const float  cz    = ab[0] * ac[1] - ab[1] * ac[0];
+        if (cx * cx + cy * cy + cz * cz <= 1.0e-12F) {
+            ++degenerate;
+        }
+    }
+    return degenerate;
 }
 
 }  // namespace vx

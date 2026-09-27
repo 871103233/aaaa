@@ -15,6 +15,11 @@ namespace vx {
 class TerrainWorld;
 class TerrainMaterialTable;
 
+/// 球体挖除的**平滑过渡带**宽度（格）：球面之外再留这么宽的一条带，把密度从"挖空"平滑地过渡回
+/// "原样"，使洞（与 T50 在碎块补丁上挖出的缺口）在等值面上都是平滑曲面而不是硬边。
+/// **唯一口径**：`DigVolumeWorld::RasterizeBall`（地形）与 `CarveCollapseUnitPatch`（碎块补丁，T50）共用。
+inline constexpr double kCarveSdfBandBlocks = 1.5;
+
 /// 体积块的**填充分类**（T30）：整块全实心 / 全空时，它不可能参与塌落的支撑判定，
 /// 可被整块排除出邻域（见 `ApplyCollapse` 的竖直范围推导）。缓存它把"塌落邻域"从
 /// 整个体积的高度收到真正可能失支撑的那几块上。
@@ -162,6 +167,33 @@ public:
     bool CarveSphere(const glm::dvec3& center, float radiusBlocks, std::vector<BlockCoord>& dirtyOut,
                      VoxelBounds* boundsOut = nullptr);
 
+    /// **按伤害预算**的球体挖除（T31 / [ADR 0013](../../docs/adr/0013-destructible-elements.md)）：
+    /// `center` 世界坐标（格）、`radiusBlocks` = **候选范围上界**（格）、
+    /// `budgetPoints` = `damage × points_per_cubic_block`（**整数点**，由调用方算好）。
+    ///
+    /// 规则（逐字实现 ADR 0013 §二）：
+    ///   ① 候选 = 球心 `radiusBlocks` 内的全部**格³**（以格心到球心的距离为准），按
+    ///      「距离升序 → (x, y, z) 升序」的**确定序**遍历（红线 7，禁止随机 / 依赖容器序）；
+    ///   ② 每格消耗该格材质的 `toughness`（点/格³，**四舍五入为整数点**）；`toughness <= 0` 或该材质
+    ///      `indestructible` ⇒ **跳过**（永不挖除，且**不消耗**预算）；
+    ///   ③ 余额不足以破坏**下一格** ⇒ **立即停止**（该格及其更远者保留）。
+    ///   随后以"最后一个被破坏的格"的半径作为**光滑球面半径**栅格化这块区域（球面本身光滑 ⇒ 无台阶感），
+    ///   并对**不可破坏材质**的采样保持原状。
+    ///
+    /// **T53（岩石遮挡爆炸波）**：在 ② 之前先做一次**以爆心为起点的可达性洪泛** —— 爆炸波是标量扩散，
+    /// 不能穿过**不可破坏材质（岩）**。因此：
+    ///   - 只有**可达**的格才参与 ② 的预算结算（被遮挡的格**不消耗预算**）；
+    ///   - ④ 的栅格化走"按掩码"路径（`RasterizeBall` 收到 `BlastMask`）⇒ 岩石**之后**的采样保持原状
+    ///     —— 否则预算算得再准，光滑球面照样会把岩后的土一并挖掉。
+    ///   - 爆心落在岩体内部 ⇒ 洪泛一格都进不去 ⇒ 波不外泄（`destroyed == 0`，返回 `false`）。
+    ///   - 波**可以**绕过岩体的边缘（洪泛含空气格与可破坏格）—— 这与"爆炸波会绕过障碍物衍射"一致；
+    ///     只有**真正被围住**的格才受保护。
+    ///
+    /// 返回是否有实际改动；`dirtyOut` / `boundsOut` 的语义与 `CarveSphere` 完全一致
+    /// （挖除结果照旧交给既有脏块重网格 / 碰撞体同步 / 塌落流程）。
+    bool CarveByDamage(const glm::dvec3& center, float radiusBlocks, int budgetPoints,
+                       std::vector<BlockCoord>& dirtyOut, VoxelBounds* boundsOut = nullptr);
+
     /// 重网格 `dirty` 中列出的块（去重），返回实际重网格的块数。未创建的块跳过。
     [[nodiscard]] std::size_t RemeshDirtyBlocks(const std::vector<BlockCoord>& dirty);
 
@@ -200,6 +232,46 @@ public:
     [[nodiscard]] const TerrainMaterialTable& Materials() const noexcept;
 
 private:
+    /// **爆炸波可达性掩码**（T53）：按**世界整数格**索引 —— 与 `CarveByDamage` 的候选格³、
+    /// `RasterizeBall` 的采样点落在**同一张网格**上（本模块的既有口径：格³ `(x, y, z)` 的代表采样
+    /// 就是采样点 `(x, y, z)`）。
+    ///
+    /// `Reachable(x, y, z)` = 波能到达该格 ⇒ 该格既参与预算结算、也允许被栅格化。
+    /// **掩码之外一律视为不可达**（保守：宁可不挖）：掩码覆盖"球 + 过渡带"的 AABB，
+    /// 因此 `RasterizeBall` 真正会写到的采样全部在掩码范围内。
+    struct BlastMask {
+        int                       minX  = 0;
+        int                       minY  = 0;
+        int                       minZ  = 0;
+        int                       sizeX = 0;
+        int                       sizeY = 0;
+        int                       sizeZ = 0;
+        std::vector<std::uint8_t> reachable;  ///< 1 = 可达；索引 = 与 `DensityRegion` 同布局
+
+        [[nodiscard]] bool Contains(int x, int y, int z) const noexcept {
+            return x >= minX && x < minX + sizeX && y >= minY && y < minY + sizeY && z >= minZ &&
+                   z < minZ + sizeZ;
+        }
+        [[nodiscard]] std::size_t Index(int x, int y, int z) const noexcept {
+            return static_cast<std::size_t>(x - minX) +
+                   static_cast<std::size_t>(sizeX) * (static_cast<std::size_t>(y - minY) +
+                                                     static_cast<std::size_t>(sizeY) *
+                                                         static_cast<std::size_t>(z - minZ));
+        }
+        [[nodiscard]] bool Reachable(int x, int y, int z) const noexcept {
+            return Contains(x, y, z) && reachable[Index(x, y, z)] != 0U;
+        }
+    };
+
+    /// 把半径 `radius` 的**光滑球面**栅格化进密度场 —— `CarveSphere` 与 `CarveByDamage` 共用的底层。
+    /// `skipIndestructible = true` 时，**不可破坏材质**所在的采样保持原状（T31）。
+    /// `mask` 非空时，**不可达**的采样同样保持原状（T53：爆炸波被岩石遮挡 ⇒ 岩后不被破坏）。
+    bool RasterizeBall(const glm::dvec3& center, float radius, bool skipIndestructible, const BlastMask* mask,
+                       std::vector<BlockCoord>& dirtyOut, VoxelBounds* boundsOut);
+
+    /// 该采样点所属材质是否**不可破坏**（`indestructible = true` 或 `toughness <= 0`，T31 / ADR 0013）。
+    [[nodiscard]] bool IsIndestructibleSample(int worldX, int worldY, int worldZ) const noexcept;
+
     /// 高度场推导的密度（区域外回退路径；无地形数据 ⇒ 视为空）。
     [[nodiscard]] float TerrainDerivedDensity(double x, double y, double z) const noexcept;
 

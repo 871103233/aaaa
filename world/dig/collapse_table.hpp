@@ -8,11 +8,17 @@ namespace vx {
 ///
 /// 设计意图与备选方案见 [ADR 0015](../../docs/adr/0015-structure-units-and-rigid-collapse.md)
 /// （2026-09-27 修订：**统一连通分量刚体化**，删除逐列下落）；
+/// **scope 由 [ADR 0018](../../docs/adr/0018-structural-support-and-representation-preserving-destruction.md) 决策一定案**
+/// （T49：支撑求解的 scope = "以被改动采样为起点的实心**连通域**"，固定窗口只在超上限时作为**回退**）；
 /// 单位口径：长度 = 格（= 体素边长）、质量 = 任意一致的"格³"质量单位、角度 = 弧度。
 struct CollapseSpec {
     bool  enabled                 = true;  ///< 是否启用塌落
     float maxCantileverBlocks     = 4.0F;  ///< 悬挑上限（格），必须 ≥ 0
-    int   neighborhoodMarginBlocks = 0;    ///< 在"派生邻域"之外再额外外扩的块数（1 块 = 32 格），必须 ∈ [0, 4]
+    /// **起始**窗口在"派生邻域"之外再额外外扩的块数（1 块 = 32 格），必须 ∈ [0, 4]。
+    ///
+    /// T49 起它只决定**起始**窗口：连通域触到窗口边界时窗口会**只向那一侧翻倍扩张**，
+    /// 直到把连通域包住（或撞上 `kMaxRegionSamples` 8M 的**累计**上限 ⇒ 告警 + 回退到这个固定窗口）。
+    int   neighborhoodMarginBlocks = 0;
 
     // ---- T33 / T43：刚体化倒塌 ----
     //

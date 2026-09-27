@@ -3,6 +3,7 @@
 #include <glm/geometric.hpp>
 #include <glm/vec3.hpp>
 
+#include <algorithm>
 #include <cmath>
 
 namespace vx {
@@ -43,6 +44,44 @@ inline constexpr float kJumpApexHeightRatio = 0.6F;
         return 0.0F;
     }
     return std::sqrt(2.0F * gravity * kJumpApexHeightRatio * characterHeight);
+}
+
+/// T54：跳跃辅助的两个容差窗口（**唯一口径**；`game/main.cpp` 与单测共用）。
+///
+/// 为什么需要（业内规范）：`jumpPressed` 是"本帧按下"的**边沿**，而"是否站在可行走地面上"是**连续**量 ——
+/// 两者在帧边界上错开一拍就会变成玩家可感知的"按了没跳 / 落地了没跳"。两个窗口分别补两侧：
+///   - **土狼时间**（coyote time）：刚离开可行走地面后的 `kJumpCoyoteSeconds` 内仍允许起跳；
+///   - **跳跃缓冲**（jump buffer）：落地前 `kJumpBufferSeconds` 内按下的那次请求，在**落地的那一步**兑现。
+/// 取值与 60 Hz 固定步（16.7 ms/步）同量级：太短（< 2 步）补不上边界错拍，
+/// 太长会让"离地许久仍能起跳 / 空中多段跳"变得可感知。
+inline constexpr float kJumpCoyoteSeconds = 0.10F;
+inline constexpr float kJumpBufferSeconds = 0.15F;
+
+/// T54：跳跃辅助的跨固定步状态。**必须在固定步里推进**（红线 11：不得用可变帧间隔驱动）。
+struct JumpAssist {
+    float coyoteTimer = 0.0F;  ///< 距"上一次站在可行走地面上"的剩余容差（秒）
+    float bufferTimer = 0.0F;  ///< 距"上一次按下跳跃"的剩余容差（秒）
+
+    void Reset() noexcept {
+        coyoteTimer = 0.0F;
+        bufferTimer = 0.0F;
+    }
+};
+
+/// 推进**一个固定步**的跳跃辅助，返回本步是否应当起跳。
+///
+/// 起跳门槛 = `walkableGround`（Jolt `EGroundState::OnGround`）—— **不含**"站在过陡坡上"，
+/// 因此贴着垂直岩壁下滑时**不会**被当成可起跳状态（这正是缺陷 T54 的机制）。
+/// 起跳即把两个计时器清零 ⇒ 同一次按键不会被消费两次，也不会出现二段跳。
+[[nodiscard]] inline bool AdvanceJumpAssist(JumpAssist& assist, bool walkableGround, bool jumpPressed,
+                                            float dt) noexcept {
+    assist.coyoteTimer = walkableGround ? kJumpCoyoteSeconds : std::max(0.0F, assist.coyoteTimer - dt);
+    assist.bufferTimer = jumpPressed ? kJumpBufferSeconds : std::max(0.0F, assist.bufferTimer - dt);
+    if (assist.bufferTimer > 0.0F && assist.coyoteTimer > 0.0F) {
+        assist.Reset();
+        return true;
+    }
+    return false;
 }
 
 }  // namespace vx

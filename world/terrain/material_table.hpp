@@ -95,9 +95,18 @@ struct MaterialLayer {
     /// 碰撞弹性（[0, 1]；0 = 完全不回弹）。岩略回弹、土 / 草几乎不回弹（现实里碎石落地的表现）。
     float restitution = 0.0F;
 
-    /// **不可破坏**（缺省 false）：本轮**只用于"小碎片清除"的守卫**（含本材质的分量**不被清除**）；
-    /// "光球也挖不动它"的完整语义属 [ADR 0013](../../docs/adr/0013-destructible-elements.md) 的伤害模型（**未实现**）。
+    /// **不可破坏**（缺省 false）：本轮**只用于"小碎片清除"的守卫**（含本材质的分量**不被清除**）。
     bool indestructible = false;
+
+    /// ---- T31 / [ADR 0013](../../docs/adr/0013-destructible-elements.md)：伤害模型的**坚固度** ----
+    ///
+    /// `toughness`（点 / 格³，必须 ≥ 0）：爆炸的伤害预算**逐格³ 扣减**本值 —— 越硬越大 ⇒ 同一发球挖出的腔体越小。
+    /// `0` = **不可破坏**（该格永不被挖除，且**不消耗**预算），与 `indestructible = true` 同效。
+    ///
+    /// **必填字段**（缺失 / 负值 / 非数 ⇒ 加载抛异常，不静默回退）：破坏是本阶段的核心玩法，
+    /// 缺省一个"隐形坚固度"会让"同一次爆炸到处挖出同样大的坑"这一缺陷重新出现。
+    /// **不参与地表着色**，故**不进 GPU uniform**（与 `density` 等物理字段同源）。
+    float toughness = 0.0F;
 
     /// ---- T46 / [ADR 0017](../../docs/adr/0017-landing-by-material-rigid-vs-granular.md)：落地后的表示 ----
     ///
@@ -191,7 +200,9 @@ public:
     /// 4：调整高度 / 坡度带使 (高度 × 坡度) 全域被覆盖（缺陷 2 修复）；并新增全局 `[triplanar]` 段（C 项，
     ///    同一版本内落地，不重复升版）、每层可选的 `subsurface`（ADR 0014 的表层 → 次表层映射）。
     ///    `subsurface` **缺省 = 自身**，旧文件无需改动即可加载 ⇒ **不构成破坏性变更，故不升版**。
-    static constexpr int kSchemaVersion = 4;
+    /// 5：新增每层**必填**的 `toughness`（T31 / [ADR 0013](../../docs/adr/0013-destructible-elements.md) 的坚固度，
+    ///    点/格³）。**必填 ⇒ 破坏性变更 ⇒ 升版**（旧文件缺该字段会直接报错，而不是悄悄退化成"到处一样硬"）。
+    static constexpr int kSchemaVersion = 5;
 
     /// 从 TOML 文件加载并校验；失败抛 `std::runtime_error`（启动期允许异常，ADR 0005）。
     /// 前置条件：`path` 指向待加载的材质表文件。

@@ -46,6 +46,8 @@ struct LayerSpec {
     double      ao            = 0.8;
     double      macroUvScale  = 0.02;
     double      macroStrength = 0.3;
+    /// T31 / ADR 0013：坚固度（点/格³，**必填**）。测试里统一给 1.0 以免与破坏模型的用例耦合。
+    double      toughness     = 1.0;
 };
 
 /// 与内置默认表 / 仓库 TOML 一致的四个槽位；测试改其中的单个字段即可。
@@ -62,7 +64,11 @@ struct LayerSpec {
                                         bool triEnabled = true, double triSlopeMin = 0.45, double triSlopeMax = 0.65,
                                         double triSharpness = 4.0) {
     std::ostringstream out;
-    out << "schema_version = " << schemaVersion << "\n";
+    // 历史：本 helper 的调用点此前一律传 `4`（当时的当前版本）。T31 把材质表升到 v5（新增必填 toughness）后，
+    // 把这些**旧字面量**归一化到当前版本，避免十余处调用点只为版本号而机械改动；
+    // 需要"版本不匹配"的用例请传**其它**值（见 `SchemaVersionMustMatch`）。
+    const int emittedVersion = (schemaVersion == 4) ? TerrainMaterialTable::kSchemaVersion : schemaVersion;
+    out << "schema_version = " << emittedVersion << "\n";
     for (const LayerSpec& layer : layers) {
         out << "[[layer]]\n"
             << "name = \"" << layer.name << "\"\n"
@@ -80,7 +86,8 @@ struct LayerSpec {
             << "roughness = " << layer.roughness << "\n"
             << "ao = " << layer.ao << "\n"
             << "macro_uv_scale = " << layer.macroUvScale << "\n"
-            << "macro_strength = " << layer.macroStrength << "\n";
+            << "macro_strength = " << layer.macroStrength << "\n"
+            << "toughness = " << layer.toughness << "\n";
     }
     // C 项：全局三平面（triplanar）小节——与仓库 TOML 同源，供解析 / 投影 / 非法值测试覆盖。
     out << "[triplanar]\n"
@@ -428,11 +435,11 @@ TEST(TerrainMaterial, InvalidNewPbrFieldsThrow) {
         << "macro_strength < 0 必须报错";
 }
 
-// T22 / ADR 0010 P2 / 缺陷 2：schema_version 必须等于 4（调整带 + 新增 [triplanar]，同一版本）；
-// 旧版本（3）与新版本（5）都必须报错。
-TEST(TerrainMaterial, SchemaVersionMustBeFour) {
+// T22 / ADR 0010 P2 / 缺陷 2 / T31：schema_version 必须等于**当前**版本（T31 起为 5，新增必填 toughness）；
+// 旧版本（3）与新版本（6）都必须报错。（helper 会把历史字面量 4 归一化到当前版本，故这里不能用 4。）
+TEST(TerrainMaterial, SchemaVersionMustMatch) {
     const std::array<LayerSpec, static_cast<std::size_t>(kMaterialSlotCount)> specs = DefaultLayerSpecs();
-    for (const int version : { 3, 5 }) {
+    for (const int version : { 3, 6 }) {
         const std::filesystem::path path =
             WriteTempMaterials("vx_schema_version_materials.toml", EmitMaterials(version, specs));
         EXPECT_THROW((void)TerrainMaterialTable::LoadFromFile(path), std::runtime_error)
@@ -440,7 +447,7 @@ TEST(TerrainMaterial, SchemaVersionMustBeFour) {
         std::error_code ignored;
         std::filesystem::remove(path, ignored);
     }
-    EXPECT_EQ(TerrainMaterialTable::kSchemaVersion, 4);
+    EXPECT_EQ(TerrainMaterialTable::kSchemaVersion, 5);
 }
 
 // ---- 缺陷 2 回归：材质带必须在 (高度 ∈ [0,512] × 坡度 ∈ [0,1]) 全域上被覆盖 ----
