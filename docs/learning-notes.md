@@ -908,7 +908,13 @@ Naive Surface Nets 每个 cell **只放一个顶点**。当一个 cell 的实心
 - **视觉层面**：捏合处可能出现极小的破口 / 双面叠合，表现为"**某个面透明 / 没染色**"（背面剔除后看到背景）；
 - **与"退化三角形"是两件事**：零面积三角形量的是"画不出片元"，而捏合边量的是"拓扑不合法" ——
   两者都要有各自的判据（本项目：`CountDegenerateTriangles` + `CountBoundaryEdges` + "绕序反转"三项）。
-- **通行修法**：把歧义 cell 的顶点**按实体侧连通分组**、每组各放一个顶点（dual contouring 的常见做法）；
-  或退一步，只做零面积三角形的剔除与绕序修正。**注意**：本项目要求任何修法都不得改变"未触及区域顶点逐位不变"
-  （T42 / T50 的表示守恒），所以**能做**与**可接受**是两回事，须先定口径。
-- **相关**：`docs/plans/v0.1.md` T55 行、`docs/devlog.md` 的 T53+T54 条目、[ADR 0007](adr/0007-volume-meshing-algorithm.md)。
+- **通行修法**：把歧义 cell 的顶点**按实体侧（角之间"共棱"连通）分组**、每组各放一个顶点 ——
+  这就是 **Manifold Dual Contouring** 的通行做法；同时四边形发射时必须取"**与这根网格棱同一分量**"的子顶点。
+- **本项目已落地（T55 / 2026-09-29）**：采用上述"**拆顶点**"；**否掉**了"只丢弃零面积三角形"这条候选 ——
+  实测固件里 `退化 = 0` 而 `边界边 = 1`，说明非流形来自"**4 个三角形共用一条边**"，与面积是否为零无关。
+  与 ADR 0007 原定的"切 Marching Cubes"相比：MC 是表驱动、**顶点在 case 之间跳变**，会破坏"与地形同源 /
+  破坏时表示守恒"这两条既有判据，故**留在 SN 家族**即可闭环（见 [ADR 0019](adr/0019-ambiguous-cell-vertex-splitting.md)）。
+- **"能做"与"可接受"的差别**：本项目要求任何修法都不得改变"未触及区域顶点**逐位不变**"（T42 / T50 的表示守恒）；
+  拆顶点的实现里**单分量 cell 的偏移恒为 0**，因此非歧义区域**逐位不变**（`RegionEntryIsBitIdenticalToBlockEntryAtBlockSize` 钉死）。
+- **相关**：`docs/plans/v0.1.md` T55 行、`docs/devlog.md` 的 2026-09-29 条目、
+  [ADR 0007](adr/0007-volume-meshing-algorithm.md)、[ADR 0019](adr/0019-ambiguous-cell-vertex-splitting.md)。

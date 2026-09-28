@@ -445,8 +445,9 @@ TEST(VolumeMesher, RegionEntryFallsBackToNoMaterialOverride) {
 }
 
 // ---------------------------------------------------------------------------
-// T55 探针（**临时诊断**，定案后改成回归判据）：整数密度 + 球面正好穿过格点时的
-// "退化三角形 / 边界边"统计 —— 用来把"某个面透明"钉到一个可测量上（观测先于结论）。
+// T55 回归判据（"某个面透明 / 缺面"）：外观网格必须**流形且无缺面**。
+// 两个互补的检查 —— ① 稠密光滑球面（整数密度 + 球面正好穿过格点等多种对齐）不得产生
+// 退化三角形 / 边界边 / 绕序反转；② **歧义面**（网格面四角成棋盘格）必须被拆成两片各自成面。
 // ---------------------------------------------------------------------------
 TEST(VolumeMesherProbe, LatticeAlignedQuantaReport) {
     struct Config {
@@ -468,9 +469,39 @@ TEST(VolumeMesherProbe, LatticeAlignedQuantaReport) {
     for (const Config& config : configs) {
         const QuantizedSphereSampler sampler(config.cx, config.cy, config.cz, config.radius);
         const MeshData               mesh = vx::BuildVolumeMesh(sampler);
-        std::printf("[T55 探针] %-16s 顶点 %5zu 三角 %5zu **退化 %3zu** 边界边 %3zu **绕序反转 %3zu**\n",
+        std::printf("[T55 复现] %-16s 顶点 %5zu 三角 %5zu **退化 %3zu** 边界边 %3zu **绕序反转 %3zu**\n",
                     config.name, mesh.vertices.size(), mesh.indices.size() / 3U, vx::CountDegenerateTriangles(mesh),
                     vx::CountBoundaryEdges(mesh), CountBackwardTriangles(mesh));
+        EXPECT_EQ(vx::CountDegenerateTriangles(mesh), 0U) << config.name << "：不得出现退化三角形";
+        EXPECT_EQ(vx::CountBoundaryEdges(mesh), 0U) << config.name << "：等值面必须闭合（每条边恰被 2 个三角形共用）";
+        EXPECT_EQ(CountBackwardTriangles(mesh), 0U) << config.name << "：正面必须朝向空侧（否则被背面剔除 = 透明）";
     }
     std::fflush(stdout);
+}
+
+// ---------------------------------------------------------------------------
+// T55 复现固件（**临时探针**）：**歧义面** —— 某个网格面（grid face）的四角符号成**棋盘格**
+/// （对角实心、对角空）。此时该面的 4 条棱**全部**与表面相交 ⇒ 该面两侧的 cell 顶点之间的
+/// 那条网格边会被**多达 4 个四边形**共用（非流形捏合）；同时两侧 cell 都是"对角实心"的歧义 cell，
+/// 只能放 1 个顶点 ⇒ 四边形自交 ⇒ 其中某个三角形绕序翻转（背面剔除 ⇒ 屏幕表现与"面透明"一致）。
+// ---------------------------------------------------------------------------
+namespace {
+class CheckerboardFaceSampler final : public IVolumeSampler {
+public:
+    /// 两个**对角相邻**的实心采样点（网格面 `x=3` 上，(3,3,3) 与 (3,4,4)）：该面的四角符号成棋盘格。
+    /// 位置刻意离区域边界 ≥3 格，避免"区域边界棱"造成的假阳性。
+    [[nodiscard]] float Sample(int i, int j, int k) const override {
+        const bool solid = (i == 3) && (((j == 3) && (k == 3)) || ((j == 4) && (k == 4)));
+        return solid ? static_cast<float>(kDensityMin) : static_cast<float>(kDensityMax);
+    }
+};
+}  // namespace
+
+TEST(VolumeMesher, AmbiguousFaceMeshesAsTwoManifoldSheets) {
+    const CheckerboardFaceSampler sampler;
+    const MeshData                mesh = vx::BuildRegionMesh(sampler, 8, 8, 8);
+    ASSERT_FALSE(mesh.indices.empty()) << "两个对角实心点必须各自生成一片闭合等值面";
+    EXPECT_EQ(vx::CountBoundaryEdges(mesh), 0U) << "歧义面两侧必须各自成面 ⇒ 无边界边（非流形已被拆顶点修掉）";
+    EXPECT_EQ(vx::CountDegenerateTriangles(mesh), 0U) << "不得出现退化三角形";
+    EXPECT_EQ(CountBackwardTriangles(mesh), 0U) << "正面必须朝向空侧（否则被背面剔除 = 看起来透明）";
 }
