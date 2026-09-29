@@ -17,6 +17,25 @@
 namespace vx {
 namespace {
 
+// ---- 层间共面重叠的光栅化深度偏移（T78 / 2026-09-29）----
+//
+// 用途：地表 tile 网格与可挖体积网格在**层间接管边界环**上逐点重合（共面）⇒ 两个面各自栅格化出的
+// 深度仅有浮点插值级差异 ⇒ 逐像素随机胜负 ⇒ **z-fighting 闪烁**（世界扩到 1 km 后边界环被搬到地图正中，可见）。
+// 业界标准手段 = **光栅化 depth bias / polygon offset**（D3D12 `D3D12_RASTERIZER_DESC::DepthBias`、
+// Vulkan `VkPipelineRasterizationStateCreateInfo::depthBiasConstantFactor`、UE `FMeshPassProcessor` 的
+// `DepthBias`）：给**地表**这一层一个**正**偏移（把它的深度往"更远"推）⇒ 共面处**体积面稳定胜出**、
+// 不改几何、不留缝。
+//
+// 取值说明（**待实测微调的经验值**）：SDL3_gpu 把 `depth_bias_constant_factor` 原样映射到后端，
+// 而后端会**再乘以该深度格式的最小可分辨差 `r`**（float32 深度 `r ≈ 2^-23`），且 **D3D12 后端会把它
+// 取整**（`SDL_gpu_d3d12.c` 的 `SDL_lroundf`）⇒ 形如 `1e-3` 的浮点量级在本机 D3D12 上会被取整成 **0**、
+// 完全失效。故这里给**整数值** `100`（等效归一化深度偏移 ≈ `100 × 2^-23 ≈ 1.2e-5`），配合 slope factor
+// 覆盖掠射角；量级目标 = "稳定压过共面差异、又不产生可察觉台阶"。**本机实测若仍闪 ⇒ 适度上调，
+// 若地表相对体积出现可见下沉 ⇒ 下调**（对应 devlog 2026-09-29 T78 条目的"待实测微调"）。
+inline constexpr float kSurfaceDepthBiasConstant = 100.0F;
+inline constexpr float kSurfaceDepthBiasSlope    = 1.0F;
+inline constexpr float kSurfaceDepthBiasClamp    = 0.0F;
+
 [[nodiscard]] std::vector<std::uint8_t> read_binary_file(const std::filesystem::path& path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) {
@@ -119,12 +138,13 @@ struct ShaderResourceCounts {
     return shader;
 }
 
-/// 同步创建一个 GPU 缓冲并把 `data` 上传进去。
+/// **只创建**（不上传、不做任何同步等待）一个 GPU 缓冲；失败抛 `std::runtime_error`。
 ///
-/// 只在网格上传这样的**非热路径**调用：内部会向 GPU 提交并把等待收敛到一次 fence。
-/// 失败时抛 `std::runtime_error`（启动 / 加载期允许异常）。
-[[nodiscard]] SDL_GPUBuffer* create_and_upload_buffer(SDL_GPUDevice* device, SDL_GPUBufferUsageFlags usage,
-                                                      const void* data, std::uint32_t size) {
+/// T75：供"先按容量建缓冲、再走 `UpdateMeshGeometry` 提交即走"的新路径使用 ——
+/// 旧路径（`create_and_upload_buffer`）每次上传都要额外建一个 transfer buffer 并**等一次 fence**，
+/// 对"每帧都要重建若干网格"的流式/破坏路径是不可接受的成本（见 `references/performance-and-hitches.md` §1.4）。
+[[nodiscard]] SDL_GPUBuffer* create_buffer(SDL_GPUDevice* device, SDL_GPUBufferUsageFlags usage,
+                                           std::uint32_t size) {
     SDL_GPUBufferCreateInfo bufferInfo {};
     bufferInfo.usage = usage;
     bufferInfo.size  = size;
@@ -133,46 +153,6 @@ struct ShaderResourceCounts {
     if (buffer == nullptr) {
         throw std::runtime_error(std::string("SDL_CreateGPUBuffer 失败：") + SDL_GetError());
     }
-
-    SDL_GPUTransferBufferCreateInfo transferInfo {};
-    transferInfo.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
-    transferInfo.size  = size;
-
-    SDL_GPUTransferBuffer* transfer = SDL_CreateGPUTransferBuffer(device, &transferInfo);
-    if (transfer == nullptr) {
-        SDL_ReleaseGPUBuffer(device, buffer);
-        throw std::runtime_error(std::string("SDL_CreateGPUTransferBuffer 失败：") + SDL_GetError());
-    }
-
-    void* mapped = SDL_MapGPUTransferBuffer(device, transfer, /*cycle=*/false);
-    if (mapped == nullptr) {
-        SDL_ReleaseGPUTransferBuffer(device, transfer);
-        SDL_ReleaseGPUBuffer(device, buffer);
-        throw std::runtime_error(std::string("SDL_MapGPUTransferBuffer 失败：") + SDL_GetError());
-    }
-    std::memcpy(mapped, data, size);
-    SDL_UnmapGPUTransferBuffer(device, transfer);
-
-    SDL_GPUCommandBuffer* commandBuffer = SDL_AcquireGPUCommandBuffer(device);
-    if (commandBuffer == nullptr) {
-        SDL_ReleaseGPUTransferBuffer(device, transfer);
-        SDL_ReleaseGPUBuffer(device, buffer);
-        throw std::runtime_error(std::string("SDL_AcquireGPUCommandBuffer 失败：") + SDL_GetError());
-    }
-
-    SDL_GPUCopyPass* copyPass = SDL_BeginGPUCopyPass(commandBuffer);
-    SDL_GPUTransferBufferLocation source { transfer, 0 };
-    SDL_GPUBufferRegion           destination { buffer, 0, size };
-    SDL_UploadToGPUBuffer(copyPass, &source, &destination, /*cycle=*/false);
-    SDL_EndGPUCopyPass(copyPass);
-
-    SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(commandBuffer);
-    if (fence != nullptr) {
-        SDL_WaitForGPUFences(device, /*wait_all=*/true, &fence, 1);
-        SDL_ReleaseGPUFence(device, fence);
-    }
-
-    SDL_ReleaseGPUTransferBuffer(device, transfer);
     return buffer;
 }
 
@@ -602,6 +582,22 @@ void MeshRenderer::CreateMainPipeline(std::uint32_t sampleCount) {
     }
     m_pipelineSampleCount = sampleCount;
 
+    // T78：**带光栅化深度偏移的主通道变体**（与 `m_pipeline` 只差 `rasterizer_state` 的深度偏移）。
+    // 与 `m_pipeline` 在同一处（这里）创建 / 重建 ⇒ **绝不出现在 `RenderFrame` 热路径**（SKILL 硬规则 4）。
+    if (m_pipelineDepthBiased != nullptr) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_pipelineDepthBiased);
+        m_pipelineDepthBiased = nullptr;
+    }
+    info.rasterizer_state.enable_depth_bias            = true;
+    info.rasterizer_state.depth_bias_constant_factor   = kSurfaceDepthBiasConstant;
+    info.rasterizer_state.depth_bias_slope_factor      = kSurfaceDepthBiasSlope;
+    info.rasterizer_state.depth_bias_clamp             = kSurfaceDepthBiasClamp;
+    m_pipelineDepthBiased = SDL_CreateGPUGraphicsPipeline(m_device, &info);
+    if (m_pipelineDepthBiased == nullptr) {
+        m_pipelineSampleCount = 0;
+        throw std::runtime_error(std::string("创建带深度偏移的主通道管线失败：") + SDL_GetError());
+    }
+
     // T67：天空管线与主通道**共用同一个渲染通道**（天空先画、网格覆盖其上）⇒ 采样数必须与目标一致，
     // 因此与主通道同生共死：这里一并（重）建，`EnsureMainPipeline` 的两个判断即覆盖两者。
     if (m_skyPipeline != nullptr) {
@@ -761,6 +757,9 @@ MeshRenderer::~MeshRenderer() {
     if (m_pipeline != nullptr) {
         SDL_ReleaseGPUGraphicsPipeline(m_device, m_pipeline);
     }
+    if (m_pipelineDepthBiased != nullptr) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_pipelineDepthBiased);
+    }
     if (m_tonemapPipeline != nullptr) {
         SDL_ReleaseGPUGraphicsPipeline(m_device, m_tonemapPipeline);
     }
@@ -795,24 +794,29 @@ MeshRenderer::~MeshRenderer() {
     }
 }
 
-MeshHandle MeshRenderer::UploadMesh(const MeshData& mesh, const glm::dvec3& origin, bool emissive) {
+MeshHandle MeshRenderer::UploadMesh(const MeshData& mesh, const glm::dvec3& origin, bool emissive,
+                                   std::uint32_t reserveVertexCount, std::uint32_t reserveIndexCount,
+                                   bool depthBiased) {
     if (mesh.vertices.empty() || mesh.indices.empty()) {
         return MeshHandle {};
     }
 
-    const std::uint32_t vertexBytes = static_cast<std::uint32_t>(mesh.vertices.size() * sizeof(MeshVertex));
-    const std::uint32_t indexBytes  = static_cast<std::uint32_t>(mesh.indices.size() * sizeof(std::uint32_t));
+    const std::uint32_t vertexCapacity =
+        std::max(static_cast<std::uint32_t>(mesh.vertices.size()), reserveVertexCount);
+    const std::uint32_t indexCapacity = std::max(static_cast<std::uint32_t>(mesh.indices.size()), reserveIndexCount);
 
     MeshResources resources;
-    resources.vertexBuffer =
-        create_and_upload_buffer(m_device, SDL_GPU_BUFFERUSAGE_VERTEX, mesh.vertices.data(), vertexBytes);
-    resources.indexBuffer =
-        create_and_upload_buffer(m_device, SDL_GPU_BUFFERUSAGE_INDEX, mesh.indices.data(), indexBytes);
-    resources.vertexCount = static_cast<std::uint32_t>(mesh.vertices.size());
-    resources.indexCount = static_cast<std::uint32_t>(mesh.indices.size());
-    // 静态网格的"实际绘制索引数" = 上传的索引数（T42；变长网格由 `UpdateMeshGeometry` 改写）。
-    resources.usedIndexCount = resources.indexCount;
-    resources.emissive  = emissive;
+    resources.vertexBuffer = create_buffer(m_device, SDL_GPU_BUFFERUSAGE_VERTEX,
+                                           vertexCapacity * static_cast<std::uint32_t>(sizeof(MeshVertex)));
+    resources.indexBuffer  = create_buffer(
+        m_device, SDL_GPU_BUFFERUSAGE_INDEX, indexCapacity * static_cast<std::uint32_t>(sizeof(std::uint32_t)));
+    // 登记的容量 = 实际建出来的缓冲大小 ⇒ 后续 `UpdateMeshGeometry` 只允许写这个前缀之内。
+    resources.vertexCount = vertexCapacity;
+    resources.indexCount  = indexCapacity;
+    // 本帧实际绘制索引数由下面的 `UpdateMeshGeometry` 写（T42 的"变长网格"口径）。
+    resources.usedIndexCount = 0;
+    resources.emissive       = emissive;
+    resources.depthBiased    = depthBiased;  // T78：主通道是否走带深度偏移的管线变体（阴影通道不理会）
     // 世界原点只作"这块网格在世界哪里"的登记（T41）；绘制时与渲染原点相减得平移量。
     // 存 `double`（红线 6）：偏移在 double 下相减后才落回 float，大坐标也不会丢精度。
     resources.origin[0] = origin.x;
@@ -828,7 +832,15 @@ MeshHandle MeshRenderer::UploadMesh(const MeshData& mesh, const glm::dvec3& orig
         slot = static_cast<std::uint32_t>(m_meshes.size());
         m_meshes.push_back(resources);
     }
-    return MeshHandle { slot + 1 };
+    const MeshHandle handle { slot + 1 };
+
+    // **提交即走**（T75）：复用常驻暂存缓冲 + 单命令缓冲，**不建 transfer buffer、不等 fence**。
+    // 这一步是"每块 2 次 `SDL_WaitForGPUFences`"的消除点（旧路径见 `create_and_upload_buffer`）。
+    if (!UpdateMeshGeometry(handle, mesh, origin)) {
+        ReleaseMesh(handle);
+        throw std::runtime_error("UploadMesh：网格上传失败（容量预留不足或 GPU 命令提交失败）");
+    }
+    return handle;
 }
 
 bool MeshRenderer::EnsureStagingBuffer(SDL_GPUTransferBuffer*& buffer, std::uint32_t& capacity,
@@ -1535,11 +1547,18 @@ void MeshRenderer::LogTextureAccounting(std::uint32_t width, std::uint32_t heigh
 }
 
 void MeshRenderer::DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURenderPass* pass, const MeshHandle* meshes,
-                              std::size_t meshCount, bool pushEmissive, EmissivePushState& emissiveState,
-                              MeshTransformPushState& transformState) {
+                              std::size_t meshCount, bool pushEmissive, SDL_GPUGraphicsPipeline* depthBiasedPipeline,
+                              EmissivePushState& emissiveState, MeshTransformPushState& transformState) {
     if (meshes == nullptr) {
         return;
     }
+
+    // T78：当前绑定的管线是否为"带深度偏移变体"。进入时调用方已绑定**基础**管线（主通道 `m_pipeline` /
+    // 阴影通道 `m_shadowPipeline`）⇒ 初值 false。`depthBiasedPipeline == nullptr`（阴影通道）时下面的
+    // 判断恒为 false ⇒ **不切换管线**、保持阴影现状。
+    // 切换只在"该网格的标记与当前绑定不一致"时发生 ⇒ 绑定次数 = 标记切换次数（调用方把地表 tile 全部
+    // 排在绘制列表最前 ⇒ 至多 1 次切换）⇒ 最多 2 条管线，**绝不逐网格绑定**、也不重排网格（保持既有确定序）。
+    bool biasPipelineBound = false;
 
     for (std::size_t i = 0; i < meshCount; ++i) {
         const MeshHandle handle = meshes[i];
@@ -1554,6 +1573,13 @@ void MeshRenderer::DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURender
         // 此时索引数为 0，直接跳过（**不推 uniform、不绑定、不绘制**）。
         if (resources.usedIndexCount == 0U) {
             continue;
+        }
+
+        // T78：按网格标记选择管线（只在标记变化时绑定）。
+        const bool wantsBiased = (depthBiasedPipeline != nullptr) && resources.depthBiased;
+        if (wantsBiased != biasPipelineBound) {
+            SDL_BindGPUGraphicsPipeline(pass, wantsBiased ? depthBiasedPipeline : m_pipeline);
+            biasPipelineBound = wantsBiased;
         }
 
         // 逐网格模型变换（T41 起；T33 由 `vec4` 偏移泛化为 `mat4`）：把**网格局部坐标**变成渲染相对坐标。
@@ -1724,8 +1750,9 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
             SDL_GPUBuffer* matrixBuffers[1] = { m_shadowMatrixBuffers[cascade] };
             SDL_BindGPUVertexStorageBuffers(shadowPass, 0, matrixBuffers, 1);
 
-            DrawMeshes(commandBuffer, shadowPass, meshes, meshCount, /*pushEmissive=*/false, shadowEmissiveState,
-                       shadowTransformState);
+            // T78：阴影通道**不使用**深度偏移变体（传 nullptr）⇒ 保持阴影现状、逐网格不切管线。
+            DrawMeshes(commandBuffer, shadowPass, meshes, meshCount, /*pushEmissive=*/false,
+                       /*depthBiasedPipeline=*/nullptr, shadowEmissiveState, shadowTransformState);
             SDL_EndGPURenderPass(shadowPass);
         }
     }
@@ -1849,7 +1876,9 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
     // T41 / T33：逐网格模型变换同样逐网格推送，主通道另有自己的一份去重状态。
     EmissivePushState      emissiveState;
     MeshTransformPushState transformState;
-    DrawMeshes(commandBuffer, pass, meshes, meshCount, /*pushEmissive=*/true, emissiveState, transformState);
+    // T78：主通道传入带深度偏移的管线变体 —— `DrawMeshes` 只在地表 tile（标记为 true）那一段切换过去。
+    DrawMeshes(commandBuffer, pass, meshes, meshCount, /*pushEmissive=*/true, m_pipelineDepthBiased, emissiveState,
+               transformState);
 
     SDL_EndGPURenderPass(pass);
 

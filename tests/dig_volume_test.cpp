@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -845,4 +846,377 @@ TEST(DigVolumeProbe, CarvedBlocksReportDegenerateAndBackwardTriangles) {
     }
     std::fflush(stdout);
 }
+
+// ============================================================================================
+// T79 ④：挖除路径的**零语义提速**（块范围定位 + scratch 复用 + 平方距离筛除）。
+// 判据（红线）：改造后路径的结果必须与"改前的朴素实现"**逐位一致** —— 脏块集合 + 逐格密度。
+//
+// 参考实现刻意朴素：`RasterizeBall` 的块选择**遍历全部常驻块**（改造前的写法）；候选 / 掩码 /
+// 洪泛栈每次都新建普通 `std::vector`；距离筛除用平方、排序键用 `sqrt`（与生产路径同口径）。
+// 它只依赖公开只读接口（`Blocks()` / `SampleDensity` / `SampleMaterialSlot` / `Materials()`），
+// 因此是对"生产路径"的**独立**对照，而不是把生产代码抄一遍。
+// ============================================================================================
+namespace {
+
+[[nodiscard]] std::size_t RefDensityIndex(int i, int j, int k) noexcept {
+    const std::size_t extent = static_cast<std::size_t>(vx::kVolumeSampleCount);
+    return static_cast<std::size_t>(i) + extent * (static_cast<std::size_t>(j) + extent * static_cast<std::size_t>(k));
+}
+
+struct RefCandidate {
+    double distance = 0.0;
+    int    x        = 0;
+    int    y        = 0;
+    int    z        = 0;
+};
+
+/// 参考掩码：与生产路径同一布局，但可达性用普通的 `vector<uint8_t>`（每次 `assign` 清零）。
+struct RefBlastMask {
+    int                       minX  = 0;
+    int                       minY  = 0;
+    int                       minZ  = 0;
+    int                       sizeX = 0;
+    int                       sizeY = 0;
+    int                       sizeZ = 0;
+    std::vector<std::uint8_t> reachable;
+
+    [[nodiscard]] bool Contains(int x, int y, int z) const noexcept {
+        return x >= minX && x < minX + sizeX && y >= minY && y < minY + sizeY && z >= minZ && z < minZ + sizeZ;
+    }
+    [[nodiscard]] std::size_t Index(int x, int y, int z) const noexcept {
+        return static_cast<std::size_t>(x - minX) +
+               static_cast<std::size_t>(sizeX) * (static_cast<std::size_t>(y - minY) +
+                                                  static_cast<std::size_t>(sizeY) *
+                                                      static_cast<std::size_t>(z - minZ));
+    }
+    [[nodiscard]] bool Reachable(int x, int y, int z) const noexcept {
+        return Contains(x, y, z) && reachable[Index(x, y, z)] != 0U;
+    }
+};
+
+[[nodiscard]] bool RefIsIndestructible(const DigVolumeWorld& world, int x, int y, int z) {
+    const std::uint8_t slot = world.SampleMaterialSlot(x, y, z);
+    if (slot == vx::kNoMaterialSlot) {
+        return true;
+    }
+    const vx::MaterialLayer& layer = world.Materials().Layer(static_cast<int>(slot));
+    return layer.indestructible || !(layer.toughness > 0.0F);
+}
+
+/// 朴素栅格化（改造前的写法）：**遍历全部常驻块** + AABB 早退；直接改 `density` 副本。
+bool RefRasterizeBall(const DigVolumeWorld& pristine, std::map<BlockCoord, std::vector<std::int8_t>>& density,
+                      const glm::dvec3& center, float radiusBlocks, bool skipIndestructible, const RefBlastMask* mask,
+                      std::vector<BlockCoord>& dirtyOut) {
+    if (!(radiusBlocks > 0.0F) || density.empty()) {
+        return false;
+    }
+    const double radius  = static_cast<double>(radiusBlocks);
+    const double outer   = radius + vx::kCarveSdfBandBlocks;
+    const double outerSq = outer * outer;
+    bool         changedAny = false;
+
+    for (auto& entry : density) {
+        const BlockCoord          coord = entry.first;
+        std::vector<std::int8_t>& block = entry.second;
+        const int    originX = vx::BlockOriginBlocks(coord.x);
+        const int    originY = vx::BlockOriginBlocks(coord.y);
+        const int    originZ = vx::BlockOriginBlocks(coord.z);
+        const double maxX    = static_cast<double>(originX + vx::kVolumeBlockSize);
+        const double maxY    = static_cast<double>(originY + vx::kVolumeBlockSize);
+        const double maxZ    = static_cast<double>(originZ + vx::kVolumeBlockSize);
+        if (center.x + outer < static_cast<double>(originX) || center.x - outer > maxX ||
+            center.y + outer < static_cast<double>(originY) || center.y - outer > maxY ||
+            center.z + outer < static_cast<double>(originZ) || center.z - outer > maxZ) {
+            continue;
+        }
+
+        bool blockChanged = false;
+        for (int k = 0; k < vx::kVolumeSampleCount; ++k) {
+            for (int j = 0; j < vx::kVolumeSampleCount; ++j) {
+                for (int i = 0; i < vx::kVolumeSampleCount; ++i) {
+                    // 参考场景的带宽为 0（`FromRegions` 默认）⇒ `BelowDiggableBand` 恒 false，不做裁剪。
+                    const double dx = static_cast<double>(originX + i) - center.x;
+                    const double dy = static_cast<double>(originY + j) - center.y;
+                    const double dz = static_cast<double>(originZ + k) - center.z;
+                    const double distanceSq = dx * dx + dy * dy + dz * dz;
+                    if (distanceSq >= outerSq) {
+                        continue;
+                    }
+                    const double signedDistance = radius - std::sqrt(distanceSq);
+                    const int    carved         = std::clamp(
+                        static_cast<int>(std::lround(signedDistance * static_cast<double>(vx::kDensityUnitsPerBlock))),
+                        vx::kDensityMin, vx::kDensityMax);
+                    if (skipIndestructible && RefIsIndestructible(pristine, originX + i, originY + j, originZ + k)) {
+                        continue;
+                    }
+                    if (mask != nullptr && !mask->Reachable(originX + i, originY + j, originZ + k)) {
+                        continue;
+                    }
+                    std::int8_t& value = block[RefDensityIndex(i, j, k)];
+                    if (carved > static_cast<int>(value)) {
+                        value        = static_cast<std::int8_t>(carved);
+                        blockChanged = true;
+                    }
+                }
+            }
+        }
+        if (blockChanged) {
+            dirtyOut.push_back(coord);
+            changedAny = true;
+        }
+    }
+    return changedAny;
+}
+
+/// 朴素 `CarveByDamage`：完整复刻 ADR 0013 的三段（候选 → 洪泛 → 预算）+ ④ 朴素栅格化。
+bool RefCarveByDamage(const DigVolumeWorld& pristine, std::map<BlockCoord, std::vector<std::int8_t>>& density,
+                      const glm::dvec3& center, float radiusBlocks, int budgetPoints,
+                      std::vector<BlockCoord>& dirtyOut) {
+    if (!(radiusBlocks > 0.0F) || budgetPoints <= 0 || density.empty()) {
+        return false;
+    }
+    const double radius   = static_cast<double>(radiusBlocks);
+    const double radiusSq = radius * radius;
+
+    // ① 候选格³。
+    std::vector<RefCandidate> cells;
+    const int loX = static_cast<int>(std::floor(center.x - radius));
+    const int hiX = static_cast<int>(std::ceil(center.x + radius));
+    const int loY = static_cast<int>(std::floor(center.y - radius));
+    const int hiY = static_cast<int>(std::ceil(center.y + radius));
+    const int loZ = static_cast<int>(std::floor(center.z - radius));
+    const int hiZ = static_cast<int>(std::ceil(center.z + radius));
+    for (int z = loZ; z <= hiZ; ++z) {
+        for (int y = loY; y <= hiY; ++y) {
+            for (int x = loX; x <= hiX; ++x) {
+                const double dx = static_cast<double>(x) + 0.5 - center.x;
+                const double dy = static_cast<double>(y) + 0.5 - center.y;
+                const double dz = static_cast<double>(z) + 0.5 - center.z;
+                const double distanceSq = dx * dx + dy * dy + dz * dz;
+                if (distanceSq > radiusSq) {
+                    continue;
+                }
+                cells.push_back(RefCandidate { std::sqrt(distanceSq), x, y, z });
+            }
+        }
+    }
+    std::sort(cells.begin(), cells.end(), [](const RefCandidate& a, const RefCandidate& b) {
+        if (a.distance != b.distance) {
+            return a.distance < b.distance;
+        }
+        if (a.x != b.x) {
+            return a.x < b.x;
+        }
+        if (a.y != b.y) {
+            return a.y < b.y;
+        }
+        return a.z < b.z;
+    });
+
+    // ② 掩码 + 洪泛。
+    const double blastReach   = radius + vx::kCarveSdfBandBlocks;
+    const double blastReachSq = blastReach * blastReach;
+    RefBlastMask mask;
+    mask.minX  = static_cast<int>(std::floor(center.x - blastReach));
+    mask.minY  = static_cast<int>(std::floor(center.y - blastReach));
+    mask.minZ  = static_cast<int>(std::floor(center.z - blastReach));
+    mask.sizeX = static_cast<int>(std::ceil(center.x + blastReach)) - mask.minX + 1;
+    mask.sizeY = static_cast<int>(std::ceil(center.y + blastReach)) - mask.minY + 1;
+    mask.sizeZ = static_cast<int>(std::ceil(center.z + blastReach)) - mask.minZ + 1;
+    const std::size_t maskCells = static_cast<std::size_t>(mask.sizeX) * static_cast<std::size_t>(mask.sizeY) *
+                                  static_cast<std::size_t>(mask.sizeZ);
+    mask.reachable.assign(maskCells, 0U);
+    std::vector<std::uint8_t> slotOf(maskCells, static_cast<std::uint8_t>(vx::kNoMaterialSlot));
+    std::vector<std::uint8_t> solidOf(maskCells, 0U);
+    std::vector<std::uint8_t> blockerOf(maskCells, 1U);
+    for (int z = mask.minZ; z < mask.minZ + mask.sizeZ; ++z) {
+        for (int y = mask.minY; y < mask.minY + mask.sizeY; ++y) {
+            for (int x = mask.minX; x < mask.minX + mask.sizeX; ++x) {
+                const double dx = static_cast<double>(x) - center.x;
+                const double dy = static_cast<double>(y) - center.y;
+                const double dz = static_cast<double>(z) - center.z;
+                if (dx * dx + dy * dy + dz * dz > blastReachSq) {
+                    continue;
+                }
+                const std::size_t  index = mask.Index(x, y, z);
+                const std::uint8_t slot  = pristine.SampleMaterialSlot(x, y, z);
+                const bool         solid =
+                    pristine.SampleDensity(static_cast<double>(x), static_cast<double>(y), static_cast<double>(z)) < 0.0F;
+                bool indestructible = true;
+                if (slot != vx::kNoMaterialSlot) {
+                    const vx::MaterialLayer& layer = pristine.Materials().Layer(static_cast<int>(slot));
+                    indestructible                 = layer.indestructible || !(layer.toughness > 0.0F);
+                }
+                slotOf[index]    = slot;
+                solidOf[index]   = solid ? 1U : 0U;
+                blockerOf[index] = (solid && indestructible) ? 1U : 0U;
+            }
+        }
+    }
+    {
+        const int        originX = static_cast<int>(std::floor(center.x));
+        const int        originY = static_cast<int>(std::floor(center.y));
+        const int        originZ = static_cast<int>(std::floor(center.z));
+        std::vector<int> stack;
+        if (mask.Contains(originX, originY, originZ)) {
+            const std::size_t originIndex = mask.Index(originX, originY, originZ);
+            if (blockerOf[originIndex] == 0U) {
+                mask.reachable[originIndex] = 1U;
+                stack.push_back(static_cast<int>(originIndex));
+            }
+        }
+        const int planeStride = mask.sizeX * mask.sizeY;
+        while (!stack.empty()) {
+            const int index = stack.back();
+            stack.pop_back();
+            const int x = mask.minX + index % mask.sizeX;
+            const int y = mask.minY + (index / mask.sizeX) % mask.sizeY;
+            const int z = mask.minZ + index / planeStride;
+            const int neighbours[6][3] = { { x - 1, y, z }, { x + 1, y, z }, { x, y - 1, z },
+                                           { x, y + 1, z }, { x, y, z - 1 }, { x, y, z + 1 } };
+            for (const int(&next)[3] : neighbours) {
+                if (!mask.Contains(next[0], next[1], next[2])) {
+                    continue;
+                }
+                const std::size_t nextIndex = mask.Index(next[0], next[1], next[2]);
+                if (mask.reachable[nextIndex] != 0U || blockerOf[nextIndex] != 0U) {
+                    continue;
+                }
+                mask.reachable[nextIndex] = 1U;
+                stack.push_back(static_cast<int>(nextIndex));
+            }
+        }
+    }
+
+    // ③ 预算结算。
+    int         remaining  = budgetPoints;
+    double      stopRadius = 0.0;
+    std::size_t destroyed  = 0;
+    for (const RefCandidate& cell : cells) {
+        const std::size_t index = mask.Index(cell.x, cell.y, cell.z);
+        if (mask.reachable[index] == 0U) {
+            continue;
+        }
+        const std::uint8_t slot = slotOf[index];
+        if (slot == vx::kNoMaterialSlot) {
+            continue;
+        }
+        if (solidOf[index] == 0U) {
+            continue;
+        }
+        const vx::MaterialLayer& layer = pristine.Materials().Layer(static_cast<int>(slot));
+        const int                cost  = static_cast<int>(std::lround(layer.toughness));
+        if (cost > remaining) {
+            break;
+        }
+        remaining -= cost;
+        stopRadius = cell.distance;
+        ++destroyed;
+    }
+    if (destroyed == 0) {
+        return false;
+    }
+
+    // ④ 朴素栅格化。
+    return RefRasterizeBall(pristine, density, center, static_cast<float>(stopRadius), true, &mask, dirtyOut);
+}
+
+/// 把 `Blocks()` 的密度拷进一份可变副本（参考实现的输入 / 输出）。
+[[nodiscard]] std::map<BlockCoord, std::vector<std::int8_t>> CopyDensity(const DigVolumeWorld& world) {
+    std::map<BlockCoord, std::vector<std::int8_t>> copy;
+    for (const auto& entry : world.Blocks()) {
+        copy.emplace(entry.first, entry.second.density);
+    }
+    return copy;
+}
+
+/// 逐位对照参考结果与生产路径的块密度。
+void ExpectSameDensity(const DigVolumeWorld& actual, const std::map<BlockCoord, std::vector<std::int8_t>>& reference,
+                       const char* label) {
+    ASSERT_EQ(actual.Blocks().size(), reference.size()) << label;
+    for (const auto& entry : actual.Blocks()) {
+        const auto found = reference.find(entry.first);
+        ASSERT_NE(found, reference.end()) << label << "：参考实现缺少块";
+        EXPECT_EQ(entry.second.density, found->second) << label << "：密度必须逐位相同";
+    }
+}
+
+}  // namespace
+
+// `CarveSphere`（半径驱动，无掩码）：结果与朴素全量扫描的参考实现逐位一致。
+TEST(DigVolumeRegression, OptimizedCarveSphereMatchesNaiveReference) {
+    struct Config {
+        glm::dvec3 center;
+        float      radius;
+    };
+    const Config configs[] = {
+        { glm::dvec3(8.0, 116.0, 8.0), 4.0F },      // 小半径、整数球心
+        { glm::dvec3(16.5, 112.5, 16.5), 6.0F },    // 半格球心
+        { glm::dvec3(6.25, 112.75, 7.5), 8.0F },    // 贴块边界（跨 x = 0 外的块边界）
+        { glm::dvec3(16.5, 119.25, 16.5), 6.0F },   // 近地表（球面部分落在空中）
+        { glm::dvec3(16.0, 120.0, 16.0), 12.0F },   // 大半径（覆盖多块范围推导）
+    };
+
+    for (const Config& cfg : configs) {
+        FlatVolume pristine;
+        FlatVolume actual;
+
+        std::map<BlockCoord, std::vector<std::int8_t>> reference = CopyDensity(pristine.volumes);
+        std::vector<BlockCoord>                        refDirty;
+        const bool refChanged =
+            RefRasterizeBall(pristine.volumes, reference, cfg.center, cfg.radius, false, nullptr, refDirty);
+
+        std::vector<BlockCoord> actualDirty;
+        const bool              actualChanged = actual.volumes.CarveSphere(cfg.center, cfg.radius, actualDirty);
+
+        EXPECT_EQ(actualChanged, refChanged);
+        EXPECT_EQ(actualDirty, refDirty) << "脏块集合（含顺序）必须相同";
+        ExpectSameDensity(actual.volumes, reference, "CarveSphere");
+    }
+}
+
+// `CarveByDamage`（材质坚固度 × 伤害预算 + 岩遮挡掩码）：结果与朴素参考实现逐位一致。
+TEST(DigVolumeRegression, OptimizedCarveByDamageMatchesNaiveReference) {
+    struct Config {
+        glm::dvec3 center;
+        float      radius;
+        int        budget;
+        bool       rockWall;
+    };
+    const Config configs[] = {
+        { glm::dvec3(16.0, 112.0, 16.0), 6.0F, 2710, false },      // 手感锚点（土，r ≈ 6）
+        { glm::dvec3(16.5, 112.5, 16.5), 6.0F, 2710, false },      // 半格球心
+        { glm::dvec3(15.25, 111.75, 16.75), 7.25F, 5000, false },  // 偏移球心
+        { glm::dvec3(16.75, 112.5, 15.5), 10.0F, 20000, false },   // 足预算
+        { glm::dvec3(16.25, 111.5, 16.25), 10.0F, 9000, false },   // 半预算（提前停止）
+        { glm::dvec3(6.25, 112.75, 7.5), 8.0F, 12000, false },     // 贴块边界
+        { glm::dvec3(16.5, 119.25, 16.5), 6.0F, 8000, false },     // 近地表
+        { glm::dvec3(12.5, 110.5, 16.5), 10.0F, 40000, true },     // 岩墙遮挡（T53 掩码 / 洪泛路径）
+    };
+
+    for (const Config& cfg : configs) {
+        FlatVolume pristine;
+        FlatVolume actual;
+        // 两侧完全相同的材质标记（走"已写入优先"路径）：整片土 + 可选的一道岩墙。
+        MarkBox(pristine.volumes, 0, 96, 0, 31, 127, 31, 1U);
+        MarkBox(actual.volumes, 0, 96, 0, 31, 127, 31, 1U);
+        if (cfg.rockWall) {
+            MarkBox(pristine.volumes, 18, 96, 0, 19, 127, 31, 2U);
+            MarkBox(actual.volumes, 18, 96, 0, 19, 127, 31, 2U);
+        }
+
+        std::map<BlockCoord, std::vector<std::int8_t>> reference = CopyDensity(pristine.volumes);
+        std::vector<BlockCoord>                        refDirty;
+        const bool refChanged =
+            RefCarveByDamage(pristine.volumes, reference, cfg.center, cfg.radius, cfg.budget, refDirty);
+
+        std::vector<BlockCoord> actualDirty;
+        const bool actualChanged = actual.volumes.CarveByDamage(cfg.center, cfg.radius, cfg.budget, actualDirty);
+
+        EXPECT_EQ(actualChanged, refChanged);
+        EXPECT_EQ(actualDirty, refDirty) << "脏块集合（含顺序）必须相同";
+        ExpectSameDensity(actual.volumes, reference, "CarveByDamage");
+    }
+}
+
 

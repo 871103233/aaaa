@@ -274,8 +274,9 @@ TEST(DigVolumeResidency, SchedulerKeepsWindowResidentAndNeverUnloadsCarvedBlocks
     ASSERT_TRUE(volumes.CarveSphere(glm::dvec3(8.0, 116.0, 8.0), 4.0F, dirty));
     EXPECT_TRUE(volumes.IsBlockDirty(carvedBlock));
 
-    // 玩家前进一格 tile（世界列 +64）⇒ 该建 4 块（x ∈ {2,3}）、该卸 3 块（旧的 4 块里被挖过的那块留下）。
-    ASSERT_TRUE(scheduler.Update(volumes, 64.0, 0.0));
+    // 玩家前进一格 tile：**必须越过滞回带宽**（世界列 64 + kWindowHysteresisBlocks）窗口才切（T73 / ADR 0020 修订）
+    // ⇒ 该建 4 块（x ∈ {2,3}）、该卸 3 块（旧的 4 块里被挖过的那块留下）。
+    ASSERT_TRUE(scheduler.Update(volumes, 64.0 + vx::kWindowHysteresisBlocks, 0.0));
     EXPECT_EQ(scheduler.PendingCreateCount(), 4U);
     EXPECT_EQ(scheduler.PendingUnloadCount(), 3U);
     EXPECT_EQ(scheduler.KeptDirtyCount(), 1U);
@@ -295,4 +296,83 @@ TEST(DigVolumeResidency, SchedulerKeepsWindowResidentAndNeverUnloadsCarvedBlocks
     ASSERT_TRUE(scheduler.Update(volumes, 0.0, 0.0));
     EXPECT_EQ(scheduler.PendingCreateCount(), 3U);
     EXPECT_EQ(scheduler.PendingUnloadCount(), 4U);
+}
+
+// ---------------------------------------------------------------------------
+// T73（2026-09-29）：**窗口滞回** —— 消除"站在 tile 边界上反复翻转"引起的 63 块重建（T72 定位到的卡顿根因）
+// ---------------------------------------------------------------------------
+
+TEST(DigVolumeResidency, HysteresisCenterTileHoldsUntilTheBandIsCrossed) {
+    constexpr double kTile = static_cast<double>(vx::kTerrainTileSize);
+
+    // 同一个 tile ⇒ 不变
+    EXPECT_EQ(vx::HysteresisCenterTile(0, 0, 10.0, vx::kWindowHysteresisBlocks), 0);
+    // 越过边界但**未达带宽** ⇒ 保持不动（这就是"消灭边界抖动"的那一条）
+    EXPECT_EQ(vx::HysteresisCenterTile(0, 1, kTile + 15.9, vx::kWindowHysteresisBlocks), 0);
+    // 恰好达带宽 ⇒ 挪一格（边界含等号，可判定）
+    EXPECT_EQ(vx::HysteresisCenterTile(0, 1, kTile + 16.0, vx::kWindowHysteresisBlocks), 1);
+    EXPECT_EQ(vx::HysteresisCenterTile(0, 1, kTile + 40.0, vx::kWindowHysteresisBlocks), 1);
+    // 负方向对称（tile -1 的上边界 = 0）
+    EXPECT_EQ(vx::HysteresisCenterTile(0, -1, -15.9, vx::kWindowHysteresisBlocks), 0);
+    EXPECT_EQ(vx::HysteresisCenterTile(0, -1, -16.0, vx::kWindowHysteresisBlocks), -1);
+    // **出生点的亚格级抖动（z ≈ ±1e-9）不得触发切换** —— 这正是 T72 的根因场景
+    EXPECT_EQ(vx::HysteresisCenterTile(0, -1, -1e-9, vx::kWindowHysteresisBlocks), 0);
+    EXPECT_EQ(vx::HysteresisCenterTile(0, 1, 1e-9, vx::kWindowHysteresisBlocks), 0);
+}
+
+TEST(DigVolumeResidency, HysteresisCenterTileJumpsForFarTeleportAndZeroBandDisablesIt) {
+    // 传送 / 越界救援的远跳：**一次到目标**（不逐格挪 ⇒ 不会退化成几十次 63 块重建）
+    EXPECT_EQ(vx::HysteresisCenterTile(0, 5, 350.0, vx::kWindowHysteresisBlocks), 5);
+    EXPECT_EQ(vx::HysteresisCenterTile(3, -4, -300.0, vx::kWindowHysteresisBlocks), -4);
+
+    // `band = 0` ⇒ 无滞回：越过边界即挪一格（= 引入滞回之前的行为，作对照口径）
+    EXPECT_EQ(vx::HysteresisCenterTile(0, 1, 64.0, 0.0), 1);
+    EXPECT_EQ(vx::HysteresisCenterTile(0, -1, -64.0, 0.0), -1);
+}
+
+TEST(DigVolumeResidency, BoundaryJitterDoesNotFlipTheWindowOrScheduleWork) {
+    const MapPreset preset = FlatPreset();
+
+    TerrainWorld world(preset.seed, TerrainMaterialTable::Default());
+    world.SetMapPreset(preset);
+    for (int tileZ = -1; tileZ <= 1; ++tileZ) {
+        for (int tileX = -1; tileX <= 1; ++tileX) {
+            world.LoadTile(tileX, tileZ);
+        }
+    }
+
+    const DigRegionTable regions = FlatRegions();
+    DigVolumeWorld     volumes(world, regions);
+    DigVolumeScheduler scheduler(regions, /*radiusTiles*/ 0);
+
+    const DigVolumeWindow window = vx::WindowForPlayerBlocks(0.0, 0.0, 0);
+    std::vector<BlockCoord> initial;
+    for (const BlockCoord& coord : regions.Blocks()) {
+        if (window.ContainsBlock(coord)) {
+            initial.push_back(coord);
+        }
+    }
+    volumes.BeginInitFromHeightField(initial);
+    StepUntilDone(volumes);
+    const std::size_t residentBefore = volumes.ResidentBlocks().size();
+    ASSERT_EQ(residentBefore, 4U);
+
+    EXPECT_FALSE(scheduler.Update(volumes, 0.0, 0.0));
+
+    // 出生点压在 tile 边界上：反复跨边界的**亚格级抖动**不得产生任何待办（否则每次都是 63 块重建）
+    for (int i = 0; i < 64; ++i) {
+        const double jitter = ((i % 2) == 0) ? 1e-9 : -1e-9;
+        EXPECT_FALSE(scheduler.Update(volumes, jitter, jitter)) << "第 " << i << " 次抖动产生了待办";
+        EXPECT_EQ(scheduler.PendingCreateCount(), 0U);
+        EXPECT_EQ(scheduler.PendingUnloadCount(), 0U);
+    }
+    EXPECT_EQ(volumes.ResidentBlocks().size(), residentBefore) << "抖动不得改变常驻集合";
+
+    // 越过边界但未达带宽（15.9 格）⇒ 仍不动
+    EXPECT_FALSE(scheduler.Update(volumes, static_cast<double>(vx::kTerrainTileSize) + 15.9, 0.0));
+    EXPECT_EQ(scheduler.PendingCreateCount(), 0U);
+
+    // 越过带宽（16.0 格）⇒ 才切窗口并产生待办
+    EXPECT_TRUE(scheduler.Update(volumes, static_cast<double>(vx::kTerrainTileSize) + 16.0, 0.0));
+    EXPECT_GT(scheduler.PendingCreateCount(), 0U);
 }

@@ -23,7 +23,11 @@ struct ProjectileSpec {
     float gravityScale           = 1.0F;   ///< 重力系数（× 角色重力），必须 ≥ 0（0 = 无重力弹道）
     float lifetimeSeconds        = 6.0F;   ///< 存活时间（秒），必须 > 0
     float fireIntervalSeconds    = 0.30F;  ///< 连发冷却（秒），必须 ≥ 0
-    float explosionRadiusBlocks  = 6.0F;   ///< 爆炸半径（格）：体积挖除半径 / 地表坑半径，必须 > 0
+    /// 爆炸半径（格）：体积挖除半径 / 地表坑半径，必须 > 0。
+    /// **T71（2026-09-29）**：`6.0 → 4.0`（性能；见 `assets/config/projectiles.toml` 该字段的注释与
+    /// `docs/devlog.md` 的 T71 条目）。本默认值必须与仓库内 `projectiles.toml` **一致**（有单测钉住：
+    /// `ProjectileTable.LoadsShippedTableAndRejectsMissingFile`）。
+    float explosionRadiusBlocks  = 4.0F;
     float explosionDepthBlocks   = 6.0F;   ///< **地表**爆破的坑心下挖深度（格），必须 > 0
     float explosionRimBlocks     = 2.0F;   ///< **地表**爆破的外环隆起（格），必须 ≥ 0
     float explosionFalloff       = 0.6F;   ///< 衰减带占半径的比例，必须 ∈ (0, 1]

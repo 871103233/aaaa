@@ -52,6 +52,30 @@ struct DigVolumeWindow {
 /// `radiusTiles == 0` = 只保留玩家所在的那一个 tile。
 [[nodiscard]] DigVolumeWindow WindowForPlayerBlocks(double worldX, double worldZ, int radiusTiles) noexcept;
 
+/// **窗口滞回带宽**（格；[ADR 0020](../../docs/adr/0020-dig-volume-vertical-band-and-dynamic-residency.md) 决策二的
+/// **2026-09-29 修订** / T73）：玩家**越过 tile 边界**必须超过本值，窗口中心 tile 才允许挪一格。
+///
+/// 为什么需要（实测依据见 `docs/devlog.md` 的 T72 条目）：窗口挪一格 = **63 块**（9 层 × 7 块）的建 / 卸，
+/// 而**出生点恰好压在 tile 边界上**（`z ≈ -1e-9`）⇒ **亚格级抖动**即让窗口 `(0,-1) ⇄ (0,0)` 反复翻，
+/// 每次都是一串 33~175 ms 的帧尖峰（几乎全在**逻辑相位** 62~168 ms）。本带宽把"数值抖动"与"真的走过去"分开。
+///
+/// 取 **16 格 = 1/4 tile**：按步行 9 格/秒约 1.8 s、按飞行 28 格/秒约 0.57 s 的容差；
+/// 玩家越过边界 16 格以内时窗口**保持不动**（旧窗口仍然完整覆盖玩家 —— 半径 2 tile = 128 格）。
+/// `0` = 关闭滞回（**等价于引入本项之前的行为**，供单测与对照使用）。
+inline constexpr double kWindowHysteresisBlocks = 16.0;
+
+/// 带**滞回**地推进窗口中心 tile（纯函数，红线 7 —— 结果只由入参决定）。
+///
+/// 语义（逐条可测）：
+///   - `playerTile == centerTile` ⇒ 不变；
+///   - 相差 **≥ 2 格**（传送 / 越界救援后的远跳）⇒ **直接跳到 `playerTile`**（一次调整到底，不逐格挪）；
+///   - 相差 **恰好 1 格** ⇒ 仅当玩家沿该方向**越过边界 ≥ `hysteresisBlocks` 格**时才挪一格，否则保持不变；
+///   - `hysteresisBlocks <= 0` ⇒ 等价于**无滞回**（越过边界即挪一格）。
+///
+/// `playerCoord` 为该轴的世界坐标（格），用于判断"越过了多少"。
+[[nodiscard]] int HysteresisCenterTile(int centerTile, int playerTile, double playerCoord,
+                                       double hysteresisBlocks) noexcept;
+
 /// 一次"常驻集合调整"的目标清单（由 `PlanDigVolumeResidency` 算出，**纯数据**）。
 ///
 /// 四个清单都**只由入参唯一决定**（不依赖容器迭代顺序 / 时间 / 线程序）⇒ 可复现（红线 7）。

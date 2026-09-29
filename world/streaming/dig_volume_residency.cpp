@@ -33,6 +33,26 @@ DigVolumeWindow WindowForPlayerBlocks(double worldX, double worldZ, int radiusTi
     return window;
 }
 
+int HysteresisCenterTile(int centerTile, int playerTile, double playerCoord,
+                         double hysteresisBlocks) noexcept {
+    const int diff = playerTile - centerTile;
+    if (diff == 0) {
+        return centerTile;
+    }
+    const int dir = (diff > 0) ? 1 : -1;
+    if (diff > 1 || diff < -1) {
+        return playerTile;  // 传送 / 远跳：一次调整到底（不逐格挪，否则传送会退化成几十次 63 块重建）
+    }
+
+    const double band     = (hysteresisBlocks > 0.0) ? hysteresisBlocks : 0.0;
+    const double tileSize = static_cast<double>(kTerrainTileSize);
+    // 当前中心 tile 与相邻 tile 之间的那条边界（世界列坐标）。
+    const double boundary  = (dir > 0) ? static_cast<double>(centerTile + 1) * tileSize
+                                      : static_cast<double>(centerTile) * tileSize;
+    const double overshoot = (dir > 0) ? (playerCoord - boundary) : (boundary - playerCoord);
+    return (overshoot >= band) ? (centerTile + dir) : centerTile;
+}
+
 DigVolumeResidencyPlan PlanDigVolumeResidency(const DigVolumeWindow& window,
                                              const std::vector<BlockCoord>& regionBlocks,
                                              const std::vector<BlockCoord>& resident,
@@ -95,13 +115,25 @@ DigVolumeScheduler::DigVolumeScheduler(const DigRegionTable& regions, int radius
     : m_regions(regions), m_radiusTiles((radiusTiles > 0) ? radiusTiles : 0) {}
 
 bool DigVolumeScheduler::Update(const DigVolumeWorld& volumes, double playerX, double playerZ) {
-    const DigVolumeWindow next = WindowForPlayerBlocks(playerX, playerZ, m_radiusTiles);
-    if (m_windowValid && next.centerTileX == m_window.centerTileX && next.centerTileZ == m_window.centerTileZ) {
-        return HasPendingWork();  // 幂等：窗口没动就别打乱正在分帧推进的待办
+    const DigVolumeWindow player = WindowForPlayerBlocks(playerX, playerZ, m_radiusTiles);
+    if (m_windowValid) {
+        // T73 / ADR 0020 决策二的 2026-09-29 修订：**滞回** —— 只有"越过边界足够深"或"远跳（传送）"
+        // 才改窗口中心 tile。否则"站在 tile 边界上的亚格级抖动"会让窗口反复翻转，每次重建 63 个块
+        // （T72 实测：这是"不挖坑也卡"的根因）。
+        const int nextX =
+            HysteresisCenterTile(m_window.centerTileX, player.centerTileX, playerX, kWindowHysteresisBlocks);
+        const int nextZ =
+            HysteresisCenterTile(m_window.centerTileZ, player.centerTileZ, playerZ, kWindowHysteresisBlocks);
+        if (nextX == m_window.centerTileX && nextZ == m_window.centerTileZ) {
+            return HasPendingWork();  // 幂等：窗口没动就别打乱正在分帧推进的待办
+        }
+        m_window.centerTileX = nextX;
+        m_window.centerTileZ = nextZ;
+        m_window.radiusTiles = m_radiusTiles;
+    } else {
+        m_window      = player;
+        m_windowValid = true;
     }
-
-    m_window      = next;
-    m_windowValid = true;
 
     m_desiredCount = 0;
     for (const BlockCoord& coord : m_regions.Blocks()) {

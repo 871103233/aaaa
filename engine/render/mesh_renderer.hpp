@@ -211,7 +211,7 @@ public:
     MeshRenderer(const MeshRenderer&) = delete;
     MeshRenderer& operator=(const MeshRenderer&) = delete;
 
-    /// 创建并同步上传一个网格。空网格（顶点或索引为空）返回无效句柄。
+    /// 创建并按（可预留的）容量上传一个网格。空网格（顶点或索引为空）返回无效句柄。
     ///
     /// `origin` 是该网格的**世界原点**（地表 tile = tile 世界原点、可挖体积块 = 块世界原点）：
     /// 顶点只承载**网格局部**坐标，绘制时由 `DrawMeshes` 用 `origin − 渲染原点` 作为逐网格偏移（T41）。
@@ -220,8 +220,19 @@ public:
     /// 前置条件：`mesh` 的索引为 32 位且都在顶点范围内。
     /// `emissive = true` 时该网格的主通道绘制会带上 `SetEmissiveColor` 的自发光项（**在雾之后**叠加），
     /// 用于光球之类的自发光体；阴影通道不受影响（只写深度）。
-    /// 注意：上传会阻塞到 GPU 完成，只应在加载 / 生成阶段调用，**不得**放进每帧热路径。
-    [[nodiscard]] MeshHandle UploadMesh(const MeshData& mesh, const glm::dvec3& origin, bool emissive = false);
+    ///
+    /// `depthBiased = true` 时该网格走**带光栅化深度偏移的主通道管线变体**（T78 / 2026-09-29）：
+    /// 用于**层间共面重叠**的网格（地表 tile 与可挖体积网格在接管边界环上逐点重合 ⇒ 不偏移会 z-fighting）。
+    /// 偏移让**体积面稳定胜出**（地表面被压在其下），不改几何、不留缝。阴影通道**不使用**该变体。
+    ///
+    /// **容量**（T75 / 2026-09-29）：缓冲容量 = `max(实际, 预留)`。**变长网格必须预留** ——
+    /// 可挖体积块的 Surface Nets 网格、以及"被体积接管过又恢复"的地表 tile，都会在后续
+    /// `UpdateMeshGeometry` 时变大；容量不够就只能走"重建"兜底（等价于旧路径）。
+    /// **本方法不做同步等待**（内部走 `UpdateMeshGeometry` 的"提交即走"路径）⇒ 可用于生成 / 加载帧；
+    /// 真正的热路径成本控制靠"预留容量 + 逐帧上传预算"（见 `references/performance-and-hitches.md`）。
+    [[nodiscard]] MeshHandle UploadMesh(const MeshData& mesh, const glm::dvec3& origin, bool emissive = false,
+                                       std::uint32_t reserveVertexCount = 0,
+                                       std::uint32_t reserveIndexCount = 0, bool depthBiased = false);
 
     /// 用一个**顶点数不变**的新顶点数组就地刷新已上传网格的顶点缓冲；索引缓冲保持不变。
     ///
@@ -374,6 +385,10 @@ private:
         /// 改写；`0` = 本帧不可见（跳过绘制）—— 因此"清空一个倒塌槽位"是零上传、零绘制的。
         std::uint32_t  usedIndexCount = 0;
         bool           emissive     = false;  ///< 主通道是否叠加自发光项（见 `UploadMesh`）
+        /// 主通道是否使用**带光栅化深度偏移的管线变体**（T78 / 2026-09-29；见 `UploadMesh` 的 `depthBiased`）。
+        /// 来源 = 上传时的调用方标记（当前仅**地表 tile** 置 true）；用途 = 消除"层间接管边界环上
+        /// 地表网格与可挖体积网格共面重叠"引起的 z-fighting 闪烁。**阴影通道不理会本标记**。
+        bool           depthBiased  = false;
         /// 该网格的**世界原点**（T41）：绘制时推送 `平移(原点 − 渲染原点) × 旋转`（见 `MeshTransformUniform`）。
         /// 顶点只承载网格局部坐标，故重定基不必重传顶点（见 `SetRenderOrigin`）。
         /// **`double`**：世界定位不用 `float`（红线 6）——偏移在 `double` 下相减后才落回 `float`。
@@ -441,6 +456,12 @@ private:
     /// 自发光网格用 `m_emissiveColor`，其余网格用零（`SDL_gpu.h` §SDL_PushGPUFragmentUniformData：
     /// "Subsequent draw calls in this command buffer will use this uniform data" ⇒ 逐网格推送即可）。
     ///
+    /// `depthBiasedPipeline` 为**主通道**的"带深度偏移变体"管线（T78）；为 `nullptr` 时（阴影通道）
+    /// 本方法不切换管线，保持调用方绑定的那条。非空时：逐网格按其 `depthBiased` 标记选择管线，
+    /// **仅在该标记与当前绑定不一致时**才 `SDL_BindGPUGraphicsPipeline` ⇒ 绑定次数 = 标记切换次数
+    /// （调用方保证"同一标记的网格连续出现"：地表 tile 全在绘制列表最前）⇒ **最多 2 次**，
+    /// **绝不退化为逐网格绑定**，且**保持既有确定序**（不重排网格）。
+    ///
     /// T39：`emissiveState` 是**推送去重**状态 —— 推送值与该状态相同则跳过推送。因为 uniform 数据对
     /// **后续**绘制持续生效，跳过"值没变"的推送不改变任何绘制结果，却把推送次数从"每网格一次"降到
     /// "值变化次数"（本场景实测约 2 次/帧）。调用方须在每个渲染通道开始时传入一个**全新状态**。
@@ -460,8 +481,8 @@ private:
     };
 
     void DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURenderPass* pass, const MeshHandle* meshes,
-                    std::size_t meshCount, bool pushEmissive, EmissivePushState& emissiveState,
-                    MeshTransformPushState& transformState);
+                    std::size_t meshCount, bool pushEmissive, SDL_GPUGraphicsPipeline* depthBiasedPipeline,
+                    EmissivePushState& emissiveState, MeshTransformPushState& transformState);
 
     /// 把纹理显存**按项**打到日志（材质数组 / 深度 / HDR / 阴影），供预算核对（ADR 0010 记账义务）。
     void LogTextureAccounting(std::uint32_t width, std::uint32_t height) const;
@@ -480,6 +501,12 @@ private:
 
     /// `m_pipeline` 当前烘焙的采样数档位（必须与渲进的目标一致；不一致时 `EnsureMainPipeline` 重建）。
     std::uint32_t m_pipelineSampleCount = 1;
+
+    /// 主通道的**带光栅化深度偏移变体**（T78 / 2026-09-29）：与 `m_pipeline` 除 `rasterizer_state` 的
+    /// 深度偏移外**完全相同**（同一批 Shader、同一顶点布局、同一目标格式、同一采样数）。
+    /// 由**地表 tile** 之类的共面重叠网格使用（见 `UploadMesh` 的 `depthBiased`）；**随 MSAA 档位与
+    /// `m_pipeline` 在 `CreateMainPipeline` 里同生共死**。**`RenderFrame` 热路径绝不创建它**。
+    SDL_GPUGraphicsPipeline* m_pipelineDepthBiased = nullptr;
 
     /// 色调映射管线：全屏三角形，HDR 颜色目标 → 交换链（无深度、不剔除）。
     SDL_GPUGraphicsPipeline* m_tonemapPipeline = nullptr;

@@ -232,6 +232,10 @@ struct WorldAabb {
 /// "这块 tile 在世界哪里"由随网格登记的**原点**（= tile 世界原点）在绘制时补上（偏移 = 原点 − 渲染原点）。
 /// 因此渲染原点重定基**不会**再触发任何上传（这正是 T41 要消除的卡顿）。
 /// `boundsOut` 非空时写出该网格的**世界空间** AABB（T39：每帧视锥剔除用，上传时算一次）。
+///
+/// T78：地表 tile **一律走带光栅化深度偏移的管线变体**（`depthBiased = true`）。原因是层间接管
+/// （ADR 0011 / T61）在**常驻集合的边界环**上让地表四边形仍由地表网格绘制，而体积同时绘制同一层地表
+/// （共面）⇒ z-fighting 闪烁；给地表一个正深度偏移即可让体积面稳定胜出（见 `mesh_renderer.*` T78 注释）。
 void UploadTileMesh(vx::MeshRenderer& renderer, vx::MeshHandle& handle, const vx::TerrainWorld& world,
                     const vx::TileCoord& coord, WorldAabb* boundsOut = nullptr) {
     if (boundsOut != nullptr) {
@@ -247,10 +251,19 @@ void UploadTileMesh(vx::MeshRenderer& renderer, vx::MeshHandle& handle, const vx
         *boundsOut = BoundsOfVertices(tileMesh->mesh.vertices, tileOrigin);
     }
     if (handle.IsValid()) {
+        // **T75 快路径**：地表 tile 的网格拓扑固定（65×65 高度场）或"被体积接管后**变小**" ⇒ 容量通常够用，
+        // 于是复用同一对缓冲"提交即走"（旧路径 = `ReleaseMesh` + `UploadMesh` = **等 2 次 fence**）。
+        if (renderer.UpdateMeshGeometry(handle, tileMesh->mesh, tileOrigin)) {
+            return;
+        }
+        // 容量不够（该 tile 曾被体积接管、网格变小，现在恢复成整张地表）⇒ 重建；**不静默**。
+        VX_LOG_WARN("地表 tile (%d, %d) 网格超出上传时的容量 ⇒ 重建 GPU 缓冲（T75 兜底路径；此后该 tile 回到快路径）",
+                    coord.x, coord.z);
         renderer.ReleaseMesh(handle);
         handle = vx::MeshHandle {};
     }
-    handle = renderer.UploadMesh(tileMesh->mesh, tileOrigin);
+    handle = renderer.UploadMesh(tileMesh->mesh, tileOrigin, /*emissive=*/false,
+                                 /*reserveVertexCount=*/0, /*reserveIndexCount=*/0, /*depthBiased=*/true);
 }
 
 /// 把绝对世界空间相机求值结果平移到渲染原点附近：`eye` / `target` / `view` 全部减去渲染原点。
@@ -517,13 +530,14 @@ void UploadVolumeMesh(vx::MeshRenderer& renderer, vx::MeshHandle& handle, const 
     if (boundsOut != nullptr) {
         *boundsOut = WorldAabb {};
     }
-    if (handle.IsValid()) {
-        renderer.ReleaseMesh(handle);  // 挖除会改变顶点数，故不能用 UpdateMeshVertices
-        handle = vx::MeshHandle {};
-    }
 
     const vx::MeshData* blockMesh = volumes.FindMesh(coord);
     if (blockMesh == nullptr || blockMesh->vertices.empty() || blockMesh->indices.empty()) {
+        // 无表面（全实心 / 全空）：**就地置空**（`usedIndexCount = 0` ⇒ 本帧不可见）。
+        // T75：旧路径在这里会 `ReleaseMesh` + 下一次重建缓冲；现在复用同一对缓冲、零上传。
+        if (handle.IsValid()) {
+            (void)renderer.UpdateMeshGeometry(handle, vx::MeshData {}, glm::dvec3(0.0));
+        }
         return;
     }
 
@@ -533,7 +547,24 @@ void UploadVolumeMesh(vx::MeshRenderer& renderer, vx::MeshHandle& handle, const 
     if (boundsOut != nullptr) {
         *boundsOut = BoundsOfVertices(blockMesh->vertices, blockOrigin);
     }
-    handle = renderer.UploadMesh(*blockMesh, blockOrigin);
+
+    // **T75 快路径**：挖除会改变顶点 / 索引数，但**复用同一对 GPU 缓冲**"提交即走"
+    // （旧路径 = `ReleaseMesh` + `UploadMesh` = 建 2 个 transfer buffer + 2 个 GPU 缓冲 + **等 2 次 fence**）。
+    if (handle.IsValid() && renderer.UpdateMeshGeometry(handle, *blockMesh, blockOrigin)) {
+        return;
+    }
+    if (handle.IsValid()) {
+        // 容量不够（挖出的腔体比首次上传时更大）⇒ 必须重建；**不静默**（SKILL：禁止默默降级）。
+        VX_LOG_WARN("可挖体积块 (%d, %d, %d) 网格超出上传时的容量（%zu 顶点 / %zu 索引）⇒ 重建 GPU 缓冲并按 2× 预留"
+                    "（T75 兜底路径；此后该块回到非阻塞快路径）",
+                    coord.x, coord.y, coord.z, blockMesh->vertices.size(), blockMesh->indices.size());
+        renderer.ReleaseMesh(handle);
+        handle = vx::MeshHandle {};
+    }
+    // 预留 2×：挖洞只会让 SN 网格继续变大，预留后后续重网格都走快路径（容量按缓冲实际大小记账）。
+    handle = renderer.UploadMesh(*blockMesh, blockOrigin, /*emissive=*/false,
+                                 static_cast<std::uint32_t>(blockMesh->vertices.size() * 2U),
+                                 static_cast<std::uint32_t>(blockMesh->indices.size() * 2U));
 }
 
 /// 一个**常驻**可挖体积块在游戏层的槽位（T61）：常驻集合是**动态**的 ⇒ 不能再用"按块坐标下标索引的
