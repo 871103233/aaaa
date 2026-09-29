@@ -13,6 +13,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <vector>
 
 namespace {
@@ -281,4 +284,124 @@ TEST(TerrainMaterialTexture, SteppedBuilderMatchesOneShotByteForByte) {
     EXPECT_EQ(stepped.roughnessRgba, oneShot.roughnessRgba);
     EXPECT_EQ(stepped.aoRgba, oneShot.aoRgba);
     EXPECT_EQ(stepped.macroRgba, oneShot.macroRgba);
+}
+
+// ---------------------------------------------------------------------------
+// T66 / V0.3 ⓒ：**真实 CC0 美术贴图**的解析 / 降采样 / 失败回落
+//
+// 说明：真实资源**不入库**（所有者 2026-09-29 裁定），故这里刻意**不依赖任何真实贴图文件** ——
+// 只覆盖"纯函数 + 失败路径"（成功路径由启动冒烟日志给出证据：`真实美术贴图已加载` + 显存记账）。
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using vx::DownscaleBoxRgba8;
+using vx::ImageRgba8;
+using vx::MaterialTextureAssetLoader;
+using vx::MaterialTextureAssetSpec;
+using vx::ResolveMapFile;
+using vx::TerrainMaterialTable;
+
+/// 测试用临时目录（析构即清理）：避免污染仓库，也避免依赖 `assets/` 下不入库的资源。
+class TempDirectory final {
+public:
+    explicit TempDirectory(const char* name)
+        : m_path(std::filesystem::temp_directory_path() / (std::string("vx_t66_") + name)) {
+        std::error_code code;
+        std::filesystem::remove_all(m_path, code);
+        std::filesystem::create_directories(m_path, code);
+    }
+    ~TempDirectory() {
+        std::error_code code;
+        std::filesystem::remove_all(m_path, code);
+    }
+
+    TempDirectory(const TempDirectory&) = delete;
+    TempDirectory& operator=(const TempDirectory&) = delete;
+
+    [[nodiscard]] const std::filesystem::path& Path() const noexcept { return m_path; }
+
+private:
+    std::filesystem::path m_path;
+};
+
+/// 写一个**空**文件（只为验证"存在性 / 扩展名解析"，不参与解码）。
+void TouchFile(const std::filesystem::path& path) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream out(path, std::ios::binary);
+    out << 'x';
+}
+
+}  // namespace
+
+// 扩展名解析：**固定顺序**（jpg → jpeg → png → tga → bmp），找不到返回空路径（⇒ 调用方回落，不崩）。
+TEST(RealTextures, ResolveMapFilePrefersFixedExtensionOrderAndReportsMissing) {
+    const TempDirectory directory("resolve");
+
+    // 只有 png：找到它。
+    TouchFile(directory.Path() / "albedo.png");
+    EXPECT_EQ(ResolveMapFile(directory.Path(), "albedo").extension().string(), ".png");
+
+    // 再加 jpg：**jpg 优先**（固定顺序 ⇒ 跨机器结果一致，红线 7）。
+    TouchFile(directory.Path() / "albedo.jpg");
+    EXPECT_EQ(ResolveMapFile(directory.Path(), "albedo").extension().string(), ".jpg");
+
+    // 完全不存在 ⇒ 空路径。
+    EXPECT_TRUE(ResolveMapFile(directory.Path(), "roughness").empty());
+}
+
+// 整数倍 box 降采样：逐块算术平均、确定性（同输入 ⇒ 逐字节相同）；**非整数倍 ⇒ 明确失败**（返回 nullopt）。
+TEST(RealTextures, DownscaleBoxAveragesExactlyAndRejectsNonIntegerFactor) {
+    ImageRgba8 source;
+    source.width  = 4;
+    source.height = 4;
+    source.pixels.assign(4U * 4U * 4U, 0);
+    // 4×4 的 R 通道按"每个 2×2 块 = 一个常量"填：块 (0,0)=10、(1,0)=20、(0,1)=30、(1,1)=40。
+    for (std::uint32_t y = 0; y < 4; ++y) {
+        for (std::uint32_t x = 0; x < 4; ++x) {
+            const std::uint8_t value = static_cast<std::uint8_t>((y / 2 == 0 ? 10 : 30) + (x / 2 == 0 ? 0 : 10));
+            const std::size_t  index = (static_cast<std::size_t>(y) * 4U + x) * 4U;
+            source.pixels[index]     = value;       // R
+            source.pixels[index + 3] = 255;         // A
+        }
+    }
+
+    const auto scaled = DownscaleBoxRgba8(source, 2);
+    ASSERT_TRUE(scaled.has_value());
+    EXPECT_EQ(scaled->width, 2U);
+    EXPECT_EQ(scaled->height, 2U);
+    EXPECT_EQ(scaled->pixels[(0U * 2U + 0U) * 4U], 10);  // 左上块均值
+    EXPECT_EQ(scaled->pixels[(0U * 2U + 1U) * 4U], 20);  // 右上块均值
+    EXPECT_EQ(scaled->pixels[(1U * 2U + 0U) * 4U], 30);  // 左下块均值
+    EXPECT_EQ(scaled->pixels[(1U * 2U + 1U) * 4U], 40);  // 右下块均值
+
+    // 确定性：再跑一次逐字节相同。
+    const auto again = DownscaleBoxRgba8(source, 2);
+    ASSERT_TRUE(again.has_value());
+    EXPECT_EQ(again->pixels, scaled->pixels);
+
+    // 4 → 3 不是整数倍 ⇒ 明确失败（不引入任意重采样，保证确定性且实现简单）。
+    EXPECT_FALSE(DownscaleBoxRgba8(source, 3).has_value());
+    EXPECT_FALSE(DownscaleBoxRgba8(source, 0).has_value());
+}
+
+// **回落契约**（P6 的连带要求）：资源缺失时加载器**不抛异常**，只置失败位 + 可读原因；
+// 干净克隆（`assets/textures/` 被 gitignore）必然走这条路径 ⇒ 游戏必须照常启动并回落程序生成贴图。
+TEST(RealTextures, LoaderFailsSoftlyWithReasonWhenAssetsAreMissing) {
+    const TempDirectory          directory("missing");
+    const TerrainMaterialTable   table = TerrainMaterialTable::Default();  // 生命周期必须覆盖 loader（见其前置条件）
+
+    const MaterialTextureAssetSpec spec { directory.Path() / "does_not_exist", 64 };
+    MaterialTextureAssetLoader    loader(table, spec);
+    EXPECT_TRUE(loader.Step(0)) << "根目录不存在 ⇒ 构造时即已判定失败（Step 直接返回“已结束”）";
+    EXPECT_TRUE(loader.Failed());
+    EXPECT_FALSE(loader.Reason().empty());
+    EXPECT_NE(loader.Reason().find("资源根目录不存在"), std::string::npos) << "原因要能指向具体路径";
+
+    // 根目录存在、但缺贴图 ⇒ 同样**软失败**并指出缺哪一张。
+    const MaterialTextureAssetSpec spec2 { directory.Path(), 64 };
+    MaterialTextureAssetLoader    loader2(table, spec2);
+    (void)loader2.Step(100);
+    EXPECT_TRUE(loader2.Failed());
+    EXPECT_NE(loader2.Reason().find("grass"), std::string::npos) << "原因要指出是哪个材质目录 / 贴图；实际：" << loader2.Reason();
 }

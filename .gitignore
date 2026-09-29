@@ -32,3 +32,9 @@ desktop.ini
 # ---------- 生成物 ----------
 assets/generated/
 *.log
+
+# ---------- 美术资源（**不入库**）----------
+# 依据 docs/plans/v0.3.md §1.1 第 2 条（所有者 2026-09-29 裁定）：仓库只放 **下载脚本 + 校验和 + 许可台账**，
+# 资源文件由 `tools/fetch_assets.ps1` 按需取回（全部 CC0）。校验和见 `tools/assets.sha256`（**该文件进仓库**）。
+assets/textures/
+assets/models/

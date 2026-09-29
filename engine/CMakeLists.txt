@@ -6,6 +6,7 @@
 
 find_package(Jolt CONFIG REQUIRED)
 find_package(tomlplusplus CONFIG REQUIRED)
+find_package(Stb REQUIRED)   # 纹理资源加载（T57）；只用其头，实现编在 texture_loader.cpp 内
 
 add_library(voxel_engine STATIC
     core/clock.cpp
@@ -17,14 +18,20 @@ add_library(voxel_engine STATIC
     platform/settings.cpp
     platform/window.cpp
     render/camera.cpp
+    render/environment.cpp
     render/frustum.cpp
     render/lighting_table.cpp
     render/mesh_renderer.cpp
     render/shadow_cascade.cpp
+    render/texture_loader.cpp
     render/triangle_renderer.cpp
 )
 
 target_include_directories(voxel_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+# stb 为 SYSTEM 包含目录：GCC/Clang 会把该目录下的头当系统头、不报其告警（MSVC 侧由
+# texture_loader.cpp 内的 `#pragma warning(push, 0)` 承担，见该文件顶部说明）。
+target_include_directories(voxel_engine SYSTEM PRIVATE ${Stb_INCLUDE_DIR})
 
 target_link_libraries(voxel_engine
     PUBLIC  voxel_build_options

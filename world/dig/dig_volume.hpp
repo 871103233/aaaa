@@ -116,6 +116,11 @@ public:
     /// 窗口因此始终响应、加载进度可连续刷新。
     void BeginInitFromHeightField();
 
+    /// **只初始化 `coords` 列出的块**（T60 / [ADR 0020](adr/0020-dig-volume-vertical-band-and-dynamic-residency.md)
+    /// 决策二）：启动时的常驻集合 = **玩家窗口**，而不是整张可挖区域表 ⇒ 初始内存不随世界总量增长。
+    /// 其余语义与无参重载完全一致（清空块、建足迹缓存、游标复位）。前置条件：`coords` 升序且都属于可挖区域表。
+    void BeginInitFromHeightField(const std::vector<BlockCoord>& coords);
+
     /// 推进分步初始化：执行至多 `maxSteps` 个步骤，返回**是否全部完成**。
     ///
     /// 步骤总数为 `2 × 块数`：**先逐块填充密度、再逐块网格化**。分成两轮的原因是不可交换 ——
@@ -124,8 +129,8 @@ public:
     /// `BeginInitFromHeightField` 时游标为 0 —— 此时等价于从头开始。
     bool StepInitFromHeightField(std::size_t maxSteps);
 
-    /// 分步初始化的总步数（= `2 × 块数`）。
-    [[nodiscard]] std::size_t InitTotalSteps() const noexcept { return m_regions.Blocks().size() * 2U; }
+    /// 分步初始化的总步数（= `2 × 待初始化的块数`；见 `BeginInitFromHeightField` 的两个重载）。
+    [[nodiscard]] std::size_t InitTotalSteps() const noexcept { return m_initCoords.size() * 2U; }
 
     /// 分步初始化已完成的步数。
     [[nodiscard]] std::size_t InitCompletedSteps() const noexcept { return m_initCursor; }
@@ -201,6 +206,29 @@ public:
     /// 返回该块是否存在（不存在 ⇒ 无操作）。语义与 `RemeshDirtyBlocks({coord})` 完全一致。
     bool RemeshBlock(const BlockCoord& coord);
 
+    // ---- 运行期常驻调度（T60 / [ADR 0020](adr/0020-dig-volume-vertical-band-and-dynamic-residency.md) 决策二 / 五）----
+
+    /// 按需**创建**一个块（填密度 + 网格化）。块已存在、或 `coord` 不属于可挖区域表 ⇒ 返回 false。
+    /// 语义与批量初始化里的"填密度 + 网格化"逐字一致（同一对 `FillBlockDensity` / `MeshBlock`）。
+    bool CreateBlock(const BlockCoord& coord);
+
+    /// **卸载**一个块（释放密度 / 材质 / 网格）。块不存在、或该块**已被玩家改动** ⇒ 返回 false
+    /// （ADR 0020 决策五：玩家挖过的洞不得随走远而消失）。
+    bool UnloadBlock(const BlockCoord& coord);
+
+    /// **强制卸载**（ADR 0020 决策五的**淘汰**路径）：语义与 `UnloadBlock` 相同，但**不检查是否被改动**。
+    ///
+    /// 只应由 `DigVolumeScheduler` 在"脏块常驻数超上限"时调用 —— 它**会丢掉玩家在该块挖出的洞**，
+    /// 故调用方必须已经 WARN（不静默降级）。
+    bool EvictBlock(const BlockCoord& coord);
+
+    /// 该块是否**已被玩家改动**（挖过 `carved`、或写过体素材质 `material`）⇒ 按 ADR 0020 决策五不得卸载。
+    /// 块不存在 ⇒ false。
+    [[nodiscard]] bool IsBlockDirty(const BlockCoord& coord) const noexcept;
+
+    /// 当前**常驻**的块坐标（**升序**；供常驻调度器做集合差）。
+    [[nodiscard]] std::vector<BlockCoord> ResidentBlocks() const;
+
     // ---- 体素级读写（T29 塌落等规则用）----
 
     /// 读出一个世界空间矩形区域的密度采样；**区域外**（区域落在块集合之外）的采样填 `+127`（空）。
@@ -272,6 +300,17 @@ private:
     /// 该采样点所属材质是否**不可破坏**（`indestructible = true` 或 `toughness <= 0`，T31 / ADR 0013）。
     [[nodiscard]] bool IsIndestructibleSample(int worldX, int worldY, int worldZ) const noexcept;
 
+    /// 该列的**带宽地板**（世界 Y，格）：`地表高度 − DigRegionTable::BandDownBlocks()`。
+    ///
+    /// 见 T59 / [ADR 0020](adr/0020-dig-volume-vertical-band-and-dynamic-residency.md) 决策一。
+    /// 未启用带宽（`BandDownBlocks() == 0`，旧口径）或该列无地形数据 ⇒ 返回 `kBandFloorNone`
+    /// （恒低于任何合法 Y ⇒ 一律不裁剪）。
+    [[nodiscard]] double ColumnBandFloor(int worldX, int worldZ) const noexcept;
+
+    /// 该采样点是否**在地表以下超出了可挖带宽**（T59）。语义与 `IsIndestructibleSample` 同口径：
+    /// **命中即不可挖，且不消耗伤害预算**。地表以上不需要判据（本就是空气、无物可挖）。
+    [[nodiscard]] bool BelowDiggableBand(int worldX, int worldY, int worldZ) const noexcept;
+
     /// 高度场推导的密度（区域外回退路径；无地形数据 ⇒ 视为空）。
     [[nodiscard]] float TerrainDerivedDensity(double x, double y, double z) const noexcept;
 
@@ -293,6 +332,10 @@ private:
 
     /// 分步初始化的游标：已完成的步数（`InitCompletedSteps` 暴露给加载画面）。
     std::size_t m_initCursor = 0;
+
+    /// 本轮分步初始化要处理的块（**升序**）。无参 `BeginInitFromHeightField` ⇒ 全部区域块（旧行为）；
+    /// 带参重载 ⇒ 只初始化传入的那一批（T60：启动时只常驻玩家窗口）。
+    std::vector<BlockCoord> m_initCoords;
 
     // 足迹缓存：覆盖 `[footprintMin − 1, footprintMax + 1]` 的整数列。
     std::vector<float> m_surfaceCache;

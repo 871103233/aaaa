@@ -4,6 +4,7 @@
 #include "terrain/terrain_world.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -16,6 +17,10 @@ namespace {
 /// 密度成为**真实距离**而不是饱和值，Surface Nets 的顶点插值才落在正确位置（否则墙面会整体偏厚）。
 /// 取值与**唯一口径** `vx::kCarveSdfBandBlocks`（`dig_volume.hpp`，T50 的碎块补丁雕刻共用）一致。
 constexpr double kCarveBandBlocks = kCarveSdfBandBlocks;
+
+/// **"该列不裁剪"的哨兵地板**（T59 / [ADR 0020](../../docs/adr/0020-dig-volume-vertical-band-and-dynamic-residency.md)
+/// 决策一）：恒低于任何合法世界 Y（世界垂直范围 0~512 格），故用 `y < 地板` 判定时永不命中。
+constexpr double kBandFloorNone = -1.0;
 
 /// 向下取整的整数除法（负数也正确）。
 [[nodiscard]] int FloorDiv(int value, int divisor) noexcept {
@@ -83,7 +88,7 @@ private:
 }  // namespace
 
 DigVolumeWorld::DigVolumeWorld(const TerrainWorld& terrain, const DigRegionTable& regions)
-    : m_terrain(terrain), m_regions(regions) {}
+    : m_terrain(terrain), m_regions(regions), m_initCoords(regions.Blocks()) {}
 
 bool DigVolumeWorld::IsInsideRegion(double x, double y, double z) const noexcept {
     return m_regions.IsDiggable(x, y, z);
@@ -313,13 +318,19 @@ void DigVolumeWorld::InitFromHeightField() {
 }
 
 void DigVolumeWorld::BeginInitFromHeightField() {
+    // 旧行为：初始化**全部**区域块（单测与"不关心常驻调度"的调用方走这条）。
+    BeginInitFromHeightField(m_regions.Blocks());
+}
+
+void DigVolumeWorld::BeginInitFromHeightField(const std::vector<BlockCoord>& coords) {
     m_blocks.clear();
+    m_initCoords = coords;
     BuildSurfaceHeightCache();
     m_initCursor = 0;
 }
 
 bool DigVolumeWorld::StepInitFromHeightField(std::size_t maxSteps) {
-    const std::vector<BlockCoord>& coords = m_regions.Blocks();
+    const std::vector<BlockCoord>& coords = m_initCoords;
     const std::size_t              blocks = coords.size();
     const std::size_t              total  = blocks * 2U;
 
@@ -385,9 +396,20 @@ bool DigVolumeWorld::RasterizeBall(const glm::dvec3& center, float radiusBlocks,
         }
 
         bool blockChanged = false;
+        // T59 / ADR 0020 决策一：**每列的"带宽地板"只算一次**（列 = `(originX + i, originZ + k)`）——
+        // 预填在 k 层内，避免在 33³ 内层反复查地表高度。`kBandFloorNone` = 该列不裁剪。
+        std::array<double, static_cast<std::size_t>(kVolumeSampleCount)> columnBandFloor {};
         for (int k = 0; k < kVolumeSampleCount; ++k) {
+            for (int i = 0; i < kVolumeSampleCount; ++i) {
+                columnBandFloor[static_cast<std::size_t>(i)] = ColumnBandFloor(originX + i, originZ + k);
+            }
             for (int j = 0; j < kVolumeSampleCount; ++j) {
+                const double sampleY = static_cast<double>(originY + j);
                 for (int i = 0; i < kVolumeSampleCount; ++i) {
+                    // 地表以下超出带宽 ⇒ 不可挖（与"不可破坏材质"同口径：保持原状、不参与挖除）。
+                    if (sampleY < columnBandFloor[static_cast<std::size_t>(i)]) {
+                        continue;
+                    }
                     const double dx = static_cast<double>(originX + i) - center.x;
                     const double dy = static_cast<double>(originY + j) - center.y;
                     const double dz = static_cast<double>(originZ + k) - center.z;
@@ -449,6 +471,77 @@ bool DigVolumeWorld::IsIndestructibleSample(int worldX, int worldY, int worldZ) 
     }
     const MaterialLayer& layer = Materials().Layer(static_cast<int>(slot));
     return layer.indestructible || !(layer.toughness > 0.0F);
+}
+
+double DigVolumeWorld::ColumnBandFloor(int worldX, int worldZ) const noexcept {
+    const int bandDown = m_regions.BandDownBlocks();
+    if (bandDown <= 0) {
+        return kBandFloorNone;  // 未启用带宽 ⇒ 旧口径（不裁剪）
+    }
+    float surface = 0.0F;
+    if (!SurfaceHeight(static_cast<double>(worldX), static_cast<double>(worldZ), surface)) {
+        return kBandFloorNone;  // 该列没有地形数据 ⇒ 无从判断，按"不裁剪"处理（不改变既有行为）
+    }
+    return static_cast<double>(surface) - static_cast<double>(bandDown);
+}
+
+bool DigVolumeWorld::BelowDiggableBand(int worldX, int worldY, int worldZ) const noexcept {
+    return static_cast<double>(worldY) < ColumnBandFloor(worldX, worldZ);
+}
+
+bool DigVolumeWorld::CreateBlock(const BlockCoord& coord) {
+    if (m_blocks.find(coord) != m_blocks.end()) {
+        return false;  // 已常驻
+    }
+    const std::vector<BlockCoord>& allowed = m_regions.Blocks();  // 升序（`DigRegionTable` 保证）
+    if (!std::binary_search(allowed.begin(), allowed.end(), coord)) {
+        return false;  // 窗口只能从可挖区域表里取（ADR 0004 硬约束 2）
+    }
+    // 与批量初始化**逐字同一条路径**：先填密度，再网格化（保证"按需创建"与"批量初始化"结果一致）。
+    FillBlockDensity(coord);
+    MeshBlock(coord);
+    return true;
+}
+
+bool DigVolumeWorld::UnloadBlock(const BlockCoord& coord) {
+    const auto found = m_blocks.find(coord);
+    if (found == m_blocks.end()) {
+        return false;
+    }
+    if (IsBlockDirty(coord)) {
+        return false;  // ADR 0020 决策五：已改动的块不得卸载（否则玩家挖的洞会消失）
+    }
+    m_blocks.erase(found);
+    return true;
+}
+
+bool DigVolumeWorld::EvictBlock(const BlockCoord& coord) {
+    const auto found = m_blocks.find(coord);
+    if (found == m_blocks.end()) {
+        return false;
+    }
+    // 刻意**不查** `IsBlockDirty`：淘汰是"内存上界"这一硬约束的出口（ADR 0020 决策五），代价是丢改动。
+    m_blocks.erase(found);
+    return true;
+}
+
+bool DigVolumeWorld::IsBlockDirty(const BlockCoord& coord) const noexcept {
+    const auto found = m_blocks.find(coord);
+    if (found == m_blocks.end()) {
+        return false;
+    }
+    // `carved` = 被挖过；`material` 非空 = 写过体素材质（塌落搬来的残骸落在该块）。
+    // 两者都属于"这个块已经与纯函数推导值不同"⇒ 卸载会丢玩家改动。
+    return found->second.carved || !found->second.material.empty();
+}
+
+std::vector<BlockCoord> DigVolumeWorld::ResidentBlocks() const {
+    std::vector<BlockCoord> coords;
+    coords.reserve(m_blocks.size());
+    for (const auto& entry : m_blocks) {
+        coords.push_back(entry.first);  // `std::map` 按 key 升序 ⇒ 天然升序
+    }
+    return coords;
 }
 
 bool DigVolumeWorld::CarveSphere(const glm::dvec3& center, float radiusBlocks, std::vector<BlockCoord>& dirtyOut,
@@ -616,6 +709,11 @@ bool DigVolumeWorld::CarveByDamage(const glm::dvec3& center, float radiusBlocks,
         }
         if (solidOf[index] == 0U) {
             continue;  // 已经是空（空气）：无物可破坏 ⇒ **不消耗**预算（否则在空气中爆炸会"空烧"预算、把腔体算大）
+        }
+        // T59 / ADR 0020 决策一：**地表以下超出带宽**的格不可挖 ⇒ 跳过，且**不消耗预算**
+        // （与"被岩石遮挡"、"已是空气"同口径：近侧该挖多少还是多少）。
+        if (BelowDiggableBand(cell.x, cell.y, cell.z)) {
+            continue;
         }
         const MaterialLayer& layer = Materials().Layer(static_cast<int>(slot));
         const int            cost  = static_cast<int>(std::lround(layer.toughness));  // 点 / 格³ → 整数点

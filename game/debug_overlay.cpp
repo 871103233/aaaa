@@ -221,7 +221,7 @@ void DebugOverlay::BuildUI(const DebugStats& stats, SystemPanelContext& panelCon
     StatRow(UiText(UiLabel::DirtyTiles, cjk), UiText(UiLabel::CountFormat, cjk), stats.lastDirtyTileCount);
     StatRow(UiText(UiLabel::TileBodies, cjk), UiText(UiLabel::CountFormat, cjk), stats.tileBodyCount);
     StatRow(UiText(UiLabel::VolumeBlocks, cjk), UiText(UiLabel::VolumeBlocksFormat, cjk), stats.volumeBlockCount,
-            stats.carvedBlockCount);
+            stats.carvedBlockCount, stats.volumePendingActions, stats.volumeKeptDirtyCount);
     StatRow(UiText(UiLabel::VolumeBodies, cjk), UiText(UiLabel::CountFormat, cjk), stats.volumeBodyCount);
     StatRow(UiText(UiLabel::CollapseMoved, cjk), UiText(UiLabel::CountFormat, cjk), stats.collapseMovedVoxels);
 

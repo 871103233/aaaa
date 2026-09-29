@@ -158,6 +158,9 @@ TEST(DigRegion, LoadsShippedTableAndToleratesMissingFile) {
     EXPECT_EQ(fromFile.Regions()[0].blockMax, (BlockCoord { 4, 8, 4 }));
     // 块 7 × 9 × 7 = 441 个（整张测试地图的地表都可挖，含世界边缘的共享边界列 128）
     EXPECT_EQ(fromFile.Blocks().size(), 441U);
+    // T59 / ADR 0020 决策一：竖向带宽随文件落地（缺失 = 0 = 不裁剪的旧口径）。
+    EXPECT_EQ(fromFile.BandDownBlocks(), 16);
+    EXPECT_EQ(fromFile.BandUpBlocks(), 8);
 
     const DigRegionTable missing = DigRegionTable::LoadFromFile(std::filesystem::path("no_such_dig_regions.toml"));
     EXPECT_TRUE(missing.Empty()) << "文件缺失必须返回空表且不抛异常（ADR 0006）";
@@ -217,6 +220,57 @@ TEST(DigVolume, CarveSphereEmptiesInsideAndKeepsOutside) {
     ASSERT_NE(mesh, nullptr);
     EXPECT_FALSE(mesh->vertices.empty()) << "挖出洞体后该块必须产生等值面";
     EXPECT_FALSE(mesh->indices.empty());
+}
+
+// T59 / [ADR 0020](../../docs/adr/0020-dig-volume-vertical-band-and-dynamic-residency.md) 决策一：
+// **地表以下超过 `band_down` 的体素不可挖**（"只有地表部分深度可挖"；与"岩"同口径：保持原状、不消耗预算）。
+TEST(DigVolume, VerticalBandKeepsVoxelsBelowTheFloorSolid) {
+    const MapPreset preset = FlatPreset();
+
+    TerrainWorld world(preset.seed, TerrainMaterialTable::Default());
+    world.SetMapPreset(preset);
+    world.LoadTile(0, 0);  // 平坦地表 = 120 格
+
+    // band_down = 16 ⇒ 地板 = 120 − 16 = **104 格**。
+    const DigRegionTable regions = DigRegionTable::FromRegions(
+        { MakeRegion("block", true, 0, BlockCoord { 0, 3, 0 }, BlockCoord { 0, 3, 0 }) }, /*bandDownBlocks*/ 16,
+        /*bandUpBlocks*/ 8);
+    ASSERT_EQ(regions.BandDownBlocks(), 16);
+    DigVolumeWorld volumes(world, regions);
+    volumes.InitFromHeightField();
+
+    // 球心 y = 112、半径 12 ⇒ 球体覆盖 y ∈ [100, 124]，**本应**连 104 以下一起挖空。
+    std::vector<BlockCoord> dirty;
+    ASSERT_TRUE(volumes.CarveSphere(glm::dvec3(8.0, 112.0, 8.0), 12.0F, dirty));
+
+    EXPECT_GT(volumes.SampleDensity(8.0, 108.0, 8.0), 0.0F) << "带宽之内（104 以上）必须被挖空";
+    EXPECT_LT(volumes.SampleDensity(8.0, 102.0, 8.0), 0.0F) << "带宽之下（104 以下）必须保持实心";
+    EXPECT_LT(volumes.SampleDensity(8.0, 100.0, 8.0), 0.0F) << "球体最深处（100）同样不可挖";
+}
+
+// T59：**整体落在带宽之下的爆炸一格都挖不动** —— 这一条同时证明"不消耗预算"
+// （预算结算里带宽之下的格走 `continue`，故 `destroyed` 恒为 0 ⇒ 不发生栅格化、返回 false）。
+TEST(DigVolume, BlastEntirelyBelowTheBandCarvesNothing) {
+    const MapPreset preset = FlatPreset();
+
+    TerrainWorld world(preset.seed, TerrainMaterialTable::Default());
+    world.SetMapPreset(preset);
+    world.LoadTile(0, 0);
+
+    const DigRegionTable regions = DigRegionTable::FromRegions(
+        { MakeRegion("block", true, 0, BlockCoord { 0, 3, 0 }, BlockCoord { 0, 3, 0 }) }, /*bandDownBlocks*/ 16,
+        /*bandUpBlocks*/ 8);
+    DigVolumeWorld volumes(world, regions);
+    volumes.InitFromHeightField();
+
+    const float before = volumes.SampleDensity(8.0, 98.0, 8.0);
+    ASSERT_LT(before, 0.0F) << "前置：该点原本是实心";
+
+    // 爆心 y = 98、半径 6 ⇒ 全部候选格都在 104 之下。
+    std::vector<BlockCoord> dirty;
+    EXPECT_FALSE(volumes.CarveByDamage(glm::dvec3(8.0, 98.0, 8.0), 6.0F, /*budgetPoints*/ 100000, dirty));
+    EXPECT_TRUE(dirty.empty());
+    EXPECT_FLOAT_EQ(volumes.SampleDensity(8.0, 98.0, 8.0), before) << "带宽之下的采样必须逐值不变";
 }
 
 // 挖除的空气球：不产生任何改动（避免把"打进天空"当成一次爆炸破坏）。

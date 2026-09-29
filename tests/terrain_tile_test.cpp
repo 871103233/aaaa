@@ -5,8 +5,10 @@
 #include <glm/vec3.hpp>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace {
 
@@ -138,4 +140,58 @@ TEST(TerrainQuery, ReportsHeightAndObstructionWithinLoadedTiles) {
 
     EXPECT_FALSE(world.QueryObstruction(above, above + glm::vec3(1.0F, 0.0F, 0.0F), safeT));
     EXPECT_FLOAT_EQ(safeT, 1.0F);
+}
+
+// T58：`MaxSurfaceHeightBlocks()` 每帧被调用（CSM 投射体扩展），故其成本**不得与"世界总量"成正比**
+// —— 实现依赖 `TerrainTile::maxSurfaceBlocks`（生成 / 重网格时刷新的缓存）。这里钉死两件事：
+// ① 缓存 == 遍历该 tile 全部顶点算出的真值（不会算错）；
+// ② 笔刷改动（写列 + 重网格）后缓存随之更新，**两个方向都跟上**（抬高会变大、削低会回落 ⇒ 不会长期偏大）。
+TEST(TerrainTile, CachesMaxSurfaceHeightAndRefreshesAfterBrushEdit) {
+    TerrainWorld world(kSeed, TerrainMaterialTable::Default());
+    LoadTiles(world, 0, 1, 0, 1);
+
+    // ① 每个已加载 tile 的缓存值都等于"按顶点重算"的结果，且总最大值取各 tile 缓存的最大值。
+    float expectedOverallMax = 0.0F;
+    for (int tileZ = 0; tileZ <= 1; ++tileZ) {
+        for (int tileX = 0; tileX <= 1; ++tileX) {
+            const TerrainTile* tile = world.FindTile(tileX, tileZ);
+            ASSERT_NE(tile, nullptr);
+            float naiveMax = 0.0F;
+            for (const Height height : tile->heights) {
+                naiveMax = std::max(naiveMax, HeightToBlocks(height));
+            }
+            EXPECT_NEAR(tile->maxSurfaceBlocks, naiveMax, 1e-5F);
+            expectedOverallMax = std::max(expectedOverallMax, naiveMax);
+        }
+    }
+    EXPECT_NEAR(world.MaxSurfaceHeightBlocks(), expectedOverallMax, 1e-5F);
+
+    // ② 把 (10, 20) 抬到 400 格（高于这批 tile 的噪声上限）⇒ 缓存与总最大值都必须跟上。
+    //    `WriteColumnHeight` 只标脏，刷新发生在 `RemeshDirtyTiles` 里（与游戏内笔刷同一条路径）。
+    constexpr Height kRaisedUnits = static_cast<Height>(400 * vx::kHeightUnitsPerBlock);
+    std::vector<vx::TileCoord> dirty;
+    world.WriteColumnHeight(10, 20, kRaisedUnits, dirty);
+    ASSERT_FALSE(dirty.empty());
+    EXPECT_GT(world.RemeshDirtyTiles(dirty), std::size_t { 0 });
+    EXPECT_NEAR(world.MaxSurfaceHeightBlocks(), 400.0F, 1e-5F);
+
+    // ③ 再把它削回 0 ⇒ 缓存必须**回落**（证明缓存会在重网格时重算，而不是只增不减）。
+    dirty.clear();
+    world.WriteColumnHeight(10, 20, static_cast<Height>(0), dirty);
+    ASSERT_FALSE(dirty.empty());
+    EXPECT_GT(world.RemeshDirtyTiles(dirty), std::size_t { 0 });
+    EXPECT_LT(world.MaxSurfaceHeightBlocks(), 400.0F);
+
+    // 回落后的值与"按顶点重算"一致。
+    float recomputedOverallMax = 0.0F;
+    for (int tileZ = 0; tileZ <= 1; ++tileZ) {
+        for (int tileX = 0; tileX <= 1; ++tileX) {
+            const TerrainTile* tile = world.FindTile(tileX, tileZ);
+            ASSERT_NE(tile, nullptr);
+            for (const Height height : tile->heights) {
+                recomputedOverallMax = std::max(recomputedOverallMax, HeightToBlocks(height));
+            }
+        }
+    }
+    EXPECT_NEAR(world.MaxSurfaceHeightBlocks(), recomputedOverallMax, 1e-5F);
 }

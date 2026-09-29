@@ -1,19 +1,113 @@
 #pragma once
 
+#include "render/texture_loader.hpp"  // ImageRgba8（真实贴图的解码结果类型）
 #include "terrain/material_table.hpp"
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
+#include <optional>
+#include <string>
 #include <vector>
 
 namespace vx {
+
+/// 真实美术贴图的**来源规格**（T66 / V0.3 ⓒ）。
+///
+/// 目录约定（由 `tools/fetch_assets.ps1` 产出，见 `NOTICE.md` 的「美术资源台账」）：
+///   `<root>/<层名>/{albedo,normal,roughness,ao}.<ext>`
+/// 其中 `<层名>` = `[[layer]].name`（grass / dirt / rock / sand），`<ext>` ∈ {jpg, jpeg, png, tga, bmp}（按序尝试，确定性）。
+struct MaterialTextureAssetSpec {
+    std::filesystem::path root;          ///< 资源根目录（解析后的绝对路径）
+    std::uint32_t         size = 1024;   ///< 上传边长；源图边长必须是它的整数倍（整数倍 box 降采样）
+};
+
+/// 四件套的文件名主干（不含扩展名），顺序 = 数组创建顺序（albedo / normal / roughness / ao）。
+inline constexpr const char* kMaterialMapStems[4] = { "albedo", "normal", "roughness", "ao" };
+
+/// 真实贴图集的加载结果（四件套各一份、**layer-major** 连续，与 `MaterialTextureSet` 同布局口径）。
+///
+/// **不含 macro**：宏观变化图是"低频噪声"（用于打破平铺重复），真实资源里没有对应物 ⇒
+/// 真实贴图模式下改为**用该层自己的 albedo 按 `macro_uv_scale` 放大采样**（见 mesh.frag / 启动日志），
+/// 因此不额外占用显存，也不需要第二个资源目录。
+struct MaterialTextureAssetSet {
+    std::uint32_t             size       = 0;  ///< 四件套的上传边长（所有层一致）
+    std::uint32_t             layerCount = 0;  ///< 层数（= `kMaterialSlotCount`）
+    std::vector<std::uint8_t> albedoRgba;
+    std::vector<std::uint8_t> normalRgba;
+    std::vector<std::uint8_t> roughnessRgba;
+    std::vector<std::uint8_t> aoRgba;
+    std::vector<std::uint32_t> sourceSize;  ///< 每层的**源图**边长（日志用；须为 `MaterialTextureAssetSpec::size` 的整数倍）
+};
+
+/// 在 `directory` 下按**固定扩展名顺序**找 `stem.<ext>`（`jpg` → `jpeg` → `png` → `tga` → `bmp`）；
+/// 找不到返回空路径。**纯函数**（只读文件系统、不抛异常）—— 便于单测扩展名顺序与缺失判定。
+[[nodiscard]] std::filesystem::path ResolveMapFile(const std::filesystem::path& directory, const std::string& stem);
+
+/// **确定性 box 降采样**（RGBA8）：`target` 必须整除 `source.width` / `source.height`，否则返回 `nullopt`。
+///
+/// 纯函数（同一输入 ⇒ 逐字节相同，红线 7）：每个目标像素 = 对应 `factor × factor` 源像素块的**算术平均**
+/// （四舍五入到整数）。降采样的理由见 `MaterialTextureSettings::size`（显存预算）。
+[[nodiscard]] std::optional<ImageRgba8> DownscaleBoxRgba8(const ImageRgba8& source, std::uint32_t target);
+
+/// 尝试加载**四层 × 四件套**的真实美术贴图（含整数倍降采样到 `spec.size`）—— **一次跑完**的便捷入口。
+///
+/// 成功（**全部**层、**全部**四件套都在且尺寸合法一致）⇒ 返回结果；
+/// 任一缺失 / 解码失败 / 尺寸不是 `spec.size` 的整数倍 / 层间源尺寸不一致 ⇒ 返回 `nullopt`，
+/// 并在 `reasonOut`（非空时）写出**可读原因**（调用方据此 `WARN` 后回落到程序生成贴图 —— 不静默、不崩）。
+///
+/// ⚠ **启动路径不要用它**：解码 16 张 2048² JPEG + 降采样需数秒，一次跑完会让画面停下等待
+/// （SKILL「不冻结画面」）⇒ 启动请改用 `MaterialTextureAssetLoader` 分步推进（两者结果**逐字节相同**）。
+///
+/// 分工边界：本函数**只读文件**、不碰 GPU；上传仍由调用方在加载期做。
+[[nodiscard]] std::optional<MaterialTextureAssetSet> TryLoadMaterialTextureAssets(
+    const TerrainMaterialTable& table, const MaterialTextureAssetSpec& spec, std::string* reasonOut = nullptr);
+
+/// **可分步（可切帧）**的真实美术贴图加载器：每步只处理**一张**贴图（读盘 + 解码 + 降采样 ≈ 百毫秒），
+/// 调用方在两次 `Step` 之间出一帧加载画面即可让画面与进度持续刷新（SKILL「不冻结画面」）。
+///
+/// 语义与 `TryLoadMaterialTextureAssets` 完全一致（同一实现）：失败时 `Failed() == true`、
+/// `Reason()` 给出可读原因，调用方 **WARN 后回落**程序生成贴图（不静默、不崩）。
+///
+/// **前置条件：`table` 的生命周期必须覆盖本对象**（内部只存引用，不复制材质表）。
+class MaterialTextureAssetLoader final {
+public:
+    MaterialTextureAssetLoader(const TerrainMaterialTable& table, MaterialTextureAssetSpec spec);
+    ~MaterialTextureAssetLoader();
+
+    MaterialTextureAssetLoader(const MaterialTextureAssetLoader&) = delete;
+    MaterialTextureAssetLoader& operator=(const MaterialTextureAssetLoader&) = delete;
+    MaterialTextureAssetLoader(MaterialTextureAssetLoader&&) = delete;
+    MaterialTextureAssetLoader& operator=(MaterialTextureAssetLoader&&) = delete;
+
+    /// 处理至多 `maxMaps` 张贴图（= `maxMaps` 个 (层, 件套) 组合），返回**是否已结束**
+    /// （成功完成 **或** 已失败）。`maxMaps == 0` 时不做工作，只返回当前状态。
+    bool Step(std::size_t maxMaps);
+
+    /// 进度 ∈ [0, 1]（已处理贴图数 / 总数 = 16）。
+    [[nodiscard]] float Progress() const noexcept;
+
+    /// 是否已失败（此时 `Take()` 无意义）。
+    [[nodiscard]] bool Failed() const noexcept;
+
+    /// 失败原因（未失败时为空串）。
+    [[nodiscard]] const std::string& Reason() const noexcept;
+
+    /// 取走结果（**只能调用一次**）。前置条件：已结束且未失败。
+    [[nodiscard]] MaterialTextureAssetSet Take();
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+};
 
 /// 程序生成的占位材质贴图的默认每层边长（像素）。
 ///
 /// 保持 256（ADR 0010 P2 的显存记账区间即按 256² 给出）：五张纹理数组（albedo / normal /
 /// roughness / AO 各 4 层 + macro 1 层）含 mip 约 5.67 MB，落在方案 §7.2.1 的
 /// 「P2 ≈ 5.6 MB（256²）～ 22.4 MB（512²）」区间内。
+/// **真实贴图（T66）不走本常量**：其上传边长由 `MaterialTextureSettings::size` 给出（1024²）。
 inline constexpr std::uint32_t kMaterialTextureSize = 256;
 
 /// 宏观变化（macro variation）纹理数组的层数：**只有 1 层**（ADR 0010 P2）。

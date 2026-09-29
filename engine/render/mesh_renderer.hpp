@@ -97,6 +97,20 @@ struct TextureArrayDesc {
     const std::uint8_t* pixels     = nullptr;
 };
 
+/// 一份**等距柱状** HDRI 的原始像素（T67 / [ADR 0021](../../docs/adr/0021-environment-ibl.md)）。
+///
+/// 布局与 `texture_loader.hpp` 的 `ImageRgb32f` 相同，但这里**刻意不复用那个类型**：
+/// 渲染器只吃"原始线性像素"，不依赖加载器（`texture_loader` 的输出由上层喂进来）。
+///
+/// 约定：**线性光**、float32、RGB 三通道、行主序、行间无填充、**第 0 行 = 天顶**
+/// （与 `sky.frag` 的等距柱状约定一致：`v = 0` 在天顶）。
+struct EnvironmentSource {
+    /// 前置条件：非空，且长度 ≥ `width * height * 3`。
+    const float*  pixels = nullptr;
+    std::uint32_t width  = 0;
+    std::uint32_t height = 0;
+};
+
 /// 材质 uniform 块的最大字节数（`SetMaterialUniform` 的容量上限）。
 /// 当前片元块 = 渲染原点（`vec4`）+ 三平面参数（`vec4`，C 项）+ 4 层 × 4 个 `vec4` = 288 字节
 /// （ADR 0010 P2 起每层含 roughness / ao / 宏观参数）；留余量给后续参数。
@@ -171,11 +185,16 @@ protected:
 ///   - 顶点着色器入口 `main`：消费上面 `MeshVertex` 的三个 location，
 ///     绑定一个只读 storage buffer（set 0 / slot 0，内容为 `CameraUniform`），
 ///     并读取**一个顶点 uniform 块**（set 1 / slot 0，内容为 `MeshTransformUniform` —— 逐网格模型变换，见 `DrawMeshes`）；
-///   - 片元着色器入口 `main`：采样六个纹理数组（slot 0..4 = albedo / normal / roughness / AO / macro
-///     材质四件套与宏观变化，slot 5 = 阴影深度数组）
+///   - 片元着色器入口 `main`：采样九个纹理（slot 0..4 = albedo / normal / roughness / AO / macro
+///     材质四件套与宏观变化，slot 5 = 阴影深度数组，**slot 6..8 = 环境贴图三件套**（T67：irradiance /
+///     预过滤高光 / BRDF LUT；未烘焙时绑 1×1 占位））
 ///     并读取四个 uniform 块（slot 0 = 材质，slot 1 = 光照；slot 2 = 阴影，槽 3 = **自发光**，见下）。
 ///   - **自发光**（T27）：`UploadMesh(..., true)` 的网格在**同一条管线**里由槽 3 给出发光颜色
 ///     （`DrawMeshes` 逐网格推送；普通网格推零值）——不加开关分支、不加第二条管线。
+///   - **天空**（T67）：`sky.frag` + `tonemap.vert` 组成的全屏三角管线，在**主通道内、网格之前**绘制
+///     （深度测试与写入关闭 ⇒ 网格照常覆盖天空）；采样 slot 0 = HDRI，uniform 槽 0 = 逆视图投影。
+///   - **IBL 烘焙**（T67）：`ibl_irradiance.frag` / `ibl_prefilter.frag` / `ibl_brdf_lut.frag` 三条
+///     全屏三角管线，仅在 `BakeEnvironment` 内使用（加载期，不在渲染帧里）。
 ///   - 阴影通道另用 `shadow.vert` + 空入口 `shadow.frag`：无颜色目标、只写深度，
 ///     顶点 set 0 / slot 0 绑定该级的光空间矩阵（与相机矩阵**同类**机制：`SDL_BindGPUVertexStorageBuffers`），
 ///     set 1 / slot 0 读取**同一份**逐网格偏移（两个通道必须推同一份值，否则阴影与几何错位）。
@@ -288,6 +307,24 @@ public:
         m_emissiveColor[2] = blue;
     }
 
+    /// 烘焙并上传**环境贴图**（T67 / [ADR 0021](../../docs/adr/0021-environment-ibl.md)）：
+    /// 天空 HDRI + 漫反射 irradiance（32×16）+ 预过滤高光（6 级 mip，128×64 起）+ BRDF LUT（256²）。
+    ///
+    /// 时机：**加载期一次性**（阻塞到 GPU 完成，与 `CreateTextureArray` 同模式）——三条烘焙 pass 各提交一次、
+    /// 结束时等一次栅栏；SKILL「不冻结画面」要求的是"画面不停"，加载画面在此期间照常出帧。
+    /// 返回 false 表示失败（HDRI 为空 / 创造纹理或管线失败）⇒ 调用方 **WARN 并回落半球天空光**；
+    /// 失败时本次的产物会被释放干净（可从零重试，不泄漏）。
+    /// 成功后再调用会**先释放旧产物**再重建（重载不泄漏）。
+    /// 前置条件：`source.pixels` 非空且 `width / height ≥ 1`（不满足直接返回 false，不抛）。
+    [[nodiscard]] bool BakeEnvironment(const EnvironmentSource& source);
+
+    /// 只读：环境贴图是否可用（`BakeEnvironment` 成功）。
+    /// false ⇒ 主通道不绘制天空，且环境项走半球天空光回落（见 `BuildLightingUniform` 的 IBL 启用位）。
+    [[nodiscard]] bool EnvironmentReady() const noexcept { return m_environmentReady; }
+
+    /// 只读：环境贴图的显存字节总量（4 张纹理之和；已计入 `Stats().textureBytes`）。
+    [[nodiscard]] std::uint64_t EnvironmentTextureBytes() const noexcept { return m_environmentBytes; }
+
     /// 设置本帧相机常量；下一次 `RenderFrame` 生效。
     void SetCamera(const CameraView& camera) noexcept;
 
@@ -346,6 +383,7 @@ private:
     };
 
     /// 保证主通道图形管线与请求的 MSAA 档位一致（档位变化时用常驻 Shader 重建）。
+    /// T67 起**同时**重建天空管线：它在主通道的同一个渲染通道里绘制，采样数必须与目标一致。
     void EnsureMainPipeline(std::uint32_t sampleCount);
 
     /// 保证一块**常驻暂存缓冲**的容量 ≥ `bytes`（容量够则**不重新分配** ⇒ 稳态零堆分配 / 零 GPU 资源创建）。
@@ -356,6 +394,28 @@ private:
     /// 按给定档位创建主通道图形管线（用常驻的 `m_meshVertexShader` / `m_meshFragmentShader`），
     /// 写入 `m_pipeline` 与 `m_pipelineSampleCount`；失败抛 `std::runtime_error`。
     void CreateMainPipeline(std::uint32_t sampleCount);
+
+    /// 创建一条**全屏三角**图形管线（顶点阶段复用 `m_fullscreenVertexShader`，无顶点输入、不剔除）。
+    ///
+    /// `colorFormat` 即其唯一颜色目标的格式；`withDepthStencil = true` 时声明 D32_FLOAT 深度目标但
+    /// **不启用深度测试 / 写入**（用于"在主通道的同一个渲染通道里画天空"），`false` 用于离屏烘焙 pass。
+    /// 失败返回 nullptr（调用方决定抛还是回落：主通道抛、烘焙回落）。
+    [[nodiscard]] SDL_GPUGraphicsPipeline* CreateFullscreenPipeline(SDL_GPUShader* fragmentShader,
+                                                                   SDL_GPUTextureFormat colorFormat,
+                                                                   bool withDepthStencil, std::uint32_t sampleCount,
+                                                                   const char* label);
+
+    /// 开一个**单颜色目标、无深度**的渲染通道、画一个全屏三角形、关通道（T67：三条烘焙 pass 与色调映射共用）。
+    ///
+    /// `samplers` / `fragmentUniform` 可为空（分别为 0 个采样器 / 不推送 uniform）。
+    void DrawFullscreenPass(SDL_GPUCommandBuffer* commandBuffer, const SDL_GPUColorTargetInfo& colorTarget,
+                            SDL_GPUGraphicsPipeline* pipeline, const SDL_GPUTextureSamplerBinding* samplers,
+                            std::uint32_t samplerCount, const void* fragmentUniform,
+                            std::uint32_t fragmentUniformBytes);
+
+    /// 释放全部环境贴图资源（天空 / irradiance / 预过滤 / LUT）并同步显存记账与就绪标志。
+    /// 无资源时为无操作（可重复调用；`BakeEnvironment` 重建前与析构都走这里）。
+    void ReleaseEnvironmentTextures() noexcept;
 
     /// 保证深度目标与当前交换链尺寸、MSAA 档位一致（尺寸或档位变化时重建）。
     /// 档位 = 1 即单采样深度（回到 P0 行为）；档位 > 1 为多采样深度（`D32_FLOAT`，`sample_count = 档位`）。
@@ -426,6 +486,47 @@ private:
 
     /// 阴影深度管线：**仅顶点着色器**、无颜色目标、深度目标 = `D32_FLOAT` 深度数组的一层。
     SDL_GPUGraphicsPipeline* m_shadowPipeline = nullptr;
+
+    // ---- 环境贴图 / IBL（T67 / ADR 0021）----
+
+    /// 全屏三角的**顶点阶段**（`tonemap.vert`）：色调映射、天空与三条烘焙管线**共用同一个对象**。
+    /// 常驻到析构（与 `m_meshVertexShader` 同理由：天空管线要随 MSAA 档位重建，重建时复用同一批 Shader）。
+    SDL_GPUShader* m_fullscreenVertexShader = nullptr;
+
+    /// 天空的片元阶段（`sky.frag`）：**常驻**（天空管线随 MSAA 档位重建）。
+    SDL_GPUShader* m_skyFragmentShader = nullptr;
+
+    /// 天空管线：全屏三角，写 HDR 颜色目标；声明深度目标但**关闭深度测试与写入** ⇒ 网格照常覆盖天空。
+    /// 采样数必须与主通道目标一致 ⇒ 由 `EnsureMainPipeline` 随 MSAA 档位一起重建。
+    SDL_GPUGraphicsPipeline* m_skyPipeline = nullptr;
+
+    /// 三条 IBL 烘焙管线（仅加载期在 `BakeEnvironment` 内使用；采样数恒为 1、无深度目标）。
+    SDL_GPUGraphicsPipeline* m_irradiancePipeline = nullptr;  ///< HDRI → 32×16 余弦卷积
+    SDL_GPUGraphicsPipeline* m_prefilterPipeline  = nullptr;  ///< HDRI → 6 级 mip 的 GGX 预过滤高光
+    SDL_GPUGraphicsPipeline* m_brdfLutPipeline    = nullptr;  ///< 无输入 → 256² BRDF LUT
+
+    /// 环境贴图四件套（`R16G16B16A16_FLOAT`）：天空 HDRI、漫反射 irradiance、预过滤高光、BRDF LUT。
+    /// **只有同时非空且 `m_environmentReady` 时**才被采样（见 `RenderFrame` 的天空绘制与采样器绑定）。
+    SDL_GPUTexture* m_skyTexture        = nullptr;
+    SDL_GPUTexture* m_irradianceTexture = nullptr;
+    SDL_GPUTexture* m_prefilterTexture  = nullptr;
+    SDL_GPUTexture* m_brdfLutTexture    = nullptr;
+
+    /// 环境贴图的采样器：**U 重复 / V,W 钳制** + 线性过滤 + mipmap 线性。
+    /// 为什么 U 重复：等距柱状贴图在方位角方向首尾相接（u = 0 与 u = 1 是同一个方向）；
+    /// V 必须钳制：极点是奇点，重复会跨到对侧。
+    SDL_GPUSampler* m_environmentSampler = nullptr;
+
+    /// 1×1 占位纹理（`R16G16B16A16_FLOAT`，内容 = 白）：环境贴图未就绪时用来**满足采样器绑定**
+    /// （着色器已声明 binding 6..8，SDL_gpu 要求声明的采样器都有绑定；此时 `fogParams.z = 0`，
+    /// 着色器整段跳过 IBL 采样 ⇒ 内容无意义，只求"有合法绑定"）。
+    SDL_GPUTexture* m_environmentPlaceholder = nullptr;
+
+    /// 环境贴图的显存字节（四张之和，含预过滤的 mip 链）；随创建 / 释放增减（`m_stats.textureBytes` 同步）。
+    std::uint64_t m_environmentBytes = 0;
+
+    /// 环境贴图是否可用（`BakeEnvironment` 成功）。false ⇒ 不画天空 + 环境项走半球天空光。
+    bool m_environmentReady = false;
 
     SDL_GPUBuffer*         m_cameraUniformBuffer  = nullptr;
     SDL_GPUTransferBuffer* m_cameraTransferBuffer = nullptr;

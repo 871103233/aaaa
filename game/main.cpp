@@ -26,10 +26,12 @@
 #include "platform/settings.hpp"
 #include "platform/window.hpp"
 #include "render/camera.hpp"
+#include "render/environment.hpp"
 #include "render/frustum.hpp"
 #include "render/lighting_table.hpp"
 #include "render/mesh_renderer.hpp"
 #include "render/shadow_cascade.hpp"
+#include "render/texture_loader.hpp"
 #include "rigid_collapse.hpp"
 #include "terrain/material_table.hpp"
 #include "terrain/material_textures.hpp"
@@ -46,6 +48,7 @@
 #include "dig/terrain_brush.hpp"
 #include "dig/volume_collapse.hpp"
 #include "dig/volume_collision.hpp"
+#include "streaming/dig_volume_residency.hpp"
 
 #include <SDL3/SDL.h>
 
@@ -55,6 +58,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <map>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -186,6 +190,11 @@ struct CpuFrameCost {
 #else
     return std::filesystem::path(relative);
 #endif
+}
+
+/// 同上；`relative` 为 `std::filesystem::path`（T66：材质表 `[textures].root` 就是该类型）。
+[[nodiscard]] std::filesystem::path SourceAssetPath(const std::filesystem::path& relative) {
+    return SourceAssetPath(relative.string().c_str());
 }
 
 /// 一个网格的**世界空间** AABB（世界范围 ≤ 512 格，`float` 足以精确表示整数坐标）。
@@ -527,6 +536,62 @@ void UploadVolumeMesh(vx::MeshRenderer& renderer, vx::MeshHandle& handle, const 
     handle = renderer.UploadMesh(*blockMesh, blockOrigin);
 }
 
+/// 一个**常驻**可挖体积块在游戏层的槽位（T61）：常驻集合是**动态**的 ⇒ 不能再用"按块坐标下标索引的
+/// 平行数组"（数组一增删，所有下标全错）。这里改成**按块坐标索引**的表。
+struct VolumeSlot {
+    vx::MeshHandle handle {};  ///< 该块的 GPU 网格（无表面时保持无效）
+    WorldAabb      bounds {};  ///< T39：世界空间 AABB（视锥剔除用；上传时更新）
+};
+
+/// 常驻体积块表：`std::map` ⇒ 按块坐标升序、可增删、查找 O(log n)。
+/// **键存在 == 该块常驻**（T61：层间交接过滤与碰撞同步都以它为唯一事实来源）。
+using VolumeSlotTable = std::map<vx::BlockCoord, VolumeSlot>;
+
+/// 世界列 / 高度 → 所属体积块坐标（块边长 32 格；向下取整，负坐标也正确）。
+[[nodiscard]] vx::BlockCoord BlockOfWorldPoint(int worldX, int worldY, int worldZ) noexcept {
+    const auto floorDiv = [](int value, int divisor) {
+        const int quotient  = value / divisor;
+        const int remainder = value % divisor;
+        return (remainder != 0 && ((remainder < 0) != (divisor < 0))) ? (quotient - 1) : quotient;
+    };
+    return vx::BlockCoord { floorDiv(worldX, vx::kVolumeBlockSize), floorDiv(worldY, vx::kVolumeBlockSize),
+                            floorDiv(worldZ, vx::kVolumeBlockSize) };
+}
+
+/// 上传（或重传）表里某个体积块的 GPU 网格；块不在表里 ⇒ 无操作。
+void UploadVolumeMeshAt(VolumeSlotTable& slots, vx::MeshRenderer& renderer, const vx::DigVolumeWorld& volumes,
+                        const vx::BlockCoord& coord) {
+    const auto found = slots.find(coord);
+    if (found == slots.end()) {
+        return;
+    }
+    UploadVolumeMesh(renderer, found->second.handle, volumes, coord, &found->second.bounds);
+}
+
+/// **层间交接过滤器 = 当前常驻集合**（T61 / [ADR 0020](../../docs/adr/0020-dig-volume-vertical-band-and-dynamic-residency.md) 决策三）。
+///
+/// 判据与 `DigRegionTable::SkipQuad` **同形**（四角**全部**可挖才跳过地表四边形），但输入从
+/// "静态标记区域"换成"**当前常驻**的体积块" ⇒ 窗口外的地表照旧由地表网格绘制，**不会出现空洞**。
+class ResidentQuadFilter final : public vx::ITerrainQuadFilter {
+public:
+    explicit ResidentQuadFilter(const VolumeSlotTable& slots) noexcept : m_slots(slots) {}
+
+    [[nodiscard]] bool SkipQuad(const vx::TerrainQuad& quad) const override {
+        for (int corner = 0; corner < 4; ++corner) {
+            const vx::BlockCoord block =
+                BlockOfWorldPoint(quad.columnX[corner], static_cast<int>(std::floor(quad.height[corner])),
+                                  quad.columnZ[corner]);
+            if (m_slots.find(block) == m_slots.end()) {
+                return false;  // 有一角不常驻 ⇒ 地表照旧画（层间接管只发生在常驻集合内）
+            }
+        }
+        return true;
+    }
+
+private:
+    const VolumeSlotTable& m_slots;
+};
+
 /// T27：爆炸写回世界所需的全部句柄与缓冲（避免十几个参数一路传下去）。
 struct WorldEditContext {
     vx::TerrainWorld&                  world;
@@ -538,10 +603,8 @@ struct WorldEditContext {
     vx::MeshRenderer&                  renderer;
     const std::vector<vx::TileCoord>&  tileCoords;
     std::vector<vx::MeshHandle>&       tileHandles;
-    const std::vector<vx::BlockCoord>& volumeCoords;
-    std::vector<vx::MeshHandle>&       volumeHandles;
+    VolumeSlotTable&                   volumeSlots;   ///< T61：**动态**常驻集合（按块坐标索引；含 GPU 网格与 AABB）
     std::vector<WorldAabb>&            tileBounds;    ///< T39：地表 tile 的世界 AABB（剔除用；上传时更新）
-    std::vector<WorldAabb>&            volumeBounds;  ///< T39：可挖体积块的世界 AABB（同上）
     vx::PendingDestruction&            pending;       ///< T37：延后破坏队列（爆炸只入队，重活按帧预算做）
     vx::PhysicsWorld&                  physics;       ///< T33：倒塌整体的动态刚体建在它上面
     vx::RigidCollapseRuntime&          rigidCollapse; ///< T33：倒塌整体的运行时（刚体 + 渲染网格池）
@@ -752,11 +815,7 @@ private:
         switch (unit.kind) {
             case vx::PendingDestruction::UnitKind::VolumeRemesh: {
                 (void)context.volumes.RemeshBlock(unit.block);
-                const std::size_t index = VolumeIndex(context, unit.block);
-                if (index < context.volumeHandles.size()) {
-                    UploadVolumeMesh(context.renderer, context.volumeHandles[index], context.volumes, unit.block,
-                                     &context.volumeBounds[index]);
-                }
+                UploadVolumeMeshAt(context.volumeSlots, context.renderer, context.volumes, unit.block);
                 break;
             }
             case vx::PendingDestruction::UnitKind::TileRemesh: {
@@ -781,23 +840,23 @@ private:
                 // 既有判据（ADR 0012）：**被体积接管的 tile 不重建高度场碰撞体**，
                 // 否则会把刚交出去的隐形高度场又装回来（角色会被挡在自己挖的洞口外）。
                 const vx::TerrainTileMesh* tileMesh = context.world.FindMesh(unit.tile.x, unit.tile.z);
-                if (tileMesh != nullptr && !tileMesh->mesh.indices.empty()) {
+                if (tileMesh == nullptr) {
+                    break;
+                }
+                if (!tileMesh->mesh.indices.empty()) {
                     (void)context.collision.SyncTile(context.world, unit.tile.x, unit.tile.z);
+                } else {
+                    // T61：常驻集合随玩家移动 ⇒ **接管状态会翻转**（走远卸载 ⇒ 地表重新由高度场绘制）。
+                    // 判据与启动期同源（"该 tile 的地表网格已无面"），故这里把高度场碰撞体**撤掉** ——
+                    // 反方向（从"有面"到"无面"）也要走这一步，否则残留的隐形高度场会挡住新挖的洞口。
+                    context.collision.RemoveTile(unit.tile.x, unit.tile.z);
                 }
                 break;
             }
         }
     }
 
-    /// 块坐标 → 句柄 / 包围盒数组下标；找不到返回"越界值"（调用方据此跳过）。
-    [[nodiscard]] static std::size_t VolumeIndex(const WorldEditContext& context, const vx::BlockCoord& block) {
-        for (std::size_t i = 0; i < context.volumeCoords.size(); ++i) {
-            if (context.volumeCoords[i] == block) {
-                return i;
-            }
-        }
-        return context.volumeHandles.size();
-    }
+    /// tile 坐标 → 句柄 / 包围盒数组下标；找不到返回"越界值"（调用方据此跳过）。
     [[nodiscard]] static std::size_t TileIndex(const WorldEditContext& context, const vx::TileCoord& tile) {
         for (std::size_t i = 0; i < context.tileCoords.size(); ++i) {
             if (context.tileCoords[i] == tile) {
@@ -861,6 +920,7 @@ constexpr double kLoadWorkBudgetMs = 8.0;
 /// 加载阶段（顺序即**实际执行顺序**，也是进度顺序）。
 enum class LoadStage : int {
     Textures = 0,     ///< 程序生成材质贴图 + 上传（最重，实测约 1.9 s）
+    Environment,      ///< 环境贴图（T67）：HDRI 解码 + IBL 三件套烘焙（ADR 0021 实测约数百毫秒）
     TerrainTiles,     ///< 地表 tile 生成与网格化
     DiggableVolumes,  ///< 可挖体积密度填充与等值面网格化
     CollisionBodies,  ///< 地表高度场 / 可挖体积三角网碰撞体
@@ -869,14 +929,24 @@ enum class LoadStage : int {
     kCount
 };
 
-/// 各阶段的进度权重（无量纲，只需相对大小；量级取自 T36 的启动耗时分解）。
-inline constexpr double kLoadStageWeights[static_cast<int>(LoadStage::kCount)] = { 1.9, 2.0, 1.6, 1.0, 0.1, 0.6 };
+/// 各阶段的进度权重（无量纲，只需相对大小；量级取自 T36 的启动耗时分解，环境贴图按 ADR 0021 的预估量级）。
+inline constexpr double kLoadStageWeights[static_cast<int>(LoadStage::kCount)] = { 1.9, 0.8, 2.0, 1.6, 1.0, 0.1, 0.6 };
 
 /// 材质贴图分步生成的**每批行数**：256² 下单行约 0.8 ms，故 6 行 ≈ 5 ms，落在预算内。
 constexpr std::size_t kTextureRowsPerSlice = 6;
 
 /// 可挖体积分步初始化的**每批步数**：一步 = 一个块的密度填充或网格化（约 1~5 ms），故取 1。
 constexpr std::size_t kVolumeInitStepsPerSlice = 1;
+
+/// T61 / [ADR 0020](../../docs/adr/0020-dig-volume-vertical-band-and-dynamic-residency.md) 决策二：
+/// 可挖体积**常驻窗口的半径**（单位：tile）。`2` ⇒ 5×5 tile ≈ 320 m 见方（所有者 2026-09-29 确认）。
+/// 窗口之外只能炸地表坑、**挖不出三维洞**（ADR 0020 后果 1，切换条件已登记）。
+constexpr int kDigVolumeWindowRadiusTiles = 2;
+
+/// T61：**每帧最多做几个"建块 / 卸块"动作**（与 `kVolumeInitStepsPerSlice` 同口径，一个动作 ≈ 1~5 ms）。
+/// 新建块的**碰撞体**与因此受影响的 **tile 重网格**不在这里同步做 —— 它们入 `PendingDestruction` 队列，
+/// 由既有的每帧预算（`kDestructionBudgetMs`）摊平（ADR 0020 决策四）。
+constexpr std::size_t kVolumeResidencyActionsPerFrame = 1;
 
 /// 网格上传的**每批个数**：单个网格的上传是一次阻塞拷贝，取 4 使其 ≲ 5 ms。
 constexpr std::size_t kMeshUploadsPerSlice = 4;
@@ -886,6 +956,8 @@ constexpr std::size_t kMeshUploadsPerSlice = 4;
     switch (stage) {
         case LoadStage::Textures:
             return vx::UiLabel::LoadingStageTextures;
+        case LoadStage::Environment:
+            return vx::UiLabel::LoadingStageEnvironment;
         case LoadStage::TerrainTiles:
             return vx::UiLabel::LoadingStageTerrainTiles;
         case LoadStage::DiggableVolumes:
@@ -1021,9 +1093,10 @@ int main(int argc, char** argv) {
         } else {
             const double densityMb =
                 static_cast<double>(digRegions.Blocks().size()) * 36.0 / 1024.0;  // 每块 33³ ≈ 36 KB（ADR 0008）
-            VX_LOG_INFO("可挖区域表已加载（schema_version=%d）：%zu 个区域，共 %zu 个体积块（32³，密度数据约 %.2f MB）",
+            VX_LOG_INFO("可挖区域表已加载（schema_version=%d）：%zu 个区域，共 %zu 个体积块（32³，密度数据约 %.2f MB）；"
+                        "**竖向带宽**：地表以下 %d 格 / 地表以上 %d 格（0 = 不裁剪，T59 / ADR 0020）",
                         digRegions.SchemaVersion(), digRegions.Regions().size(), digRegions.Blocks().size(),
-                        densityMb);
+                        densityMb, digRegions.BandDownBlocks(), digRegions.BandUpBlocks());
             for (const vx::DigRegion& region : digRegions.Regions()) {
                 VX_LOG_INFO("  区域 [%s]（%s，优先级 %d）：块 x∈[%d,%d] y∈[%d,%d] z∈[%d,%d] ⇒ 世界 x∈[%d,%d) y∈[%d,%d) "
                             "z∈[%d,%d)（min/max 已**向外吸附**到 32 格块边界）",
@@ -1161,23 +1234,60 @@ int main(int argc, char** argv) {
 
         LoadingScreen loading { window, renderer, debugOverlay, input, clearColor };
 
-        // ---- 阶段 1：材质贴图（生成 + 上传）----
-        // T22 / ADR 0010 P2：程序生成的占位材质贴图（多尺度 albedo / 法线 + roughness + AO + 宏观变化），
-        // 上传为五个 2D 纹理数组（albedo/normal/roughness/AO 各 4 层，macro 1 层），供片元着色器逐像素混合
-        // 并做 PBR。无二进制资产、种子确定性。显存由 CreateTextureArray 自动计入 RenderStats::textureBytes。
+        // ---- 阶段 1：材质贴图（★ T66：**真实 CC0 资源优先，缺失则回落程序生成**）----
         //
-        // T36：一次跑完约 1.9 s，是启动期最重的一步 ⇒ 改为**分步**（每次几个像素行），期间照常出加载画面。
-        // 分步与一次性生成**逐字节相同**（红线 7：只改变"何时可见"）。
-        vx::MaterialTextureBuilder textureBuilder(preset.seed);
-        if (!loading.Run(LoadStage::Textures, [&textureBuilder]() {
-                return textureBuilder.Step(kTextureRowsPerSlice)
-                           ? 1.0
-                           : static_cast<double>(textureBuilder.Progress());
-            })) {
-            VX_LOG_INFO("加载期收到退出请求（材质贴图阶段），退出");
-            return EXIT_SUCCESS;
+        // 两种模式（语义差异见 `materials.toml` 的 `[textures]` 与 `mesh.frag` 的 `textureMode`）：
+        //   ① **真实贴图**：`[textures].enabled = true` 且四层 × 四件套齐备 ⇒ 上传 1024² 真实资源
+        //      （贴图是**绝对值**：粗糙度 / AO 直取贴图；层色 tint 由 CPU 置 1）。
+        //   ② **程序生成（回落路径）**：缺任一资源 / 未启用 ⇒ **WARN + 程序生成占位贴图**（不静默、不崩）。
+        // 两条路径都**分步推进**（解码 16 张 2048² JPEG + 降采样要数秒），期间照常出加载画面。
+        bool                        realTextureMode = false;
+        vx::MaterialTextureAssetSet materialAssets;
+        if (materials.Textures().enabled) {
+            // 资源**不入库**（所有者 2026-09-29 裁定，见 docs/plans/v0.3.md §1.1）：干净克隆下这里必然失败 ⇒
+            // 只 WARN 并回落，不报错、不拦启动。
+            vx::MaterialTextureAssetLoader assetLoader(
+                materials,
+                vx::MaterialTextureAssetSpec { SourceAssetPath(materials.Textures().root), materials.Textures().size });
+            if (!loading.Run(LoadStage::Textures, [&assetLoader]() {
+                    return assetLoader.Step(/*maxMaps=*/1) ? 1.0 : static_cast<double>(assetLoader.Progress());
+                })) {
+                VX_LOG_INFO("加载期收到退出请求（材质贴图阶段），退出");
+                return EXIT_SUCCESS;
+            }
+            if (assetLoader.Failed()) {
+                VX_LOG_WARN("真实美术贴图不可用 ⇒ **回落程序生成占位贴图**（不静默）：%s；"
+                            "取资源：powershell -ExecutionPolicy Bypass -File tools\\fetch_assets.ps1"
+                            "（来源 / 许可 / SHA-256 见 NOTICE.md「美术资源台账」）",
+                            assetLoader.Reason().c_str());
+            } else {
+                materialAssets   = assetLoader.Take();
+                realTextureMode  = true;
+                VX_LOG_INFO("**真实美术贴图已加载**：%u² × %u 层 × [albedo / normal / roughness / AO]；"
+                            "源图 %u² ⇒ 整数倍 box 降采样（确定性）；来源 / 许可 / SHA-256 见 NOTICE.md 台账；"
+                            "**宏观变化改用该层 albedo 放大采样**（真实资源无 macro 图，不额外占显存）",
+                            materialAssets.size, materialAssets.layerCount, materialAssets.sourceSize[0]);
+            }
+        } else {
+            VX_LOG_INFO("材质表未启用 `[textures]`（或 `enabled = false`）⇒ 使用**程序生成**占位贴图");
         }
-        {
+
+        if (!realTextureMode) {
+            // T22 / ADR 0010 P2：程序生成的占位材质贴图（多尺度 albedo / 法线 + roughness + AO + 宏观变化），
+            // 上传为五个 2D 纹理数组（albedo/normal/roughness/AO 各 4 层，macro 1 层），供片元着色器逐像素混合
+            // 并做 PBR。无二进制资产、种子确定性。显存由 CreateTextureArray 自动计入 RenderStats::textureBytes。
+            //
+            // T36：一次跑完约 1.9 s，是启动期最重的一步 ⇒ 改为**分步**（每次几个像素行），期间照常出加载画面。
+            // 分步与一次性生成**逐字节相同**（红线 7：只改变"何时可见"）。
+            vx::MaterialTextureBuilder textureBuilder(preset.seed);
+            if (!loading.Run(LoadStage::Textures, [&textureBuilder]() {
+                    return textureBuilder.Step(kTextureRowsPerSlice)
+                               ? 1.0
+                               : static_cast<double>(textureBuilder.Progress());
+                })) {
+                VX_LOG_INFO("加载期收到退出请求（材质贴图阶段），退出");
+                return EXIT_SUCCESS;
+            }
             const vx::MaterialTextureSet materialTextures = textureBuilder.Take();
             const vx::TextureArrayDesc   albedoDesc { materialTextures.size, materialTextures.size,
                                                     materialTextures.layerCount, materialTextures.albedoRgba.data() };
@@ -1206,12 +1316,124 @@ int main(int argc, char** argv) {
                         materialTextures.size, materialTextures.size, materialTextures.layerCount,
                         vx::kMaterialMacroLayerCount, baseBytes * mipFactor * totalLayerCount / (1024.0 * 1024.0),
                         baseBytes / (1024.0 * 1024.0));
+        } else {
+            // 真实贴图：四张数组（无 macro 资源 ⇒ macro 槽位**绑 albedo 数组**，着色器按宏观尺度采样该层 albedo）。
+            const vx::TextureArrayDesc albedoDesc { materialAssets.size, materialAssets.size, materialAssets.layerCount,
+                                                    materialAssets.albedoRgba.data() };
+            const vx::TextureArrayDesc normalDesc { materialAssets.size, materialAssets.size, materialAssets.layerCount,
+                                                    materialAssets.normalRgba.data() };
+            const vx::TextureArrayDesc roughnessDesc { materialAssets.size, materialAssets.size,
+                                                       materialAssets.layerCount, materialAssets.roughnessRgba.data() };
+            const vx::TextureArrayDesc aoDesc { materialAssets.size, materialAssets.size, materialAssets.layerCount,
+                                                materialAssets.aoRgba.data() };
+            const vx::TextureArrayHandle albedoTexture    = renderer.CreateTextureArray(albedoDesc);
+            const vx::TextureArrayHandle normalTexture    = renderer.CreateTextureArray(normalDesc);
+            const vx::TextureArrayHandle roughnessTexture = renderer.CreateTextureArray(roughnessDesc);
+            const vx::TextureArrayHandle aoTexture        = renderer.CreateTextureArray(aoDesc);
+            renderer.SetSampledTextureArrays(albedoTexture, normalTexture, roughnessTexture, aoTexture,
+                                             /*macro=*/albedoTexture);
+
+            const double mipFactor = 4.0 / 3.0;
+            const double baseBytes = static_cast<double>(materialAssets.size) * materialAssets.size * 4.0;
+            VX_LOG_INFO("真实材质贴图已上传：%u×%u，R8G8B8A8_UNORM；四件套各 %u 层（**无 macro 数组**：macro 槽位绑 albedo），"
+                        "含 mip 约 %.2f MB 显存（第 0 级 %.2f MB/层）",
+                        materialAssets.size, materialAssets.size, materialAssets.layerCount,
+                        baseBytes * mipFactor * 4.0 * static_cast<double>(materialAssets.layerCount) / (1024.0 * 1024.0),
+                        baseBytes / (1024.0 * 1024.0));
         }
+
+        // ---- 阶段 2：环境贴图（★ T67 / ADR 0021：天空 HDRI + IBL 三件套）----
+        //
+        // 语义：把"环境光"从**半球天空光的常量近似**换成**与画面里的天空同源**的 HDRI 光照
+        // （漫反射 irradiance + 预过滤高光 + BRDF LUT —— 全部在加载期烘焙、运行期只采样）。
+        // 资源**不入库**（所有者 2026-09-29 裁定，同 T66）：干净克隆 / 离线环境必然没有 HDRI ⇒
+        // 只 `WARN` 并**回落**半球天空光（不静默、不崩）。
+        //
+        // 为什么分两步（解码 → 烘焙）交给 `loading.Run`：解码 2048×1024 的 `.hdr` 约 0.1 s、
+        // 三条烘焙 pass 约数百毫秒（ADR 0021 后果 2）—— 之间照常出一帧加载画面（SKILL「不冻结画面」）。
+        bool environmentIblReady = false;
+        if (lighting.Environment().enabled) {
+            const std::filesystem::path hdriPath = SourceAssetPath(lighting.Environment().hdri);
+            vx::ImageRgb32f             hdri;
+            std::string                 environmentFailure;
+
+            int        step     = 0;
+            const bool advanced = loading.Run(LoadStage::Environment, [&]() {
+                if (step == 0) {
+                    // 解码在 CPU 侧、不触碰 GPU（见 texture_loader.hpp 的线程约定）；
+                    // `LoadImageHdr` 失败一律抛（不静默回退）⇒ 这里接住并转成"WARN + 回落"。
+                    try {
+                        hdri = vx::LoadImageHdr(hdriPath);
+                    } catch (const std::exception& error) {
+                        environmentFailure = error.what();
+                    }
+                } else if (step == 1 && environmentFailure.empty()) {
+                    // 烘焙：三条 GPU 全屏 pass，一次提交 + 等栅栏（ADR 0021：加载期阻塞式一次性提交）。
+                    // 计时是 ADR 0021 后果 2 的**实测回填义务**（预估"数百毫秒"，> 1 s 即须改分帧 / 下沉）。
+                    vx::Clock  bakeClock;
+                    const bool baked = renderer.BakeEnvironment(
+                        vx::EnvironmentSource { hdri.pixels.data(), hdri.width, hdri.height });
+                    const double bakeMs = bakeClock.Tick() * 1000.0;
+                    if (baked) {
+                        environmentIblReady = true;
+                        VX_LOG_INFO("**环境贴图已烘焙**（IBL 三件套）：HDRI %ux%u（半精度上传、线性光）；"
+                                    "irradiance %ux%u + 预过滤 %u 级 mip（%ux%u 起）+ BRDF LUT %u²；"
+                                    "环境贴图显存 %.2f MB；烘焙耗时 %.0f ms",
+                                    hdri.width, hdri.height, vx::kEnvironmentIrradianceWidth,
+                                    vx::kEnvironmentIrradianceHeight, vx::kEnvironmentPrefilterMipCount,
+                                    vx::kEnvironmentPrefilterBaseWidth, vx::kEnvironmentPrefilterBaseHeight,
+                                    vx::kEnvironmentBrdfLutSize,
+                                    static_cast<double>(renderer.EnvironmentTextureBytes()) / (1024.0 * 1024.0), bakeMs);
+                    } else {
+                        environmentFailure = "IBL 烘焙失败（详见上一行 ERROR 日志）";
+                    }
+                }
+                ++step;
+                return (step >= 2) ? 1.0 : 0.5;
+            });
+            if (!advanced) {
+                VX_LOG_INFO("加载期收到退出请求（环境贴图阶段），退出");
+                return EXIT_SUCCESS;
+            }
+            if (!environmentIblReady) {
+                VX_LOG_WARN("环境贴图不可用 ⇒ **回落半球天空光**（不静默）：%s；"
+                            "取资源：powershell -ExecutionPolicy Bypass -File tools\\fetch_assets.ps1"
+                            "（来源 / 许可 / SHA-256 见 NOTICE.md「美术资源台账」）",
+                            environmentFailure.c_str());
+            }
+        } else {
+            VX_LOG_INFO("光照表未启用 `[environment]`（或 enabled = false）⇒ 环境光使用**半球天空光**"
+                        "（ADR 0010 P1；打开 assets/config/lighting.toml 的 [environment] 段即可对比）");
+        }
+
+        // ---- T61 / ADR 0020 决策二：**常驻集合 = 玩家窗口 ∩ 可挖区域** ----
+        // 启动只常驻"出生点窗口"那批块；之后由 `DigVolumeScheduler` 随玩家移动建立 / 卸载。
+        // 必须**先于** `LoadTile`：层间交接过滤器（ADR 0011）的输入已由"静态区域"换成"当前常驻集合"。
+        const vx::DigVolumeWindow spawnWindow =
+            vx::WindowForPlayerBlocks(preset.spawnX, preset.spawnZ, kDigVolumeWindowRadiusTiles);
+        std::vector<vx::BlockCoord> initialVolumeCoords;
+        for (const vx::BlockCoord& coord : digRegions.Blocks()) {
+            if (spawnWindow.ContainsBlock(coord)) {
+                initialVolumeCoords.push_back(coord);
+            }
+        }
+        VolumeSlotTable volumeSlots;
+        for (const vx::BlockCoord& coord : initialVolumeCoords) {
+            volumeSlots.emplace(coord, VolumeSlot {});
+        }
+        ResidentQuadFilter    residentQuadFilter(volumeSlots);
+        vx::DigVolumeScheduler volumeScheduler(digRegions, kDigVolumeWindowRadiusTiles);
+        VX_LOG_INFO("可挖体积常驻窗口（ADR 0020）：玩家 tile (%d, %d) ± %d ⇒ 目标 %zu 块（区域表共 %zu 块）",
+                    spawnWindow.centerTileX, spawnWindow.centerTileZ, spawnWindow.radiusTiles,
+                    initialVolumeCoords.size(), digRegions.Blocks().size());
+        std::vector<vx::BlockCoord> volumeResidencyChanged;  ///< 每帧调度产生的"建 / 卸"块（复用缓冲）
+        std::vector<vx::BlockCoord> volumeCreated;           ///< 本帧新建的块（入延后队列，复用缓冲）
+        std::vector<vx::TileCoord>  volumeTouchedTiles;      ///< 本帧接管状态翻转的 tile（入延后队列，复用缓冲）
 
         vx::TerrainWorld world(preset.seed, materials);
         world.SetMapPreset(preset);  // 噪声先行、编辑覆盖其上（必须在 LoadTile 之前）
-        // T8 层间交接（ADR 0011）：可挖区域内的地表四边形交给体积网格渲染，故必须在 LoadTile 之前设置。
-        world.SetQuadFilter(&digRegions);
+        // T8 层间交接（ADR 0011）＋ T61：判据 = **当前常驻集合**（ADR 0020 决策三），故必须在 LoadTile 之前设置。
+        world.SetQuadFilter(&residentQuadFilter);
 
         // 地图范围由预设的 tile 半径决定：tile ∈ [-r, r] → 世界列 ∈ [-r*64, r*64]。
         std::vector<vx::TileCoord>  tileCoords;
@@ -1267,7 +1489,8 @@ int main(int argc, char** argv) {
         // T36：块数可达数百（每块 33³ 采样 + 一次等值面网格化），一次跑完要停下等好几秒 ⇒ 分步推进：
         // 每帧在预算内做一步（填一块密度 / 网格化一块），两次之间照常出加载画面。
         vx::DigVolumeWorld digVolumes(world, digRegions);
-        digVolumes.BeginInitFromHeightField();
+        // T61：**只初始化常驻集合**（玩家窗口 ∩ 区域表），而不是整张区域表（ADR 0020 决策二）。
+        digVolumes.BeginInitFromHeightField(initialVolumeCoords);
         if (!loading.Run(LoadStage::DiggableVolumes, [&digVolumes]() {
                 if (digVolumes.StepInitFromHeightField(kVolumeInitStepsPerSlice)) {
                     return 1.0;
@@ -1278,19 +1501,17 @@ int main(int argc, char** argv) {
             VX_LOG_INFO("加载期收到退出请求（可挖体积阶段），退出");
             return EXIT_SUCCESS;
         }
-        std::vector<vx::BlockCoord> volumeCoords = digRegions.Blocks();
-        std::vector<vx::MeshHandle> volumeHandles(volumeCoords.size());
         {
             std::size_t surfaceBlocks = 0;
-            for (const vx::BlockCoord& coord : volumeCoords) {
+            for (const vx::BlockCoord& coord : initialVolumeCoords) {
                 const vx::MeshData* mesh = digVolumes.FindMesh(coord);
                 if (mesh != nullptr && !mesh->vertices.empty()) {
                     ++surfaceBlocks;
                 }
             }
             VX_LOG_INFO("可挖体积就绪：%zu 个块（密度 %.2f MB + 体素材质 %.2f MB，后者**懒分配**），其中 %zu 块存在等值面"
-                        "（Surface Nets 网格化，法线由密度梯度给出）；**区域内已由体积接管地表网格**（ADR 0011）",
-                        volumeCoords.size(), static_cast<double>(digVolumes.VoxelBytes()) / (1024.0 * 1024.0),
+                        "（Surface Nets 网格化，法线由密度梯度给出）；**常驻集合内的地表已由体积接管**（ADR 0011 / 0020）",
+                        initialVolumeCoords.size(), static_cast<double>(digVolumes.VoxelBytes()) / (1024.0 * 1024.0),
                         static_cast<double>(digVolumes.MaterialBytes()) / (1024.0 * 1024.0), surfaceBlocks);
         }
 
@@ -1305,7 +1526,7 @@ int main(int argc, char** argv) {
         std::size_t         takenOverTiles = 0;
         {
             const std::size_t tileCount   = tileCoords.size();
-            const std::size_t volumeCount = volumeCoords.size();
+            const std::size_t volumeCount = initialVolumeCoords.size();
             const std::size_t totalUnits  = tileCount + volumeCount;
             std::size_t       unit        = 0;
             if (!loading.Run(LoadStage::CollisionBodies, [&]() {
@@ -1322,7 +1543,7 @@ int main(int argc, char** argv) {
                             ++collisionTiles;
                         }
                     } else {
-                        (void)volumeCollision.SyncBlock(digVolumes, volumeCoords[unit - tileCount]);
+                        (void)volumeCollision.SyncBlock(digVolumes, initialVolumeCoords[unit - tileCount]);
                     }
                     ++unit;
                     return static_cast<double>(unit) / static_cast<double>(totalUnits);
@@ -1446,7 +1667,6 @@ int main(int argc, char** argv) {
 
         // T39：每个网格的**世界空间** AABB（上传时算一次，之后每帧只做视锥剔除判定）。
         std::vector<WorldAabb> tileBounds(tileCoords.size());
-        std::vector<WorldAabb> volumeBounds(volumeCoords.size());
 
         // T37：延后破坏队列与其执行器（爆炸只入队；重网格 / 上传 / 碰撞体重建按每帧预算推进）。
         vx::PendingDestruction pendingDestruction;
@@ -1458,7 +1678,7 @@ int main(int argc, char** argv) {
         std::size_t volumeMeshCount = 0;
         {
             const std::size_t tileCount   = tileCoords.size();
-            const std::size_t volumeCount = volumeCoords.size();
+            const std::size_t volumeCount = initialVolumeCoords.size();
             const std::size_t totalUnits  = tileCount + volumeCount;
             std::size_t       unit        = 0;
             if (!loading.Run(LoadStage::MeshUpload, [&]() {
@@ -1471,9 +1691,9 @@ int main(int argc, char** argv) {
                             UploadTileMesh(renderer, tileHandles[unit], world, tileCoords[unit], &tileBounds[unit]);
                         } else {
                             const std::size_t index = unit - tileCount;
-                            UploadVolumeMesh(renderer, volumeHandles[index], digVolumes, volumeCoords[index],
-                                             &volumeBounds[index]);
-                            if (volumeHandles[index].IsValid()) {
+                            UploadVolumeMeshAt(volumeSlots, renderer, digVolumes, initialVolumeCoords[index]);
+                            const auto uploaded = volumeSlots.find(initialVolumeCoords[index]);
+                            if (uploaded != volumeSlots.end() && uploaded->second.handle.IsValid()) {
                                 ++volumeMeshCount;
                             }
                         }
@@ -1485,7 +1705,7 @@ int main(int argc, char** argv) {
             }
         }
         VX_LOG_INFO("可挖体积网格已上传：%zu/%zu 个块有可见表面（其余块全实心或全空，无等值面）", volumeMeshCount,
-                    volumeCoords.size());
+                    volumeSlots.size());
 
         // T13：主角**可视**胶囊体（装饰用，尺寸与碰撞胶囊一致；不参与任何物理）。
         // 一次性上传局部网格（脚底为原点），此后每帧只就地刷新顶点位置；绘制顺序由每帧的绘制列表决定。
@@ -1535,17 +1755,15 @@ int main(int argc, char** argv) {
                                               renderer,
                                               tileCoords,
                                               tileHandles,
-                                              volumeCoords,
-                                              volumeHandles,
+                                              volumeSlots,
                                               tileBounds,
-                                              volumeBounds,
                                               pendingDestruction,
                                               physics,
                                               rigidCollapse };
 
         // 每帧的绘制列表（tile + 体积 + 主角 + 活动光球 + **倒塌整体**）：容量固定，稳态零分配。
         std::vector<vx::MeshHandle> frameHandles;
-        frameHandles.reserve(tileHandles.size() + volumeHandles.size() + 1 + orbHandles.size() +
+        frameHandles.reserve(tileHandles.size() + volumeSlots.size() + 1 + orbHandles.size() +
                              static_cast<std::size_t>(collapseSpec.maxActiveUnits));
 
         /// T33：本帧**落定**（倒了、停住了）的倒塌整体 —— 帧末统一体素化回写（缓冲复用，稳态零分配）。
@@ -1880,6 +2098,67 @@ int main(int argc, char** argv) {
             // T33：把活跃倒塌整体的位姿推给渲染器（每帧一次 64 B 推送 / 个，**不重烘焙顶点**）。
             rigidCollapse.SyncRender(renderer);
 
+            // ---- T61（ADR 0020 决策二 / 四）：**常驻集合随玩家移动** ----
+            // 每帧按预算建 / 卸少量块（一个动作 ≈ 1~5 ms，见 `kVolumeResidencyActionsPerFrame`）；
+            // 建 / 卸引起的**重网格、GPU 上传、碰撞体增删**不在这里同步做，一律入既有的延后队列，
+            // 由下面的 `destructionProcessor` 按 `kDestructionBudgetMs` 摊平（重活不得留在渲染帧里）。
+            // 为什么跟着窗口走：静态全图在 1 km 下要 69~549 MB，而窗口内只需 ≈ 7~10 MB（ADR 0020）。
+            {
+                const vx::PhysicsWorld::CharacterState playerState = physics.GetCharacterState(character);
+                const bool wasBusy = volumeScheduler.HasPendingWork();
+                volumeResidencyChanged.clear();
+                if (volumeScheduler.Update(digVolumes, playerState.position.x, playerState.position.z)) {
+                    (void)volumeScheduler.Step(digVolumes, kVolumeResidencyActionsPerFrame,
+                                               volumeResidencyChanged);
+                }
+                if (!volumeResidencyChanged.empty()) {
+                    volumeCreated.clear();
+                    volumeTouchedTiles.clear();
+                    for (const vx::BlockCoord& coord : volumeResidencyChanged) {
+                        const auto slot = volumeSlots.find(coord);
+                        if (digVolumes.Blocks().find(coord) != digVolumes.Blocks().end()) {
+                            if (slot == volumeSlots.end()) {
+                                // 新建：**先入表**（层间交接过滤器读的就是这张表，ADR 0011 / 0020 决策三），
+                                // 再立刻上传它的网格 —— 本帧稍后处理 tile 重网格时，体积面**已经在画**，
+                                // 因此不会出现"地表已被跳过、体积还没画"的破洞。
+                                volumeSlots.emplace(coord, VolumeSlot {});
+                                UploadVolumeMeshAt(volumeSlots, renderer, digVolumes, coord);
+                                volumeCreated.push_back(coord);
+                            }
+                        } else if (slot != volumeSlots.end()) {
+                            // 走远卸载（或超上限淘汰）：释放 GPU 网格 + 撤销三角网碰撞体。
+                            if (slot->second.handle.IsValid()) {
+                                renderer.ReleaseMesh(slot->second.handle);
+                            }
+                            volumeSlots.erase(slot);
+                            volumeCollision.RemoveBlock(coord);
+                        } else {
+                            continue;  // 世界与表里都没有 ⇒ 无变化（防御性）
+                        }
+                        volumeTouchedTiles.push_back(vx::TileCoord { vx::TileOfBlockIndex(coord.x),
+                                                                     vx::TileOfBlockIndex(coord.z) });
+                    }
+                    if (!volumeCreated.empty()) {
+                        // 只补"碰撞体"这一半：网格已在 `CreateBlock` 内生成、上面已上传（T61：不重复重网格）。
+                        pendingDestruction.MergeVolumeBlockCollisions(volumeCreated);
+                    }
+                    if (!volumeTouchedTiles.empty()) {
+                        // 接管状态翻转的 tile 必须重网格：常驻集合一变，`ResidentQuadFilter` 的判据就变了
+                        // （否则窗口边缘会出现空洞或重影面）。延后阶段的 `TileCollision` 分支据此增删高度场。
+                        pendingDestruction.MergeTiles(volumeTouchedTiles);
+                    }
+                }
+                if (wasBusy && !volumeScheduler.HasPendingWork()) {
+                    // 一次"窗口调整"**收尾后**记一条（每次跨越 tile 边界一条，不逐帧刷屏）——走动验收的可观测证据。
+                    // 必须放在上面的同步之后：否则本帧那一个动作还没落到 `volumeSlots` 上，打印出来的计数会差一个。
+                    VX_LOG_INFO("可挖体积常驻集合已随窗口调整完毕（ADR 0020）：玩家 tile (%d, %d) ⇒ 常驻 %zu 块"
+                                "（世界内 %zu 块、窗口目标 %zu 块、**留驻脏块 %zu 块**）",
+                                volumeScheduler.Window().centerTileX, volumeScheduler.Window().centerTileZ,
+                                volumeSlots.size(), digVolumes.Blocks().size(), volumeScheduler.DesiredCount(),
+                                volumeScheduler.KeptDirtyCount());
+                }
+            }
+
             const std::size_t destructionUnits = destructionProcessor.Process(editContext, kDestructionBudgetMs);
             if (terrainExplosionSeen) {
                 // 地表爆破的外环会抬高地形 ⇒ 复用缺陷 B2 的救场：把被埋住的角色顶回地面。
@@ -1951,10 +2230,10 @@ int main(int argc, char** argv) {
                     ++visibleTiles;
                 }
             }
-            for (std::size_t i = 0; i < volumeHandles.size(); ++i) {
-                if (volumeHandles[i].IsValid() &&
-                    VisibleToCamera(frustum, volumeBounds[i], renderOrigin, sunDirection)) {
-                    frameHandles.push_back(volumeHandles[i]);
+            for (const auto& entry : volumeSlots) {
+                if (entry.second.handle.IsValid() &&
+                    VisibleToCamera(frustum, entry.second.bounds, renderOrigin, sunDirection)) {
+                    frameHandles.push_back(entry.second.handle);
                     ++visibleVolumes;
                 }
             }
@@ -1983,7 +2262,7 @@ int main(int argc, char** argv) {
                 cullingLogged = true;
                 VX_LOG_INFO("首帧视锥剔除（T39）：地表 tile %zu/%zu、可挖体积块 %zu/%zu 通过（含阴影扫掠余量）；"
                             "本帧提交网格 %zu 个",
-                            visibleTiles, tileHandles.size(), visibleVolumes, volumeHandles.size(),
+                            visibleTiles, tileHandles.size(), visibleVolumes, volumeSlots.size(),
                             submittedThisFrame);
             }
 
@@ -2002,8 +2281,11 @@ int main(int argc, char** argv) {
             stats.explosionRadius   = orbSpec.explosionRadiusBlocks;
             stats.orbActiveCount    = orbPool.ActiveCount();
             stats.orbCapacity       = orbPool.Capacity();
-            stats.volumeBlockCount  = volumeCoords.size();
+            stats.volumeBlockCount  = volumeSlots.size();
             stats.carvedBlockCount  = digVolumes.CarvedBlockCount();
+            // T61：常驻调度的可观测量 —— "待办"回落说明窗口已跟上玩家，"留驻"增长说明玩家改造的洞被保住。
+            stats.volumePendingActions = volumeScheduler.PendingActionCount();
+            stats.volumeKeptDirtyCount = volumeScheduler.KeptDirtyCount();
             stats.mouseCaptured     = mouseCaptured;
             stats.loadedTileCount   = tileCoords.size();
             stats.lastDirtyTileCount = destructionUnits;
@@ -2076,15 +2358,19 @@ int main(int argc, char** argv) {
             // 材质参数（高度带 / 坡度带 / UV 尺度 / 层色）来自与 TerrainWorld **同一份**材质表；
             // 渲染原点每次重定基后都要刷新（原点进 uniform，片元据此把渲染相对坐标还原为世界坐标）。
             const vx::MaterialUniform materialUniform =
-                vx::BuildMaterialUniform(world.Materials(), renderOrigin.x, renderOrigin.y, renderOrigin.z);
+                vx::BuildMaterialUniform(world.Materials(), renderOrigin.x, renderOrigin.y, renderOrigin.z,
+                                         realTextureMode);
             renderer.SetMaterialUniform(&materialUniform, sizeof(materialUniform));
 
             // 光照与雾参数（T21a / T21c）：来自启动期加载的同一份光照表，经 BuildLightingUniform 单入口投影。
             // **相机世界位置每帧变化**（第三人对焦跟随 + 避障），而雾按视距插值，故 uniform 必须每帧重建。
             // `view.eye` 是绝对世界坐标，与片元还原出的 worldPosition 同空间。
-            const vx::LightingUniform lightingUniform =
-                vx::BuildLightingUniform(lighting, static_cast<double>(view.eye.x),
-                                         static_cast<double>(view.eye.y), static_cast<double>(view.eye.z));
+            // T67：`environmentIblReady` 决定环境项走 IBL 还是半球天空光回落；两者**共用同一个 uniform 结构**，
+            // 只是 `fogParams.zw` 不同（着色器按位分支），因此切换不需要换管线、也不需要重编 Shader。
+            const vx::LightingUniform lightingUniform = vx::BuildLightingUniform(
+                lighting, static_cast<double>(view.eye.x), static_cast<double>(view.eye.y),
+                static_cast<double>(view.eye.z),
+                environmentIblReady ? vx::kEnvironmentPrefilterMipCount : 0U);
             renderer.SetLightingUniform(&lightingUniform, sizeof(lightingUniform));
 
             // 相机常量（T39 起 `relativeView` 在**构建绘制列表之前**就已算好，见那里的视锥剔除）。

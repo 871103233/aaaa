@@ -25,10 +25,12 @@
 #   - shadow.cascade_count ∈ [1, 4]；shadow.resolution 是 2 的幂且 ≥ 256；
 #     shadow.max_distance > 0；shadow.split_lambda ∈ [0, 1]；depth_bias / normal_offset / caster_height_min ≥ 0；
 #     shadow.cascade_blend ∈ [0, 0.5]。
+#   - （T67）[environment] 段**可选**：给了就必须有 enabled（布尔）与 hdri（字符串）；
+#     enabled = true 时 hdri 不得为空。整段缺失 = 不启用 IBL（回落半球天空光）。
 #
 # 版本历史：v1 首版（无 [shadow]）→ v2 新增 [shadow]（T21b）→ v4 新增 shadow.caster_height_min（缺陷 1 修复）
 #   → **v5 新增 shadow.cascade_blend（缺陷 B8 修复：级联边界混合）**。
-#   （v3 未使用；版本号按缺陷修复要求推进。）
+#   （v3 未使用；版本号按缺陷修复要求推进。T67 的 [environment] 是**可选段**，不改版本号 ⇒ 旧文件照旧可用。）
 
 schema_version = 5
 
@@ -139,3 +141,20 @@ caster_height_min = 160.0
 #   两级权重和恒为 1），消除跨级联的硬跳变。
 #   0.1 → 过渡带占该级覆盖距离的 10%（相对比例，近处不会过宽）；设 0 则逐字退回"单级采样"（旧行为）。
 cascade_blend = 0.1
+
+# ---------------------------------------------------------------------------
+# 环境贴图 / IBL（T67：天空 HDRI + 漫反射 irradiance + 预过滤高光 + BRDF LUT）
+# ---------------------------------------------------------------------------
+# 依据：docs/adr/0021-environment-ibl.md（超出 ADR 0010 的"半球天空光"质量线，故另开 ADR）。
+# 本段是**可选段**：整段注释掉 = 不启用 IBL ⇒ 环境光退回 ADR 0010 P1 的半球天空光（`[sky]` 的三色按法线插值）。
+# 两种模式可直接对比：注释 / 取消注释本段后重启即可（`[sky]` 段在 IBL 模式下仍被用作**雾色来源**与回落值）。
+[environment]
+# enabled：是否尝试启用 IBL。false 或整段缺失 ⇒ 走半球天空光回落（不报错）。
+enabled = true
+
+# hdri：等距柱状 HDRI 的路径（相对**仓库根**；`game/` 会用 SourceAssetPath 解析成绝对路径）。
+#   口径：Radiance `.hdr`、线性光、第 0 行 = 天顶（与 sky.frag / ibl_*.frag 的等距柱状约定一致；
+#   投影口径 u = atan2(z,x)/2π + 0.5、v = acos(y)/π 在四处逐字相同）。
+#   资源**不入库**（所有者 2026-09-29 裁定）：干净克隆下这里必然缺失 ⇒ 只 WARN 并回落，不拦启动。
+#   取资源：powershell -ExecutionPolicy Bypass -File tools\fetch_assets.ps1
+hdri = "assets/textures/env/kloofendal_48d_partly_cloudy_2k.hdr"

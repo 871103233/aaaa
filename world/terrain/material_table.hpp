@@ -27,6 +27,30 @@ struct TriplanarSettings {
     float sharpness = 4.0F;
 };
 
+/// 真实美术贴图的来源与规格（T66 / V0.3 ⓒ「表现与深度」）。
+///
+/// **为什么放在材质表里**：贴图路径与网格化无关，但"地表长什么样"是材质表的事（ADR 0009 的唯一事实来源），
+/// 且**层名 → 子目录名**的映射需要层的信息（`[[layer]].name`）。因此段 `[textures]` 与 `[[layer]]` 同文件。
+///
+/// **语义（与 [ADR 0009](../../docs/adr/0009-terrain-material-pipeline.md) / ADR 0010 的关系）**：本段**不改变管线**
+/// （仍是 splat 权重混合 + 四件套 + PBR），只把"程序生成的占位贴图"换成**真实 CC0 资源**。
+/// 资源**不入库**，由 `tools/fetch_assets.ps1` 取回（见 `NOTICE.md` 的「美术资源台账」）。
+///
+/// **缺省与回落**：段可缺失（`enabled = false`）⇒ 完全走程序生成贴图（旧文件照旧可用，**不升 schema_version**）。
+/// 即使 `enabled = true`，只要**任一**贴图缺失 / 尺寸不合法 ⇒ 调用方**WARN 并回落**程序生成贴图（不得崩、不得静默）。
+struct MaterialTextureSettings {
+    /// 是否尝试使用真实贴图（缺省 false = 程序生成）。
+    bool enabled = false;
+
+    /// 资源根目录（相对于**资源根**，见 `main.cpp` 的资产目录解析）；每层的子目录名 = 该层的 `name`。
+    std::filesystem::path root = "assets/textures/terrain";
+
+    /// 上传边长（像素）。源图边长必须是它的**整数倍**（按整数倍做确定性 box 降采样）；
+    /// 依据：ADR 0008 的 VRAM 上限 300 MB —— 2048² × 16 层 = 588 MB 放不下，1024² ≈ 86 MB 才进预算
+    /// （所有者 2026-09-29 裁定：1024² + MSAA 4×→2×）。
+    std::uint32_t size = 1024;
+};
+
 /// splat 槽位数量：等于纹理数组的层数，并与 `render/mesh_renderer.hpp` 的纹理采样约定一致。
 ///
 /// ADR 0009 起权重在**片元着色器**逐像素计算，不再写入顶点属性；本常量只约束
@@ -159,6 +183,11 @@ struct MaterialLayerUniform {
 ///
 /// `triplanar` 是全局三平面参数（C 项）：`x = enabled(1/0)`、`y = slope_min`、`z = slope_max`、
 /// `w = sharpness`。与 mesh.frag 的 `MaterialBlock.triplanar` 逐字对应。
+///
+/// `textureMode`（T66）：`x = 真实贴图模式(1/0)`，其余为填充。**真实模式下贴图是"绝对值"** ——
+/// 粗糙度 / AO 直接取自贴图（层基准值不参与），层色 tint 由 `BuildMaterialUniform` 置 1（真实 albedo 自带上色）；
+/// **程序模式下贴图是"相对变化"**（粗糙度 ±20%、AO 为系数）。两种语义必须由着色器按该标志分支，
+/// 否则真贴图会被再乘一次基准值（贴图变化被抹平）。
 struct MaterialUniform {
     float renderOriginX = 0.0F;
     float renderOriginY = 0.0F;
@@ -170,12 +199,17 @@ struct MaterialUniform {
     float triplanarSlopeMax = 0.70F;
     float triplanarSharpness = 4.0F;
 
+    float realTextureMode = 0.0F;  ///< 1 = 使用真实美术贴图（贴图值为绝对值）、0 = 程序生成占位（相对变化）
+    float textureModeUnused1 = 0.0F;
+    float textureModeUnused2 = 0.0F;
+    float textureModeUnused3 = 0.0F;
+
     std::array<MaterialLayerUniform, static_cast<std::size_t>(kMaterialSlotCount)> layers {};
 };
 
-static_assert(sizeof(MaterialUniform) == 16 * (2 + 4 * static_cast<std::size_t>(kMaterialSlotCount)),
+static_assert(sizeof(MaterialUniform) == 16 * (3 + 4 * static_cast<std::size_t>(kMaterialSlotCount)),
               "MaterialUniform 必须与 mesh.frag 的 std140 布局逐字节一致"
-              "（渲染原点 + 三平面参数 + 4 层 × 4 个 vec4 = 288 字节）");
+              "（渲染原点 + 三平面参数 + 贴图模式 + 4 层 × 4 个 vec4 = 304 字节）");
 
 class TerrainMaterialTable;
 
@@ -183,9 +217,14 @@ class TerrainMaterialTable;
 ///
 /// 这是 CPU→GPU 材质参数的**唯一**入口：任何新增参数都必须先加进 `MaterialLayer`，
 /// 再在这里投影；**禁止**在着色器里硬编码第二份带 / 尺度 / 层色。
+///
+/// `realTextures`（T66）：**调用方按启动期的实际结果**传入 —— true = 已上传真实美术贴图
+/// （此时层色 tint 一律置 1：真实 albedo 自带上色，再乘配置里的单色 tint 会变成双层上色；
+/// 粗糙度 / AO 由着色器直接取贴图，层基准值不参与）。默认 false = 程序生成占位贴图的旧口径。
 /// 前置条件：`table` 已通过 `LoadFromFile` 或 `Default()` 填充。
 [[nodiscard]] MaterialUniform BuildMaterialUniform(const TerrainMaterialTable& table, double originX,
-                                                   double originY, double originZ) noexcept;
+                                                   double originY, double originZ,
+                                                   bool realTextures = false) noexcept;
 
 /// 地表材质表：启动期从 `assets/config/materials.toml` 一次性读入（ADR 0005）。
 ///
@@ -202,6 +241,8 @@ public:
     ///    `subsurface` **缺省 = 自身**，旧文件无需改动即可加载 ⇒ **不构成破坏性变更，故不升版**。
     /// 5：新增每层**必填**的 `toughness`（T31 / [ADR 0013](../../docs/adr/0013-destructible-elements.md) 的坚固度，
     ///    点/格³）。**必填 ⇒ 破坏性变更 ⇒ 升版**（旧文件缺该字段会直接报错，而不是悄悄退化成"到处一样硬"）。
+    /// 5（T66 追加，**不升版**）：新增**可选**段 `[textures]`（真实 CC0 美术贴图，见 `MaterialTextureSettings`）。
+    ///    缺省 = `enabled = false` ⇒ 与旧口径逐字相同，**不构成破坏性变更**。
     static constexpr int kSchemaVersion = 5;
 
     /// 从 TOML 文件加载并校验；失败抛 `std::runtime_error`（启动期允许异常，ADR 0005）。
@@ -222,9 +263,13 @@ public:
     /// 全局三平面（triplanar）参数（C 项）。供 `BuildMaterialUniform` 与着色器使用。
     [[nodiscard]] const TriplanarSettings& Triplanar() const noexcept { return m_triplanar; }
 
+    /// 真实美术贴图的来源与规格（T66 / 段 `[textures]`；缺省 = 不启用 ⇒ 程序生成占位贴图）。
+    [[nodiscard]] const MaterialTextureSettings& Textures() const noexcept { return m_textures; }
+
 private:
     std::array<MaterialLayer, static_cast<std::size_t>(kMaterialSlotCount)> m_layers {};
     TriplanarSettings                                                       m_triplanar;
+    MaterialTextureSettings                                                 m_textures;
     int                                                                     m_schemaVersion = kSchemaVersion;
 };
 

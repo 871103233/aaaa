@@ -46,6 +46,7 @@ voxel-engine/
 ├── world/                     世界层（分层混合，见 ADR 0004）
 │   ├── dig/                   笔刷挖掘 / 堆建与脏 tile 收集
 │   ├── generation/            确定性种子与噪声（FastNoiseLite 封装）
+│   ├── streaming/             可挖体积的常驻调度（V0.2 起；见 ADR 0020）
 │   └── terrain/               地表高度场 tile / 网格化 / 材质混合 / ITerrainQuery 实现
 ├── CMakeLists.txt             根构建
 ├── CMakePresets.json          构建预设
@@ -65,7 +66,7 @@ voxel-engine/
 | `vcpkg.json` | 依赖清单 + `builtin-baseline` + 构建期 host 工具 | — | baseline 已锁定；增删依赖需评审，并在提交信息说明原因；**构建期工具（`shaderc` / `sdl3-shadercross`）必须写成 `{ "name": "...", "host": true }`**；端口名一律用 vcpkg 名（`enkits`，不是 `enkiTS`） |
 | `.clang-format` / `.clang-tidy` / `.editorconfig` | 风格与静态检查 | — | 与开发规范第三节保持一致 |
 | `.gitattributes` | 行尾统一（`eol=lf`）+ LFS 追踪规则 | — | `.ps1` 保持 LF（不强制 CRLF） |
-| `.gitignore` | 忽略 `build/`、`vcpkg_installed/`、`*.spv`、IDE 产物 | — | 保留 `.trae/skills/`（CI 依赖其中的门禁脚本） |
+| `.gitignore` | 忽略 `build/`、`vcpkg_installed/`、`*.spv`、IDE 产物、**美术资源目录（`assets/textures/`、`assets/models/`）** | — | 保留 `.trae/skills/`（CI 依赖其中的门禁脚本）；**不得**忽略 `tools/assets.sha256`（它是资源台账的一部分） |
 | `LICENSE` / `NOTICE.md` | 许可与第三方组件清单 | — | 引入新第三方库须同步 `NOTICE.md` |
 
 ---
@@ -95,6 +96,7 @@ voxel-engine/
 | `world/terrain/` | 地表高度场 tile（64×64、`int16` 1/16 格）、网格化与梯度法线、材质混合、`ITerrainQuery` 实现、**碰撞体采样构建**（`terrain_collision`） | 可依赖 `engine` | tile 网格须多采样一行/列（65×65），保证相邻 tile 边界**逐位相等、无裂缝**；世界定位用整数 / `double` |
 | `world/generation/` | 确定性种子派生与噪声（FastNoiseLite 封装，pimpl 隔离）、**预设固定地图加载**（`map_preset`：种子 / 范围 / 出生点 / 地形编辑区，TOML） | 可依赖 `engine` | 生成必须是**纯函数**（种子 + 整数坐标）；预设编辑叠加在噪声之上，**同一文件必须得到同一世界**；禁止 `rand()` / 时间 / 线程顺序 |
 | `world/dig/` | 地形笔刷：平整填平 / 削平（`Level`）、平滑爆破（`Crater`）、球笔刷挖 / 堆，与脏 tile 收集；**可挖区域标记表**（`dig_region`：ADR 0006 的数据文件部分 + 层间交接过滤器）与**可挖体积**（`dig_volume` + `volume_mesher`：33³ `int8` 密度、Surface Nets 等值面）；**弹丸规格表**（`projectile_table`：弹道 + 爆炸破坏 + 自发光，`[[projectile]]` 数组留多类型扩展）；**破坏表**（`destruction_table`：伤害预算的换算系数，T31 / ADR 0013）与**倒塌规则表**（`collapse_table`，T29 / ADR 0015 / 0018） | 可依赖 `engine` | 只标脏**受影响**的 tile / 体积块；重网格与 GPU 上传不得阻塞主线程；爆破 / 平整剖面**边界一阶连续**；**体积只在标记区域内存在**（ADR 0004 硬约束 2）；体积块与地表网格的交接口径见 ADR 0011 |
+| `world/streaming/` | **可挖体积的常驻调度**（V0.2 起，[ADR 0020](adr/0020-dig-volume-vertical-band-and-dynamic-residency.md)）：`dig_volume_residency.*` = 玩家窗口（tile ± K）→ **纯函数集合差**（要建 / 要卸 / 脏块留驻 / 超限淘汰）→ **分帧推进**的建块与卸块（`DigVolumeWorld::CreateBlock` / `UnloadBlock`） | 可依赖 `engine` 与 `world/terrain`、`world/dig` | **不做**主线程同步重活（建 / 卸必须分帧或下沉 worker）；**已改动的（脏）块不得卸载**；LOD 与存档 IO 不在此阶段 |
 | `world/CMakeLists.txt` | 世界层构建目标 | — | 新增源文件 / 子目录须在此登记 |
 
 ---
@@ -122,11 +124,12 @@ voxel-engine/
 
 | 条目 | 职责 | 依赖方向 | 约束 |
 | --- | --- | --- | --- |
-| `assets/` | 运行时资源源文件 | — | 生成物放 `assets/generated/`（已忽略） |
-| `assets/config/` | 配置表：`materials.toml`（地表材质槽与权重规则）、`lighting.toml`（太阳 / 天空光 / 雾 / 阴影）、`brush.toml`（平整 / 削平 / 爆破笔刷参数；**T27 起未绑定按键**）、`dig_regions.toml`（可挖区域标记，ADR 0006）、`projectiles.toml`（弹丸：弹道 + 爆炸破坏 + 自发光，T27）等 | — | 带 `schema_version`；由 toml++ 在**启动期**加载，失败即明确报错（ADR 0005）。**唯一例外**：`dig_regions.toml` 缺失按 ADR 0006 返回空表（不报错） |
+| `assets/` | 运行时资源源文件 | — | 生成物放 `assets/generated/`（已忽略）；**美术资源（`assets/textures/`、`assets/models/`）不入库**，由 `tools/fetch_assets.ps1` 取回（见下方两行） |
+| `assets/config/` | 配置表：`materials.toml`（地表材质槽与权重规则）、`lighting.toml`（太阳 / 天空光 / 雾 / 阴影 / **环境贴图 `[environment]`（T67，可选段）**）、`brush.toml`（平整 / 削平 / 爆破笔刷参数；**T27 起未绑定按键**）、`dig_regions.toml`（可挖区域标记，ADR 0006）、`projectiles.toml`（弹丸：弹道 + 爆炸破坏 + 自发光，T27）等 | — | 带 `schema_version`；由 toml++ 在**启动期**加载，失败即明确报错（ADR 0005）。**唯一例外**：`dig_regions.toml` 缺失按 ADR 0006 返回空表（不报错） |
 | `assets/maps/` | 预设固定地图（TOML）：种子 / 覆盖范围 / 出生点 / 地形编辑区（flatten · raise · carve） | — | 带 `schema_version`；**非法文件必须显式报错，不得静默回退**；同一文件必须得到同一世界 |
 | `assets/shaders/` | GLSL 源（`.vert` / `.frag` / `.comp`） | — | 只放源；`.spv` / `.dxil` 由构建生成到 `<build>/assets/shaders/`；新增须在 `game/CMakeLists.txt` 里 `add_shader` |
-| `assets/textures/` | 纹理源（供地表 splat 纹理使用） | — | 旧 `layers.toml`（纹理数组层号表）**已随 ADR 0004 作废，并于 2026-09-29 删除**（当前目录为空；地表材质走**程序生成占位贴图**，见 `world/terrain/material_textures.*`）。真实美术资源落地时在此新增 |
+| `assets/textures/` | **CC0 美术贴图**（**不入库**；T65 起由脚本取回）：`terrain/<材质>/{albedo,normal,roughness,ao}.jpg`（草 / 土 / 岩 / 沙，2048²）、`env/*.hdr`（环境贴图，等距柱状；**T67 起被天空通道与 IBL 烘焙消费**） | — | **被 `.gitignore` 排除** ⇒ 干净克隆后需执行 `tools/fetch_assets.ps1`；来源 / 许可 / SHA-256 逐项登记在 `NOTICE.md`「美术资源台账」；校验和清单 = `tools/assets.sha256`（**该文件进仓库**）。**缺文件时上层必须 WARN + 回落**（贴图 → 程序生成；HDRI → 半球天空光），不得崩、不得静默 |
+| `assets/models/` | 3D 模型（**不入库**，规划中）：主角与后续道具 / NPC 的 glTF / .glb | — | 与 `assets/textures/` 同口径：由 `tools/fetch_assets.ps1` 取回并登记台账；**消费者 = `engine/render/model_loader.*`（T68 落地后）** |
 
 ---
 
@@ -135,6 +138,7 @@ voxel-engine/
 | 条目 | 职责 | 依赖方向 | 约束 |
 | --- | --- | --- | --- |
 | `cmake/` | 自写构建辅助模块 | — | 不放业务逻辑；工具缺失时降级为**警告**，不阻断配置 |
+| `tools/` | 仓库级脚本（不入构建）：**`fetch_assets.ps1`**（取回 CC0 美术资源，幂等 + SHA-256 校验；资源不入库见 `assets/textures/` 行）、`assets.sha256`（**进仓库**的校验和清单） | — | 脚本须**纯 ASCII 或带 BOM 的 UTF-8**（Windows PowerShell 5.1 按系统代码页读 `.ps1`）；不得写入 `assets/` 之外的目录；重复运行必须幂等 |
 | `cmake/Shaders.cmake` | 两段式 Shader 编译：GLSL →(glslc) SPIR-V →(shadercross) DXIL | — | 两种格式**都必须产出**：Vulkan 用 SPIR-V，D3D12 用 DXIL |
 | `.github/workflows/` | CI：门禁 → 构建 → 测试 | — | 文件与 CI 脚本保持**纯 ASCII**（原因见 `ci.yml` 顶部注释）；新增步骤须本地可复现 |
 | `docs/` | 方案文档、ADR、文件索引、开发记录、学习笔记、阶段计划、**内容基线文档** | — | 与代码同步 |
@@ -159,9 +163,11 @@ voxel-engine/
 | `engine/input/input_map.hpp` | 输入动作状态层（上层只消费动作；鼠标按键与键盘对称） |
 | `engine/platform/window.hpp` | 窗口与事件循环；**唯一**把 SDL 事件翻译进 `InputMap` 的地方；相对鼠标模式（捕获 / 释放）在此封装 |
 | `engine/render/triangle_renderer.hpp` | PoC 冒烟测试路径（保留可编译，未接线） |
-| `engine/render/mesh_renderer.hpp` | 通用网格渲染路径（顶点/索引缓冲、相机 UBO、索引绘制、纹理数组、HDR 目标 + 色调映射通道、渲染开销记账、**自发光网格**：片元 uniform 槽 3 逐网格推送、**变长几何就地更新**：`UpdateMeshGeometry` 只上传用到的顶点 / 索引前缀 + 每网格 `usedIndexCount`（T42）） |
-| `engine/render/lighting_table.hpp` | `assets/config/lighting.toml` 的加载与校验；**光照 → GPU 的唯一投影入口**（`LightingUniform` / `BuildLightingUniform`） |
+| `engine/render/mesh_renderer.hpp` | 通用网格渲染路径（顶点/索引缓冲、相机 UBO、索引绘制、纹理数组、HDR 目标 + 色调映射通道、渲染开销记账、**自发光网格**：片元 uniform 槽 3 逐网格推送、**变长几何就地更新**：`UpdateMeshGeometry` 只上传用到的顶点 / 索引前缀 + 每网格 `usedIndexCount`（T42）、**天空管线 + IBL 烘焙 + 环境纹理绑定**（T67：`BakeEnvironment` / `EnvironmentReady` / 全屏通道辅助 `DrawFullscreenPass`）） |
+| `engine/render/environment.hpp` | **环境贴图口径**（T67 / [ADR 0021](adr/0021-environment-ibl.md)）：天空 / irradiance / 预过滤 / BRDF LUT 的尺寸与级数（**唯一事实来源**）+ 纯函数（`PrefilterRoughnessForMip` / `EstimateTextureMipChainBytes` / `HalfFromFloat`）。不含 GPU 与 SDL 类型 |
+| `engine/render/lighting_table.hpp` | `assets/config/lighting.toml` 的加载与校验（含**可选** `[environment]` 段，T67）；**光照 → GPU 的唯一投影入口**（`LightingUniform` / `BuildLightingUniform`，后者按"实际烘焙成的预过滤 mip 级数"给出 IBL 启用位） |
 | `engine/render/shadow_cascade.hpp` | CSM **纯函数**：级联分割、texel 对齐的光空间矩阵、`ShadowUniform`（无世界 / 游戏专有类型） |
+| `engine/render/texture_loader.hpp` | **纹理资源加载**（T57）：从文件读图 → LDR `RGBA8` / HDR（`.hdr`）线性 `RGB32F`；**解码前**尺寸守卫（`kMaxImageDimension`）、失败**即抛不静默回退**；**无 GPU 触碰**（可从工作线程调用，上传仍留在渲染线程）。`stb_image` 只在 `.cpp` 内出现（公共头不泄漏）。**消费者**：T66 地表 PBR 贴图、T67 环境贴图（HDRI 由 `game/` 解码后喂给 `MeshRenderer::BakeEnvironment`） |
 | `engine/render/camera.hpp` | 第三人称相机 + 避障；`ITerrainQuery` 查询契约（由 `world/` 实现） |
 | `world/terrain/terrain_world.hpp` | 地表世界入口：tile 容器、网格、脏重网格，并实现 `ITerrainQuery` |
 | `world/terrain/material_table.hpp` | `assets/config/materials.toml` 的加载与校验；**CPU→GPU 材质参数唯一投影入口**（`MaterialUniform` / `BuildMaterialUniform`）。**T43 起每层另有四个物理字段**（`density` / `friction` / `restitution` / `indestructible`，见 [ADR 0016](adr/0016-collapse-realism-impulse-material-debris.md)）与 **T46 的落地口径字段 `rigid_debris`**（刚性碎块落地后保留几何体，见 [ADR 0017](adr/0017-landing-by-material-rigid-vs-granular.md)）：**都不参与地表着色、因此不进 GPU uniform**，只决定倒塌整体的质量 / 摩擦 / 弹性、小碎片清除的守卫与落地后的表示；五个字段**可选**、缺省值等价于引入前的口径 ⇒ `schema_version` 保持 4 |
@@ -175,6 +181,7 @@ voxel-engine/
 | `world/dig/collapse_table.hpp` | 倒塌规则表（`assets/config/collapse.toml`，`schema_version = 3`）：`enabled` / `max_cantilever_blocks` / `neighborhood_margin_blocks` / `settle_linear_speed` / `settle_angular_speed` / `settle_steps` / `initial_tilt_speed` / `impulse_speed` / `debris_delete_max_voxels` / `max_active_units`，逐项校验、非法即抛（**v3 删除** `mass_per_voxel` / `friction`：质量 / 摩擦 / 弹性改由材质表驱动，见 T43） |
 | `world/dig/projectile_table.hpp` | 弹丸规格表（`assets/config/projectiles.toml`）：弹道 / 爆炸破坏 / 自发光；`[[projectile]]` 数组留出多类型扩展 |
 | `world/dig/destruction_table.hpp` | **破坏表**（`assets/config/destruction.toml`，`schema_version = 1`，T31 / [ADR 0013](adr/0013-destructible-elements.md)）：`points_per_cubic_block`（伤害预算的**唯一手感旋钮**）+ `prop_damage_threshold` / `prop_broken_tint`（**器物参数先落表**，待 ADR 0004 层 ③ 消费）；缺失 / 越界 / 版本不符一律抛异常（不静默回退） |
+| `world/streaming/dig_volume_residency.hpp` | **可挖体积的常驻调度**（T60 / [ADR 0020](adr/0020-dig-volume-vertical-band-and-dynamic-residency.md)）：`TileOfBlockIndex`（块→tile **精确**映射）/ `DigVolumeWindow` + `WindowForPlayerBlocks`（玩家窗口）/ `PlanDigVolumeResidency`（**纯函数**：要建 / 要卸 / **脏块留驻** / 超限淘汰最远者）/ `DigVolumeScheduler`（`Update` 幂等 + `Step` 先建后卸、确定序、分帧） |
 | `game/orb.hpp` | 光球（T27）：弹道推进与命中检测（**纯函数**，只依赖 `IOrbWorldQuery`）、程序化球网格、固定容量弹丸池 |
 | `game/rigid_collapse.hpp` | 倒塌整体的运行时（T33 / ADR 0015）：网格池（**只在启动时**建 GPU 资源）、`Spawn` 用 `UpdateMeshGeometry` 写一次**与地形同源的等值面**（T42；只上传用到的前缀，超容量按整个四边形截断）、每步读刚体位姿 + 落定检测、每帧只推 `mat4`、落定后 `Writeback` + 清空槽位（索引数 0 = 不可见）。**T46 / [ADR 0017](adr/0017-landing-by-material-rigid-vs-granular.md)**：刚性整体落定后**保留几何体**（`retained`，不回写 ⇒ 形状不变）；池 **16 槽**；`RetireOldestRetained`（池满腾位 ⇒ 惰性回写）/ `AwakenIntersecting`（块碰撞体重建后唤醒相交残骸）。**T47 增**：`BuildUnitMesh` 在**截断前 / 截断后**各做一次**外观网格闭合自检**（`vx::CountBoundaryEdges`），非 0 即 WARN 出**体素数 / patch 尺寸 / 两处边数 / 是否被容量截断**并把成因指名到候选 ①②③（`Spawn` 记入 `ActiveCollapseUnit`，`RetireRetained` 回报）；容量截断 WARN 补体素数与原始规模。**T48 / [ADR 0018](adr/0018-structural-support-and-representation-preserving-destruction.md) 决策三**：命中判定改由 `PhysicsWorld::RayCastDynamic` 回答（句柄 + 真实凸包表面）⇒ `ContainsRetainedPoint` / `RetireRetainedAt` **下线**。**T50 / ADR 0018 决策二**：命中动态刚体改走 **`CarveBody`**（在碎块**自身补丁**上雕刻 → 按剩余体素在**当前姿态**下原地重建刚体 → 复用同一网格槽位；剩余过少 / 凸包不足 / 重建失败 ⇒ `RetireCarved` 删除整体）⇒ 命中路径的"惰性体素化"**下线**；`CollapseCarveResult` / `TotalCarved` / `TotalCarvedVoxels` |
 | `game/out_of_bounds.hpp` | 出界判定（**纯函数**）+ 救援余量；越界/坠落时送回出生点 |

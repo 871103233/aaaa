@@ -32,9 +32,11 @@ struct DebugStats {
     std::size_t loadedTileCount    = 0;       ///< 已加载（已网格化）的 tile 数
     std::size_t lastDirtyTileCount = 0;       ///< 最近一帧因爆炸而重网格的单元数（地表 tile 或体积块）
     std::size_t tileBodyCount      = 0;       ///< 已建立物理碰撞体的 tile 数
-    std::size_t volumeBlockCount   = 0;       ///< 可挖体积块总数（T8）
+    std::size_t volumeBlockCount   = 0;       ///< **当前常驻**的可挖体积块数（T61：随玩家窗口变化）
     std::size_t carvedBlockCount   = 0;       ///< 其中被挖过 / 塌落改过的体积块数（T8 / T27 / T29）
     std::size_t volumeBodyCount    = 0;       ///< 可挖体积的三角网碰撞体数（T28）
+    std::size_t volumePendingActions = 0;     ///< T61：常驻调度待办动作数（建 + 卸 + 淘汰）
+    std::size_t volumeKeptDirtyCount = 0;     ///< T61：离开窗口但因**已被改动**而继续常驻的块数（ADR 0020 决策五）
     std::size_t collapseMovedVoxels = 0;      ///< 累计塌落移动的实心体素数（T29）
     bool        physicsReady       = false;   ///< 角色物理是否已就绪
 

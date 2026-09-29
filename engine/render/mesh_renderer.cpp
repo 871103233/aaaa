@@ -1,8 +1,10 @@
 #include "render/mesh_renderer.hpp"
 
 #include "core/clock.hpp"
-
 #include "core/log.hpp"
+#include "render/environment.hpp"
+
+#include <glm/gtc/matrix_inverse.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -174,6 +176,86 @@ struct ShaderResourceCounts {
     return buffer;
 }
 
+/// 创建一张 2D 纹理并**同步上传第 0 级**（mip 级数 = 1），返回纹理句柄；失败返回 nullptr。
+///
+/// 与 `CreateTextureArray` 同模式（阻塞到 GPU 完成）：**只在加载期**调用（T67 的 HDRI 与占位纹理）。
+/// 不做异常：环境贴图是"可失败、失败即回落"的路径（ADR 0021），由调用方决定报错还是 WARN。
+[[nodiscard]] SDL_GPUTexture* create_and_upload_texture_2d(SDL_GPUDevice* device, SDL_GPUTextureFormat format,
+                                                          std::uint32_t width, std::uint32_t height,
+                                                          SDL_GPUTextureUsageFlags usage, const void* pixels,
+                                                          std::uint32_t sourceBytes) {
+    SDL_GPUTextureCreateInfo textureInfo {};
+    textureInfo.type                 = SDL_GPU_TEXTURETYPE_2D;
+    textureInfo.format               = format;
+    textureInfo.usage                = usage;
+    textureInfo.width                = width;
+    textureInfo.height               = height;
+    textureInfo.layer_count_or_depth = 1;
+    textureInfo.num_levels           = 1;
+    textureInfo.sample_count         = SDL_GPU_SAMPLECOUNT_1;
+
+    SDL_GPUTexture* texture = SDL_CreateGPUTexture(device, &textureInfo);
+    if (texture == nullptr) {
+        return nullptr;
+    }
+
+    SDL_GPUTransferBufferCreateInfo transferInfo {};
+    transferInfo.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+    transferInfo.size  = sourceBytes;
+    SDL_GPUTransferBuffer* transfer = SDL_CreateGPUTransferBuffer(device, &transferInfo);
+    if (transfer == nullptr) {
+        SDL_ReleaseGPUTexture(device, texture);
+        return nullptr;
+    }
+
+    void* mapped = SDL_MapGPUTransferBuffer(device, transfer, /*cycle=*/false);
+    if (mapped == nullptr) {
+        SDL_ReleaseGPUTransferBuffer(device, transfer);
+        SDL_ReleaseGPUTexture(device, texture);
+        return nullptr;
+    }
+    std::memcpy(mapped, pixels, sourceBytes);
+    SDL_UnmapGPUTransferBuffer(device, transfer);
+
+    SDL_GPUCommandBuffer* commandBuffer = SDL_AcquireGPUCommandBuffer(device);
+    if (commandBuffer == nullptr) {
+        SDL_ReleaseGPUTransferBuffer(device, transfer);
+        SDL_ReleaseGPUTexture(device, texture);
+        return nullptr;
+    }
+
+    SDL_GPUCopyPass* copyPass = SDL_BeginGPUCopyPass(commandBuffer);
+    SDL_GPUTextureTransferInfo source { transfer, 0, 0, 0 };
+    SDL_GPUTextureRegion       destination { texture, /*mip_level=*/0, /*layer=*/0, 0, 0, 0, width, height, /*d=*/1 };
+    SDL_UploadToGPUTexture(copyPass, &source, &destination, /*cycle=*/false);
+    SDL_EndGPUCopyPass(copyPass);
+
+    SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(commandBuffer);
+    if (fence != nullptr) {
+        SDL_WaitForGPUFences(device, /*wait_all=*/true, &fence, 1);
+        SDL_ReleaseGPUFence(device, fence);
+    }
+    SDL_ReleaseGPUTransferBuffer(device, transfer);
+    return texture;
+}
+
+/// 把等距柱状 HDRI（线性 float32 RGB、行主序、第 0 行 = 天顶）转成 `R16G16B16A16_FLOAT` 的上传字节。
+///
+/// 为什么转半精度（T67 / ADR 0021 的显存后果）：二进制的 HDRI 只用于**采样**、
+/// 半精度对辐照度足够（动态范围 ±65504、相对精度约 1e-3），而字节数减半 ——
+/// 2048×1024 由 33.5 MB 降到 16.8 MB，直接决定是否守得住 ADR 0008 的 300 MB 预算。
+[[nodiscard]] std::vector<std::uint16_t> ConvertEquirectRgb32fToRgba16f(const EnvironmentSource& source) {
+    const std::size_t pixelCount = static_cast<std::size_t>(source.width) * static_cast<std::size_t>(source.height);
+    std::vector<std::uint16_t> out(pixelCount * 4U);
+    for (std::size_t pixel = 0; pixel < pixelCount; ++pixel) {
+        out[pixel * 4U + 0U] = HalfFromFloat(source.pixels[pixel * 3U + 0U]);
+        out[pixel * 4U + 1U] = HalfFromFloat(source.pixels[pixel * 3U + 1U]);
+        out[pixel * 4U + 2U] = HalfFromFloat(source.pixels[pixel * 3U + 2U]);
+        out[pixel * 4U + 3U] = HalfFromFloat(1.0F);  // A：采样用不到，填 1 保持"不透明白"
+    }
+    return out;
+}
+
 }  // namespace
 
 MeshRenderer::MeshRenderer(SDL_GPUDevice* device, SDL_Window* window, std::filesystem::path shader_dir,
@@ -199,49 +281,73 @@ MeshRenderer::MeshRenderer(SDL_GPUDevice* device, SDL_Window* window, std::files
     m_meshFragmentShader =
         create_shader_from_file(m_device, shader_dir / (shader_name + ".frag" + extension),
                                 SDL_GPU_SHADERSTAGE_FRAGMENT, artifact.format,
-                                ShaderResourceCounts { /*samplers=*/6, 0, 0, /*uniformBuffers=*/4 });
+                                ShaderResourceCounts { /*samplers=*/9, 0, 0, /*uniformBuffers=*/4 });
+
+    // 全屏三角的**顶点阶段**（T20 的 `tonemap.vert`）：色调映射、天空（T67）与三条 IBL 烘焙管线共用。
+    // 常驻到析构 —— 天空管线要随 MSAA 档位重建，重建时复用同一个 Shader 对象（与 m_meshVertexShader 同理由）。
+    m_fullscreenVertexShader =
+        create_shader_from_file(m_device, shader_dir / ("tonemap.vert" + extension), SDL_GPU_SHADERSTAGE_VERTEX,
+                                artifact.format, ShaderResourceCounts {});
+
+    // 天空的片元阶段（T67）：1 个采样器（等距柱状 HDRI）+ 1 个 uniform 块（逆视图投影）。
+    // 常驻（原因同上：天空管线随 MSAA 档位重建）。
+    m_skyFragmentShader =
+        create_shader_from_file(m_device, shader_dir / ("sky.frag" + extension), SDL_GPU_SHADERSTAGE_FRAGMENT,
+                                artifact.format, ShaderResourceCounts { /*samplers=*/1, 0, 0, /*uniformBuffers=*/1 });
 
     // 主通道管线：先按单采样创建（`SetMsaaSampleCount` 通常在构造之后调用；档位变化时
     // `EnsureMainPipeline` 用同一批 Shader 重建），保证构造期即验证"设备 + 管线 + Shader"链路。
+    // T67 起它**同时**创建天空管线（两者必须在同一个渲染通道里共存 ⇒ 采样数必须一致）。
     CreateMainPipeline(1);
 
     // ---- 色调映射管线（T20 / ADR 0010 P0）：HDR 目标 → 交换链 ----
     // 全屏三角形（顶点缓冲为空，位置由 gl_VertexIndex 生成）；无深度目标、sample_count = 1、不剔除。
     {
-        SDL_GPUShader* tonemapVertex =
-            create_shader_from_file(m_device, shader_dir / ("tonemap.vert" + extension),
-                                    SDL_GPU_SHADERSTAGE_VERTEX, artifact.format, ShaderResourceCounts {});
         SDL_GPUShader* tonemapFragment =
             create_shader_from_file(m_device, shader_dir / ("tonemap.frag" + extension),
                                     SDL_GPU_SHADERSTAGE_FRAGMENT, artifact.format,
                                     ShaderResourceCounts { /*samplers=*/1, 0, 0, /*uniformBuffers=*/1 });
 
-        SDL_GPUColorTargetDescription tonemapColorTarget {};
-        tonemapColorTarget.format = SDL_GetGPUSwapchainTextureFormat(m_device, m_window);
-
-        SDL_GPUGraphicsPipelineCreateInfo tonemapInfo {};
-        tonemapInfo.vertex_shader   = tonemapVertex;
-        tonemapInfo.fragment_shader = tonemapFragment;
-        // 无顶点输入（顶点缓冲与属性均为空）。
-        tonemapInfo.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
-
-        tonemapInfo.rasterizer_state.fill_mode         = SDL_GPU_FILLMODE_FILL;
-        tonemapInfo.rasterizer_state.cull_mode         = SDL_GPU_CULLMODE_NONE;
-        tonemapInfo.rasterizer_state.front_face        = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
-        tonemapInfo.rasterizer_state.enable_depth_clip = false;
-
-        tonemapInfo.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
-
-        tonemapInfo.target_info.color_target_descriptions = &tonemapColorTarget;
-        tonemapInfo.target_info.num_color_targets         = 1;
-        tonemapInfo.target_info.has_depth_stencil_target  = false;
-
-        m_tonemapPipeline = SDL_CreateGPUGraphicsPipeline(m_device, &tonemapInfo);
-        SDL_ReleaseGPUShader(m_device, tonemapVertex);
+        m_tonemapPipeline = CreateFullscreenPipeline(tonemapFragment, SDL_GetGPUSwapchainTextureFormat(m_device, m_window),
+                                                    /*withDepthStencil=*/false, /*sampleCount=*/1, "色调映射");
         SDL_ReleaseGPUShader(m_device, tonemapFragment);
 
         if (m_tonemapPipeline == nullptr) {
             throw std::runtime_error(std::string("创建色调映射管线失败：") + SDL_GetError());
+        }
+    }
+
+    // ---- IBL 烘焙管线（T67 / ADR 0021）：三条全屏三角、无深度目标、采样数恒为 1 ----
+    // 在构造期创建（而非首次烘焙时）：管线创建**不得**出现在渲染热路径，且这样"GLSL 编译错误"在启动即暴露。
+    {
+        SDL_GPUShader* irradianceFragment =
+            create_shader_from_file(m_device, shader_dir / ("ibl_irradiance.frag" + extension),
+                                    SDL_GPU_SHADERSTAGE_FRAGMENT, artifact.format,
+                                    ShaderResourceCounts { /*samplers=*/1, 0, 0, /*uniformBuffers=*/0 });
+        m_irradiancePipeline = CreateFullscreenPipeline(irradianceFragment, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT,
+                                                       /*withDepthStencil=*/false, /*sampleCount=*/1,
+                                                       "IBL 漫反射 irradiance");
+        SDL_ReleaseGPUShader(m_device, irradianceFragment);
+
+        SDL_GPUShader* prefilterFragment =
+            create_shader_from_file(m_device, shader_dir / ("ibl_prefilter.frag" + extension),
+                                    SDL_GPU_SHADERSTAGE_FRAGMENT, artifact.format,
+                                    ShaderResourceCounts { /*samplers=*/1, 0, 0, /*uniformBuffers=*/1 });
+        m_prefilterPipeline = CreateFullscreenPipeline(prefilterFragment, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT,
+                                                      /*withDepthStencil=*/false, /*sampleCount=*/1,
+                                                      "IBL 预过滤高光");
+        SDL_ReleaseGPUShader(m_device, prefilterFragment);
+
+        // BRDF LUT：无任何输入（解析拟合，见 ibl_brdf_lut.frag 顶部说明）⇒ 0 采样器、0 uniform 块。
+        SDL_GPUShader* brdfLutFragment =
+            create_shader_from_file(m_device, shader_dir / ("ibl_brdf_lut.frag" + extension),
+                                    SDL_GPU_SHADERSTAGE_FRAGMENT, artifact.format, ShaderResourceCounts {});
+        m_brdfLutPipeline = CreateFullscreenPipeline(brdfLutFragment, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT,
+                                                    /*withDepthStencil=*/false, /*sampleCount=*/1, "IBL BRDF LUT");
+        SDL_ReleaseGPUShader(m_device, brdfLutFragment);
+
+        if (m_irradiancePipeline == nullptr || m_prefilterPipeline == nullptr || m_brdfLutPipeline == nullptr) {
+            throw std::runtime_error(std::string("创建 IBL 烘焙管线失败：") + SDL_GetError());
         }
     }
 
@@ -380,6 +486,43 @@ MeshRenderer::MeshRenderer(SDL_GPUDevice* device, SDL_Window* window, std::files
         throw std::runtime_error(std::string("创建阴影采样器失败：") + SDL_GetError());
     }
 
+    // 环境贴图采样器（T67 / ADR 0021）：**U 重复 / V,W 钳制** + 线性过滤 + mipmap 线性。
+    // 为什么 U 重复：等距柱状贴图在方位角方向首尾相接（u = 0 与 u = 1 是同一方向）；
+    // V 必须钳制：两极为奇点，重复会跨到对侧。mipmap 线性供运行时 `textureLod` 在预过滤的级间过渡。
+    SDL_GPUSamplerCreateInfo environmentSamplerInfo {};
+    environmentSamplerInfo.min_filter     = SDL_GPU_FILTER_LINEAR;
+    environmentSamplerInfo.mag_filter     = SDL_GPU_FILTER_LINEAR;
+    environmentSamplerInfo.mipmap_mode    = SDL_GPU_SAMPLERMIPMAPMODE_LINEAR;
+    environmentSamplerInfo.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+    environmentSamplerInfo.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    environmentSamplerInfo.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    environmentSamplerInfo.min_lod        = 0.0F;
+    // 上限 = 预过滤贴图的最大 mip 级号（运行期 `textureLod` 的 lod 上限）；天空与 irradiance 只有 1 级，
+    // 硬件会把 lod 钳到实际级数，故同一个采样器可安全服务三张贴图。
+    environmentSamplerInfo.max_lod        = static_cast<float>(kEnvironmentPrefilterLodMax);
+    m_environmentSampler = SDL_CreateGPUSampler(m_device, &environmentSamplerInfo);
+    if (m_environmentSampler == nullptr) {
+        throw std::runtime_error(std::string("创建环境贴图采样器失败：") + SDL_GetError());
+    }
+
+    // 1×1 占位纹理（白）：`mesh.frag` 恒声明 binding 6..8 三个采样器，SDL_gpu 要求声明的采样器都有绑定，
+    // 故环境贴图未就绪时用它占位（此时 uniform 的 IBL 启用位为 0，着色器整段跳过采样 ⇒ 内容无意义）。
+    {
+        const std::uint16_t whiteHalf = HalfFromFloat(1.0F);
+        const std::uint16_t whitePixel[4] = { whiteHalf, whiteHalf, whiteHalf, whiteHalf };
+        m_environmentPlaceholder =
+            create_and_upload_texture_2d(m_device, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, 1, 1,
+                                         SDL_GPU_TEXTUREUSAGE_SAMPLER, whitePixel,
+                                         static_cast<std::uint32_t>(sizeof(whitePixel)));
+        if (m_environmentPlaceholder == nullptr) {
+            throw std::runtime_error(std::string("创建环境贴图占位纹理失败：") + SDL_GetError());
+        }
+        // 记账：4 × 2 字节 = 8 字节（虽小，但"全部纹理都记账"才让总量可核对）。
+        // 刻意**不计入** `m_environmentBytes`：那个量是"四张环境贴图之和"（`EnvironmentTextureBytes`），
+        // 占位纹理常驻到析构、不随 `ReleaseEnvironmentTextures` 释放。
+        m_stats.textureBytes += 8ULL;
+    }
+
     // 每级一个只读 storage buffer 存该级光空间矩阵（SDL_gpu 的 storage buffer 绑定不带偏移，
     // 故每级一个缓冲；非纹理资源，不计入 textureBytes）。
     for (SDL_GPUBuffer*& buffer : m_shadowMatrixBuffers) {
@@ -458,6 +601,87 @@ void MeshRenderer::CreateMainPipeline(std::uint32_t sampleCount) {
         throw std::runtime_error(std::string("SDL_CreateGPUGraphicsPipeline 失败：") + SDL_GetError());
     }
     m_pipelineSampleCount = sampleCount;
+
+    // T67：天空管线与主通道**共用同一个渲染通道**（天空先画、网格覆盖其上）⇒ 采样数必须与目标一致，
+    // 因此与主通道同生共死：这里一并（重）建，`EnsureMainPipeline` 的两个判断即覆盖两者。
+    if (m_skyPipeline != nullptr) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_skyPipeline);
+        m_skyPipeline = nullptr;
+    }
+    m_skyPipeline = CreateFullscreenPipeline(m_skyFragmentShader, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT,
+                                             /*withDepthStencil=*/true, sampleCount, "天空");
+    if (m_skyPipeline == nullptr) {
+        m_pipelineSampleCount = 0;
+        throw std::runtime_error(std::string("创建天空管线失败：") + SDL_GetError());
+    }
+}
+
+SDL_GPUGraphicsPipeline* MeshRenderer::CreateFullscreenPipeline(SDL_GPUShader* fragmentShader,
+                                                               SDL_GPUTextureFormat colorFormat,
+                                                               bool withDepthStencil, std::uint32_t sampleCount,
+                                                               const char* label) {
+    SDL_GPUColorTargetDescription colorTarget {};
+    colorTarget.format = colorFormat;
+
+    SDL_GPUGraphicsPipelineCreateInfo info {};
+    info.vertex_shader   = m_fullscreenVertexShader;
+    info.fragment_shader = fragmentShader;
+    // 无顶点输入：位置由 `gl_VertexIndex` 在顶点着色器内生成（见 tonemap.vert）。
+    info.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+
+    info.rasterizer_state.fill_mode         = SDL_GPU_FILLMODE_FILL;
+    info.rasterizer_state.cull_mode         = SDL_GPU_CULLMODE_NONE;
+    info.rasterizer_state.front_face        = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
+    info.rasterizer_state.enable_depth_clip = false;  // 全屏三角恒在 [0,1] 之外超界，不裁
+
+    info.multisample_state.sample_count = ToSdlSampleCount(sampleCount);
+
+    if (withDepthStencil) {
+        // 天空：与主通道同处一个渲染通道（该通道**有**深度目标）⇒ 必须声明深度格式；
+        // 但**关闭深度测试与写入** ⇒ 天空不遮挡、也不被任何几何遮挡（网格永远画在天空之上）。
+        info.depth_stencil_state.compare_op          = SDL_GPU_COMPAREOP_ALWAYS;
+        info.depth_stencil_state.enable_depth_test   = false;
+        info.depth_stencil_state.enable_depth_write  = false;
+        info.depth_stencil_state.enable_stencil_test = false;
+        info.target_info.depth_stencil_format        = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+        info.target_info.has_depth_stencil_target    = true;
+    } else {
+        info.target_info.has_depth_stencil_target = false;
+    }
+
+    info.target_info.color_target_descriptions = &colorTarget;
+    info.target_info.num_color_targets         = 1;
+
+    SDL_GPUGraphicsPipeline* pipeline = SDL_CreateGPUGraphicsPipeline(m_device, &info);
+    if (pipeline == nullptr) {
+        VX_LOG_ERROR("创建全屏管线失败（%s）：%s", label, SDL_GetError());
+    }
+    return pipeline;
+}
+
+void MeshRenderer::DrawFullscreenPass(SDL_GPUCommandBuffer* commandBuffer, const SDL_GPUColorTargetInfo& colorTarget,
+                                      SDL_GPUGraphicsPipeline* pipeline,
+                                      const SDL_GPUTextureSamplerBinding* samplers, std::uint32_t samplerCount,
+                                      const void* fragmentUniform, std::uint32_t fragmentUniformBytes) {
+    if (pipeline == nullptr) {
+        return;
+    }
+    // uniform 在开渲染通道前推送（对后续绘制持续生效；本通道只画这一个全屏三角，故无需去重）。
+    if (fragmentUniform != nullptr && fragmentUniformBytes > 0) {
+        SDL_PushGPUFragmentUniformData(commandBuffer, 0, fragmentUniform, fragmentUniformBytes);
+    }
+
+    SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(commandBuffer, &colorTarget, 1, nullptr);
+    if (pass == nullptr) {
+        return;
+    }
+    SDL_BindGPUGraphicsPipeline(pass, pipeline);
+    if (samplers != nullptr && samplerCount > 0) {
+        SDL_BindGPUFragmentSamplers(pass, 0, samplers, samplerCount);
+    }
+    // 顶点缓冲为空：3 个顶点由 gl_VertexIndex 直接生成。
+    SDL_DrawGPUPrimitives(pass, 3, /*num_instances=*/1, /*first_vertex=*/0, /*first_instance=*/0);
+    SDL_EndGPURenderPass(pass);
 }
 
 void MeshRenderer::EnsureMainPipeline(std::uint32_t sampleCount) {
@@ -491,6 +715,11 @@ MeshRenderer::~MeshRenderer() {
     }
     if (m_shadowTexture != nullptr) {
         SDL_ReleaseGPUTexture(m_device, m_shadowTexture);
+    }
+    // T67：环境贴图（四张，同步显存记账）与常驻的 1×1 占位纹理。
+    ReleaseEnvironmentTextures();
+    if (m_environmentPlaceholder != nullptr) {
+        SDL_ReleaseGPUTexture(m_device, m_environmentPlaceholder);
     }
     if (m_cameraTransferBuffer != nullptr) {
         SDL_ReleaseGPUTransferBuffer(m_device, m_cameraTransferBuffer);
@@ -526,6 +755,9 @@ MeshRenderer::~MeshRenderer() {
     if (m_shadowSampler != nullptr) {
         SDL_ReleaseGPUSampler(m_device, m_shadowSampler);
     }
+    if (m_environmentSampler != nullptr) {
+        SDL_ReleaseGPUSampler(m_device, m_environmentSampler);
+    }
     if (m_pipeline != nullptr) {
         SDL_ReleaseGPUGraphicsPipeline(m_device, m_pipeline);
     }
@@ -535,12 +767,31 @@ MeshRenderer::~MeshRenderer() {
     if (m_shadowPipeline != nullptr) {
         SDL_ReleaseGPUGraphicsPipeline(m_device, m_shadowPipeline);
     }
+    if (m_skyPipeline != nullptr) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_skyPipeline);
+    }
+    if (m_irradiancePipeline != nullptr) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_irradiancePipeline);
+    }
+    if (m_prefilterPipeline != nullptr) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_prefilterPipeline);
+    }
+    if (m_brdfLutPipeline != nullptr) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_brdfLutPipeline);
+    }
     // 主通道 Shader 常驻到析构（T23）：必须在**使用它们的管线**销毁之后再释放。
     if (m_meshVertexShader != nullptr) {
         SDL_ReleaseGPUShader(m_device, m_meshVertexShader);
     }
     if (m_meshFragmentShader != nullptr) {
         SDL_ReleaseGPUShader(m_device, m_meshFragmentShader);
+    }
+    // T67：全屏三角的顶点 / 天空片元阶段同样常驻到析构（天空管线随 MSAA 档位重建）。
+    if (m_fullscreenVertexShader != nullptr) {
+        SDL_ReleaseGPUShader(m_device, m_fullscreenVertexShader);
+    }
+    if (m_skyFragmentShader != nullptr) {
+        SDL_ReleaseGPUShader(m_device, m_skyFragmentShader);
     }
 }
 
@@ -919,6 +1170,139 @@ void MeshRenderer::SetCamera(const CameraView& camera) noexcept {
     m_cameraUniform.viewProjection = camera.viewProjection;
 }
 
+void MeshRenderer::ReleaseEnvironmentTextures() noexcept {
+    // 四张环境贴图（不含常驻的 1×1 占位纹理 —— 见构造函数里的记账说明）。
+    SDL_GPUTexture** members[] = { &m_skyTexture, &m_irradianceTexture, &m_prefilterTexture, &m_brdfLutTexture };
+    for (SDL_GPUTexture** member : members) {
+        if (*member != nullptr) {
+            SDL_ReleaseGPUTexture(m_device, *member);
+            *member = nullptr;
+        }
+    }
+    // 记账同步（重复调用时 m_environmentBytes 已为 0，扣 0 无副作用）。
+    m_stats.textureBytes -= m_environmentBytes;
+    m_environmentBytes       = 0;
+    m_environmentReady       = false;
+    m_textureAccountingDirty = true;
+}
+
+bool MeshRenderer::BakeEnvironment(const EnvironmentSource& source) {
+    if (source.pixels == nullptr || source.width == 0 || source.height == 0) {
+        return false;
+    }
+
+    // 重建前先把上一次的产物释放干净（幂等 ⇒ 失败可重试、重载不泄漏）。
+    ReleaseEnvironmentTextures();
+
+    constexpr std::uint64_t kBytesPerPixel = 8ULL;  // R16G16B16A16_FLOAT
+    auto account = [this](std::uint64_t bytes) {
+        m_environmentBytes += bytes;
+        m_stats.textureBytes += bytes;
+    };
+
+    // ---- ① 天空 HDRI：转半精度后上传（只作采样源 ⇒ usage 只需 SAMPLER）----
+    const std::vector<std::uint16_t> skyPixels = ConvertEquirectRgb32fToRgba16f(source);
+    m_skyTexture = create_and_upload_texture_2d(
+        m_device, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, source.width, source.height, SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        skyPixels.data(), static_cast<std::uint32_t>(skyPixels.size() * sizeof(std::uint16_t)));
+    if (m_skyTexture == nullptr) {
+        VX_LOG_ERROR("上传天空 HDRI 失败（%u×%u）：%s", source.width, source.height, SDL_GetError());
+        ReleaseEnvironmentTextures();
+        return false;
+    }
+    account(EstimateTextureMipChainBytes(source.width, source.height, /*levels=*/1, kBytesPerPixel));
+
+    // ---- ② 三件套的渲染目标：先建纹理（烘焙 pass 必须有输出目标）----
+    // 为什么格式用 RGBA16F 而不是 ADR 0021 里估计的 RG16F（BRDF LUT）：R16G16B16A16_FLOAT 是
+    // 主通道 HDR 目标**已经在用**的格式，渲染目标支持面最广；代价是 LUT 多 0.25 MB（256² × 4 B），
+    // 在 300 MB 预算下可忽略。切换条件：需要省这点显存时改回 RG16F 并实测后端支持。
+    auto createBakeTarget = [this](std::uint32_t width, std::uint32_t height, std::uint32_t levels) {
+        SDL_GPUTextureCreateInfo info {};
+        info.type                 = SDL_GPU_TEXTURETYPE_2D;
+        info.format               = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+        info.usage                = SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
+        info.width                = width;
+        info.height               = height;
+        info.layer_count_or_depth = 1;
+        info.num_levels           = levels;
+        info.sample_count         = SDL_GPU_SAMPLECOUNT_1;
+        return SDL_CreateGPUTexture(m_device, &info);
+    };
+
+    m_irradianceTexture = createBakeTarget(kEnvironmentIrradianceWidth, kEnvironmentIrradianceHeight, /*levels=*/1);
+    m_prefilterTexture  = createBakeTarget(kEnvironmentPrefilterBaseWidth, kEnvironmentPrefilterBaseHeight,
+                                          kEnvironmentPrefilterMipCount);
+    m_brdfLutTexture    = createBakeTarget(kEnvironmentBrdfLutSize, kEnvironmentBrdfLutSize, /*levels=*/1);
+    if (m_irradianceTexture == nullptr || m_prefilterTexture == nullptr || m_brdfLutTexture == nullptr) {
+        VX_LOG_ERROR("创建 IBL 烘焙目标失败：%s", SDL_GetError());
+        ReleaseEnvironmentTextures();
+        return false;
+    }
+    account(EstimateTextureMipChainBytes(kEnvironmentIrradianceWidth, kEnvironmentIrradianceHeight, 1, kBytesPerPixel));
+    account(EstimateTextureMipChainBytes(kEnvironmentPrefilterBaseWidth, kEnvironmentPrefilterBaseHeight,
+                                         kEnvironmentPrefilterMipCount, kBytesPerPixel));
+    account(EstimateTextureMipChainBytes(kEnvironmentBrdfLutSize, kEnvironmentBrdfLutSize, 1, kBytesPerPixel));
+
+    // ---- ③ 三条烘焙 pass：同一个命令缓冲内依次绘制，末尾一次提交 + 等栅栏（与 CreateTextureArray 同模式）----
+    SDL_GPUCommandBuffer* commandBuffer = SDL_AcquireGPUCommandBuffer(m_device);
+    if (commandBuffer == nullptr) {
+        VX_LOG_ERROR("IBL 烘焙获取命令缓冲失败：%s", SDL_GetError());
+        ReleaseEnvironmentTextures();
+        return false;
+    }
+
+    const SDL_GPUTextureSamplerBinding skyBinding { m_skyTexture, m_environmentSampler };
+    // 三条 pass 都是"全屏覆盖" ⇒ 颜色目标用 DONT_CARE 加载（省一次无用的读取 / 清屏）。
+    constexpr SDL_GPULoadOp  kOverwriteLoad = SDL_GPU_LOADOP_DONT_CARE;
+    constexpr SDL_GPUStoreOp kKeepStore     = SDL_GPU_STOREOP_STORE;
+
+    {
+        SDL_GPUColorTargetInfo target {};
+        target.texture  = m_irradianceTexture;
+        target.load_op  = kOverwriteLoad;
+        target.store_op = kKeepStore;
+        DrawFullscreenPass(commandBuffer, target, m_irradiancePipeline, &skyBinding, 1, nullptr, 0);
+    }
+
+    for (std::uint32_t mip = 0; mip < kEnvironmentPrefilterMipCount; ++mip) {
+        struct PrefilterUniform {
+            float params[4];  ///< x = 本 mip 对应的 roughness（std140：单个 vec4）
+        };
+        PrefilterUniform uniform {};
+        uniform.params[0] = PrefilterRoughnessForMip(mip);
+
+        SDL_GPUColorTargetInfo target {};
+        target.texture   = m_prefilterTexture;
+        target.mip_level = mip;
+        target.load_op   = kOverwriteLoad;
+        target.store_op  = kKeepStore;
+        DrawFullscreenPass(commandBuffer, target, m_prefilterPipeline, &skyBinding, 1, &uniform,
+                           static_cast<std::uint32_t>(sizeof(uniform)));
+    }
+
+    {
+        SDL_GPUColorTargetInfo target {};
+        target.texture  = m_brdfLutTexture;
+        target.load_op  = kOverwriteLoad;
+        target.store_op = kKeepStore;
+        DrawFullscreenPass(commandBuffer, target, m_brdfLutPipeline, nullptr, 0, nullptr, 0);
+    }
+
+    SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(commandBuffer);
+    if (fence == nullptr) {
+        // 提交失败：命令缓冲已被消费，**不敢**在此释放纹理（GPU 可能仍在用）⇒ 保留资源、
+        // 只把"就绪"置否（着色器因此不会采样它们）；记账保持不变，析构或下次烘焙会回收。
+        VX_LOG_ERROR("IBL 烘焙提交失败：%s", SDL_GetError());
+        return false;
+    }
+    SDL_WaitForGPUFences(m_device, /*wait_all=*/true, &fence, 1);
+    SDL_ReleaseGPUFence(m_device, fence);
+
+    m_environmentReady       = true;
+    m_textureAccountingDirty = true;
+    return true;
+}
+
 void MeshRenderer::SetMsaaSampleCount(std::uint32_t sampleCount) noexcept {
     // 引擎不定义档位口径（来自上层设置），这里只做**硬件能力**归一：取 ≤ 请求值且被设备支持的最高档。
     const std::uint32_t effective = ResolveSupportedSampleCount(m_device, sampleCount);
@@ -1141,12 +1525,13 @@ void MeshRenderer::LogTextureAccounting(std::uint32_t width, std::uint32_t heigh
                                              : 0.0;
     VX_LOG_INFO("GPU 纹理显存记账：材质数组 %.2f MB + 深度目标 %.2f MB + HDR 目标 %.2f MB + "
                 "阴影 %u 级 %u² %.2f MB（占 %.1f%%）+ MSAA %u×（颜色 %.2f MB + 深度 %.2f MB = %.2f MB）"
-                " = 合计 %.2f MB（交换链 %ux%u）",
+                "+ 环境贴图 %.2f MB = 合计 %.2f MB（交换链 %ux%u）",
                 static_cast<double>(materialBytes) / kBytesPerMb, static_cast<double>(baseDepthBytes) / kBytesPerMb,
                 static_cast<double>(m_hdrBytes) / kBytesPerMb, m_shadowTextureCascades, m_shadowTextureResolution,
                 static_cast<double>(m_shadowTextureBytes) / kBytesPerMb, shadowShare, m_msaaSampleCount,
                 static_cast<double>(m_msaaColorBytes) / kBytesPerMb, static_cast<double>(msaaDepthBytes) / kBytesPerMb,
-                static_cast<double>(msaaTotalBytes) / kBytesPerMb, totalMb, width, height);
+                static_cast<double>(msaaTotalBytes) / kBytesPerMb,
+                static_cast<double>(m_environmentBytes) / kBytesPerMb, totalMb, width, height);
 }
 
 void MeshRenderer::DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURenderPass* pass, const MeshHandle* meshes,
@@ -1380,13 +1765,35 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
     depthTarget.layer             = 0;
 
     SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(commandBuffer, &colorTarget, 1, &depthTarget);
+
+    // ---- 天空（T67 / ADR 0021 第一条）：主通道内、**网格之前** ----
+    // 深度测试与写入均关闭 ⇒ 天空既不遮挡几何、也不被几何遮挡，网格随后照常覆盖它；
+    // 因此不需要第二条颜色目标，也不会与 MSAA 的 resolve 冲突（天空写在同一个多采样目标里）。
+    // 视线方向由**逆视图投影**逐像素求得 —— 相机在渲染相对坐标系的原点（红线 6 / T41），故无需相机位置。
+    if (m_environmentReady && m_skyTexture != nullptr) {
+        struct SkyUniform {
+            glm::mat4 inverseViewProjection;  ///< 相机视投影矩阵的逆（作用在**渲染相对**坐标上）
+        };
+        SkyUniform skyUniform {};
+        skyUniform.inverseViewProjection = glm::inverse(m_cameraUniform.viewProjection);
+
+        // 片元 uniform 槽 0：本通道随后的材质 uniform 会把它覆盖掉（天空已绘制完毕，顺序即语义）。
+        SDL_PushGPUFragmentUniformData(commandBuffer, 0, &skyUniform, static_cast<Uint32>(sizeof(skyUniform)));
+
+        SDL_BindGPUGraphicsPipeline(pass, m_skyPipeline);
+        SDL_GPUTextureSamplerBinding skyBinding { m_skyTexture, m_environmentSampler };
+        SDL_BindGPUFragmentSamplers(pass, 0, &skyBinding, 1);
+        SDL_DrawGPUPrimitives(pass, 3, /*num_instances=*/1, /*first_vertex=*/0, /*first_instance=*/0);
+    }
+
     SDL_BindGPUGraphicsPipeline(pass, m_pipeline);
 
     SDL_GPUBuffer* cameraBuffers[1] = { m_cameraUniformBuffer };
     SDL_BindGPUVertexStorageBuffers(pass, 0, cameraBuffers, 1);
 
     // 片元资源：采样器槽 0..4 = albedo / normal / roughness / AO / macro（材质四件套 + 宏观变化），
-    // 槽 5 = 阴影深度数组；uniform 槽 0 = 材质、槽 1 = 光照、槽 2 = 阴影（槽 3 = 自发光，逐网格推送）。
+    // 槽 5 = 阴影深度数组，槽 6..8 = 环境贴图三件套（T67：irradiance / 预过滤高光 / BRDF LUT）；
+    // uniform 槽 0 = 材质、槽 1 = 光照、槽 2 = 阴影（槽 3 = 自发光，逐网格推送）。
     // 都在调用方设置过时才绑定 / 推送；引擎不解释其内容。
     const bool materialArraysReady =
         m_albedoTexture.IsValid() && m_normalTexture.IsValid() && m_roughnessTexture.IsValid() &&
@@ -1394,7 +1801,12 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
         m_normalTexture.id <= m_textureArrays.size() && m_roughnessTexture.id <= m_textureArrays.size() &&
         m_aoTexture.id <= m_textureArrays.size() && m_macroTexture.id <= m_textureArrays.size();
     if (materialArraysReady) {
-        SDL_GPUTextureSamplerBinding bindings[6] = {};
+        // 环境贴图未就绪时绑 1×1 占位纹理：着色器恒声明 binding 6..8（SDL_gpu 要求声明的采样器都有绑定），
+        // 而此时光照 uniform 的 IBL 启用位为 0 ⇒ 着色器整段跳过采样，占位内容不会被用到。
+        const bool environmentReady = m_environmentReady && m_irradianceTexture != nullptr &&
+                                      m_prefilterTexture != nullptr && m_brdfLutTexture != nullptr;
+
+        SDL_GPUTextureSamplerBinding bindings[9] = {};
         bindings[0].texture = m_textureArrays[m_albedoTexture.id - 1];
         bindings[0].sampler = m_layerSampler;
         bindings[1].texture = m_textureArrays[m_normalTexture.id - 1];
@@ -1408,7 +1820,15 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
         // 着色器恒声明阴影采样器（槽 5），故即使阴影关闭也必须绑定（关闭时由 uniform 的 enabled 跳过采样）。
         bindings[5].texture = m_shadowTexture;
         bindings[5].sampler = m_shadowSampler;
-        SDL_BindGPUFragmentSamplers(pass, 0, bindings, 6);
+        bindings[6].texture = environmentReady ? m_irradianceTexture : m_environmentPlaceholder;
+        bindings[6].sampler = m_environmentSampler;
+        bindings[7].texture = environmentReady ? m_prefilterTexture : m_environmentPlaceholder;
+        bindings[7].sampler = m_environmentSampler;
+        // BRDF LUT 用**复用的 HDR 采样器**（clamp 寻址 + 线性 + 不采 mip）：正是 LUT 需要的采样行为
+        // （LUT 不是等距柱状、不该在 U 方向回绕），故不为它单建采样器。
+        bindings[8].texture = environmentReady ? m_brdfLutTexture : m_environmentPlaceholder;
+        bindings[8].sampler = m_hdrSampler;
+        SDL_BindGPUFragmentSamplers(pass, 0, bindings, 9);
     }
     if (m_materialUniformSize > 0) {
         SDL_PushGPUFragmentUniformData(commandBuffer, 0, m_materialUniform.data(),
@@ -1440,25 +1860,18 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
     tonemapTarget.load_op  = SDL_GPU_LOADOP_DONT_CARE;
     tonemapTarget.store_op = SDL_GPU_STOREOP_STORE;  // 叠加层稍后以 LOAD 追加，故必须存储
 
-    // 色调映射片元 uniform（std140：单个 vec4，x = 曝光）；在开渲染通道前推送。
+    // 色调映射片元 uniform（std140：单个 vec4，x = 曝光）；由 `DrawFullscreenPass` 在开通道前推送。
     struct TonemapUniform {
         float exposureParams[4];
     };
     TonemapUniform tonemapUniform {};
     tonemapUniform.exposureParams[0] = m_exposure;
-    SDL_PushGPUFragmentUniformData(commandBuffer, 0, &tonemapUniform, static_cast<Uint32>(sizeof(tonemapUniform)));
 
-    SDL_GPURenderPass* tonemapPass = SDL_BeginGPURenderPass(commandBuffer, &tonemapTarget, 1, nullptr);
-    if (tonemapPass != nullptr) {
-        SDL_BindGPUGraphicsPipeline(tonemapPass, m_tonemapPipeline);
-
-        SDL_GPUTextureSamplerBinding hdrBinding { m_hdrTexture, m_hdrSampler };
-        SDL_BindGPUFragmentSamplers(tonemapPass, 0, &hdrBinding, 1);
-
-        // 顶点缓冲为空：3 个顶点由 gl_VertexIndex 直接生成。
-        SDL_DrawGPUPrimitives(tonemapPass, 3, /*num_instances=*/1, /*first_vertex=*/0, /*first_instance=*/0);
-        SDL_EndGPURenderPass(tonemapPass);
-    }
+    // T67：全屏三角通道的公共形状（开通道 → 绑管线 → 绑采样器 → 推 uniform → 画 3 顶点 → 关通道）
+    // 抽到 `DrawFullscreenPass`，色调映射与三条 IBL 烘焙 pass 共用（四处逐字相同）。
+    const SDL_GPUTextureSamplerBinding hdrBinding { m_hdrTexture, m_hdrSampler };
+    DrawFullscreenPass(commandBuffer, tonemapTarget, m_tonemapPipeline, &hdrBinding, 1, &tonemapUniform,
+                       static_cast<std::uint32_t>(sizeof(tonemapUniform)));
 
     // 叠加层：与 3D 通道共用本命令缓冲（交换链纹理只在获取它的命令缓冲里有效）。
     if (overlay != nullptr) {

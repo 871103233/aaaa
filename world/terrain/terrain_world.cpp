@@ -13,6 +13,17 @@ namespace {
 /// 遮挡查询的采样步长（格）：越小越精确，越大越省。
 constexpr float kObstructionStepBlocks = 0.25F;
 
+/// 重算并写回 tile 的高度缓存（O(65²)）。只在**生成**与**重网格**时调用，
+/// 因此 `MaxSurfaceHeightBlocks()` 得以从"每帧 O(tile × 顶点)"降为"每帧 O(tile)"。
+void RefreshTileMaxSurfaceBlocks(TerrainTile& tile) noexcept {
+    float maximum = 0.0F;
+    for (const Height height : tile.heights) {
+        const float blocks = HeightToBlocks(height);
+        maximum            = (blocks > maximum) ? blocks : maximum;
+    }
+    tile.maxSurfaceBlocks = maximum;
+}
+
 }  // namespace
 
 TerrainWorld::TerrainWorld(std::uint64_t worldSeed, TerrainMaterialTable materials)
@@ -28,14 +39,18 @@ void TerrainWorld::GenerateTile(int tileX, int tileZ) {
     GenerateTerrainTile(tile, m_noise);
     // 预设地图：噪声先行，编辑按文件顺序覆盖其上（T11；纯函数，边界列逐位一致）。
     ApplyMapEditsToTile(m_mapEdits, tile);
+    RefreshTileMaxSurfaceBlocks(tile);
 }
 
 void TerrainWorld::MeshTile(int tileX, int tileZ) {
-    const TerrainTile* tile = FindTile(tileX, tileZ);
-    if (tile == nullptr) {
+    const auto found = m_tiles.find(TileCoord { tileX, tileZ });
+    if (found == m_tiles.end()) {
         return;
     }
-    m_meshes[TileCoord { tileX, tileZ }] = BuildTerrainMesh(*tile, m_quadFilter);
+    TerrainTile& tile = found->second;
+    // 高度缓存在这里刷新：`MeshTile` 是"生成后"与"笔刷改动后"（经 `RemeshDirtyTiles`）的**唯一汇合点**。
+    RefreshTileMaxSurfaceBlocks(tile);
+    m_meshes[TileCoord { tileX, tileZ }] = BuildTerrainMesh(tile, m_quadFilter);
 }
 
 void TerrainWorld::LoadTile(int tileX, int tileZ) {
@@ -100,13 +115,12 @@ std::size_t TerrainWorld::RemeshDirtyTiles(const std::vector<TileCoord>& dirty) 
 }
 
 float TerrainWorld::MaxSurfaceHeightBlocks() const noexcept {
+    // 只遍历 tile（每 tile 的顶点最大值已由 `MeshTile` / `GenerateTile` 缓存）：
+    // 每帧成本与 **tile 数**成正比，而不是与"tile × 顶点"成正比（见 `TerrainTile::maxSurfaceBlocks`）。
     float maximum = 0.0F;
     for (const auto& entry : m_tiles) {
-        const TerrainTile& tile = entry.second;
-        for (const Height height : tile.heights) {
-            const float blocks = HeightToBlocks(height);
-            maximum            = (blocks > maximum) ? blocks : maximum;
-        }
+        const float blocks = entry.second.maxSurfaceBlocks;
+        maximum            = (blocks > maximum) ? blocks : maximum;
     }
     return maximum;
 }

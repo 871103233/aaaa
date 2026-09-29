@@ -70,8 +70,8 @@ TEST(MapPreset, LoadsValidFileWithExpectedValues) {
     EXPECT_EQ(preset.schemaVersion, MapPreset::kSchemaVersion);
     EXPECT_FALSE(preset.name.empty());
     EXPECT_EQ(preset.seed, kExpectedSeed);
-    EXPECT_EQ(preset.tileRadiusX, 1);
-    EXPECT_EQ(preset.tileRadiusZ, 1);
+    EXPECT_EQ(preset.tileRadiusX, 8);
+    EXPECT_EQ(preset.tileRadiusZ, 8);
     EXPECT_DOUBLE_EQ(preset.spawnX, 0.0);
     EXPECT_DOUBLE_EQ(preset.spawnZ, 0.0);
 

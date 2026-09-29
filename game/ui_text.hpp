@@ -67,8 +67,8 @@ enum class UiLabel : int {
     CountFormat,                  ///< 计数数值格式（`%zu`）
     Orbs,                         ///< 行标签：光球（活动 / 上限）
     OrbCountFormat,               ///< 光球计数格式（`%zu / %zu`）
-    VolumeBlocks,                 ///< 行标签：可挖体积块
-    VolumeBlocksFormat,           ///< 可挖体积块格式（`%zu（已挖 %zu）`）
+    VolumeBlocks,                 ///< 行标签：可挖体积块（T61：**常驻**集合，随玩家窗口变化）
+    VolumeBlocksFormat,           ///< 可挖体积块格式（`%zu（已挖 %zu；待办 %zu、留驻 %zu）`，T61 起含常驻调度）
     VolumeBodies,                 ///< 行标签：体积碰撞体（T28）
     CollapseMoved,                ///< 行标签：累计塌落体素（T29）
 
@@ -94,6 +94,7 @@ enum class UiLabel : int {
     LoadingHint,              ///< 提示：画面不会卡住，可继续操作窗口
     LoadingProgressFormat,    ///< 进度百分比格式（`%.0f%%`）
     LoadingStageTextures,     ///< 阶段：材质贴图
+    LoadingStageEnvironment,  ///< 阶段：环境贴图（T67 的 HDRI 解码 + IBL 烘焙）
     LoadingStageTerrainTiles, ///< 阶段：地形 tile
     LoadingStageDigVolumes,   ///< 阶段：可挖体积
     LoadingStageCollision,    ///< 阶段：碰撞体
@@ -160,7 +161,7 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsEnglish = {
     "Orbs",
     "%zu / %zu",
     "Diggable volume blocks",
-    "%zu (carved %zu)",
+    "%zu (carved %zu; pending %zu, kept %zu)",
     "Volume colliders",
     "Collapsed voxels (total)",
     "Render Cost",
@@ -182,6 +183,7 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsEnglish = {
     "The view keeps updating while the world is generated; the window stays responsive",
     "%.0f%%",
     "Material textures",
+    "Environment (HDRI / IBL)",
     "Terrain tiles",
     "Diggable volumes",
     "Collision bodies",
@@ -243,7 +245,7 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsChinese = {
     "光球（活动 / 上限）",
     "%zu / %zu",
     "可挖体积块",
-    "%zu（已挖 %zu）",
+    "%zu（已挖 %zu；待办 %zu、留驻 %zu）",
     "体积碰撞体",
     "累计塌落体素",
     "渲染开销",
@@ -265,6 +267,7 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsChinese = {
     "生成期间画面持续刷新、窗口保持响应；世界就绪后自动进入",
     "%.0f%%",
     "材质贴图",
+    "环境贴图（HDRI / IBL）",
     "地形 tile",
     "可挖体积",
     "碰撞体",

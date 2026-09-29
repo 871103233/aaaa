@@ -293,4 +293,212 @@ MaterialTextureSet GenerateMaterialTextures(std::uint64_t worldSeed, std::uint32
     return builder.Take();
 }
 
+// ---------------------------------------------------------------------------
+// T66 / V0.3 ⓒ：真实 CC0 美术贴图的解析与加载（资源不入库，见 NOTICE.md 的「美术资源台账」）
+// ---------------------------------------------------------------------------
+
+std::filesystem::path ResolveMapFile(const std::filesystem::path& directory, const std::string& stem) {
+    // 扩展名顺序固定 ⇒ 同一份资源目录在任何机器上解析出**同一个文件**（红线 7）。
+    static constexpr const char* kExtensions[] = { ".jpg", ".jpeg", ".png", ".tga", ".bmp" };
+    std::error_code             code;
+    for (const char* extension : kExtensions) {
+        std::filesystem::path candidate = directory / (stem + extension);
+        if (std::filesystem::is_regular_file(candidate, code) && !code) {
+            return candidate;
+        }
+        code.clear();
+    }
+    return {};
+}
+
+std::optional<ImageRgba8> DownscaleBoxRgba8(const ImageRgba8& source, std::uint32_t target) {
+    if (target == 0 || source.width == 0 || source.height == 0) {
+        return std::nullopt;
+    }
+    if (source.pixels.size() != static_cast<std::size_t>(source.width) * source.height * 4U) {
+        return std::nullopt;  // 输入不满足 ImageRgba8 的长度约定
+    }
+    if (source.width % target != 0 || source.height % target != 0) {
+        return std::nullopt;  // 只支持**整数倍**降采样（不引入任意重采样，保持确定性且实现简单）
+    }
+    const std::uint32_t factorX = source.width / target;
+    const std::uint32_t factorY = source.height / target;
+
+    ImageRgba8 result;
+    result.width  = target;
+    result.height = target;
+    result.pixels.assign(static_cast<std::size_t>(target) * target * 4U, 0);
+
+    const std::uint32_t blockArea = factorX * factorY;
+    for (std::uint32_t y = 0; y < target; ++y) {
+        for (std::uint32_t x = 0; x < target; ++x) {
+            std::uint32_t sum[4] = { 0, 0, 0, 0 };
+            for (std::uint32_t dy = 0; dy < factorY; ++dy) {
+                const std::size_t rowOffset =
+                    (static_cast<std::size_t>(y * factorY + dy) * source.width + static_cast<std::size_t>(x * factorX)) * 4U;
+                for (std::uint32_t dx = 0; dx < factorX; ++dx) {
+                    const std::size_t index = rowOffset + static_cast<std::size_t>(dx) * 4U;
+                    for (int channel = 0; channel < 4; ++channel) {
+                        sum[channel] += source.pixels[index + static_cast<std::size_t>(channel)];
+                    }
+                }
+            }
+            const std::size_t destination =
+                (static_cast<std::size_t>(y) * target + static_cast<std::size_t>(x)) * 4U;
+            for (int channel = 0; channel < 4; ++channel) {
+                // 四舍五入到最近整数（+ 半个分母），保证与"整数平均"的直觉一致。
+                result.pixels[destination + static_cast<std::size_t>(channel)] =
+                    static_cast<std::uint8_t>((sum[channel] + blockArea / 2U) / blockArea);
+            }
+        }
+    }
+    return result;
+}
+
+/// 真实贴图的总张数 = 层数 × 四件套（albedo / normal / roughness / ao）。
+constexpr std::size_t kMaterialTextureAssetMapCount = static_cast<std::size_t>(kMaterialSlotCount) * 4U;
+
+/// 真实贴图加载的**实现**（分步）：状态只是一个 (层, 件套) 游标 + 累加中的结果集。
+/// 之所以要分步：解码 16 张 2048² JPEG + 降采样要数秒，一次跑完会让画面停下等待（SKILL「不冻结画面」）。
+struct MaterialTextureAssetLoader::Impl {
+    const TerrainMaterialTable* table = nullptr;
+    MaterialTextureAssetSpec    spec;
+
+    MaterialTextureAssetSet set;      ///< 累加中的结果（层-major 切片按游标逐块写入）
+    std::size_t             cursor   = 0;  ///< 已处理的 (层, 件套) 数，总数 = 4 × 4 = 16
+    std::uint32_t           sourceSize0 = 0;  ///< 第一张有效贴图的源边长（层间必须一致）
+    bool                    failed   = false;
+    std::string             reason;
+
+    void Fail(const std::string& why) {
+        failed = true;
+        reason = why;
+    }
+
+    /// 处理第 `cursor` 张（层 = cursor / 4、件套 = cursor % 4）；异常一律转成"失败 + 原因"（不向上抛：启动期要能回落）。
+    void ProcessOne() {
+        const std::size_t slot = cursor / 4U;
+        const int         map  = static_cast<int>(cursor % 4U);
+        const MaterialLayer&    layer     = table->Layer(static_cast<int>(slot));
+        const std::filesystem::path directory = spec.root / layer.name;
+
+        std::error_code code;
+        if (!std::filesystem::is_directory(directory, code) || code) {
+            Fail("缺少材质目录：" + directory.string());
+            return;
+        }
+        const std::filesystem::path file = ResolveMapFile(directory, kMaterialMapStems[map]);
+        if (file.empty()) {
+            Fail("缺少贴图：" + (directory / (std::string(kMaterialMapStems[map]) + ".<jpg|jpeg|png|tga|bmp>")).string());
+            return;
+        }
+
+        ImageRgba8 source;
+        try {
+            source = LoadImageRgba8(file);
+        } catch (const std::exception& error) {
+            Fail(std::string("解码失败：") + file.string() + "（" + error.what() + "）");
+            return;
+        }
+        if (source.width != source.height) {
+            Fail("贴图不是正方形：" + file.string());
+            return;
+        }
+        if (sourceSize0 == 0) {
+            sourceSize0 = source.width;  // 第一张图定义全局源尺寸
+        } else if (source.width != sourceSize0) {
+            // 层间 / 件套间尺寸必须一致：纹理数组只支持**单一尺寸**，混用会让某一层被错误拉伸。
+            Fail("贴图尺寸不一致：" + file.string() + "（" + std::to_string(source.width) + " vs " +
+                 std::to_string(sourceSize0) + "）");
+            return;
+        }
+        set.sourceSize[slot] = source.width;
+
+        const std::optional<ImageRgba8> scaled = DownscaleBoxRgba8(source, spec.size);
+        if (!scaled.has_value()) {
+            Fail("源图边长必须是目标边长（" + std::to_string(spec.size) + "）的整数倍：" + file.string() + "（源 " +
+                 std::to_string(source.width) + "）");
+            return;
+        }
+
+        std::vector<std::uint8_t>& target = (map == 0)   ? set.albedoRgba
+                                            : (map == 1) ? set.normalRgba
+                                            : (map == 2) ? set.roughnessRgba
+                                                         : set.aoRgba;
+        const std::size_t offset = static_cast<std::size_t>(spec.size) * spec.size * 4U * slot;
+        std::copy(scaled->pixels.begin(), scaled->pixels.end(),
+                  target.begin() + static_cast<std::ptrdiff_t>(offset));
+    }
+};
+
+MaterialTextureAssetLoader::MaterialTextureAssetLoader(const TerrainMaterialTable& table, MaterialTextureAssetSpec spec)
+    : m_impl(std::make_unique<Impl>()) {
+    m_impl->table = &table;
+    m_impl->spec  = std::move(spec);
+
+    if (m_impl->spec.size == 0) {
+        m_impl->Fail("规格非法：size == 0");
+        return;
+    }
+    std::error_code code;
+    if (!std::filesystem::is_directory(m_impl->spec.root, code) || code) {
+        // 资源不入库（见 docs/plans/v0.3.md §1.1）：干净克隆下**必然**走到这里 ⇒ 只记录原因，由调用方 WARN 后回落。
+        m_impl->Fail("资源根目录不存在：" + m_impl->spec.root.string());
+        return;
+    }
+
+    Impl& impl = *m_impl;
+    impl.set.size       = impl.spec.size;
+    impl.set.layerCount = static_cast<std::uint32_t>(kMaterialSlotCount);
+    const std::size_t totalBytes =
+        static_cast<std::size_t>(impl.spec.size) * impl.spec.size * 4U * static_cast<std::size_t>(kMaterialSlotCount);
+    impl.set.albedoRgba.assign(totalBytes, 0);
+    impl.set.normalRgba.assign(totalBytes, 0);
+    impl.set.roughnessRgba.assign(totalBytes, 0);
+    impl.set.aoRgba.assign(totalBytes, 0);
+    impl.set.sourceSize.assign(static_cast<std::size_t>(kMaterialSlotCount), 0);
+}
+
+MaterialTextureAssetLoader::~MaterialTextureAssetLoader() = default;
+
+bool MaterialTextureAssetLoader::Step(std::size_t maxMaps) {
+    Impl& impl = *m_impl;
+    std::size_t processed = 0;
+    while (!impl.failed && impl.cursor < kMaterialTextureAssetMapCount && processed < maxMaps) {
+        impl.ProcessOne();
+        ++impl.cursor;
+        ++processed;
+    }
+    return impl.failed || impl.cursor >= kMaterialTextureAssetMapCount;
+}
+
+float MaterialTextureAssetLoader::Progress() const noexcept {
+    const float ratio = static_cast<float>(m_impl->cursor) / static_cast<float>(kMaterialTextureAssetMapCount);
+    return std::clamp(ratio, 0.0F, 1.0F);
+}
+
+bool MaterialTextureAssetLoader::Failed() const noexcept { return m_impl->failed; }
+
+const std::string& MaterialTextureAssetLoader::Reason() const noexcept { return m_impl->reason; }
+
+MaterialTextureAssetSet MaterialTextureAssetLoader::Take() { return std::move(m_impl->set); }
+
+std::optional<MaterialTextureAssetSet> TryLoadMaterialTextureAssets(const TerrainMaterialTable& table,
+                                                                   const MaterialTextureAssetSpec& spec,
+                                                                   std::string* reasonOut) {
+    MaterialTextureAssetLoader loader(table, spec);
+    while (!loader.Step(kMaterialTextureAssetMapCount)) {
+    }
+    if (loader.Failed()) {
+        if (reasonOut != nullptr) {
+            *reasonOut = loader.Reason();
+        }
+        return std::nullopt;
+    }
+    if (reasonOut != nullptr) {
+        reasonOut->clear();
+    }
+    return loader.Take();
+}
+
 }  // namespace vx

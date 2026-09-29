@@ -78,6 +78,26 @@ namespace {
     return kMaxTerrainHeightBlocks / kVolumeBlockSize;
 }
 
+/// 读**可选**的非负整数字段（缺失 ⇒ 0）；存在但非法即抛。
+///
+/// 用于 T59 / [ADR 0020](../../docs/adr/0020-dig-volume-vertical-band-and-dynamic-residency.md) 的
+/// 竖向带宽：**缺失 = 0 = 不裁剪**，与引入本字段之前的旧口径**逐位一致** ⇒ `schema_version` 无需提升。
+[[nodiscard]] int OptionalNonNegativeInt(const toml::table& table, const std::filesystem::path& path,
+                                        const char* field) {
+    if (!table.contains(field)) {
+        return 0;
+    }
+    const std::optional<std::int64_t> value = table[field].value<std::int64_t>();
+    if (!value.has_value()) {
+        throw std::runtime_error(path.string() + ": 字段 [" + field + "] 存在但不是整数");
+    }
+    if (*value < 0) {
+        throw std::runtime_error(path.string() + ": 字段 [" + field + "] 必须是非负整数（实际 " +
+                                 std::to_string(*value) + "）");
+    }
+    return static_cast<int>(*value);
+}
+
 }  // namespace
 
 void DigRegionTable::RebuildBlocks() {
@@ -114,8 +134,18 @@ void DigRegionTable::RebuildBlocks() {
     }
 }
 
-DigRegionTable DigRegionTable::FromRegions(std::vector<DigRegion> regions) {
+DigRegionTable DigRegionTable::FromRegions(std::vector<DigRegion> regions, int bandDownBlocks, int bandUpBlocks) {
     DigRegionTable table;
+    if (bandDownBlocks < 0 || bandDownBlocks > kMaxTerrainHeightBlocks) {
+        throw std::runtime_error("可挖区域表的 band_down 必须落在 [0, " +
+                                 std::to_string(kMaxTerrainHeightBlocks) + "] 格内（0 = 不裁剪）");
+    }
+    if (bandUpBlocks < 0 || bandUpBlocks > kMaxTerrainHeightBlocks) {
+        throw std::runtime_error("可挖区域表的 band_up 必须落在 [0, " + std::to_string(kMaxTerrainHeightBlocks) +
+                                 "] 格内（0 = 不裁剪）");
+    }
+    table.m_bandDown = bandDownBlocks;
+    table.m_bandUp   = bandUpBlocks;
     // priority 升序；同优先级保持文件顺序（`stable_sort`）⇒ 解析时"后出现的覆盖先出现的"。
     std::stable_sort(regions.begin(), regions.end(), [](const DigRegion& left, const DigRegion& right) {
         return left.priority < right.priority;
@@ -212,7 +242,11 @@ DigRegionTable DigRegionTable::LoadFromFile(const std::filesystem::path& path) {
         }
     }
 
-    return FromRegions(std::move(regions));
+    // T59 / ADR 0020 决策一：**竖向带宽**（可选字段；缺失 = 0 = 不裁剪 ⇒ 旧文件照旧可用）。
+    const int bandDown = OptionalNonNegativeInt(document, path, "band_down");
+    const int bandUp   = OptionalNonNegativeInt(document, path, "band_up");
+
+    return FromRegions(std::move(regions), bandDown, bandUp);
 }
 
 bool DigRegionTable::IsDiggable(double x, double y, double z) const noexcept {

@@ -22,6 +22,7 @@ add_library(voxel_world STATIC
     dig/volume_mesher.cpp
     generation/map_preset.cpp
     generation/terrain_noise.cpp
+    streaming/dig_volume_residency.cpp
     terrain/material_blender.cpp
     terrain/material_table.cpp
     terrain/material_textures.cpp

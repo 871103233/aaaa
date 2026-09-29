@@ -28,7 +28,7 @@ struct SystemSettings {
     int         masterVolume = 80;                             ///< 主音量（0–100）
     int         frameRateCap = kFrameRateCapUnset;             ///< 帧率上限（Hz）；哨兵 0 = 取刷新率
     float       exposure     = 1.0F;                           ///< HDR 色调映射曝光（T20 / ADR 0010）
-    int         msaaSamples  = 4;                              ///< MSAA 档位（1 / 2 / 4 / 8；T23 / ADR 0010 P3）
+    int         msaaSamples  = 2;                              ///< MSAA 档位（1 / 2 / 4 / 8；T23 / ADR 0010 P3）
 };
 
 /// 设置文件格式版本；不匹配即报错（不做静默迁移）。
@@ -44,13 +44,18 @@ inline constexpr float kExposureMin     = 0.1F;
 inline constexpr float kExposureMax     = 8.0F;
 inline constexpr float kExposureDefault = 1.0F;
 
-/// MSAA 档位（T23 / ADR 0010 P3）：**只允许 {1, 2, 4, 8}**，默认 4×（1 = 关闭）。
+/// MSAA 档位（T23 / ADR 0010 P3）：**只允许 {1, 2, 4, 8}**，默认 **2×**（1 = 关闭）。
+///
+/// **默认值由 4 改为 2 的依据（T66 / V0.3 ⓒ，所有者 2026-09-29 裁定）**：地表换成真实 PBR 贴图后
+/// 纹理数组占 **1024² × 16 层 ≈ 86 MB**（含 mip），而 ADR 0008 的 VRAM 上限是 **300 MB**；
+/// 2560×1440 下 MSAA 4× 要 154.69 MB、2× 约 77 MB ⇒ **4× → 2× 腾出的 78 MB 正好让贴图进预算**
+/// （实测合计 ≈ 253 MB）。这是**显存预算内的取舍**，不是画质线变更：档位仍可在 Esc 系统面板里改回 4×。
 ///
 /// 口径与 `exposure` 完全一致：`msaa_samples` 是**可选字段**（缺失取默认，旧版设置文件仍能载入），
 /// 类型错误报错，数值越界由 `ClampMsaaSampleCount` 钳制到**最近的合法档**。
 inline constexpr int kMsaaSampleCountMin     = 1;
 inline constexpr int kMsaaSampleCountMax     = 8;
-inline constexpr int kMsaaSampleCountDefault = 4;
+inline constexpr int kMsaaSampleCountDefault = 2;
 
 /// 纯函数：把 MSAA 档位钳制到**最近的合法档** `{1, 2, 4, 8}`（越界即钳制，不报错）。
 ///

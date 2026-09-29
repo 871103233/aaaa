@@ -324,9 +324,18 @@ TEST(TerrainMaterial, UniformIsDerivedFromLoadedTableNotHandCopied) {
     EXPECT_FLOAT_EQ(uniform.renderOriginY, 34.0F);
     EXPECT_FLOAT_EQ(uniform.renderOriginZ, 56.0F);
     // C 项布局：渲染原点 + 三平面参数（各 vec4）+ 每层 4 个 vec4 = 16 + 16 + 64×4 = 288 字节（≤ 512）。
-    EXPECT_EQ(sizeof(vx::MaterialUniform), static_cast<std::size_t>(16 * (2 + 4 * kMaterialSlotCount)));
-    EXPECT_EQ(sizeof(vx::MaterialUniform), static_cast<std::size_t>(288));
+    // T66 追加：贴图模式 vec4（+16 字节）⇒ 304 字节。
+    EXPECT_EQ(sizeof(vx::MaterialUniform), static_cast<std::size_t>(16 * (3 + 4 * kMaterialSlotCount)));
+    EXPECT_EQ(sizeof(vx::MaterialUniform), static_cast<std::size_t>(304));
     EXPECT_LE(sizeof(vx::MaterialUniform), vx::kMaxMaterialUniformBytes);
+    // T66：默认（程序生成贴图）模式位为 0；显式传 true 时为 1，且层色 tint 一律置 1（真实 albedo 自带上色）。
+    EXPECT_FLOAT_EQ(uniform.realTextureMode, 0.0F);
+    const vx::MaterialUniform realTexturesUniform = vx::BuildMaterialUniform(table, 12.0, 34.0, 56.0, true);
+    EXPECT_FLOAT_EQ(realTexturesUniform.realTextureMode, 1.0F);
+    EXPECT_FLOAT_EQ(realTexturesUniform.layers[0].tintR, 1.0F);
+    EXPECT_FLOAT_EQ(realTexturesUniform.layers[0].tintG, 1.0F);
+    EXPECT_FLOAT_EQ(realTexturesUniform.layers[0].tintB, 1.0F);
+    EXPECT_FLOAT_EQ(realTexturesUniform.layers[0].uvScale, table.Layer(0).uvScale) << "除 tint 外其余字段不受模式影响";
     // C 项：三平面参数必须由同一份表投影（临时表未改 triplanar → 等于表内值）。
     EXPECT_FLOAT_EQ(uniform.triplanarEnabled, table.Triplanar().enabled ? 1.0F : 0.0F);
     EXPECT_FLOAT_EQ(uniform.triplanarSlopeMin, table.Triplanar().slopeMin);
@@ -627,4 +636,55 @@ TEST(TerrainMaterial, InvalidTriplanarSettingsThrow) {
     std::string noSection = EmitMaterials(4, specs);
     noSection.erase(noSection.find("[triplanar]"));
     EXPECT_TRUE(loadWithTriplanar("vx_tri_missing.toml", noSection)) << "缺 [triplanar] 段必须报错";
+}
+
+// T66 / V0.3 ⓒ：`[textures]` 段（真实 CC0 美术贴图）——**可选**（缺省 = 不启用）⇒ 旧文件照旧可用；
+// 写了就按同口径校验（类型错 / 越界一律抛，不静默回退）。
+TEST(TerrainMaterial, TextureSettingsAreOptionalAndValidated) {
+    const std::array<LayerSpec, static_cast<std::size_t>(kMaterialSlotCount)> specs = DefaultLayerSpecs();
+    const std::string base = EmitMaterials(4, specs);
+
+    // ① 缺省（没有 [textures] 段）⇒ 不启用，且给出与 header 一致的默认值。
+    {
+        const std::filesystem::path path = WriteTempMaterials("vx_textures_absent.toml", base);
+        const TerrainMaterialTable  table = TerrainMaterialTable::LoadFromFile(path);
+        EXPECT_FALSE(table.Textures().enabled) << "缺省必须是不启用（程序生成占位贴图）";
+        EXPECT_EQ(table.Textures().root, std::filesystem::path("assets/textures/terrain"));
+        EXPECT_EQ(table.Textures().size, 1024U);
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
+    }
+
+    // ② 正常段：逐字段解析。
+    {
+        const std::string content = base +
+                                    "\n[textures]\nenabled = true\nroot = \"assets/textures/terrain\"\nsize = 512\n";
+        const std::filesystem::path path = WriteTempMaterials("vx_textures_ok.toml", content);
+        const TerrainMaterialTable  table = TerrainMaterialTable::LoadFromFile(path);
+        EXPECT_TRUE(table.Textures().enabled);
+        EXPECT_EQ(table.Textures().root, std::filesystem::path("assets/textures/terrain"));
+        EXPECT_EQ(table.Textures().size, 512U);
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
+    }
+
+    // ③ 非法：size 越界 / 启用但 root 为空 ⇒ 必须抛。
+    const auto throws = [&base](const char* fileName, const std::string& content) {
+        const std::filesystem::path path = WriteTempMaterials(fileName, content);
+        const bool                  threw = [&path] {
+            try {
+                (void)TerrainMaterialTable::LoadFromFile(path);
+            } catch (const std::runtime_error&) {
+                return true;
+            }
+            return false;
+        }();
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
+        return threw;
+    };
+    EXPECT_TRUE(throws("vx_textures_size_small.toml", base + "\n[textures]\nsize = 8\n")) << "size < 16 必须报错";
+    EXPECT_TRUE(throws("vx_textures_size_big.toml", base + "\n[textures]\nsize = 8192\n")) << "size > 4096 必须报错";
+    EXPECT_TRUE(throws("vx_textures_root_empty.toml", base + "\n[textures]\nenabled = true\nroot = \"\"\n"))
+        << "启用真实贴图时 root 不得为空";
 }

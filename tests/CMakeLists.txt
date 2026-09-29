@@ -7,7 +7,7 @@
 #   4. 存档往返与迁移    —— V0.3 起
 #
 # 另含：固定步长主循环、输入层、第三人称相机、地表材质、笔刷挖堆与脏 tile 粒度、
-# Jolt 角色物理（高度场落地 / 上台阶，无窗口无 GPU）；
+# Jolt 角色物理（高度场落地 / 上台阶，无窗口无 GPU）、纹理资源加载（T57）；
 # 以及缺陷 B2/B3 回归：笔刷长按下的几何不变量、堆土时角色被顶回地表、相机退化防护、
 # 跳跃初速由身高派生、空格按下在零逻辑步帧的帧级锁存。
 
@@ -18,6 +18,8 @@ add_executable(voxel_tests
     character_test.cpp
     destruction_queue_test.cpp
     dig_volume_test.cpp
+    dig_volume_residency_test.cpp
+    environment_test.cpp
     fixed_step_test.cpp
     frame_limiter_test.cpp
     frustum_test.cpp
@@ -37,6 +39,7 @@ add_executable(voxel_tests
     terrain_material_test.cpp
     terrain_material_texture_test.cpp
     terrain_tile_test.cpp
+    texture_loader_test.cpp
     ui_font_test.cpp
     ui_text_test.cpp
     volume_collapse_test.cpp

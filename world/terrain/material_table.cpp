@@ -246,6 +246,39 @@ TerrainMaterialTable TerrainMaterialTable::LoadFromFile(const std::filesystem::p
     }
     table.m_triplanar = parsedTriplanar;
 
+    // T66：真实美术贴图段（**可选** —— 缺失即"不启用" ⇒ 程序生成占位贴图，旧文件照旧可用，故不升 schema_version）。
+    // 写了就按同口径校验：类型错 / 越界一律抛（不静默回退）。
+    if (const toml::table* textures = document["textures"].as_table(); textures != nullptr) {
+        MaterialTextureSettings parsedTextures;
+
+        if (const auto enabled = (*textures)["enabled"].value<bool>(); enabled.has_value()) {
+            parsedTextures.enabled = *enabled;
+        } else if (textures->contains("enabled")) {
+            throw std::runtime_error(Describe(path, "textures", "enabled") + "不是布尔值");
+        }
+
+        if (const auto root = (*textures)["root"].value<std::string>(); root.has_value()) {
+            parsedTextures.root = *root;
+        } else if (textures->contains("root")) {
+            throw std::runtime_error(Describe(path, "textures", "root") + "不是字符串");
+        }
+
+        if (const auto size = (*textures)["size"].value<std::int64_t>(); size.has_value()) {
+            if (*size < 16 || *size > static_cast<std::int64_t>(4096)) {
+                throw std::runtime_error(Describe(path, "textures", "size") + "必须落在 [16, 4096]");
+            }
+            parsedTextures.size = static_cast<std::uint32_t>(*size);
+        } else if (textures->contains("size")) {
+            throw std::runtime_error(Describe(path, "textures", "size") + "不是整数");
+        }
+
+        if (parsedTextures.enabled && parsedTextures.root.empty()) {
+            throw std::runtime_error(Describe(path, "textures", "root") + "启用真实贴图时不能为空");
+        }
+
+        table.m_textures = parsedTextures;
+    }
+
     return table;
 }
 
@@ -310,11 +343,14 @@ TerrainMaterialTable TerrainMaterialTable::Default() {
     // C 项：三平面参数（默认值即 TriplanarSettings 的成员初值，与 assets/config/materials.toml 的 [triplanar] 一致）。
     table.m_triplanar = TriplanarSettings {};
 
+    // T66：真实贴图段缺省 = 不启用（`Default()` 供单测使用，不应依赖外部资源文件）。
+    table.m_textures = MaterialTextureSettings {};
+
     return table;
 }
 
 MaterialUniform BuildMaterialUniform(const TerrainMaterialTable& table, double originX, double originY,
-                                     double originZ) noexcept {
+                                     double originZ, bool realTextures) noexcept {
     MaterialUniform uniform;
     uniform.renderOriginX = static_cast<float>(originX);
     uniform.renderOriginY = static_cast<float>(originY);
@@ -326,6 +362,9 @@ MaterialUniform BuildMaterialUniform(const TerrainMaterialTable& table, double o
     uniform.triplanarSlopeMin  = triplanar.slopeMin;
     uniform.triplanarSlopeMax  = triplanar.slopeMax;
     uniform.triplanarSharpness = triplanar.sharpness;
+
+    // T66：贴图模式（真实贴图 = 贴图值为**绝对值**；程序生成 = 贴图值为**相对变化**）。
+    uniform.realTextureMode = realTextures ? 1.0F : 0.0F;
 
     for (std::size_t slot = 0; slot < static_cast<std::size_t>(kMaterialSlotCount); ++slot) {
         const MaterialLayer& layer = table.Layer(static_cast<int>(slot));
@@ -340,9 +379,11 @@ MaterialUniform BuildMaterialUniform(const TerrainMaterialTable& table, double o
         out.slopeMax = layer.slopeMax;
         out.slopeBlend = layer.slopeBlend;
         out.roughness = layer.roughness;
-        out.tintR = layer.tintR;
-        out.tintG = layer.tintG;
-        out.tintB = layer.tintB;
+        // T66：真实贴图模式下层色一律置 1 —— 真实 albedo 自带上色，配置里的单色 tint（为程序生成的
+        // 单色细节贴图而调）会变成"二次上色"，把真实颜色压暗 / 染色。
+        out.tintR = realTextures ? 1.0F : layer.tintR;
+        out.tintG = realTextures ? 1.0F : layer.tintG;
+        out.tintB = realTextures ? 1.0F : layer.tintB;
         out.uvScale = layer.uvScale;
         out.macroUvScale = layer.macroUvScale;
         out.macroStrength = layer.macroStrength;

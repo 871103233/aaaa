@@ -85,6 +85,22 @@ struct FogLayer {
     ColorRgb color { 0.70F, 0.80F, 0.92F };
 };
 
+/// 环境贴图 / IBL 配置（T67 / [ADR 0021](../../docs/adr/0021-environment-ibl.md)）。
+///
+/// 配置里是**可选段** `[environment]`：整段缺失 ⇒ `enabled = false` ⇒ 环境光走**半球天空光回落路径**
+/// （旧版 `lighting.toml` 照旧可用，与 T66 的 `[textures]` 同口径）。
+/// **资源缺失 / 烘焙失败同样回落**：本结构体是否 `enabled` 只表达"配置是否要求"，
+/// 运行期实际是否走 IBL 由启动期的烘焙结果决定（见 `BuildLightingUniform` 的 `environmentPrefilterMipCount`）。
+struct EnvironmentSettings {
+    /// 是否尝试启用 IBL（HDRI 天空 + irradiance + 预过滤高光 + BRDF LUT）。
+    bool enabled = false;
+
+    /// 等距柱状 HDRI 的文件路径（`.hdr`，线性光）。按**仓库根**给出，由 `game/` 解析为绝对路径。
+    /// 前置条件：`enabled = true` 时非空（加载期校验）。
+    std::filesystem::path hdri;
+};
+
+
 /// 片元着色器的光照 uniform 块（`set = 3, binding = 1`），std140 布局。
 ///
 /// 字段排布与 `assets/shaders/mesh.frag` 的 `LightingBlock` **逐字对应**，每行一个 `vec4`：
@@ -95,7 +111,7 @@ struct FogLayer {
 ///   - `skyGroundLinear`       = `(地面反弹色 rgb, 0)`
 ///   - `cameraPositionWorld`   = `(相机世界位置 xyz, 0)`
 ///   - `fogColorDensity`       = `(雾色 rgb, 密度)`
-///   - `fogParams`             = `(启用(1/0), 高度衰减, 0, 0)`
+///   - `fogParams`             = `(启用(1/0), 高度衰减, **IBL 启用(1/0)**, **预过滤最大 mip 级号**)`
 ///
 /// **颜色一律是线性光**（见 `BuildLightingUniform` 的说明）。
 struct LightingUniform {
@@ -136,8 +152,12 @@ struct LightingUniform {
 
     float fogEnabled       = 0.0F;  ///< 1 = 启用、0 = 禁用（着色器用它整体跳过雾）
     float fogHeightFalloff = 0.0F;
-    float fogUnused0       = 0.0F;
-    float fogUnused1       = 0.0F;
+    /// T67 / [ADR 0021](../../docs/adr/0021-environment-ibl.md)：**IBL 启用位**（1/0）。
+    /// 1 = 环境光走 IBL 三件套（irradiance + 预过滤高光 + BRDF LUT）；0 = 退回半球天空光（`mesh.frag` 的回落路径）。
+    /// 由调用方按启动期的**实际烘焙结果**设置（烘焙失败 / HDRI 缺失 ⇒ 0）。
+    float fogIblEnabled    = 0.0F;
+    /// T67：预过滤高光贴图的**最大 mip 级号**（= 级数 − 1）。着色器按 `lod = roughness × 本值` 选级。
+    float fogIblPrefilterLodMax = 0.0F;
 };
 
 static_assert(sizeof(LightingUniform) == 8 * sizeof(float) * 4,
@@ -163,8 +183,14 @@ class LightingTable;
 /// `sun.direction` 在这里归一化，uniform 里恒为单位向量。
 /// 前置条件：`table` 已通过 `LoadFromFile` 或 `Default()` 填充；
 /// `cameraX/Y/Z` 为**绝对世界坐标**下的相机位置（雾按视距插值需要）。
+///
+/// `environmentPrefilterMipCount`（T67 / ADR 0021）：**启动期实际烘焙成的**预过滤贴图 mip 级数；
+/// `0` = 未启用 / 烘焙失败 ⇒ uniform 的 IBL 启用位为 0，着色器走**半球天空光回落路径**。
+/// 之所以由调用方传入"实际级数"而不是在这里读配置：**配置要求 ≠ 真的烘焙成功**
+/// （资源缺失、GPU 失败都要回落），而着色器必须与 GPU 上的贴图一致。
 [[nodiscard]] LightingUniform BuildLightingUniform(const LightingTable& table, double cameraX, double cameraY,
-                                                   double cameraZ) noexcept;
+                                                   double cameraZ,
+                                                   std::uint32_t environmentPrefilterMipCount = 0) noexcept;
 
 /// 光照与雾配置表：启动期从 `assets/config/lighting.toml` 一次性读入（ADR 0005 / ADR 0010）。
 ///
@@ -178,6 +204,7 @@ public:
     /// v4（缺陷 1 修复）：`[shadow]` 新增 `caster_height_min`（投射体扩展下限兜底）——缺失即报错。
     /// v5（缺陷 B8 修复）：`[shadow]` 新增 `cascade_blend`（级联过渡带宽度比例）——缺失即报错。
     ///   （v3 未使用；版本号按缺陷修复要求推进。）
+    /// T67：新增 `[environment]` 段（可选，缺省 = 不启用 IBL）——**不改** 版本号（旧文件照旧可用）。
     static constexpr int kSchemaVersion = 5;
 
     /// 从 TOML 文件加载并校验；失败抛 `std::runtime_error`（启动期允许异常，ADR 0005）。
@@ -192,15 +219,17 @@ public:
     [[nodiscard]] const SkyLight& Sky() const noexcept { return m_sky; }
     [[nodiscard]] const FogLayer& Fog() const noexcept { return m_fog; }
     [[nodiscard]] const ShadowSettings& Shadow() const noexcept { return m_shadow; }
+    [[nodiscard]] const EnvironmentSettings& Environment() const noexcept { return m_environment; }
 
     [[nodiscard]] int SchemaVersion() const noexcept { return m_schemaVersion; }
 
 private:
-    SunLight       m_sun;
-    SkyLight       m_sky;
-    FogLayer       m_fog;
-    ShadowSettings m_shadow;
-    int            m_schemaVersion = kSchemaVersion;
+    SunLight            m_sun;
+    SkyLight            m_sky;
+    FogLayer            m_fog;
+    ShadowSettings      m_shadow;
+    EnvironmentSettings m_environment;
+    int                 m_schemaVersion = kSchemaVersion;
 };
 
 }  // namespace vx

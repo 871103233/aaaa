@@ -183,6 +183,21 @@ LightingTable LightingTable::LoadFromFile(const std::filesystem::path& path) {
         throw std::runtime_error(Describe(path, "shadow", "cascade_blend") + "必须落在 [0, 0.5]");
     }
 
+    // T67 / ADR 0021：`[environment]` 段**可选**（与 T66 的 `[textures]` 同口径）。
+    // 整段缺失 ⇒ 保持默认 `enabled = false` ⇒ 环境光走半球天空光回落路径，旧版文件照旧可用。
+    if (const toml::table* environment = document["environment"].as_table(); environment != nullptr) {
+        table.m_environment.enabled = ReadBool(*environment, path, "environment", "enabled");
+        const std::optional<std::string> hdri = (*environment)["hdri"].value<std::string>();
+        if (!hdri.has_value()) {
+            throw std::runtime_error(Describe(path, "environment", "hdri") + "缺失或不是字符串");
+        }
+        table.m_environment.hdri = std::filesystem::path(*hdri);
+        // 启用时路径不得为空 —— 空路径只可能是配置写漏，属"非法值即抛"的范围（不静默回落）。
+        if (table.m_environment.enabled && table.m_environment.hdri.empty()) {
+            throw std::runtime_error(Describe(path, "environment", "hdri") + "在 enabled = true 时不能为空");
+        }
+    }
+
     return table;
 }
 
@@ -196,11 +211,14 @@ LightingTable LightingTable::Default() {
     table.m_fog = FogLayer { true, 0.0030F, 0.02F, table.m_sky.horizonColor };
     // T21b：默认值即本结构体的成员初值（与 assets/config/lighting.toml 的 [shadow] 一致）。
     table.m_shadow = ShadowSettings {};
+    // T67：环境贴图段（与 assets/config/lighting.toml 的 [environment] 一致）。
+    table.m_environment.enabled = true;
+    table.m_environment.hdri    = std::filesystem::path("assets/textures/env/kloofendal_48d_partly_cloudy_2k.hdr");
     return table;
 }
 
-LightingUniform BuildLightingUniform(const LightingTable& table, double cameraX, double cameraY,
-                                     double cameraZ) noexcept {
+LightingUniform BuildLightingUniform(const LightingTable& table, double cameraX, double cameraY, double cameraZ,
+                                     std::uint32_t environmentPrefilterMipCount) noexcept {
     const SunLight& sun = table.Sun();
     const SkyLight& sky = table.Sky();
     const FogLayer& fog = table.Fog();
@@ -250,6 +268,12 @@ LightingUniform BuildLightingUniform(const LightingTable& table, double cameraX,
     uniform.fogDensity       = fog.density;
     uniform.fogEnabled       = fog.enabled ? 1.0F : 0.0F;
     uniform.fogHeightFalloff = fog.heightFalloff;
+
+    // T67 / ADR 0021：IBL 启用位与预过滤 mip 级号。级号 = 级数 − 1（烘焙时 mip i ⇒ roughness = i / 级号）。
+    // 级数为 0 ⇒ 未启用 / 烘焙失败 ⇒ 着色器退回半球天空光（uniform 里的两格必须同时为 0，不留半启用态）。
+    uniform.fogIblEnabled = (environmentPrefilterMipCount > 0) ? 1.0F : 0.0F;
+    uniform.fogIblPrefilterLodMax =
+        (environmentPrefilterMipCount > 0) ? static_cast<float>(environmentPrefilterMipCount - 1) : 0.0F;
 
     return uniform;
 }

@@ -22,6 +22,17 @@ struct TerrainTile {
                            static_cast<std::size_t>(kTerrainTileVertexCount)>
         heights {};
 
+    /// 本 tile 内**最高的地表高度（格）** —— 由 `TerrainWorld` 在生成 / 重网格后写回的**缓存**。
+    ///
+    /// 为什么缓存：`TerrainWorld::MaxSurfaceHeightBlocks()` 每帧被调用（CSM 的投射体扩展要用），
+    /// 若每次都遍历"全部 tile × 全部顶点"，成本会与**世界总量**成正比（16×16 tile 下约 108 万次/帧，
+    /// debug 下可达数十毫秒）—— 违反 SKILL 第四节的「每帧工作不得与总量成正比」。
+    /// 缓存后只需遍历 tile（与 tile 数成正比）。
+    ///
+    /// 语义：只在生成 / 重网格时刷新，故**可能偏大**（该 tile 最高的那列被削低后，
+    /// 直到重网格前仍报旧值）。方向是**安全**的：它只用来放大阴影投射体盒，偏大不会漏阴影。
+    float maxSurfaceBlocks = 0.0F;
+
     /// 本地顶点 `(i, j)` 对应的世界列坐标（单位：列）。
     [[nodiscard]] int WorldColumnX(int i) const noexcept { return TileOriginColumn(coord.x) + i; }
     [[nodiscard]] int WorldColumnZ(int j) const noexcept { return TileOriginColumn(coord.z) + j; }

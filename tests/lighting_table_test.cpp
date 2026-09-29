@@ -480,3 +480,98 @@ TEST(LightingTable, ShadowCascadeBlendNegativeThrows) {
     EXPECT_THROW((void)LightingTable::LoadFromFile(path), std::runtime_error);
     RemoveTempConfig(path);
 }
+
+// ---- T67：环境贴图（[environment] 可选段）与 IBL 启用位的 CPU→GPU 投影 ----
+
+// 提交的配置必须启用 IBL 并给出 HDRI 路径（与 Default() 同源，见下一条）。
+TEST(LightingTable, CommittedEnvironmentIsEnabled) {
+    const std::filesystem::path path =
+        std::filesystem::path(VOXEL_SOURCE_DIR) / "assets" / "config" / "lighting.toml";
+
+    const LightingTable table = LightingTable::LoadFromFile(path);
+
+    EXPECT_TRUE(table.Environment().enabled);
+    EXPECT_FALSE(table.Environment().hdri.empty()) << "enabled = true 时路径不得为空";
+    // 路径指向 `assets/textures/env/` 下的 `.hdr`（资源不入库，由 tools/fetch_assets.ps1 获取）。
+    EXPECT_EQ(table.Environment().hdri.extension().string(), ".hdr");
+}
+
+// 内置默认表与提交配置的 [environment] 一致（防"默认值与文件各写一份"）。
+TEST(LightingTable, EnvironmentDefaultsMatchCommittedConfig) {
+    const std::filesystem::path path =
+        std::filesystem::path(VOXEL_SOURCE_DIR) / "assets" / "config" / "lighting.toml";
+
+    const LightingTable loaded  = LightingTable::LoadFromFile(path);
+    const LightingTable builtin = LightingTable::Default();
+
+    EXPECT_EQ(loaded.Environment().enabled, builtin.Environment().enabled);
+    EXPECT_EQ(loaded.Environment().hdri, builtin.Environment().hdri);
+}
+
+// `[environment]` 段**整段缺失** ⇒ 不启用（旧版文件照旧可用）；这是"可选段"的契约本身。
+TEST(LightingTable, MissingEnvironmentSectionDisablesIbl) {
+    const std::filesystem::path path = WriteTempConfig("vx_lighting_no_environment.toml", kValidConfig);
+    const LightingTable         table = LightingTable::LoadFromFile(path);
+
+    EXPECT_FALSE(table.Environment().enabled);
+    EXPECT_TRUE(table.Environment().hdri.empty());
+    RemoveTempConfig(path);
+}
+
+// 段在但缺 hdri ⇒ 报错（字段缺失不得被静默当成"不启用"）。
+TEST(LightingTable, EnvironmentMissingHdriThrows) {
+    std::string content = kValidConfig;
+    content += "[environment]\nenabled = true\n";
+    const std::filesystem::path path = WriteTempConfig("vx_lighting_env_no_hdri.toml", content);
+    EXPECT_THROW((void)LightingTable::LoadFromFile(path), std::runtime_error);
+    RemoveTempConfig(path);
+}
+
+// enabled = true 但路径为空串 ⇒ 报错（空路径只可能是配置写漏）。
+TEST(LightingTable, EnvironmentEmptyPathWhenEnabledThrows) {
+    std::string content = kValidConfig;
+    content += "[environment]\nenabled = true\nhdri = \"\"\n";
+    const std::filesystem::path path = WriteTempConfig("vx_lighting_env_empty_path.toml", content);
+    EXPECT_THROW((void)LightingTable::LoadFromFile(path), std::runtime_error);
+    RemoveTempConfig(path);
+}
+
+// 合法段逐字段落地（enabled = false 时允许留空路径 —— 关闭态不要求资源）。
+TEST(LightingTable, EnvironmentParsesExplicitValues) {
+    std::string content = kValidConfig;
+    content += "[environment]\nenabled = true\nhdri = \"assets/textures/env/x.hdr\"\n";
+    const std::filesystem::path path = WriteTempConfig("vx_lighting_env_valid.toml", content);
+
+    const LightingTable table = LightingTable::LoadFromFile(path);
+    EXPECT_TRUE(table.Environment().enabled);
+    EXPECT_EQ(table.Environment().hdri.generic_string(), "assets/textures/env/x.hdr");
+
+    content.replace(content.find("enabled = true\nhdri"), std::string("enabled = true\nhdri").size(),
+                    "enabled = false\nhdri");
+    const std::filesystem::path disabledPath = WriteTempConfig("vx_lighting_env_disabled.toml", content);
+    const LightingTable         disabled     = LightingTable::LoadFromFile(disabledPath);
+    EXPECT_FALSE(disabled.Environment().enabled);
+    RemoveTempConfig(path);
+    RemoveTempConfig(disabledPath);
+}
+
+// IBL 启用位与预过滤 mip 级号：**级数为 0 必须是不启用**（回落），且两格同时为 0（不留半启用态）。
+TEST(LightingTable, UniformFlagsIblState) {
+    const LightingTable table = LightingTable::Default();
+
+    const LightingUniform fallback = BuildLightingUniform(table, 0.0, 0.0, 0.0, /*environmentPrefilterMipCount=*/0U);
+    EXPECT_FLOAT_EQ(fallback.fogIblEnabled, 0.0F);
+    EXPECT_FLOAT_EQ(fallback.fogIblPrefilterLodMax, 0.0F);
+
+    const LightingUniform enabled = BuildLightingUniform(table, 0.0, 0.0, 0.0, /*environmentPrefilterMipCount=*/6U);
+    EXPECT_FLOAT_EQ(enabled.fogIblEnabled, 1.0F);
+    // 级号 = 级数 − 1：着色器按 `lod = roughness × 本值` 选级（与烘焙侧 PrefilterRoughnessForMip 同源）。
+    EXPECT_FLOAT_EQ(enabled.fogIblPrefilterLodMax, 5.0F);
+}
+
+// 默认省参调用 = 不启用 IBL：保证既有调用点（旧测试 / 离线工具）语义不变。
+TEST(LightingTable, UniformDefaultArgumentDisablesIbl) {
+    const LightingUniform uniform = BuildLightingUniform(LightingTable::Default(), 0.0, 0.0, 0.0);
+    EXPECT_FLOAT_EQ(uniform.fogIblEnabled, 0.0F);
+    EXPECT_FLOAT_EQ(uniform.fogIblPrefilterLodMax, 0.0F);
+}

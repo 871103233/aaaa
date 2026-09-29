@@ -21,6 +21,11 @@
 //      按**逐像素由世界空间几何法线**算出的混合权重，在三个轴投影之间混合（见 triplanarWeight / 采样段）。
 //      平地路径（混合权重 ≈ 0）**早退**为单次平面投影，采样次数与旧版完全相同；参数全部来自材质表的
 //      `[triplanar]` 段（经 BuildMaterialUniform 投影），此处不留第二份常量。
+//   7. **真实美术贴图（T66 / V0.3 ⓒ）**：材质表 `[textures]` 启用且资源齐备时，四件套换成真实 CC0 贴图
+//      （1024²，`R8G8B8A8_UNORM`）。此时 `material.textureMode.x = 1`：
+//      **粗糙度 / AO 取贴图绝对值**（层基准值不参与）、层色 tint 由 CPU 侧置 1、**宏观变化改用该层 albedo 放大采样**
+//      （`u_macro` 槽位此时绑的就是 albedo 数组，见 `SetSampledTextureArrays` 的调用处）。
+//      资源缺失时由 CPU 侧 **WARN 并回落**程序生成贴图（`textureMode.x = 0`），着色器两条路径都在。
 //
 // PBR 公式（每片元；`N` 为几何 + 法线贴图后的世界法线，`L` 由地表指向太阳，`V` 由地表指向相机，
 // `H = normalize(L + V)`，`α = roughness²`）：
@@ -129,6 +134,14 @@ layout(set = 2, binding = 3) uniform sampler2DArray u_ao;
 layout(set = 2, binding = 4) uniform sampler2DArray u_macro;
 // 阴影深度数组（T21b）：层 i = 级联 i。采样器为 clamp 寻址 + 最近邻（见 mesh_renderer.cpp 的说明）。
 layout(set = 2, binding = 5) uniform sampler2DArray u_shadow;
+// T67 / ADR 0021：环境贴图三件套（`lighting.fogParams.z = 0` 时**不采样**它们，
+// 此时绑定的是渲染器持有的 1×1 占位纹理 —— 见 mesh_renderer.cpp 的 m_environmentPlaceholder）。
+//   binding 6 = 漫反射 irradiance（32×16 等距柱状，余弦卷积）
+//   binding 7 = 预过滤高光（按粗糙度分 mip 的等距柱状）
+//   binding 8 = BRDF LUT（256²，RG：A / B）
+layout(set = 2, binding = 6) uniform sampler2D u_irradiance;
+layout(set = 2, binding = 7) uniform sampler2D u_prefiltered;
+layout(set = 2, binding = 8) uniform sampler2D u_brdfLut;
 
 struct MaterialLayerParams {
     vec4 height;   // x = min, y = max, z = blend, w = 纹理数组层号
@@ -140,6 +153,11 @@ struct MaterialLayerParams {
 layout(set = 3, binding = 0, std140) uniform MaterialBlock {
     vec4 renderOrigin;  // xyz = 渲染原点（世界坐标），片元用它把相机相对位置还原为世界坐标
     vec4 triplanar;     // C 项：x = 启用(1/0), y = slope_min, z = slope_max, w = sharpness（来自材质表 [triplanar]）
+    // T66：x = 真实美术贴图模式(1/0)，其余为填充。
+    //   0 = 程序生成的占位贴图：贴图是**相对变化**（粗糙度 ±20% 乘子、AO 为系数、albedo 为单色细节 × tint）
+    //   1 = 真实 CC0 贴图：贴图是**绝对值**（粗糙度 / AO 直接取贴图值；层色 tint 由 CPU 侧置 1）
+    //   两套语义必须在这里分支，否则真贴图会被再乘一次层基准值 ⇒ 贴图自身的对比被抹平。
+    vec4 textureMode;
     MaterialLayerParams layers[kMaterialLayerCount];
 } material;
 
@@ -154,7 +172,8 @@ layout(set = 3, binding = 1, std140) uniform LightingBlock {
     vec4 skyGroundLinear;        // rgb = 地面反弹色（线性光）, a = 未用
     vec4 cameraPositionWorld;    // xyz = 相机世界位置, a = 未用（指数高度雾按视距插值需要）
     vec4 fogColorDensity;        // rgb = 雾色（线性光）, a = 密度（1 / 格）
-    vec4 fogParams;              // x = 启用(1/0), y = 高度衰减（1 / 格）
+    vec4 fogParams;              // x = 雾启用(1/0), y = 高度衰减（1 / 格）,
+                                 // z = **IBL 启用(1/0)**（T67）, w = **预过滤最大 mip 级号**（T67）
 } lighting;
 
 /// 级联阴影 uniform 块（T21b / ADR 0010 P1）：字段排布与 CPU 侧 engine/render/shadow_cascade.hpp 的
@@ -166,6 +185,15 @@ layout(set = 3, binding = 2, std140) uniform ShadowBlock {
     vec4 cameraForwardEnabled;  // xyz = 相机世界前向（单位向量）, w = 启用(1/0)
     vec4 cascadeBlendParams;    // x = cascade_blend（级联过渡带宽度比例）, y/z/w = 未用（填充位）
 } shadow;
+
+/// 等距柱状投影的**逆映射**：世界方向 → UV（T67 / ADR 0021）。
+/// 与 `sky.frag` / `ibl_irradiance.frag` / `ibl_prefilter.frag` 的映射**逐字一致**（改一处必须同步）。
+/// v = 0 在天顶、v = 1 在天底（与 HDRI 文件的常规朝向一致）。
+vec2 DirectionToEquirect(vec3 direction) {
+    const float kPi = 3.14159265358979323846;
+    return vec2(atan(direction.z, direction.x) / (2.0 * kPi) + 0.5,
+                acos(clamp(direction.y, -1.0, 1.0)) / kPi);
+}
 
 /// 自发光 uniform 块（T27 / 光球）：片元 uniform **槽 3**，由 `MeshRenderer::DrawMeshes` **逐网格**推送
 /// （`SDL_gpu.h`：push 数据对后续绘制生效 ⇒ 普通网格推零值、自发光网格推 `SetEmissiveColor` 的颜色）。
@@ -464,17 +492,25 @@ void main() {
         const float layerRough   = texture(u_roughness, vec3(planarUv, textureLayer)).r;
         const float layerAo      = texture(u_ao, vec3(planarUv, textureLayer)).r;
 
-        // 宏观变化：独立 UV 尺度（显著小于基础 UV 尺度），采样单层 macro 图的 R 通道。
+        // 宏观变化：独立 UV 尺度（显著小于基础 UV 尺度）。
+        //   - 程序生成模式：采样单层 macro 噪声图的 R 通道（值域 [0,1]）；
+        //   - 真实贴图模式（T66）：真实资源里没有"宏观变化图"，改为**用该层自己的 albedo 按宏观尺度放大采样**
+        //     —— 既打破平铺重复（真实 albedo 自带色斑 / 结构），又不额外占用显存与采样器。
         // 乘子围绕 1 上下浮动（±macro_strength），同时调制 albedo 与 roughness（ADR 0010 P2）。
-        const float macro       = texture(u_macro, vec3(worldPosition.xz * layer.macroAo.x, 0.0)).r;
+        const bool  realTextures = material.textureMode.x > 0.5;
+        const vec2  macroUv      = worldPosition.xz * layer.macroAo.x;
+        const float macro = realTextures ? texture(u_albedo, vec3(macroUv, textureLayer)).r
+                                        : texture(u_macro, vec3(macroUv, 0.0)).r;
         const float macroFactor = 1.0 + layer.macroAo.y * (macro * 2.0 - 1.0);
 
-        // 粗糙度：材质表基准 × 贴图的 ±20% 变化，钳到 kMinRoughness（避免 GGX 除零）。
+        // 粗糙度：程序生成模式 = 材质表基准 × 贴图的 ±20% 变化；真实贴图模式 = **贴图值本身**。
+        // 两者都乘宏观乘子并钳到 kMinRoughness（避免 GGX 除零）。
         const float layerSurfaceRoughness =
-            clamp(layer.slope.w * mix(kRoughnessTexLow, kRoughnessTexHigh, layerRough) * macroFactor,
+            clamp((realTextures ? layerRough : layer.slope.w * mix(kRoughnessTexLow, kRoughnessTexHigh, layerRough)) *
+                      macroFactor,
                   kMinRoughness, 1.0);
-        // 环境项系数：材质表 ao × 贴图 AO（逐像素）。
-        const float layerSurfaceAo = clamp(layer.macroAo.z * layerAo, 0.0, 1.0);
+        // 环境项系数：程序生成模式 = 材质表 ao × 贴图 AO（系数）；真实贴图模式 = **贴图 AO 本身**。
+        const float layerSurfaceAo = clamp(realTextures ? layerAo : layer.macroAo.z * layerAo, 0.0, 1.0);
 
         albedo += layerAlbedo * layer.tintUv.rgb * macroFactor * weight;
         tangentNormal += layerNormal * weight;
@@ -528,15 +564,39 @@ void main() {
 
     // 入射辐照度（方向光）：颜色 × 强度 × (1 - 遮蔽量)；阴影只衰减**直接光**。
     const vec3 sunRadiance = lighting.sunColorLinear.rgb * (lighting.sunDirectionIntensity.w * (1.0 - shadowAmount));
-    // 半球天空光：按法线 y 在"地面反弹色 ↔ 天顶色"之间插值，再乘天空强度。
-    // **环境项乘 ambientOcclusion**（ADR 0010 P2：AO 只作用于环境项，不作用于直接光）。
-    const float skyWeight   = mappedNormal.y * 0.5 + 0.5;
-    const vec3  skyColor    = mix(lighting.skyGroundLinear.rgb, lighting.skyZenithIntensity.rgb, skyWeight);
-    const vec3  skyRadiance = skyColor * lighting.skyZenithIntensity.w;
+
+    // ---- 环境项（T67 / [ADR 0021](../../docs/adr/0021-environment-ibl.md)）：**IBL 三件套** ----
+    //   `环境漫反射 = albedo · irradiance(N)`（irradiance 已含 1/π 口径，见 ibl_irradiance.frag）
+    //   `环境高光   = prefiltered(R, roughness) · (F0·A + B)`（split-sum，A/B 来自 BRDF LUT）
+    // **回落路径**（未烘焙 / HDRI 缺失）：退回 ADR 0010 P1 的半球天空光（按法线 y 插值天顶色 ↔ 地面反弹色）。
+    // 启用位与预过滤 mip 级数由光照 uniform 的 `fogParams.zw` 给出（CPU 侧投影，见 lighting_table.hpp）。
+    // 两条路径都**只乘 ambientOcclusion**（ADR 0010 P2：AO 只作用于环境项，不作用于直接光）。
+    const bool  useIbl        = lighting.fogParams.z > 0.5;
+    const float prefilterLodMax = max(lighting.fogParams.w, 0.0);
+
+    vec3 ambientDiffuse = vec3(0.0);
+    if (useIbl) {
+        ambientDiffuse = kD * albedoLinear * texture(u_irradiance, DirectionToEquirect(mappedNormal)).rgb;
+    } else {
+        const float skyWeight   = mappedNormal.y * 0.5 + 0.5;
+        const vec3  skyColor    = mix(lighting.skyGroundLinear.rgb, lighting.skyZenithIntensity.rgb, skyWeight);
+        ambientDiffuse          = kD * albedoLinear * skyColor * lighting.skyZenithIntensity.w;
+    }
+    ambientDiffuse *= ambientOcclusion;
+
+    vec3 ambientSpecular = vec3(0.0);
+    if (useIbl) {
+        // 粗粗糙度取更高 mip：lod = roughness × (mip 级数 − 1)（烘焙时 mip i ⇒ roughness = i/(级数−1)）。
+        const vec3 reflection = reflect(-viewDirection, mappedNormal);
+        const vec3 prefiltered = textureLod(u_prefiltered, DirectionToEquirect(reflection),
+                                            safeRoughness * prefilterLodMax).rgb;
+        const vec2 brdfTerms   = texture(u_brdfLut, vec2(nDotV, safeRoughness)).rg;
+        ambientSpecular = prefiltered * (F * brdfTerms.x + brdfTerms.y) * ambientOcclusion;
+    }
 
     const vec3 directDiffuse  = kD * albedoLinear * sunRadiance * nDotL;
     const vec3 directSpecular = specularBrdf * sunRadiance * nDotL;
-    const vec3 ambient        = kD * albedoLinear * skyRadiance * ambientOcclusion;
+    const vec3 ambient        = ambientDiffuse + ambientSpecular;
 
     const vec3 litColor = directDiffuse + directSpecular + ambient;
 

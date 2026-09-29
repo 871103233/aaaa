@@ -172,3 +172,73 @@ TEST(OutOfBounds, SingleRescueDoesNotRetriggerOnNextFrame) {
     position = spawn;
     EXPECT_FALSE(IsCharacterOutOfBounds(position, bounds, kOutOfBoundsMargin));
 }
+
+// ---- T62：**新尺寸（1×1 km，`tile_radius = [8, 8]`）**下的边界与出界自洽 ----
+//
+// 依据：`docs/plans/v0.2.md` T62。这三项的期望值**取自 T61 的冒烟日志**（`tile 半径 [8, 8]（289 个 tile）`
+// 那一段打印的边界盒 / 4 堵墙 / 救援余量）⇒ "纯函数算的"与"运行时打的"必须逐值一致；
+// 世界尺寸本身由地图预设的 tile 半径驱动，故换地图后这些期望值自动跟随（本组测试只是把当前出厂尺寸钉住）。
+
+// 半径 8 = 地图预设上限（每边 512 列 ⇒ 世界跨 1088 列 ≈ 1.09 km），边界盒随之推到 ±512 / 576。
+TEST(WorldBounds, DerivesOneKilometerBoundsAtMaxRadius) {
+    const WorldBounds bounds = ComputeWorldBounds(8, 8);
+
+    EXPECT_NEAR(bounds.min.x, -512.0, kTolerance);
+    EXPECT_NEAR(bounds.max.x, 576.0, kTolerance);
+    EXPECT_NEAR(bounds.min.z, -512.0, kTolerance);
+    EXPECT_NEAR(bounds.max.z, 576.0, kTolerance);
+    EXPECT_NEAR(bounds.min.y, -kWorldBoundsVerticalHeadroom, kTolerance);
+    EXPECT_NEAR(bounds.max.y, static_cast<double>(kMaxTerrainHeightBlocks) + kWorldBoundsVerticalHeadroom, kTolerance);
+
+    // 17×17 个 tile ⇒ 每边 1088 列（含共享边界列）。
+    EXPECT_NEAR(bounds.max.x - bounds.min.x, 17.0 * static_cast<double>(kTerrainTileSize), kTolerance);
+    EXPECT_NEAR(bounds.max.z - bounds.min.z, 17.0 * static_cast<double>(kTerrainTileSize), kTolerance);
+}
+
+// 1 km 尺寸下 4 堵墙仍**内表面齐平 + 竖直盖满地**：数值与冒烟日志逐值一致
+// （中心 x = ±513、Z 向半长 546、中心 y = 256、半长 264）。
+TEST(WorldBounds, OneKilometerWallsAreFlushAndCoverTheVerticalRange) {
+    const WorldBounds                 bounds = ComputeWorldBounds(8, 8);
+    const std::array<BoundaryWall, 4> walls  = ComputeBoundaryWalls(bounds, kBoundaryWallThickness);
+
+    ASSERT_EQ(walls.size(), static_cast<std::size_t>(4));
+
+    // 齐平：内表面与边界盒表面重合（玩家走不到墙里、也漏不出去）。
+    EXPECT_NEAR(walls[0].center.x + walls[0].halfExtents.x, bounds.min.x, kTolerance);
+    EXPECT_NEAR(walls[1].center.x - walls[1].halfExtents.x, bounds.max.x, kTolerance);
+    EXPECT_NEAR(walls[2].center.z + walls[2].halfExtents.z, bounds.min.z, kTolerance);
+    EXPECT_NEAR(walls[3].center.z - walls[3].halfExtents.z, bounds.max.z, kTolerance);
+
+    // 与运行期日志一致的中心 / 半长（四角靠"平行墙多铺一个墙厚"封口）。
+    EXPECT_NEAR(walls[0].center.x, -513.0, kTolerance);
+    EXPECT_NEAR(walls[1].center.x, 577.0, kTolerance);
+    EXPECT_NEAR(walls[0].halfExtents.z, 546.0, kTolerance);
+    EXPECT_NEAR(walls[2].halfExtents.x, 546.0, kTolerance);
+    EXPECT_NEAR(walls[0].center.y, 256.0, kTolerance);
+    EXPECT_NEAR(walls[0].halfExtents.y, 264.0, kTolerance);
+}
+
+// 1 km 世界里的出界救援：贴着墙**内侧**不救援（玩家能沿边走），越过余量才送回出生点（T18 口径不变）。
+TEST(OutOfBounds, RescuesAtOneKilometerOnlyBeyondTheMargin) {
+    const WorldBounds bounds = ComputeWorldBounds(8, 8);
+    const glm::dvec3  spawn(0.0, 120.5, 0.0);
+
+    // 墙内侧一格仍是可玩区（墙挡人、不替人判定出界）。
+    EXPECT_FALSE(IsCharacterOutOfBounds(glm::dvec3(bounds.min.x + 0.5, 120.0, bounds.min.z + 0.5), bounds,
+                                        kOutOfBoundsMargin));
+    EXPECT_FALSE(IsCharacterOutOfBounds(glm::dvec3(bounds.max.x - 0.5, 120.0, bounds.max.z - 0.5), bounds,
+                                        kOutOfBoundsMargin));
+    // 恰好落在余量上不算出界；多一毫米才算。
+    EXPECT_FALSE(IsCharacterOutOfBounds(glm::dvec3(bounds.max.x + kOutOfBoundsMargin, 120.0, 0.0), bounds,
+                                        kOutOfBoundsMargin));
+    EXPECT_TRUE(IsCharacterOutOfBounds(glm::dvec3(bounds.max.x + kOutOfBoundsMargin + 0.001, 120.0, 0.0), bounds,
+                                       kOutOfBoundsMargin));
+    // 坠到盒底之下、飞越 -Z 侧同样被抓回。
+    EXPECT_TRUE(IsCharacterOutOfBounds(glm::dvec3(0.0, bounds.min.y - kOutOfBoundsMargin - 1.0, 0.0), bounds,
+                                       kOutOfBoundsMargin));
+    EXPECT_TRUE(IsCharacterOutOfBounds(glm::dvec3(0.0, 120.0, bounds.min.z - kOutOfBoundsMargin - 0.001), bounds,
+                                       kOutOfBoundsMargin));
+
+    // 救援（送回出生点）后下一帧不再触发。
+    EXPECT_FALSE(IsCharacterOutOfBounds(spawn, bounds, kOutOfBoundsMargin));
+}

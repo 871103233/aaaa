@@ -43,6 +43,10 @@ struct PendingDestruction {
     /// 把一批地表 tile 加入队列（同上）。
     void MergeTiles(const std::vector<TileCoord>& tiles);
 
+    /// **只**排入"重建碰撞体"阶段（T61）：新建的可挖体积块在 `CreateBlock` 里**已经**填好密度并网格化过
+    /// （网格也已上传），再排一次重网格纯属重复劳动（一块 ≈ 5~9 ms）；这里只补它缺的那一半 —— 碰撞体。
+    void MergeVolumeBlockCollisions(const std::vector<BlockCoord>& blocks);
+
     /// 取下一个待处理单位；队列已空时返回 false。
     [[nodiscard]] bool TakeNext(Unit& out);
 
@@ -117,6 +121,14 @@ inline void PendingDestruction::MergeTiles(const std::vector<TileCoord>& tiles) 
         m_collision.push_back(Unit { UnitKind::TileCollision, BlockCoord {}, tile });
     }
     SortAndDedup(m_remesh);
+    SortAndDedup(m_collision);
+}
+
+inline void PendingDestruction::MergeVolumeBlockCollisions(const std::vector<BlockCoord>& blocks) {
+    ResetIfDrained();
+    for (const BlockCoord& block : blocks) {
+        m_collision.push_back(Unit { UnitKind::VolumeCollision, block, TileCoord {} });
+    }
     SortAndDedup(m_collision);
 }
 

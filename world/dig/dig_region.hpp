@@ -59,7 +59,9 @@ public:
     [[nodiscard]] static DigRegionTable LoadFromFile(const std::filesystem::path& path);
 
     /// 直接构造（单元测试用；不做文件 IO）。会做与装载相同的校验与块枚举。
-    [[nodiscard]] static DigRegionTable FromRegions(std::vector<DigRegion> regions);
+    /// `bandDownBlocks` / `bandUpBlocks` 见 `BandDownBlocks()`。
+    [[nodiscard]] static DigRegionTable FromRegions(std::vector<DigRegion> regions, int bandDownBlocks = 0,
+                                                    int bandUpBlocks = 0);
 
     /// 空表：没有任何可挖区域。
     [[nodiscard]] static DigRegionTable Default();
@@ -67,6 +69,15 @@ public:
     [[nodiscard]] bool Empty() const noexcept { return m_regions.empty(); }
 
     [[nodiscard]] int SchemaVersion() const noexcept { return m_schemaVersion; }
+
+    /// **竖向带宽**（T59 / [ADR 0020](adr/0020-dig-volume-vertical-band-and-dynamic-residency.md) 决策一）：
+    /// 可挖体积只允许存在于 `[该列地表高度 − BandDownBlocks, 该列地表高度 + BandUpBlocks]` 之内。
+    ///
+    /// **`0` = 不裁剪**（引入本字段之前的旧口径）⇒ 可向后兼容地省略，故 `schema_version` **不变**。
+    /// 真正起作用的是 **`band_down`**：地表以上本来就是空气、没有可挖之物，它决定玩家**向下能挖多深**
+    /// —— 这正是"只有地表部分深度可挖"的唯一旋钮。
+    [[nodiscard]] int BandDownBlocks() const noexcept { return m_bandDown; }
+    [[nodiscard]] int BandUpBlocks() const noexcept { return m_bandUp; }
 
     /// 全部区域（已按 `(priority 升序, 文件顺序)` 排列）。
     [[nodiscard]] const std::vector<DigRegion>& Regions() const noexcept { return m_regions; }
@@ -88,6 +99,8 @@ private:
     std::vector<DigRegion>  m_regions;  ///< 已按 (priority 升序, 文件顺序) 排列
     std::vector<BlockCoord> m_blocks;   ///< 全部可挖块
     int                     m_schemaVersion = kSchemaVersion;
+    int                     m_bandDown = 0;  ///< 地表以下可挖深度（格）；0 = 不裁剪（旧口径）
+    int                     m_bandUp   = 0;  ///< 地表以上可挖高度（格）；0 = 不裁剪（旧口径）
 };
 
 }  // namespace vx
