@@ -14,7 +14,7 @@
 | Dear ImGui（`imgui`，含 SDL3 与 SDL3_gpu 绑定） | 调试 UI | MIT | V0.1 |
 | toml++（`tomlplusplus`） | 配置解析 | MIT | V0.1 |
 | GoogleTest | 单元测试 | BSD-3-Clause | V0.1 |
-| enkits（enkiTS）\* | 任务调度 | zlib | V0.3 |
+| enkits（enkiTS）\* | 任务调度 | zlib | **V0.3（T81 起已真正启用）**：`vcpkg.json` 依赖 `enkits`（实测 **1.12**）；唯一引用点 = `engine/core/task_scheduler.*`（头目录 `include/enkiTS/`，只在 `.cpp` 内出现），首个消费者 = `world/streaming/volume_build_pipeline.*`（可挖体积块构建下沉 worker，见 [ADR 0022](docs/adr/0022-volume-build-worker-pipeline.md)） |
 | Taskflow \* | 任务调度（备选） | MIT | V0.3（备选） |
 | EnTT | ECS | MIT | V0.4 |
 | Jolt Physics（`joltphysics`） | 刚体物理 / 角色碰撞与地形碰撞 | MIT | V0.1 |

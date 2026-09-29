@@ -17,6 +17,14 @@ inline constexpr int kTerrainTileSize = 64;
 /// 因此拼接处的顶点位置逐位相等，不会出现裂缝（red line 12 / references/chunk-and-streaming.md §3）。
 inline constexpr int kTerrainTileVertexCount = kTerrainTileSize + 1;
 
+/// 一张**满地表** tile 的索引数上界：每格两个三角形 = `64×64×6 = 24576`。
+///
+/// **顶点数是常数**（`kTerrainTileVertexCount²`，与四边形过滤无关），而**索引数会随层间接管（ADR 0011）升降**：
+/// 被可挖体积接管的四边形不发射（网格变小），接管退去后又长回来。
+/// ⇒ 这个上界正是"tile 网格缓冲**永远够用**"的容量（T82：地表 tile 的兜底重建按它预留，
+/// 使该 tile 之后无论接管如何翻转都不再触发重建）。
+inline constexpr int kTerrainTileIndexCount = kTerrainTileSize * kTerrainTileSize * 6;
+
 /// 高度定点精度：`int16`，1/16 格（ADR 0008）。
 /// 定点而非 `float`，是为了让高度存储与比较跨调用完全确定。
 inline constexpr int kHeightUnitsPerBlock = 16;

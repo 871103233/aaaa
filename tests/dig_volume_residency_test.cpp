@@ -376,3 +376,113 @@ TEST(DigVolumeResidency, BoundaryJitterDoesNotFlipTheWindowOrScheduleWork) {
     EXPECT_TRUE(scheduler.Update(volumes, static_cast<double>(vx::kTerrainTileSize) + 16.0, 0.0));
     EXPECT_GT(scheduler.PendingCreateCount(), 0U);
 }
+
+// ---------------------------------------------------------------------------
+// T80（2026-09-29）：**窗口预取** —— 常驻半径 = 活动半径 + 预取环宽（load radius > active radius）
+// 目的：跨界时"将要进入"的块已经建好 ⇒ 不再出现成串建块尖峰（T72/T73 实测的 63 块 / 次）
+// ---------------------------------------------------------------------------
+
+// 纯函数：预取窗口是活动窗口的**超集**，且**共用同一个中心 tile**；活动窗口的语义不受影响。
+TEST(DigVolumeResidency, ResidencyWindowIsASupersetOfTheActivityWindow) {
+    const vx::DigVolumeWindow activity  = vx::WindowForPlayerBlocks(100.0, -100.0, 2);
+    const vx::DigVolumeWindow residency = vx::ResidencyWindowForPlayerBlocks(100.0, -100.0, 2, 1);
+
+    EXPECT_EQ(residency.centerTileX, activity.centerTileX);
+    EXPECT_EQ(residency.centerTileZ, activity.centerTileZ);
+    EXPECT_EQ(activity.radiusTiles, 2);
+    EXPECT_EQ(residency.radiusTiles, 3) << "常驻半径 = 活动半径 + 预取环宽";
+
+    // 超集性质：活动窗口的每一个 tile 都在常驻窗口里（逐 tile 抽查 + 边界）。
+    EXPECT_TRUE(residency.MinTileX() <= activity.MinTileX());
+    EXPECT_TRUE(residency.MaxTileX() >= activity.MaxTileX());
+    EXPECT_TRUE(residency.MinTileZ() <= activity.MinTileZ());
+    EXPECT_TRUE(residency.MaxTileZ() >= activity.MaxTileZ());
+
+    // 预取环宽 0 ⇒ 与活动窗口**逐值相同**（可作对照口径）。
+    const vx::DigVolumeWindow none = vx::ResidencyWindowForPlayerBlocks(100.0, -100.0, 2, 0);
+    EXPECT_EQ(none.radiusTiles, 2);
+    EXPECT_EQ(none.MinTileX(), activity.MinTileX());
+    EXPECT_EQ(none.MaxTileZ(), activity.MaxTileZ());
+
+    // 负的预取宽度按 0 处理（前置条件之外的值不得放大窗口）。
+    EXPECT_EQ(vx::ResidencyWindowForPlayerBlocks(0.0, 0.0, 1, -3).radiusTiles, 1);
+}
+
+// 端到端：**越过 tile 边界时不需要现场建块**（要用的那圈已在预取环里）——这正是 T80 要拿掉的尖峰来源。
+// 对照：同样的移动，预取环宽 0 时必须建 4 块（= 旧行为）。
+TEST(DigVolumeResidency, PrefetchRemovesTheCreateBurstWhenCrossingATileBoundary) {
+    const MapPreset preset = FlatPreset();
+
+    // 两个独立世界：预取 1 与预取 0（后者 = 引入预取之前的行为）。
+    TerrainWorld worldPrefetch(preset.seed, TerrainMaterialTable::Default());
+    TerrainWorld worldLegacy(preset.seed, TerrainMaterialTable::Default());
+    for (TerrainWorld* world : { &worldPrefetch, &worldLegacy }) {
+        world->SetMapPreset(preset);
+        for (int tileZ = -1; tileZ <= 1; ++tileZ) {
+            for (int tileX = -1; tileX <= 1; ++tileX) {
+                world->LoadTile(tileX, tileZ);
+            }
+        }
+    }
+
+    const DigRegionTable regions = FlatRegions();  // 36 块（3×3 tile）
+    DigVolumeWorld     volumesPrefetch(worldPrefetch, regions);
+    DigVolumeWorld     volumesLegacy(worldLegacy, regions);
+
+    constexpr int kRadius = 0;  // 活动窗口 = 玩家所在的那一个 tile（与既有单测同口径）
+
+    // ---- 预取 1：启动常驻 = 预取窗口（tile ∈ [-1, 1] ⇒ 全部 36 块）----
+    DigVolumeScheduler prefetch(regions, kRadius, vx::kResidencyPrefetchTiles);
+    const vx::DigVolumeWindow spawnResidency =
+        vx::ResidencyWindowForPlayerBlocks(0.0, 0.0, kRadius, vx::kResidencyPrefetchTiles);
+    std::vector<BlockCoord> initialPrefetch;
+    for (const BlockCoord& coord : regions.Blocks()) {
+        if (spawnResidency.ContainsBlock(coord)) {
+            initialPrefetch.push_back(coord);
+        }
+    }
+    ASSERT_EQ(initialPrefetch.size(), 36U) << "预取 1 时出生点的常驻集合已覆盖整张区域表";
+    volumesPrefetch.BeginInitFromHeightField(initialPrefetch);
+    StepUntilDone(volumesPrefetch);
+    EXPECT_FALSE(prefetch.Update(volumesPrefetch, 0.0, 0.0)) << "出生点已达成目标集合 ⇒ 无待办";
+
+    // ---- 对照：预取 0：启动常驻 = 活动窗口那一个 tile（4 块）----
+    DigVolumeScheduler legacy(regions, kRadius, 0);
+    const vx::DigVolumeWindow spawnActivity = vx::WindowForPlayerBlocks(0.0, 0.0, kRadius);
+    std::vector<BlockCoord> initialLegacy;
+    for (const BlockCoord& coord : regions.Blocks()) {
+        if (spawnActivity.ContainsBlock(coord)) {
+            initialLegacy.push_back(coord);
+        }
+    }
+    ASSERT_EQ(initialLegacy.size(), 4U);
+    volumesLegacy.BeginInitFromHeightField(initialLegacy);
+    StepUntilDone(volumesLegacy);
+    EXPECT_FALSE(legacy.Update(volumesLegacy, 0.0, 0.0));
+
+    // ---- 真实跨过 tile 边界（必须越过滞回带宽）----
+    const double crossedX = static_cast<double>(vx::kTerrainTileSize) + vx::kWindowHysteresisBlocks;
+
+    ASSERT_TRUE(legacy.Update(volumesLegacy, crossedX, 0.0));
+    EXPECT_EQ(legacy.PendingCreateCount(), 4U)
+        << "对照：预取 0 时跨界要**现场建 4 块**（旧行为的尖峰来源）";
+
+    // 预取 1：跨界时活动窗口变了（+ 环），但**要用的块全都已在常驻里** ⇒ 零建块。
+    // 常驻集合只是"多出来的一圈离开窗口后按普通规则卸载"（这里：区域表只有 3×3 tile ⇒ 只卸不建）。
+    const bool hasWork = prefetch.Update(volumesPrefetch, crossedX, 0.0);
+    EXPECT_EQ(prefetch.PendingCreateCount(), 0U) << "**T80 的核心判据：跨界不再现场建块**";
+    EXPECT_EQ(prefetch.Window().radiusTiles, kRadius) << "活动半径不变（K 语义不变）";
+    EXPECT_EQ(prefetch.ResidencyWindow().radiusTiles, kRadius + vx::kResidencyPrefetchTiles);
+    EXPECT_EQ(prefetch.Window().centerTileX, 1) << "活动窗口确实跟着玩家走了（只是不需要建块）";
+    EXPECT_TRUE(hasWork) << "仍要卸载已离开预取窗口的块（在既有分帧队列里做）";
+    // 区域表 x/z ∈ [-2, 3]（各 6 块）：新预取窗口（tile 0..2）内只剩 x ∈ {0..3} ⇒ 卸掉 x ∈ {-2, -1} 的 12 块。
+    ASSERT_EQ(prefetch.PendingUnloadCount(), 12U);
+    EXPECT_EQ(prefetch.DesiredCount(), 24U);
+
+    std::vector<BlockCoord> changed;
+    EXPECT_TRUE(prefetch.Step(volumesPrefetch, 100U, changed));
+    EXPECT_FALSE(prefetch.HasPendingWork());
+    EXPECT_EQ(changed.size(), 12U) << "只有卸载，没有任何建块";
+    // 常驻收敛到"新预取窗口 ∩ 区域表" = 24 块。
+    EXPECT_EQ(volumesPrefetch.ResidentBlocks().size(), 24U);
+}

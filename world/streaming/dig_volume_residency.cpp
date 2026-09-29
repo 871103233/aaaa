@@ -33,6 +33,12 @@ DigVolumeWindow WindowForPlayerBlocks(double worldX, double worldZ, int radiusTi
     return window;
 }
 
+DigVolumeWindow ResidencyWindowForPlayerBlocks(double worldX, double worldZ, int radiusTiles,
+                                              int prefetchTiles) noexcept {
+    const int prefetch = (prefetchTiles > 0) ? prefetchTiles : 0;
+    return WindowForPlayerBlocks(worldX, worldZ, radiusTiles + prefetch);
+}
+
 int HysteresisCenterTile(int centerTile, int playerTile, double playerCoord,
                          double hysteresisBlocks) noexcept {
     const int diff = playerTile - centerTile;
@@ -111,8 +117,9 @@ DigVolumeResidencyPlan PlanDigVolumeResidency(const DigVolumeWindow& window,
     return plan;
 }
 
-DigVolumeScheduler::DigVolumeScheduler(const DigRegionTable& regions, int radiusTiles)
-    : m_regions(regions), m_radiusTiles((radiusTiles > 0) ? radiusTiles : 0) {}
+DigVolumeScheduler::DigVolumeScheduler(const DigRegionTable& regions, int radiusTiles, int prefetchTiles)
+    : m_regions(regions), m_radiusTiles((radiusTiles > 0) ? radiusTiles : 0),
+      m_prefetchTiles((prefetchTiles > 0) ? prefetchTiles : 0) {}
 
 bool DigVolumeScheduler::Update(const DigVolumeWorld& volumes, double playerX, double playerZ) {
     const DigVolumeWindow player = WindowForPlayerBlocks(playerX, playerZ, m_radiusTiles);
@@ -135,16 +142,21 @@ bool DigVolumeScheduler::Update(const DigVolumeWorld& volumes, double playerX, d
         m_windowValid = true;
     }
 
+    // T80 / ADR 0020 决策二修订：**常驻集合按预取窗口计算**（= 活动窗口 + 预取环），
+    // 使玩家"将进入"的块提前建好。活动窗口 `m_window` 保持不变（它才是"能挖"的范围）。
+    m_residencyWindow             = m_window;
+    m_residencyWindow.radiusTiles = m_radiusTiles + m_prefetchTiles;
+
     m_desiredCount = 0;
     for (const BlockCoord& coord : m_regions.Blocks()) {
-        if (m_window.ContainsBlock(coord)) {
+        if (m_residencyWindow.ContainsBlock(coord)) {
             ++m_desiredCount;
         }
     }
 
     const std::vector<BlockCoord> resident = volumes.ResidentBlocks();
     const DigVolumeResidencyPlan  plan     = PlanDigVolumeResidency(
-        m_window, m_regions.Blocks(), resident,
+        m_residencyWindow, m_regions.Blocks(), resident,
         [&volumes](const BlockCoord& coord) { return volumes.IsBlockDirty(coord); }, kMaxKeptDirtyBlocks);
 
     m_pendingCreate = plan.toCreate;

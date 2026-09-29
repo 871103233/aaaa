@@ -7,12 +7,14 @@
 find_package(Jolt CONFIG REQUIRED)
 find_package(tomlplusplus CONFIG REQUIRED)
 find_package(Stb REQUIRED)   # 纹理资源加载（T57）；只用其头，实现编在 texture_loader.cpp 内
+find_package(enkiTS CONFIG REQUIRED)  # 任务调度（T81 起真正启用；ADR 0003：端口名 `enkits`）
 
 add_library(voxel_engine STATIC
     core/clock.cpp
     core/fixed_step.cpp
     core/frame_limiter.cpp
     core/log.cpp
+    core/task_scheduler.cpp
     input/input_map.cpp
     physics/physics_world.cpp
     platform/settings.cpp
@@ -38,5 +40,6 @@ target_link_libraries(voxel_engine
     PUBLIC  SDL3::SDL3              # 公共头文件暴露 SDL 类型，故为 PUBLIC
     PUBLIC  glm::glm
     PRIVATE Jolt::Jolt              # 只在 physics_world.cpp 内出现 Jolt 头，故为 PRIVATE
+    PRIVATE enkiTS::enkiTS          # 只在 core/task_scheduler.cpp 内出现 enkits 头，故为 PRIVATE
     PRIVATE tomlplusplus::tomlplusplus  # 只在 settings.cpp 内出现 toml++ 头，故为 PRIVATE
 )

@@ -5,15 +5,18 @@
 
 #include <glm/vec3.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <vector>
 
 namespace vx {
 
 class TerrainWorld;
 class TerrainMaterialTable;
+class VolumeBuildPipeline;  ///< T81：任务池（`world/streaming/volume_build_pipeline.hpp`）
 
 /// 球体挖除的**平滑过渡带**宽度（格）：球面之外再留这么宽的一条带，把密度从"挖空"平滑地过渡回
 /// "原样"，使洞（与 T50 在碎块补丁上挖出的缺口）在等值面上都是平滑曲面而不是硬边。
@@ -79,6 +82,77 @@ struct VoxelBounds {
 
     [[nodiscard]] bool Empty() const noexcept { return maxX < minX || maxY < minY || maxZ < minZ; }
 };
+
+/// 体积块密度数组的**下标**（`i/j/k ∈ [0, kVolumeBlockSize]`）。
+///
+/// 公开（T81）：worker 侧的纯构建路径与主线程路径**必须**用同一个布局函数（逐位一致的前提）。
+[[nodiscard]] inline std::size_t VolumeDensityIndex(int i, int j, int k) noexcept {
+    const std::size_t extent = static_cast<std::size_t>(kVolumeSampleCount);
+    return static_cast<std::size_t>(i) + extent * (static_cast<std::size_t>(j) + extent * static_cast<std::size_t>(k));
+}
+
+/// 分类一个体积块的填充（T30）：含共享边界在内的全部采样同号时可整块排除出塌落邻域。
+///
+/// 公开（T81）：同上，两条构建路径共用**同一个**实现。
+[[nodiscard]] BlockFill ClassifyFill(const std::vector<std::int8_t>& density) noexcept;
+
+/// **一个体积块的不可变构建输入**（T81 / [ADR 0022](../../docs/adr/0022-volume-build-worker-pipeline.md)）。
+///
+/// 把"填密度 + 网格化"会读到的**全部世界数据**在**主线程**上一次采齐 ⇒ 之后的计算是
+/// **纯函数**（`BuildBlockFromInput`），可以在 worker 上跑而**不读任何世界对象**（红线 7 / 9：
+/// 快照 + 单写者；worker 不碰图形 API）。
+///
+/// 采样布局（`kSampleExtent = 34`，局部坐标 `-1..kVolumeBlockSize`）：
+///   - **内部** `[0, kVolumeBlockSize]³`（33³）由 `BuildBlockFromInput` 从 `surfaceHeights` 填充
+///     （原 `FillBlockDensity` 的工作 —— 这正是要下沉到 worker 的那一半）；
+///   - **壳层**（`34³ − 33³ = 3367` 个采样，至少一个轴为 `-1`）在**采样时**就填好：邻块存在 ⇒ 取它的
+///     密度；邻块不存在 ⇒ 用 `surfaceHeights` 按**同一公式**推导 —— 与同步路径的 `BlockSampler`
+///     越界回落完全一致。
+struct BlockBuildInput {
+    static constexpr int         kPatchSize   = kVolumeBlockSize + 3;   ///< 35：列补丁宽（局部列 `-1..33`）
+    static constexpr int         kSampleExtent = kVolumeBlockSize + 2;  ///< 34：采样一侧（局部 `-1..32`）
+    static constexpr std::size_t kPatchCells  = static_cast<std::size_t>(kPatchSize) *
+                                                static_cast<std::size_t>(kPatchSize);
+    static constexpr std::size_t kSampleCells = static_cast<std::size_t>(kSampleExtent) *
+                                                static_cast<std::size_t>(kSampleExtent) *
+                                                static_cast<std::size_t>(kSampleExtent);
+
+    BlockCoord coord {};
+
+    /// 列表面高度（格；`NaN` = 该列无地形数据），局部列 `(i, k) ∈ [-1, 33]²`，下标 = `(i+1) + 35*(k+1)`。
+    std::array<float, kPatchCells> surfaceHeights {};
+
+    /// 列**派生材质槽位**（`kNoMaterialSlot` = 该列无数据），与 `surfaceHeights` 同布局。
+    /// 来源 = `TerrainWorld::QueryDigMaterialSlot`（与 `SampleMaterialSlot` 的回落路径同一实现）。
+    std::array<std::uint8_t, kPatchCells> columnMaterial {};
+
+    /// 34³ 采样密度（局部 `-1..32`）：壳层 = 邻块 / 推导值；**内部留 0**，由 worker 按补丁填充。
+    std::array<std::int8_t, kSampleCells> density {};
+
+    /// 34³ 采样**已写入的体素材质**（T42）：壳层 = 邻块的存储值（块无材质数组 ⇒ `kNoMaterialSlot`）；
+    /// **内部一律 `kNoMaterialSlot`**（新建的块从未被写过材质 —— 只有塌落残骸才写，见 `VolumeBlock::material`）。
+    /// 解析规则与 `SampleMaterialSlot` 一致：非 `kNoMaterialSlot` 优先，否则回落列派生。
+    std::array<std::uint8_t, kSampleCells> storedMaterial {};
+};
+
+/// **`BlockBuildInput` 的纯函数产物**（T81）：一个块的全部数据（密度 / 网格 / 填充分类）。
+///
+/// 与同步路径（`DigVolumeWorld::CreateBlock` = `FillBlockDensity` + `MeshBlock`）**逐位一致**
+/// （由单测钉住）—— 两条路径共用同一个公式、同一个 Surface Nets、同一个分类函数。
+struct BlockBuildResult {
+    BlockCoord               coord {};
+    std::vector<std::int8_t> density {};  ///< 33³（下标见 `VolumeDensityIndex`）
+    MeshData                 mesh {};     ///< 块内局部坐标（格）；世界定位由 `coord` 承担（红线 6）
+    BlockFill                fill = BlockFill::Mixed;
+    /// worker 侧**计算**耗时（毫秒；观测用，不参与任何判据）。**不含**主线程采快照的耗时。
+    double                   computeMs = 0.0;
+};
+
+/// 由 `BlockBuildInput` **纯函数**地构建一个块（T81）：填密度 → Surface Nets 网格化 → 填充分类。
+///
+/// 线程约定：**可在任意线程调用**（只读入参、只写返回值，不触碰任何全局 / 世界状态）⇒ 这就是
+/// 下沉 worker 的载体。`input.coord` 决定世界定位（用于越界采样时换算列索引）。
+[[nodiscard]] BlockBuildResult BuildBlockFromInput(const BlockBuildInput& input);
 
 /// 可挖体积世界（ADR 0004 层 ②）：**只在被标记区域内存在**的有界 SDF 体积。
 ///
@@ -210,7 +284,34 @@ public:
 
     /// 按需**创建**一个块（填密度 + 网格化）。块已存在、或 `coord` 不属于可挖区域表 ⇒ 返回 false。
     /// 语义与批量初始化里的"填密度 + 网格化"逐字一致（同一对 `FillBlockDensity` / `MeshBlock`）。
+    ///
+    /// **T81 / [ADR 0022](../../docs/adr/0022-volume-build-worker-pipeline.md)**：若已用
+    /// `SetBuildPipeline` 装了任务池，则本函数改为**提交异步构建**（主线程只采快照，计算在 worker）——
+    /// 此时返回 **false**（"尚未常驻"，块要等 `PollBlockBuildsAndInstall` 安装后才存在），
+    /// 调用方不得把返回值理解成"创建失败"；`false` 的语义是**"这一次没有让块就位"**。
+    /// 未装任务池（单测 / 工具 / 降级）时走原来的**同步路径**，返回是否真的建成。
     bool CreateBlock(const BlockCoord& coord);
+
+    // ---- T81：块构建下沉 worker（ADR 0022）----
+
+    /// 装上（或卸载，传 `nullptr`）块构建任务池。**不拥有**它 —— 生命周期必须覆盖本对象。
+    void SetBuildPipeline(VolumeBuildPipeline* pipeline) noexcept { m_buildPipeline = pipeline; }
+
+    /// 采集一个块的**不可变构建输入**（纯读；见 `BlockBuildInput`）。
+    ///
+    /// 线程约定：**只在主线程（单写者）调用**；成本 ≈ 35² 次地表查询 + 3367 个壳层采样读取。
+    [[nodiscard]] BlockBuildInput CaptureBlockBuildInput(const BlockCoord& coord) const;
+
+    /// 安装一个已算好的块（T81）：块已存在 ⇒ 返回 false 并**丢弃结果**（窗口又移动过 / 已被同步路径建过）。
+    /// 它等价于同步路径里 `CreateBlock` 的后半段（写入 `m_blocks`）。
+    bool InstallBuiltBlock(BlockBuildResult&& result);
+
+    /// 收包：从任务池取回至多 `maxResults` 个已完成结果并安装；安装成功的块坐标追加到 `installedOut`。
+    /// **只在主线程调用**；无任务池时为无操作（返回 0）。
+    std::size_t PollBlockBuildsAndInstall(std::vector<BlockCoord>& installedOut, std::size_t maxResults);
+
+    /// 已提交但**尚未安装**的块数（面板 / 日志用）。
+    [[nodiscard]] std::size_t PendingBuildCount() const noexcept { return m_pendingBuilds.size(); }
 
     /// **卸载**一个块（释放密度 / 材质 / 网格）。块不存在、或该块**已被玩家改动** ⇒ 返回 false
     /// （ADR 0020 决策五：玩家挖过的洞不得随走远而消失）。
@@ -297,6 +398,29 @@ private:
     bool RasterizeBall(const glm::dvec3& center, float radius, bool skipIndestructible, const BlastMask* mask,
                        std::vector<BlockCoord>& dirtyOut, VoxelBounds* boundsOut);
 
+    /// `CarveByDamage` 的一个**候选格³**（格心到爆心的距离 + 整数坐标）。
+    struct CarveCandidate {
+        double distance = 0.0;
+        int    x = 0;
+        int    y = 0;
+        int    z = 0;
+    };
+
+    /// `CarveByDamage` 复用的 scratch（T79④ / 红线 10：热路径不做堆分配）。
+    ///
+    /// 每发爆炸都要枚举候选格³（半径 4 ⇒ ≈ 9³ = 729 个）并准备"爆炸波可达性"的三张缓存 + 洪泛栈；
+    /// 这些缓冲**每次调用都被完整覆盖**（只写不读旧值）⇒ 复用**不改变结果**（红线 7），
+    /// 却把每发的 4~6 次堆分配降为**稳态零分配**（`assign` 在容量足够时不会重新分配）。
+    /// 线程约定与本类一致：只在逻辑线程、单写者 —— 因此复用是安全的（不可能被并发调用）。
+    struct CarveScratch {
+        std::vector<CarveCandidate> cells;      ///< 候选格³（每发按距离升序 → (x,y,z) 升序重排）
+        BlastMask                   mask;       ///< 爆炸波可达性掩码（`reachable` 复用容量）
+        std::vector<std::uint8_t>   slotOf;     ///< 每格材质槽位缓存（与掩码同布局）
+        std::vector<std::uint8_t>   solidOf;    ///< 每格是否实心
+        std::vector<std::uint8_t>   blockerOf;  ///< 每格是否遮挡爆炸波（实心 ∧ 不可破坏）
+        std::vector<int>            floodStack; ///< 洪泛用的显式栈（深度可达数万格 ⇒ 不用递归）
+    };
+
     /// 该采样点所属材质是否**不可破坏**（`indestructible = true` 或 `toughness <= 0`，T31 / ADR 0013）。
     [[nodiscard]] bool IsIndestructibleSample(int worldX, int worldY, int worldZ) const noexcept;
 
@@ -329,6 +453,15 @@ private:
     const TerrainWorld&      m_terrain;
     const DigRegionTable&    m_regions;
     std::map<BlockCoord, VolumeBlock> m_blocks;
+
+    /// T81（ADR 0022）：块构建任务池（**不拥有**；`nullptr` = 走同步路径）。只在主线程读写。
+    VolumeBuildPipeline* m_buildPipeline = nullptr;
+
+    /// 已提交、尚未安装的块（升序；防重复提交 + 诊断）。只在主线程读写。
+    std::set<BlockCoord> m_pendingBuilds;
+
+    /// T79④：`CarveByDamage` 的**复用 scratch**（见 `CarveScratch` —— 每次调用完整覆盖，稳态零分配）。
+    CarveScratch m_carveScratch;
 
     /// 分步初始化的游标：已完成的步数（`InitCompletedSteps` 暴露给加载画面）。
     std::size_t m_initCursor = 0;

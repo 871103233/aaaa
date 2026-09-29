@@ -3,6 +3,7 @@
 #include "terrain/material_blender.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <set>
 #include <utility>
@@ -12,6 +13,30 @@ namespace {
 
 /// 遮挡查询的采样步长（格）：越小越精确，越大越省。
 constexpr float kObstructionStepBlocks = 0.25F;
+
+/// 世界列 → 所在 tile 索引（向下取整，负坐标也正确）。
+[[nodiscard]] constexpr int TileIndexOfColumn(int column) noexcept {
+    const int quotient  = column / kTerrainTileSize;
+    const int remainder = column % kTerrainTileSize;
+    return (remainder != 0 && ((remainder < 0) != (kTerrainTileSize < 0))) ? (quotient - 1) : quotient;
+}
+
+/// 可能持有世界列 `(worldX, worldZ)` 的 tile 候选（**最多 4 个**，升序 = `std::map` 的遍历顺序）。
+///
+/// 判据：`TileContainsColumn` 是"列 ∈ `[tile 原点, tile 原点 + kTerrainTileSize]`"（**含共享边界列**），
+/// 故一个世界列每轴至多被 **2 个** tile 持有 ⇒ 候选 = `{floorDiv(c, 64), floorDiv(c, 64) − 1}` 的笛卡尔积。
+///
+/// 为什么需要（T79①）：`QueryHeight` 是**每帧热路径**（相机避障 / 弹道 / 材质派生），而
+/// `ReadColumnHeight` / `WriteColumnHeight` 原先**线性遍历全部已加载 tile**（1 km 世界 = 289 tile
+/// ⇒ 每次查询 289 次 map 命中 + 包围盒判定）。改成"由整数除法直接给出候选"后是 **O(1)**，
+/// 且**语义逐位不变**（含共享边界列会被全部命中；返回值与写入集合与遍历全部 tile 时一致）。
+[[nodiscard]] std::array<std::pair<int, int>, 4> ColumnTileCandidates(int worldX, int worldZ) noexcept {
+    const int tileX = TileIndexOfColumn(worldX);
+    const int tileZ = TileIndexOfColumn(worldZ);
+    // 顺序 = `TileCoord` 的字典序（x 优先）⇒ 与旧实现"按 map 顺序取第一个命中的 tile"完全一致。
+    return { std::pair<int, int> { tileX - 1, tileZ - 1 }, std::pair<int, int> { tileX - 1, tileZ },
+             std::pair<int, int> { tileX, tileZ - 1 }, std::pair<int, int> { tileX, tileZ } };
+}
 
 /// 重算并写回 tile 的高度缓存（O(65²)）。只在**生成**与**重网格**时调用，
 /// 因此 `MaxSurfaceHeightBlocks()` 得以从"每帧 O(tile × 顶点)"降为"每帧 O(tile)"。
@@ -73,10 +98,15 @@ const TerrainTileMesh* TerrainWorld::FindMesh(int tileX, int tileZ) const noexce
 }
 
 bool TerrainWorld::ReadColumnHeight(int worldX, int worldZ, Height& outHeight) const noexcept {
-    for (const auto& entry : m_tiles) {
-        const TerrainTile& tile = entry.second;
-        if (!TileContainsColumn(tile, worldX, worldZ)) {
+    // T79①：由整数除法直接给出**最多 4 个**候选 tile（不再遍历全部已加载 tile）。
+    for (const std::pair<int, int>& candidate : ColumnTileCandidates(worldX, worldZ)) {
+        const auto found = m_tiles.find(TileCoord { candidate.first, candidate.second });
+        if (found == m_tiles.end()) {
             continue;
+        }
+        const TerrainTile& tile = found->second;
+        if (!TileContainsColumn(tile, worldX, worldZ)) {
+            continue;  // 候选里只有真正含该列的才命中（共享边界列会被两个 tile 同时命中）
         }
         outHeight = tile.At(worldX - TileOriginColumn(tile.coord.x), worldZ - TileOriginColumn(tile.coord.z));
         return true;
@@ -88,8 +118,14 @@ void TerrainWorld::WriteColumnHeight(int worldX, int worldZ, Height height, std:
     const int clamped = std::clamp(static_cast<int>(height), kMinTerrainHeightUnits, kMaxTerrainHeightUnits);
     const Height value = static_cast<Height>(clamped);
 
-    for (auto& entry : m_tiles) {
-        TerrainTile& tile = entry.second;
+    // T79①：同 `ReadColumnHeight` —— 只查最多 4 个候选；**共享边界列仍写进全部持有它的 tile**
+    //（否则相邻 tile 在该列上不再逐位相等 ⇒ 出现裂缝，红线 12）。
+    for (const std::pair<int, int>& candidate : ColumnTileCandidates(worldX, worldZ)) {
+        const auto found = m_tiles.find(TileCoord { candidate.first, candidate.second });
+        if (found == m_tiles.end()) {
+            continue;
+        }
+        TerrainTile& tile = found->second;
         if (!TileContainsColumn(tile, worldX, worldZ)) {
             continue;
         }

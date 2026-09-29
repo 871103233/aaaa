@@ -147,6 +147,17 @@ public:
     /// 前置条件：各分量为有限值。下一次 `Update` 生效。
     void SetGravity(const glm::vec3& gravity) noexcept;
 
+    /// **优化宽相位**（T79③；Jolt 官方口径：`PhysicsSystem::OptimizeBroadPhase`）。
+    ///
+    /// 何时必须调用（Jolt 文档原文）："needed only if you've added many bodies prior to calling `Update()`
+    /// for the first time"。本项目**正是这个情形** —— 加载期一次性建好数百个静态体（地表高度场 +
+    /// 可挖体积三角网），首个 `Update` 会把同一份建树工作**摊到随后若干帧**上（各帧多花一点 CPU）。
+    /// 在**加载期收口处调用一次**即把这份工作提前做完，`Update` 的稳态帧时间因此更平（帧尖峰打点可见）。
+    ///
+    /// **不得每帧调用**（文档原文："Don't call this every frame"）—— 那是把本已摊平的工作重新集中。
+    /// 也**不需要**在批量增删静态体之后反复调用：Jolt 的批量接口本身就会建出高效的包围体层次。
+    void OptimizeBroadPhase();
+
     // ---- 通用碰撞体 ----
 
     /// 创建一个静态高度场碰撞体。返回无效句柄表示创建失败（形状参数非法等），失败原因写入日志。

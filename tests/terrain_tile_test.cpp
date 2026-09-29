@@ -142,6 +142,60 @@ TEST(TerrainQuery, ReportsHeightAndObstructionWithinLoadedTiles) {
     EXPECT_FLOAT_EQ(safeT, 1.0F);
 }
 
+// T79①：列查询必须**由整数除法直接定位候选 tile**（O(1)），且**共享边界列**仍被**所有**持有它的
+// tile 命中/写入（两条 tile 的边界列内容恒等，是"无裂缝"的必要条件，红线 12）。
+// 这条测试同时钉住"候选集完备"：越界列（未加载）不得误命中，负坐标必须向下取整。
+TEST(TerrainQuery, ColumnLookupIsDirectAndCoversSharedBoundaryColumns) {
+    TerrainWorld world(kSeed, TerrainMaterialTable::Default());
+    LoadTiles(world, 0, 1, 0, 1);
+
+    // ① 世界列 64 是 tile (0,0) 的本地 64 列、也是 tile (1,0) 的本地 0 列 ⇒ **两个 tile 都要被写**。
+    constexpr Height kRaisedUnits = static_cast<Height>(400 * vx::kHeightUnitsPerBlock);
+    std::vector<vx::TileCoord> dirty;
+    world.WriteColumnHeight(64, 10, kRaisedUnits, dirty);
+    ASSERT_FALSE(dirty.empty());
+    EXPECT_EQ(dirty.size(), 2U) << "共享边界列必须同时落到两个 tile 上";
+
+    const TerrainTile* left  = world.FindTile(0, 0);
+    const TerrainTile* right = world.FindTile(1, 0);
+    ASSERT_NE(left, nullptr);
+    ASSERT_NE(right, nullptr);
+    EXPECT_EQ(left->At(vx::kTerrainTileSize, 10), kRaisedUnits);
+    EXPECT_EQ(right->At(0, 10), kRaisedUnits);
+
+    Height read = 0;
+    ASSERT_TRUE(world.ReadColumnHeight(64, 10, read));
+    EXPECT_EQ(read, kRaisedUnits);
+
+    // ② 同一轴上另一条边界列（世界列 64 的 z 方向对应：行 64）：tile (0,0) 的本地行 64 / tile (0,1) 的本地行 0。
+    world.WriteColumnHeight(20, 64, kRaisedUnits, dirty);
+    const TerrainTile* north = world.FindTile(0, 1);
+    ASSERT_NE(north, nullptr);
+    EXPECT_EQ(north->At(20, 0), kRaisedUnits);
+
+    // ③ 未加载的列：既不报高度、也不产生脏 tile（"直接定位"必须不误命中）。
+    Height missing = 0;
+    EXPECT_FALSE(world.ReadColumnHeight(320, 10, missing)) << "tile (5,0) 未加载";
+    EXPECT_FALSE(world.ReadColumnHeight(-1, 10, missing)) << "列 -1 属于 tile (-1, *)，未加载";
+    EXPECT_FALSE(world.ReadColumnHeight(64, 400, missing)) << "tile (1,6) 未加载";
+    dirty.clear();
+    world.WriteColumnHeight(320, 10, kRaisedUnits, dirty);
+    EXPECT_TRUE(dirty.empty()) << "未加载的列不得产生脏 tile";
+}
+
+// T79①：负坐标列必须向下取整到正确的 tile（候选集 `{floorDiv(c, 64), floorDiv(c, 64) − 1}`）。
+TEST(TerrainQuery, ColumnLookupFloorsNegativeColumns) {
+    TerrainWorld world(kSeed, TerrainMaterialTable::Default());
+    LoadTiles(world, -1, 0, -1, 0);
+
+    Height height = 0;
+    ASSERT_TRUE(world.ReadColumnHeight(-64, -1, height)) << "列 -64 是 tile (-1,*) 的原点列";
+    ASSERT_TRUE(world.ReadColumnHeight(-1, -1, height)) << "列 -1 属于 tile (-1,*)";
+    EXPECT_FALSE(world.ReadColumnHeight(-65, 0, height)) << "列 -65 属于 tile (-2,*)，未加载";
+    EXPECT_FALSE(world.ReadColumnHeight(129, 0, height)) << "列 129 属于 tile (2,*)，未加载";
+    ASSERT_TRUE(world.ReadColumnHeight(1, 0, height)) << "列 1 属于 tile (0,*)（已加载）";
+}
+
 // T58：`MaxSurfaceHeightBlocks()` 每帧被调用（CSM 投射体扩展），故其成本**不得与"世界总量"成正比**
 // —— 实现依赖 `TerrainTile::maxSurfaceBlocks`（生成 / 重网格时刷新的缓存）。这里钉死两件事：
 // ① 缓存 == 遍历该 tile 全部顶点算出的真值（不会算错）；

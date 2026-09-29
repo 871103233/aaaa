@@ -9,6 +9,7 @@
     "gtest",
     "tomlplusplus",
     "joltphysics",
+    "enkits",
     "stb",
     { "name": "imgui", "features": [ "sdl3-binding", "sdlgpu3-binding" ] },
     { "name": "shaderc", "host": true },

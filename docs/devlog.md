@@ -2944,4 +2944,199 @@
   4. **待实测微调**：`kSurfaceDepthBiasConstant` / `kSurfaceDepthBiasSlope` 的量级（本机 D3D12 生效值受取整影响）。
   5. **本批（T57 … T78）尚未提交**。
 
+---
+
+## 2026-09-30  T79 + T80 + T81：六项小优化 / **窗口预取** / **enkits 建块下沉 worker**（T79 重做并闭环）
+
+- 做了什么（三件事，均为 `docs/plans/v0.3.md` 里"已获批、未开工"的条目）：
+
+  1. **T79 六项"高收益 / 低风险 / 小改动"**（**本轮串行重做** —— 上一轮曾用并行子任务实现其中三项、因并发构建出现大批假失败而整体回退，见本文件 T78 条目）：
+     - ① **列查询改 O(1) tile 定位**：`world/terrain/terrain_world.{hpp,cpp}` 新增匿名命名空间辅助 `TileIndexOfColumn`（**向下取整**，负数正确）与
+       `ColumnTileCandidates`（**至多 4 个候选 tile**，顺序 = `TileCoord` 字典序 ⇒ 与旧 `std::map` 遍历序**逐位一致**）；
+       `ReadColumnHeight` / `WriteColumnHeight` 由"遍历全部已加载 tile"改为只遍历候选集，**共享边界列仍写入全部持有者**（ADR 0008 的边界契约不变）。
+     - ② **帧尖峰打点改"帧首采样 + 帧末汇总"**：原先 `clock.Tick()` 在**逻辑相位内**推进 ⇒ `frameMs` 覆盖了"上帧尾 + 本帧头"却**跳过本帧逻辑**，
+       于是出现"逻辑 116 ms / 未计时 108 ms 交替"的**假残差**；改为**帧首一次采样**（`frameTimer`）+ 汇总日志移到**帧末**，
+       并把分段扩为「输入 / 逻辑 / UI / 剔除 / 重定基 / 动态上传 / uniform / 渲染提交 / 限帧 + 未计时 + 等交换链」。
+     - ③ **`OptimizeBroadPhase()`**：先核实**Jolt 不会自动优化**（建树工作原本摊到随后若干帧的 `Update` 里、形成"走动前几帧变慢"），
+       故在静态体全部就位后**显式调用一次**（`engine/physics/physics_world.*` 暴露 `OptimizeBroadPhase`）。
+     - ④ **挖除路径提速 + scratch 复用**：`world/dig/dig_volume.cpp` 的 `RasterizeBall` 由"**遍历全部常驻块**"改为
+       "**由球心 ± 半径推块索引范围**"（`BlockIndexOf` 三重大循环 + `m_blocks.find`）；`CarveByDamage` 的 5 个缓冲
+       （cells / `BlastMask` / slotOf / solidOf / blockerOf / floodStack）改走**成员 `CarveScratch`**（热路径零堆分配，红线 10）。
+     - ⑤ **`VolumeSlotTable` 由 `std::map` 改为"升序 `std::vector` + `unordered_map` 索引"**（`game/main.cpp`）：保留"**迭代序确定**"（升序），
+       `Find` / `Contains` / `Insert` / `Erase` 由树查找变成哈希 + 尾部追加/交换删除；`ResidentQuadFilter::SkipQuad` 改走 `Contains`。
+     - ⑥ **MSAA 档位切换的管线重建移出 `RenderFrame`**：`engine/render/mesh_renderer.cpp` 的 `SetMsaaSampleCount` 内**预建**主管线
+       （含 T78 的深度偏移变体与天空管线），`RenderFrame` 里的 `EnsureMainPipeline` 退化为**幂等保险**。
+
+  2. **T80 窗口预取**（所有者裁定分叉 **(a)（只扩常驻半径、可挖窗口 `K` 不变）**，理由：分叉 (b) 会把"能挖范围"扩大 1 tile = 64 m，
+     属**玩法口径变更**，超出本阶段"不动世界层语义"的边界）：
+     `world/streaming/dig_volume_residency.{hpp,cpp}` 新增 `inline constexpr int kResidencyPrefetchTiles = 1` 与
+     `ResidencyWindowForPlayerBlocks(worldX, worldZ, radiusTiles, prefetchTiles)`；`DigVolumeScheduler::Update` 里
+     **常驻窗口 = 活动窗口 + 预取环**（成员 `m_residencyWindow`，用它算 `DesiredCount` 与 `PlanDigVolumeResidency`），
+     而 `Window()`（"**能挖**"的口径）与 `K` **不变**；构造函数第三参默认 `0` ⇒ **旧行为逐位不变**，游戏层显式传预取值。
+
+  3. **T81 启用 enkits + 建块下沉 worker**（**先落 ADR 再动手**）：
+     - **ADR 0022**（`docs/adr/0022-volume-build-worker-pipeline.md`）：决策 = **快照式纯函数 + enkits worker 池**；
+       硬约束 = **逐位一致**（split-and-merge 不允许改变结果）；给出**并发契约表**（谁能碰什么）、失败降级（池不可用 ⇒ 回落同步 + `WARN`）、
+       四个备选方案与切换条件。
+     - **enkits 首次真正启用**：新增 `engine/core/task_scheduler.{hpp,cpp}`（`ParallelTask` + `TaskScheduler`；**enkiTS 头不出现在公共接口**，
+       用 pimpl 隔离）；`vcpkg.json` 的 `enkits` 依赖、`engine/CMakeLists.txt` 的 `enkiTS::enkiTS` 正式开始使用，`NOTICE.md` 同步标注。
+     - **`world/streaming/volume_build_pipeline.{hpp,cpp}`**：`Submit(BlockBuildInput)` 提交、完成队列 + 统计、`TakeCompleted`；
+       worker lambda 只做 `BuildBlockFromInput`（纯函数）；**主线程独占在飞作业表**。
+     - **`world/dig/dig_volume.{hpp,cpp}`**：新增 `BlockBuildInput`（**35² 高度补丁 + 34³ 壳层采样**；内部 33³ 留给 worker）、
+       `BuildBlockFromInput`（**与同步路径共用** `TerrainDerivedDensityFromHeight` / `BuildVolumeMesh` / `ClassifyFill`）、
+       `SetBuildPipeline` / `CaptureBlockBuildInput` / `InstallBuiltBlock` / `PollBlockBuildsAndInstall` / `PendingBuildCount`；
+       `CreateBlock` 在**装了池时只提交**（返回 `false` = 尚未就位）。
+     - **`game/main.cpp`**：`vx::VolumeBuildPipeline`（**声明在 `digVolumes` 之前** ⇒ 后建先毁，避免 worker 读已释放的快照）、
+       `SetBuildPipeline`、每帧 `PollBlockBuildsAndInstall(…, kVolumeBuildsInstalledPerFrame = 4)`，
+       **GPU 上传仍在渲染线程**（SDL_gpu 命令缓冲单线程，符合 `references/concurrency.md`）。
+
+- 为什么：
+  1. **T79 的六项都是 T77 扫描清单里"高收益 / 低风险 / 小改动"项**，且**先判真伪再动手**：②是**打点自身错位**（观测工具坏了 ⇒ 一切"谁贵"的判断都不可信）、
+     ③先核实"Jolt 是否已自动优化"（答：不会）、⑤是 `std::map` 在热路径上的树查找与缓存不友好。
+  2. **T80 是"预取必须提前"这条硬规则的直接落地**（SKILL 第四节第 2 条）：*load radius > active radius* 是**业界标准做法**
+     （参照：**Minecraft 的 chunk load distance**、**UE5 World Partition 的 runtime grid 预取环**、**Unity 的 streaming
+     `mipmapBias`/预取环**），本项目此前是"load = active"。**关键取舍**：只扩**常驻**半径 ⇒ 内存上界变大、但**玩法语义（能挖范围）不变**，
+     故本阶段（ⓒ 不改世界层语义）只此一条可行。
+  3. **T81 是 T72 定位出的治本项**（每次窗口翻转要建 63 块、单块 ≈22 ms + 一次阻塞上传，全在**逻辑相位**）。
+     业界同类做法：**Sodium chunk builder**（worker 独占一块、主线程只收包 + 上传）、**UE5 Task Graph**（`FNonAbandonableTask` + 完成回调）、
+     **Unity Job System + `MeshDataArray`**（`Allocator.TempJob` 快照 + 主线程 `Mesh.ApplyAndDisposeWritableMeshData`）。
+     三者共同点 = **"重活下沉、主线程只做提交与上传、结果晚 1~N 帧可见"**；这也是本项目的取向（SKILL「所有重活都必须离开渲染帧」的
+     **②下沉 worker**，而非③按帧切分）。
+  4. **为什么坚持"逐位一致"**：红线 7（确定性）与红线 9（单写者 + 不可变快照）要求"谁构建"不得改变结果；否则同一块在同步 / 异步两条路径上
+     会产生**不同的存档与不同的碰撞**。做法 = **壳层（34³−33³ = 3367 个采样）在采快照时就取好**（邻块状态在这一刻定格 = **不可变快照**），
+     内部 33³ 留给 worker，两条路径共用同一批纯函数。
+
+- 验证（命令 + 真实结果；**注：本轮 `walkback` 冒烟被"真人操作"污染，见下方「发现」第 1 条，其数字只作非受控观测**）：
+  1. **构建**：`cmake --build --preset debug --clean-first` → **104/104，零警告**（`/W4 /WX`）；随后 `cmake --build --preset debug` → `ninja: no work to do.`
+     （证明工作树与产物**完全同步**，上文"零警告"覆盖当前代码）。
+  2. **测试**：`ctest --preset debug -j 6` → **360/360 passed**（355 → 360，新增 5 项：
+     `TerrainQuery.ColumnLookupIsDirectAndCoversSharedBoundaryColumns`、`TerrainQuery.ColumnLookupFloorsNegativeColumns`、
+     `DigVolumeResidency.ResidencyWindowIsASupersetOfTheActivityWindow`、`DigVolumeResidency.PrefetchRemovesTheCreateBurstWhenCrossingATileBoundary`、
+     `DigVolumeWorker.PipelineBuildMatchesMainThreadBuildBitForBit`）；**门禁** → `scanned 130 file(s), 0 violation(s)` / `PASS`（126 → 130）。
+  3. **启动期证据**（`build/perf/input_walkback.out.log`，逐行原文）：
+     - `[0.323] MSAA 管线已按 2× 预建（T79⑥：创建移出 RenderFrame，主通道 + 深度偏移变体 + 天空）`
+     - `[4.342] 可挖体积常驻窗口（ADR 0020 决策二 + T80 预取）：玩家 tile (0, 0)：**活动窗口** ± 2（能挖三维洞）、**常驻窗口** ± 3（含预取环宽 1 格块）；启动常驻 441 块（区域表共 441 块）`
+     - `[5.838] 可挖体积块构建（T81 / ADR 0022）：**下沉 worker**（FillBlockDensity + MeshBlock 不再占用渲染帧）（worker 线程 11 个；主线程只做「采快照 + 收包 + 上传」）`
+     - `[14.216] 物理宽相位已优化（T79③ / Jolt OptimizeBroadPhase）：静态体共 396 个（地表高度场 280 + 可挖体积三角网 112 + 围墙 4），耗时 1.22 ms；此后 Update 的建树工作不再摊到随后若干帧`
+  4. **打点是否可信（T79② 的判据）**：同一档 16 条帧尖峰（16.2~79.8 s）中「**未计时**」= **0.05~0.12 ms**（例：`帧尖峰 115.7 ms：输入 0.15 + 逻辑 113.89 + … + 限帧 0.00 = 115.59，**未计时 0.10** ms`）；
+     即**每一帧的成本都被分段解释了**。对照：`build/perf/input_walk.err.log` 同一"未计时"口径下曾出现 **42.38 ms**（`帧尖峰 48.3 ms … = 5.88，未计时 42.38 ms`）
+     —— **该 42.38 ms 至今未能归因**（SKILL「观测先于结论」⇒ 登记为遗留，不作结论）。
+  5. **T79④ 的"改前 / 改后"对照（同一邻域规模 ⇒ 可比）**：改前 `build/perf/B_radius4.out.log`（T71 的 B 档，`explosion_radius = 4.0`）
+      `中心 (2.4, 120.0, 2.8) … **邻域 17457 采样** ⇒ 挖除 14.20 ms`（另一发 13.92 ms）；改后本轮 `邻域 17457 采样` 的 8 发为
+      **9.07 / 9.47 / 9.57 / 9.82 / 9.93 / 10.01 / 10.05 / 10.84 ms** ⇒ **≈ −29%**。**但任务书里的"≤ 8 ms"未达成**（仍高约 2 ms），如实登记为遗留。
+      （数据取自 `input_walkback` 这一**非受控**运行：单发计时与"谁按的鼠标"无关，且已按**同邻域规模 17457 采样**配对 ⇒ 两者可比。）
+  6. **T81 的确定性证据（自动）**：`DigVolumeWorker.PipelineBuildMatchesMainThreadBuildBitForBit` 用**两个独立世界**（同种子同编辑）比较
+     "主线程构建"与"worker 构建"的同一块：**密度逐字节相同、`fill` 相同、顶点与索引逐值相同**，覆盖"邻块存在 / 不存在"两条壳层路径，
+     并断言 `HasWorkers()`、`CreateBlock` 异步返回 `false`、`PendingBuildCount()` 1 → 0、安装后清账。
+  7. **未受控观测（务必不要当结论用）**：本轮真人操作的那段里出现
+     `[WARN] 可挖体积块 (0, 3, 0) 网格超出上传时的容量（2358 顶点 / 13506 索引）⇒ 重建 GPU 缓冲并按 2× 预留（T75 兜底路径…）`
+     —— 这是**T76 兜底路径的首次运行时观测**（容量守卫按设计触发、`WARN` 不静默）；但**期望是"不触发"**（`T76` 的待验证项），
+     故只作记录、不判优劣（同一场景下真人**连续速射 8 发**，多个大邻域塌落（144900 / 239400 采样）叠加，属极端输入）。
+
+- 发现（本轮新增的两条认知）：
+  1. **`walkback` 冒烟被"真人操作"污染**：脚本在**游戏内 t = 0~26 s 尚未送任何输入**，但日志里 t = 16.17 s 已有**爆炸**、t = 16.52 s 已有 **`F1` 面板切换**
+     ⇒ 键鼠来自**在场的真人**（沿用 T64 的判定口径：这类日志不能当自动化结果）。**后果**：任何"走动 / 开炮"档的性能数字本轮都**不可比**。
+  2. **常驻窗口在本图几乎不可能被"走"出来**：可挖区只覆盖世界中心的 **3×3 tile**（块 x/z ∈ [−2, 4] ⇒ 区域 **tile x/z ∈ [−1, 2]**，`assets/config/dig_regions.toml`），
+     而 T80 后常驻窗口 = **±3 tile** ⇒ **玩家 tile ∈ [−1, 2] 时区域表被完全覆盖（常驻恒为 441 块、零卸载零建块）**。
+     只有越过到 **tile ≥ 3（世界列 ≥ 192）或 tile ≤ −2（世界列 < −64）**，窗口才开始把区域边缘的 63 块排掉；再走回来才会重建。
+     这解释了为什么 80 s 的走动 / 飞行日志里**一条"常驻集合已随窗口调整完毕"都没有**（也就看不到 worker 建块）——
+     本轮那条 `walkback` 的最远点是 **x ≈ −59（tile −1，差 6 格没出界）**，这是 T81 运行时取证至今拿不到的直接原因。
+- 下一步 / 遗留：
+  1. **T81 运行时取证（待人工）**：起飞后**沿 −X（或 +X）持续前进到世界列 x < −64 或 x ≥ 192 再返程**（距出生点仅 ≈ 64~192 格），
+     看日志 `可挖体积常驻集合已随窗口调整完毕（ADR 0020 窗口 + T81 worker 构建）… **worker 已构建 N 块、单块计算峰值 x.xx ms**` 的 **N 是否随往返增长**
+     （`N = 0` ⇒ 走的是同步回落路径，须回报）。T80 的"成串尖峰是否消失"、T78 的"边界是否还闪"可在**同一次往返**里一起看。
+  2. **技术债**：单发"挖除" 9.5~10.8 ms（目标 ≤ 8 ms）；`input_walk.err.log` 里那条 **未计时 42.38 ms** 未归因；
+     T77 清单里 **T74（加载期首帧冻结的改造）** 仍未开工。
+  3. **并发改动未跑 TSan**：`references/concurrency.md` §6 要求"新增或修改并发逻辑后必须在 TSan 配置下跑一遍"；
+     本机为 Windows / MSVC（**MSVC 不支持 TSan**）⇒ 本轮**未跑**（已登记在 [ADR 0022](adr/0022-volume-build-worker-pipeline.md) 的「后果」里）。
+     切换条件 = Linux / Clang 的 CI 作业或本机再跑一次 `--preset tsan`；**在此之前，T81 的并发正确性只由"逐位一致单测 + 只读快照 + 单一互斥量只护完成队列"的结构性保证支撑**。
+  4. **本批（T57 … T81）尚未提交**。
+
+---
+
+## 2026-09-30  T82 落地：**地表 tile 上传按"满地表上界"预留** —— 跨界往返的兜底重建 82 → 0 次
+
+- 做了什么（所有者 2026-09-30 选定；**只改上传容量口径，不动网格化 / 接管判据**）：
+  1. `world/terrain/terrain_types.hpp` 新增 **`kTerrainTileIndexCount`**（`64×64×6 = 24576`，"满地表"索引上界），
+     并写明两条事实：**顶点数是常数**（`65×65`，与四边形过滤无关）、**只有索引数随层间接管升降**（ADR 0011）。
+  2. `game/main.cpp` 的 `UploadTileMesh`：**只要本次网格是"部分地表"（`indices < 上界`）就按上界建缓冲**
+     （`reserveIndexCount = 上界`）；满地表时 `reserve = 0`（等价，容量恰为上界）。原**兜底重建分支保留为安全网**
+     （T82 之后应当不可达）；WARN 文案回到与实际一致（不再声称"按 2× 预留"）。
+  3. `engine/render/mesh_renderer.hpp`：把 `reserveVertexCount` / `reserveIndexCount` 的**口径写进接口注释** ——
+     它是**总容量**（实现 `max(本次数量, reserve)`），**不是"额外预留"**。
+- 为什么（**含我自己踩的两次坑，价值最高**）：
+  1. 现象（T81 运行时取证发现）：跨界往返时同一 tile 在 **11 ms 内连打 2~4 次** `地表 tile … 超出上传时的容量`，
+     单档合计 **82 次**；每次都走"`ReleaseMesh` + `UploadMesh`"⇒ 白建 2 个 GPU 缓冲。
+  2. **第一版修错了**：照抄体积块路径的字面意思，以为"传 `size` 就是 2× 预留" ⇒ 实测 **82 → 81**（几乎没变）。
+     读实现才发现 `capacity = max(size, reserve)` ⇒ **传 `size` 等于不预留**。（顺带证明体积块那句"按 2× 预留"**是对的**，
+     因为它传的是 `size * 2`。）**教训**：改容量语义前必须先读实现，别照抄调用点的注释。
+  3. **第二版仍不够**：改成 `size * 2` 后 **82 → 16** —— 重复消失（每 tile 恰好 1 次），但**每个 tile 的首轮仍在**：
+     "部分地表"可能只有满地表的 1/8，翻倍补不上 8 倍的差。
+  4. **第三版（正解）**：tile 网格有**硬上界**（= 满地表）⇒ 直接按上界预留 ⇒ **0 次**。代价有**上界**：
+     能成为"部分地表"的 tile 只可能在可挖区（区域 = 中心 4×4 tile）内 ⇒ **至多 16 个 × ~98 KB ≈ 1.6 MB**
+     （未记账的几何显存）。**不给全部 289 tile 预留**：那会加约 28 MB（ADR 0008 的 300 MB 预算当前已用 262.42 MB）。
+- 验证（命令 + 真实结果）：
+  1. **构建**（改过头文件 ⇒ 按仓库教训跑 `--clean-first`）：**零警告**（`/W4 /WX`）；后续增量 `ninja: no work to do`。
+  2. **测试**：`ctest --preset debug -j 6` → **360/360 passed**；门禁 → `scanned 130 file(s), 0 violation(s)` / `PASS`。
+  3. **同一 `flybound` 档（无人操作，三次对照）**：
+     - 改造前：`errLines=86`（**82** 条容量 WARN + 4 条帧尖峰）——`build/perf/input_flybound_t81before.err.log`
+     - 第一版（无效）：`errLines=89`（81 条 WARN）——证明"看起来对"的改动**必须实测**
+     - 第二版：`errLines=35`（**16** 条 WARN，每 tile 恰 1 次、返程 0）
+     - **第三版（最终）：`errLines=8`（8 条帧尖峰 + **0** 条容量 WARN + 0 ERROR）**；日志里**没有任何** `兜底路径` 行。
+  4. **帧时间未劣化**：最终档 `hitches=8 hitchMaxMs=37.7 logicMaxMs=35.95 unaccMaxMs=0.09`；
+     同档三次实测为 4/37.2、7/49.9、8/37.7 ms ⇒ 该档尾部**本身有运行间波动**，且这些尖峰帧**无容量 WARN 伴随**
+     ⇒ 与 T82 **无关**（已并入「技术债 · 尖峰待定位」）。
+- 下一步 / 遗留：
+  1. **T82 闭环**：`plans/v0.3.md` 的「候选改进（未获批）」条目已改写为「已实施（T82）」。
+  2. **待定位（沿用）**：`flybound` 尾部 4~8 条 33~50 ms 尖峰（逻辑 31~43 ms，候选 = 主线程"创建 + 4 块安装 + 接管重网格 + 碰撞体"收口，未验证）。
+  3. **技术债不变**：单发"挖除"9.5~10.8 ms（目标 ≤ 8）；T79①③⑤ 无改前基线；T81 未跑 TSan。
+  4. **本批（T57 … T82）在写入本条时尚未提交**（随后由本次提交收录）。
+
+---
+
+## 2026-09-30  ★ T81 **运行时取证成功**；找到"自动化送输入不可靠"的真因（F1 面板抑制 + stdout 块缓冲丢尾）
+
+- 做了什么（**只改冒烟脚本 `build/vx_perf_input.ps1`，未动任何游戏/引擎代码**）：
+  1. 新增 `flybound` 档（**确定性跨界**）：按 F1（收起面板）→ F（飞行）→ Space 4 s（升空）→ **S 20 s**（飞出可挖区）→ 静置 8 s →
+     **W 10 s / 静置 6 s / W 10 s / 静置 18 s**（分两段返航，保证必然重新进入被覆盖的 tile）。
+  2. 新增**抢前台守卫** `Ensure-GameForeground`（`ShowWindow(SW_RESTORE)` + `BringWindowToTop` + `SetForegroundWindow`，
+     并用 `GetForegroundWindow()` **校验**，最多重试 20 次）+ 三次打印 `focus(...)=True/False`。
+  3. 收尾由 `Stop-Process` 改为 **`PostMessage(WM_CLOSE)` 优雅退出**（失败才强杀）——stdout 被重定向到**管道**时是**块缓冲**，
+     强杀会**丢掉尾部日志**（这正是此前冒烟"日志停在 t≈16 s、看不到 worker 行"的原因）。
+- 为什么（**两条真因，价值高于本次任务本身**）：
+  1. **默认显示的 `F1` 调试面板会抑制玩法键盘输入** ⇒ 这不是"自动化送输入不可靠"，而是**输入被游戏按设计吞掉了**：
+     `game/main.cpp` 的 `suppression.keyboardGameplay`（T15）为真时 F / W / S / Space 全被抑制，**只有 F1 本身不受抑制**
+     ⇒ 脚本必须先按一次 F1 收起面板。（此前 T72 / T75 把这一现象登记为"自动化送输入不可靠 ⇒ 只能人工验收"，**该结论是错的**，
+     本条更正；同时解释了一个此前无法解释的观察：被人碰过的那些日志里"输入是正常的"——因为真人第一件事就是按 F1 关面板。）
+  2. **stdout 管道 = 块缓冲** ⇒ 强杀丢尾。前几轮"走不到 tile 边界"的判断有一半是被这条掩盖的（实际轨迹确实越了界，
+     但收尾行被丢了；不过**只有当窗口真正跨界时才会打印收尾行**，这一条仍然成立）。
+  3. 另注：`build/*.ps1` **必须保持纯 ASCII**（本仓库既有规则，见学习笔记 Q8）——本轮在脚本里加了中文注释，PowerShell 5.1
+     按 ANSI 解码后产生了**语法错误**与"正则匹配不到中文"的怪现象。
+- 验证（`build/perf/input_flybound.out.log` / `.err.log`，逐行原文；**本次全程无人操作**，`focus(...)=True` 三次）：
+  1. **去程（卸载）**：`常驻集合已随窗口调整完毕（ADR 0020 窗口 + T81 worker 构建）` 依次打印
+     `玩家 tile (-1,-2) ⇒ 378 块` → `(-2,-2) ⇒ 324` → `(-2,-3) ⇒ 216` → `(-3,-3) ⇒ 144` → `(-3,-4) ⇒ 72` → `(-4,-4) ⇒ 36` → `(-4,-5) ⇒ **0 块**`（**全部卸载、worker 已构建 0 块** —— 卸载确实不建块）。
+  2. **回程（★ T81 的关键证据）**：`(-4,-4) ⇒ 36 块，**worker 已构建 36 块、单块计算峰值 11.06 ms**` →
+     `(-3,-4) ⇒ 72 块，**worker 已构建 72 块、峰值 12.13 ms**` → `(-3,-3) ⇒ 144 块，**144 块 / 12.13 ms**` →
+     `(-2,-2) ⇒ 324 块，**324 块 / 13.14 ms**` → `(-1,-1) ⇒ **441 块，worker 已构建 441 块、单块计算峰值 13.14 ms**、worker 11 个`。
+     ⇒ **全部 441 块由 worker 池建成**（`N = 0` 的同步回落路径**未**被走到），单块计算峰值 **≈13 ms**，
+     与 T72 记录的"单块 ≈22 ms"相比还降了（快照式纯函数 + 壳层采样预取）。
+  3. **帧时间（同一档，12 次真实跨界、最大一次重建 441 块）**：`hitches=4 hitchMaxMs=37.2 logicMaxMs=35.5 unaccMaxMs=0.09`；
+     4 条尖峰逐条为 `33.7 / 33.9 / 36.9 / 37.2 ms`，全部 `主要受限在 CPU 侧`（逻辑 31.79 / 32.05 / 35.01 / 35.50），
+     **未计时 0.06~0.09 ms**、**无 > 50 ms 单帧**。**对照 T72（T80/T81 之前）**：一次 **63 块**的窗口翻转就有 **7~10 条 33~175 ms**（逻辑峰值 62~168 ms）
+     ⇒ 本次重建量是它的 **7 倍**（441 vs 63），尖峰却收敛到 **≤ 37 ms**（T80 预取 + T81 下沉 worker 的合计效果）。
+  4. **stderr 无 ERROR**（86 行 = 4 条帧尖峰 + 82 条下述兜底 WARN）。
+- 发现（**新登记，未判真伪、本轮不改**）：
+  1. **地表 tile 的"超出容量"兜底被反复触发 82 次**：`[WARN] 地表 tile (x,z) 网格超出上传时的容量 ⇒ 重建 GPU 缓冲（T75 兜底路径；此后该 tile 回到快路径）`，
+     同一 tile 在 **11 ms 内连打 2~4 次**（如 `(-1,2)` 在 36.550 / 36.561 / 36.608 / 36.617 各一次），集中在去程窗口收缩的那几秒。
+     **机制（已读到代码）**：`game/main.cpp` 的 `UploadTileMesh` 在兜底重建时 `UploadMesh(..., reserveVertexCount = 0, reserveIndexCount = 0, …)`
+     —— **预留为 0**，而**可挖体积块那条路径预留了 2×**（`UploadVolumeMesh`）⇒ tile 每次"接管翻转后网格变大"都会再次超出、再次重建，
+     而日志承诺的"此后该 tile 回到快路径"只对"不再增长"成立。**判定**：这**不是**本轮 T79~T81 的回归（T78 之前已在 `walk` 档登记过同类成串 WARN），
+     属**已登记的兜底路径按设计触发**；但按同样口径给 tile 加预留（一行改动）能消掉重复重建，**登记为候选，须先获批**。
+- 下一步 / 遗留：
+  1. **T81 由"待人工"改为"已闭环"**（自动化的确定性取证已完成）；**T80** 亦首次拿到真实跨界的实测（见上第 3 条）。
+     仍属**人工目视**的只有 **T78**（区域边界那一圈是否还闪）。
+  2. **候选改进（待批）**：地表 tile 兜底重建加预留（消掉 82 次重复 WARN / 重复建缓冲）。
+  3. 技术债与 TSan 缺口的登记不变（见上一条 T81 条目的「下一步 / 遗留」第 2、3 条）。
+  4. **本批（T57 … T81）尚未提交**。
+
 

@@ -1,5 +1,7 @@
 #include "dig/dig_volume.hpp"
 
+#include "core/clock.hpp"
+#include "streaming/volume_build_pipeline.hpp"
 #include "terrain/material_table.hpp"
 #include "terrain/terrain_world.hpp"
 
@@ -35,14 +37,31 @@ constexpr double kBandFloorNone = -1.0;
     return FloorDiv(static_cast<int>(floored), kVolumeBlockSize);
 }
 
-/// 密度数组下标（`i/j/k ∈ [0, kVolumeBlockSize]`）。
+/// 密度数组下标（`i/j/k ∈ [0, kVolumeBlockSize]`）—— 转发到**公开**的 `VolumeDensityIndex`（T81：
+/// worker 侧的纯构建路径与主线程路径必须共用同一个布局实现，不得各写一份）。
 [[nodiscard]] inline std::size_t DensityIndex(int i, int j, int k) noexcept {
-    const std::size_t extent = static_cast<std::size_t>(kVolumeSampleCount);
-    return static_cast<std::size_t>(i) + extent * (static_cast<std::size_t>(j) + extent * static_cast<std::size_t>(k));
+    return VolumeDensityIndex(i, j, k);
 }
 
-/// 分类一个块的填充（T30）：含共享边界在内的全部采样同号时可整块排除出塌落邻域。
-[[nodiscard]] BlockFill ClassifyFill(const std::vector<std::int8_t>& density) noexcept {
+/// **由"该列表表面高度"推导密度**（唯一口径；`FillBlockDensity` 与 worker 侧纯构建路径**共用**）。
+///
+/// 语义：`d = clamp((y − 地表高度) × 127, ±127)` ⇒ 地下为负（实心）、空中为正（空）、地表处跨零。
+/// `surface` 为 `NaN`（无地形数据）时按"空"处理（+127 饱和）。
+///
+/// **为什么必须共用**（T81 / ADR 0022）：worker 构建与主线程构建要逐位一致 ⇒ 连
+/// `float`/`double` 的运算顺序与取整方式都不能有第二份实现。
+[[nodiscard]] float TerrainDerivedDensityFromHeight(float surface, double y) noexcept {
+    if (std::isnan(surface)) {
+        return static_cast<float>(kDensityMax);  // 无地形数据 ⇒ 视为空
+    }
+    const double delta = (y - static_cast<double>(surface)) * static_cast<double>(kDensityUnitsPerBlock);
+    return static_cast<float>(
+        std::clamp(delta, static_cast<double>(kDensityMin), static_cast<double>(kDensityMax)));
+}
+
+}  // namespace
+
+BlockFill ClassifyFill(const std::vector<std::int8_t>& density) noexcept {
     bool anySolid = false;
     bool anyAir   = false;
     for (const std::int8_t value : density) {
@@ -53,6 +72,8 @@ constexpr double kBandFloorNone = -1.0;
     }
     return anySolid ? BlockFill::Solid : BlockFill::Air;
 }
+
+namespace {
 
 /// 把一个体积块接到 `IVolumeSampler`：块内**直读数组**（快路径），越界回落到世界采样
 /// ⇒ 块边界与区域边界处取到的是同一份密度，等值面因此无接缝。
@@ -271,11 +292,10 @@ bool DigVolumeWorld::SurfaceHeight(double x, double z, float& outHeight) const n
 float DigVolumeWorld::TerrainDerivedDensity(double x, double y, double z) const noexcept {
     float surface = 0.0F;
     if (!SurfaceHeight(x, z, surface)) {
-        return static_cast<float>(kDensityMax);  // 无地形数据 ⇒ 视为空
+        // 无地形数据 ⇒ 推导为空。**唯一口径在 `TerrainDerivedDensityFromHeight`**（T81：worker 侧共用同一实现）。
+        surface = std::numeric_limits<float>::quiet_NaN();
     }
-    const double delta = (y - static_cast<double>(surface)) * static_cast<double>(kDensityUnitsPerBlock);
-    return static_cast<float>(
-        std::clamp(delta, static_cast<double>(kDensityMin), static_cast<double>(kDensityMax)));
+    return TerrainDerivedDensityFromHeight(surface, y);
 }
 
 void DigVolumeWorld::FillBlockDensity(const BlockCoord& coord) {
@@ -380,72 +400,86 @@ bool DigVolumeWorld::RasterizeBall(const glm::dvec3& center, float radiusBlocks,
     const double outerSq    = outer * outer;
     bool         changedAny = false;
 
-    for (auto& entry : m_blocks) {
-        VolumeBlock& block   = entry.second;
-        const int    originX = BlockOriginBlocks(block.coord.x);
-        const int    originY = BlockOriginBlocks(block.coord.y);
-        const int    originZ = BlockOriginBlocks(block.coord.z);
-        const double maxX    = static_cast<double>(originX + kVolumeBlockSize);
-        const double maxY    = static_cast<double>(originY + kVolumeBlockSize);
-        const double maxZ    = static_cast<double>(originZ + kVolumeBlockSize);
+    // T79④（T77 清单第 9 条）：**由球心与半径直接推出受影响的块索引范围**，只遍历那几个块，
+    // 不再对**全部常驻块**做 AABB 判定（旧实现每次挖除遍历 441 个块 —— 与"世界总量"成正比）。
+    // 遍历顺序仍是 `(x, y, z)` 升序 ⇒ `dirtyOut` 与旧实现**逐位一致**（红线 7）。
+    //
+    // 边界口径（为什么这个范围是完备的）：块 `b` 的采样是世界 `[origin, origin + 32]`（**含共享边界**），
+    // 而 `BlockIndexOf` 是"向下取整到 32 格"。故"球 AABB 挡住的块"至少覆盖全部**严格落在带内**的采样：
+    // 若某采样的距离 < outer，它所在块的索引必然落在 `[BlockIndexOf(c − outer), BlockIndexOf(c + outer)]`；
+    // 恰好落在 `c ± outer` 上的采样在下面会被 `distanceSq >= outerSq` 跳过 ⇒ 不会漏改。
+    const int blockMinX = BlockIndexOf(center.x - outer);
+    const int blockMaxX = BlockIndexOf(center.x + outer);
+    const int blockMinY = BlockIndexOf(center.y - outer);
+    const int blockMaxY = BlockIndexOf(center.y + outer);
+    const int blockMinZ = BlockIndexOf(center.z - outer);
+    const int blockMaxZ = BlockIndexOf(center.z + outer);
 
-        // 球（含过渡带）的 AABB 与该块的 AABB 不相交 ⇒ 完全不受影响。闭区间比较，避免"刚好相切"漏掉。
-        if (center.x + outer < static_cast<double>(originX) || center.x - outer > maxX || center.y + outer < static_cast<double>(originY) ||
-            center.y - outer > maxY || center.z + outer < static_cast<double>(originZ) || center.z - outer > maxZ) {
-            continue;
-        }
+    for (int bz = blockMinZ; bz <= blockMaxZ; ++bz) {
+        for (int by = blockMinY; by <= blockMaxY; ++by) {
+            for (int bx = blockMinX; bx <= blockMaxX; ++bx) {
+                const auto found = m_blocks.find(BlockCoord { bx, by, bz });
+                if (found == m_blocks.end()) {
+                    continue;
+                }
+                VolumeBlock& block   = found->second;
+                const int    originX = BlockOriginBlocks(block.coord.x);
+                const int    originY = BlockOriginBlocks(block.coord.y);
+                const int    originZ = BlockOriginBlocks(block.coord.z);
 
-        bool blockChanged = false;
-        // T59 / ADR 0020 决策一：**每列的"带宽地板"只算一次**（列 = `(originX + i, originZ + k)`）——
-        // 预填在 k 层内，避免在 33³ 内层反复查地表高度。`kBandFloorNone` = 该列不裁剪。
-        std::array<double, static_cast<std::size_t>(kVolumeSampleCount)> columnBandFloor {};
-        for (int k = 0; k < kVolumeSampleCount; ++k) {
-            for (int i = 0; i < kVolumeSampleCount; ++i) {
-                columnBandFloor[static_cast<std::size_t>(i)] = ColumnBandFloor(originX + i, originZ + k);
-            }
-            for (int j = 0; j < kVolumeSampleCount; ++j) {
-                const double sampleY = static_cast<double>(originY + j);
-                for (int i = 0; i < kVolumeSampleCount; ++i) {
-                    // 地表以下超出带宽 ⇒ 不可挖（与"不可破坏材质"同口径：保持原状、不参与挖除）。
-                    if (sampleY < columnBandFloor[static_cast<std::size_t>(i)]) {
-                        continue;
+                bool blockChanged = false;
+                // T59 / ADR 0020 决策一：**每列的"带宽地板"只算一次**（列 = `(originX + i, originZ + k)`）——
+                // 预填在 k 层内，避免在 33³ 内层反复查地表高度。`kBandFloorNone` = 该列不裁剪。
+                std::array<double, static_cast<std::size_t>(kVolumeSampleCount)> columnBandFloor {};
+                for (int k = 0; k < kVolumeSampleCount; ++k) {
+                    for (int i = 0; i < kVolumeSampleCount; ++i) {
+                        columnBandFloor[static_cast<std::size_t>(i)] = ColumnBandFloor(originX + i, originZ + k);
                     }
-                    const double dx = static_cast<double>(originX + i) - center.x;
-                    const double dy = static_cast<double>(originY + j) - center.y;
-                    const double dz = static_cast<double>(originZ + k) - center.z;
-                    const double distanceSq = dx * dx + dy * dy + dz * dz;
-                    if (distanceSq >= outerSq) {
-                        continue;  // 过渡带之外：保持原值（饱和实心）
-                    }
+                    for (int j = 0; j < kVolumeSampleCount; ++j) {
+                        const double sampleY = static_cast<double>(originY + j);
+                        for (int i = 0; i < kVolumeSampleCount; ++i) {
+                            // 地表以下超出带宽 ⇒ 不可挖（与"不可破坏材质"同口径：保持原状、不参与挖除）。
+                            if (sampleY < columnBandFloor[static_cast<std::size_t>(i)]) {
+                                continue;
+                            }
+                            const double dx = static_cast<double>(originX + i) - center.x;
+                            const double dy = static_cast<double>(originY + j) - center.y;
+                            const double dz = static_cast<double>(originZ + k) - center.z;
+                            const double distanceSq = dx * dx + dy * dy + dz * dz;
+                            if (distanceSq >= outerSq) {
+                                continue;  // 过渡带之外：保持原值（饱和实心）
+                            }
 
-                    // CSG 取 max：球内 `radius − dist` 为正（挖空），球外为负（保留原材质）。
-                    const double signedDistance = radius - std::sqrt(distanceSq);
-                    const int    carved = std::clamp(static_cast<int>(std::lround(signedDistance *
-                                                                                 static_cast<double>(kDensityUnitsPerBlock))),
-                                                     kDensityMin, kDensityMax);
-                    // T31：**不可破坏材质**的采样保持原状（它永不参与挖除；`CarveSphere` 不启用该开关）。
-                    if (skipIndestructible && IsIndestructibleSample(originX + i, originY + j, originZ + k)) {
-                        continue;
-                    }
-                    // T53：**爆炸波到不了**的采样保持原状（岩后的东西不受破坏）—— 只有 `CarveByDamage` 传掩码。
-                    if (mask != nullptr && !mask->Reachable(originX + i, originY + j, originZ + k)) {
-                        continue;
-                    }
-                    std::int8_t& density = block.density[DensityIndex(i, j, k)];
-                    if (carved > static_cast<int>(density)) {
-                        density      = static_cast<std::int8_t>(carved);
-                        blockChanged = true;
+                            // CSG 取 max：球内 `radius − dist` 为正（挖空），球外为负（保留原材质）。
+                            const double signedDistance = radius - std::sqrt(distanceSq);
+                            const int    carved = std::clamp(static_cast<int>(std::lround(signedDistance *
+                                                                                         static_cast<double>(kDensityUnitsPerBlock))),
+                                                             kDensityMin, kDensityMax);
+                            // T31：**不可破坏材质**的采样保持原状（它永不参与挖除；`CarveSphere` 不启用该开关）。
+                            if (skipIndestructible && IsIndestructibleSample(originX + i, originY + j, originZ + k)) {
+                                continue;
+                            }
+                            // T53：**爆炸波到不了**的采样保持原状（岩后的东西不受破坏）—— 只有 `CarveByDamage` 传掩码。
+                            if (mask != nullptr && !mask->Reachable(originX + i, originY + j, originZ + k)) {
+                                continue;
+                            }
+                            std::int8_t& density = block.density[DensityIndex(i, j, k)];
+                            if (carved > static_cast<int>(density)) {
+                                density      = static_cast<std::int8_t>(carved);
+                                blockChanged = true;
+                            }
+                        }
                     }
                 }
-            }
-        }
 
-        if (blockChanged) {
-            block.carved = true;
-            // T30：挖除只会把实心变空 ⇒ 该块至少是"混合"（原本全实心的块就此失去"可整块排除"的资格）。
-            block.fill = BlockFill::Mixed;
-            dirtyOut.push_back(block.coord);
-            changedAny = true;
+                if (blockChanged) {
+                    block.carved = true;
+                    // T30：挖除只会把实心变空 ⇒ 该块至少是"混合"（原本全实心的块就此失去"可整块排除"的资格）。
+                    block.fill = BlockFill::Mixed;
+                    dirtyOut.push_back(block.coord);
+                    changedAny = true;
+                }
+            }
         }
     }
 
@@ -497,6 +531,18 @@ bool DigVolumeWorld::CreateBlock(const BlockCoord& coord) {
     if (!std::binary_search(allowed.begin(), allowed.end(), coord)) {
         return false;  // 窗口只能从可挖区域表里取（ADR 0004 硬约束 2）
     }
+
+    // T81 / ADR 0022：装了任务池 ⇒ **只采快照 + 提交**，计算交给 worker（返回 false = "尚未就位"）。
+    // 已经在飞（`m_pendingBuilds`）⇒ 不重复提交（否则一次窗口调整会提交多次同一块）。
+    if (m_buildPipeline != nullptr) {
+        if (m_pendingBuilds.find(coord) != m_pendingBuilds.end()) {
+            return false;
+        }
+        m_pendingBuilds.insert(coord);
+        m_buildPipeline->Submit(CaptureBlockBuildInput(coord));
+        return false;  // 块要等 `PollBlockBuildsAndInstall` 安装后才存在
+    }
+
     // 与批量初始化**逐字同一条路径**：先填密度，再网格化（保证"按需创建"与"批量初始化"结果一致）。
     FillBlockDensity(coord);
     MeshBlock(coord);
@@ -561,15 +607,13 @@ bool DigVolumeWorld::CarveByDamage(const glm::dvec3& center, float radiusBlocks,
     }
 
     // ① 候选格³：格心距球心 ≤ radius（格心 = 整数格坐标 + 0.5）。
-    struct CandidateCell {
-        double distance = 0.0;
-        int    x = 0;
-        int    y = 0;
-        int    z = 0;
-    };
+    // T79④：候选表、掩码与三张缓存、洪泛栈**全部复用成员 scratch**（每次调用完整覆盖 ⇒ 结果不变，
+    // 但每发的堆分配降为稳态零；见 `dig_volume.hpp` 的 `CarveScratch`）。
+    CarveScratch&      scratch = m_carveScratch;
+    std::vector<CarveCandidate>& cells = scratch.cells;
     const double radius  = static_cast<double>(radiusBlocks);
     const double radiusSq = radius * radius;
-    std::vector<CandidateCell> cells;
+    cells.clear();
     const int loX = static_cast<int>(std::floor(center.x - radius));
     const int hiX = static_cast<int>(std::ceil(center.x + radius));
     const int loY = static_cast<int>(std::floor(center.y - radius));
@@ -586,12 +630,12 @@ bool DigVolumeWorld::CarveByDamage(const glm::dvec3& center, float radiusBlocks,
                 if (distanceSq > radiusSq) {
                     continue;
                 }
-                cells.push_back(CandidateCell { std::sqrt(distanceSq), x, y, z });
+                cells.push_back(CarveCandidate { std::sqrt(distanceSq), x, y, z });
             }
         }
     }
     // 确定序（红线 7）：距离升序 → (x, y, z) 升序 ⇒ 同输入永远同一结果。
-    std::sort(cells.begin(), cells.end(), [](const CandidateCell& a, const CandidateCell& b) {
+    std::sort(cells.begin(), cells.end(), [](const CarveCandidate& a, const CarveCandidate& b) {
         if (a.distance != b.distance) {
             return a.distance < b.distance;
         }
@@ -611,7 +655,7 @@ bool DigVolumeWorld::CarveByDamage(const glm::dvec3& center, float radiusBlocks,
     //    那一圈的格也必须判可达；球体之外的格一律视为**不可达** —— 它们既不可能被栅格化，
     //    也不该被当成"波的绕行通道"）。同时把每格的**材质槽位 / 实心性**缓存下来，
     //    洪泛与预算结算共用**一次**采样（改前预算循环还要再采一轮材质 + 密度）。
-    BlastMask mask;
+    BlastMask& mask = scratch.mask;  // T79④：复用掩码缓冲（`assign` 在容量足够时不重新分配）
     const double blastReach    = radius + kCarveBandBlocks;
     const double blastReachSq  = blastReach * blastReach;
     mask.minX  = static_cast<int>(std::floor(center.x - blastReach));
@@ -623,9 +667,12 @@ bool DigVolumeWorld::CarveByDamage(const glm::dvec3& center, float radiusBlocks,
     const std::size_t maskCells = static_cast<std::size_t>(mask.sizeX) * static_cast<std::size_t>(mask.sizeY) *
                                   static_cast<std::size_t>(mask.sizeZ);
     mask.reachable.assign(maskCells, 0U);
-    std::vector<std::uint8_t> slotOf(maskCells, static_cast<std::uint8_t>(kNoMaterialSlot));
-    std::vector<std::uint8_t> solidOf(maskCells, 0U);
-    std::vector<std::uint8_t> blockerOf(maskCells, 1U);  // 先全部视为遮挡体（球体之外不采样、也不通行）
+    std::vector<std::uint8_t>& slotOf    = scratch.slotOf;
+    std::vector<std::uint8_t>& solidOf   = scratch.solidOf;
+    std::vector<std::uint8_t>& blockerOf = scratch.blockerOf;
+    slotOf.assign(maskCells, static_cast<std::uint8_t>(kNoMaterialSlot));
+    solidOf.assign(maskCells, 0U);
+    blockerOf.assign(maskCells, 1U);  // 先全部视为遮挡体（球体之外不采样、也不通行）
     for (int z = mask.minZ; z < mask.minZ + mask.sizeZ; ++z) {
         for (int y = mask.minY; y < mask.minY + mask.sizeY; ++y) {
             for (int x = mask.minX; x < mask.minX + mask.sizeX; ++x) {
@@ -658,7 +705,8 @@ bool DigVolumeWorld::CarveByDamage(const glm::dvec3& center, float radiusBlocks,
         const int        originX = static_cast<int>(std::floor(center.x));
         const int        originY = static_cast<int>(std::floor(center.y));
         const int        originZ = static_cast<int>(std::floor(center.z));
-        std::vector<int> stack;
+        std::vector<int>& stack   = scratch.floodStack;  // T79④：复用栈缓冲（每发完整重建）
+        stack.clear();
         if (mask.Contains(originX, originY, originZ)) {
             const std::size_t originIndex = mask.Index(originX, originY, originZ);
             if (blockerOf[originIndex] == 0U) {  // 爆心落在岩体内 ⇒ 一格都进不去（波不外泄）
@@ -694,7 +742,7 @@ bool DigVolumeWorld::CarveByDamage(const glm::dvec3& center, float radiusBlocks,
     int         remaining  = budgetPoints;
     double      stopRadius = 0.0;
     std::size_t destroyed  = 0;
-    for (const CandidateCell& cell : cells) {
+    for (const CarveCandidate& cell : cells) {
         // 候选格的**格心**距球心 ≤ radius，故它的**采样点**距球心 ≤ radius + √3/2 < radius + 1.5
         // ⇒ 一定落在掩码球内，`Index` 不会越界（掩码球半径 = radius + `kCarveBandBlocks`）。
         const std::size_t index = mask.Index(cell.x, cell.y, cell.z);
@@ -909,6 +957,202 @@ std::size_t DigVolumeWorld::MaterialBytes() const noexcept {
 
 const TerrainMaterialTable& DigVolumeWorld::Materials() const noexcept {
     return m_terrain.Materials();
+}
+
+// ---------------------------------------------------------------------------
+// T81 / ADR 0022：块构建下沉 worker —— 快照采集 + 纯函数构建 + 安装
+// ---------------------------------------------------------------------------
+
+BlockBuildResult BuildBlockFromInput(const BlockBuildInput& input) {
+    vx::Clock computeClock;  // 观测：worker 侧计算耗时（不影响任何判据）
+
+    BlockBuildResult result;
+    result.coord = input.coord;
+
+    // 世界 Y 原点（密度推导要"世界高度"）。
+    const int originY = BlockOriginBlocks(input.coord.y);
+
+    // ① **填密度**（原 `FillBlockDensity` 的工作）：内部 33³ 采样由**列高度补丁**推导。
+    //    公式与同步路径**共用** `TerrainDerivedDensityFromHeight` ⇒ 逐位一致（红线 7）。
+    result.density.assign(static_cast<std::size_t>(kVolumeSampleCount) * static_cast<std::size_t>(kVolumeSampleCount) *
+                              static_cast<std::size_t>(kVolumeSampleCount),
+                          0);
+    for (int k = 0; k <= kVolumeBlockSize; ++k) {
+        for (int j = 0; j <= kVolumeBlockSize; ++j) {
+            for (int i = 0; i <= kVolumeBlockSize; ++i) {
+                const float height =
+                    input.surfaceHeights[static_cast<std::size_t>(i + 1) +
+                                         BlockBuildInput::kPatchSize * static_cast<std::size_t>(k + 1)];
+                result.density[DensityIndex(i, j, k)] =
+                    static_cast<std::int8_t>(std::lround(TerrainDerivedDensityFromHeight(
+                        height, static_cast<double>(originY + j))));
+            }
+        }
+    }
+
+    // ② **网格化**：采样器直接读**快照**（内部密度 + 壳层 + 材质补丁），不触碰世界对象。
+    //    采样索引范围与 `BuildVolumeMesh` 的读取范围一致：局部 `-1..kVolumeBlockSize`。
+    struct SnapshotSampler final : public IVolumeSampler {
+        const BlockBuildInput&          input;
+        const std::vector<std::int8_t>& density;
+
+        SnapshotSampler(const BlockBuildInput& inputRef, const std::vector<std::int8_t>& densityRef) noexcept
+            : input(inputRef), density(densityRef) {}
+
+        [[nodiscard]] float Sample(int i, int j, int k) const override {
+            const auto inside = [](int value) noexcept { return value >= 0 && value <= kVolumeBlockSize; };
+            if (inside(i) && inside(j) && inside(k)) {
+                return static_cast<float>(density[DensityIndex(i, j, k)]);
+            }
+            return static_cast<float>(
+                input.density[static_cast<std::size_t>(i + 1) +
+                              BlockBuildInput::kSampleExtent *
+                                  (static_cast<std::size_t>(j + 1) +
+                                   BlockBuildInput::kSampleExtent * static_cast<std::size_t>(k + 1))]);
+        }
+
+        /// 材质：壳层取"邻块已写入值"（非 `kNoMaterialSlot` 时优先），否则——**内部与壳层一样**——
+        /// 回落**列派生**补丁。口径与 `SampleMaterialSlot` 的两级判定逐字一致
+        /// （新建块从未写过材质 ⇒ 内部必然走回落分支）。
+        [[nodiscard]] std::uint8_t SampleMaterial(int i, int j, int k) const override {
+            const auto inside = [](int value) noexcept { return value >= 0 && value <= kVolumeBlockSize; };
+            if (!(inside(i) && inside(j) && inside(k))) {
+                const std::size_t sampleIndex =
+                    static_cast<std::size_t>(i + 1) +
+                    BlockBuildInput::kSampleExtent *
+                        (static_cast<std::size_t>(j + 1) +
+                         BlockBuildInput::kSampleExtent * static_cast<std::size_t>(k + 1));
+                const std::uint8_t stored = input.storedMaterial[sampleIndex];
+                if (stored != kNoMaterialSlot) {
+                    return stored;
+                }
+            }
+            return input.columnMaterial[static_cast<std::size_t>(i + 1) +
+                                        BlockBuildInput::kPatchSize * static_cast<std::size_t>(k + 1)];
+        }
+    } sampler { input, result.density };
+
+    result.mesh = BuildVolumeMesh(sampler);
+    result.fill = ClassifyFill(result.density);
+    result.computeMs = computeClock.Tick() * 1000.0;
+    return result;
+}
+
+BlockBuildInput DigVolumeWorld::CaptureBlockBuildInput(const BlockCoord& coord) const {
+    BlockBuildInput input;
+    input.coord = coord;
+    // **必须先填哨兵**：`kNoMaterialSlot` = 0xFF，而 `std::array` 的值初始化是 0 —— 而 0 是一个**合法材质槽位**
+    //（草）。若不清成哨兵，未写入的采样会被误判成"邻块已写入材质 0" ⇒ 与同步路径的材质不一致。
+    input.storedMaterial.fill(kNoMaterialSlot);
+
+    constexpr int kPatch = BlockBuildInput::kPatchSize;  // 35（局部列 -1..33）
+    const int     originX = BlockOriginBlocks(coord.x);
+    const int     originY = BlockOriginBlocks(coord.y);
+    const int     originZ = BlockOriginBlocks(coord.z);
+
+    // ① 列补丁：地表高度 + 列派生材质（后者**直接调用**世界的实现 ⇒ 与同步路径同一份代码）。
+    for (int kz = -1; kz <= kVolumeBlockSize + 1; ++kz) {
+        for (int ix = -1; ix <= kVolumeBlockSize + 1; ++ix) {
+            const int worldX = originX + ix;
+            const int worldZ = originZ + kz;
+            const std::size_t index =
+                static_cast<std::size_t>(ix + 1) + static_cast<std::size_t>(kPatch) * static_cast<std::size_t>(kz + 1);
+
+            float height = 0.0F;
+            input.surfaceHeights[index] =
+                SurfaceHeight(static_cast<double>(worldX), static_cast<double>(worldZ), height)
+                    ? height
+                    : std::numeric_limits<float>::quiet_NaN();
+
+            std::uint8_t slot = kNoMaterialSlot;
+            (void)m_terrain.QueryDigMaterialSlot(static_cast<float>(worldX), static_cast<float>(worldZ), slot);
+            input.columnMaterial[index] = slot;
+        }
+    }
+
+    // ② 采样壳层（局部 `-1` 那一圈，34³ − 33³ = 3367 个）：邻块存在 ⇒ 直接取它的密度 / 已写入材质；
+    //    邻块不存在 ⇒ 密度按列补丁推导（与 `BlockSampler` 的越界回落同一口径）、材质留 `kNoMaterialSlot`
+    //    （⇒ worker 侧回落列派生补丁）。内部 33³ 刻意**留空**：那正是要交给 worker 的"填密度"工作。
+    for (int k = -1; k <= kVolumeBlockSize; ++k) {
+        for (int j = -1; j <= kVolumeBlockSize; ++j) {
+            for (int i = -1; i <= kVolumeBlockSize; ++i) {
+                if (i >= 0 && j >= 0 && k >= 0) {
+                    continue;  // 内部：留给 worker 填
+                }
+                const std::size_t sampleIndex =
+                    static_cast<std::size_t>(i + 1) +
+                    BlockBuildInput::kSampleExtent *
+                        (static_cast<std::size_t>(j + 1) +
+                         BlockBuildInput::kSampleExtent * static_cast<std::size_t>(k + 1));
+
+                const int worldX = originX + i;
+                const int worldY = originY + j;
+                const int worldZ = originZ + k;
+                const BlockCoord neighbour { BlockIndexOf(static_cast<double>(worldX)),
+                                             BlockIndexOf(static_cast<double>(worldY)),
+                                             BlockIndexOf(static_cast<double>(worldZ)) };
+
+                const auto found = m_blocks.find(neighbour);
+                if (found != m_blocks.end()) {
+                    const VolumeBlock& block = found->second;
+                    input.density[sampleIndex] =
+                        block.density[DensityIndex(worldX - BlockOriginBlocks(block.coord.x),
+                                                   worldY - BlockOriginBlocks(block.coord.y),
+                                                   worldZ - BlockOriginBlocks(block.coord.z))];
+                    if (!block.material.empty()) {
+                        input.storedMaterial[sampleIndex] =
+                            block.material[DensityIndex(worldX - BlockOriginBlocks(block.coord.x),
+                                                        worldY - BlockOriginBlocks(block.coord.y),
+                                                        worldZ - BlockOriginBlocks(block.coord.z))];
+                    }
+                } else {
+                    const float height =
+                        input.surfaceHeights[static_cast<std::size_t>(i + 1) +
+                                             static_cast<std::size_t>(kPatch) * static_cast<std::size_t>(k + 1)];
+                    input.density[sampleIndex] = static_cast<std::int8_t>(std::lround(
+                        TerrainDerivedDensityFromHeight(height, static_cast<double>(worldY))));
+                }
+            }
+        }
+    }
+    return input;
+}
+
+bool DigVolumeWorld::InstallBuiltBlock(BlockBuildResult&& result) {
+    // **无论安装成功与否都要清掉"在飞"记录**：否则该坐标一旦被卸载 / 走远，
+    // `CreateBlock` 会误判"它还在飞"而拒绝重新提交 ⇒ 玩家回头时块永远建不出来。
+    m_pendingBuilds.erase(result.coord);
+    if (m_blocks.find(result.coord) != m_blocks.end()) {
+        return false;  // 已被同步路径建过 / 窗口又移动过 ⇒ 丢弃（不静默使用陈旧结果）
+    }
+    VolumeBlock block;
+    block.coord   = result.coord;
+    block.density = std::move(result.density);
+    block.mesh    = std::move(result.mesh);
+    block.carved  = false;
+    block.fill    = result.fill;
+    m_blocks.emplace(result.coord, std::move(block));
+    return true;
+}
+
+std::size_t DigVolumeWorld::PollBlockBuildsAndInstall(std::vector<BlockCoord>& installedOut, std::size_t maxResults) {
+    if (m_buildPipeline == nullptr || maxResults == 0U) {
+        return 0;
+    }
+    std::size_t installed = 0;
+    // 逐个取回（`maxResults` 有界 ⇒ 单帧主线程成本有上界：一次安装只是几次 move，不含任何计算）。
+    while (installed < maxResults) {
+        BlockBuildResult result;
+        if (!m_buildPipeline->TakeCompleted(result)) {
+            break;
+        }
+        const BlockCoord coord = result.coord;  // 安装会把密度 / 网格 move 走，坐标先取出
+        if (InstallBuiltBlock(std::move(result))) {
+            installedOut.push_back(coord);
+            ++installed;
+        }
+    }
+    return installed;
 }
 
 }  // namespace vx

@@ -1334,6 +1334,23 @@ void MeshRenderer::SetMsaaSampleCount(std::uint32_t sampleCount) noexcept {
                     (effective <= 1) ? "关闭，零额外显存开销" : "开启，主通道渲进多采样目标后 resolve 到单采样 HDR 目标",
                     previous, effective);
     }
+
+    // T79⑥（业界标准 = **PSO 预建 / 创建移出热路径**，参照 UE 的 `FShaderPipelineCache` 与 SKILL 第四节硬规则 4）：
+    // 采样数一变，主通道（含深度偏移变体）与天空管线都必须重建；原先它发生在**下一帧的 `RenderFrame` 里**
+    // ⇒ "切档当帧"被算进帧时间。现在改在**设置生效点**（本调用）就地重建，`RenderFrame` 里的
+    // `EnsureMainPipeline` 退化为**幂等保险**（档位已一致 ⇒ 直接返回，不再创建任何东西）。
+    // 为什么可以在这里建：管线创建不依赖渲染目标 / 窗口尺寸，只用常驻 Shader ⇒ 与尺寸变更解耦。
+    if (m_pipeline == nullptr || m_pipelineSampleCount != effective) {
+        try {
+            EnsureMainPipeline(effective);
+            VX_LOG_INFO("MSAA 管线已按 %u× 预建（T79⑥：创建移出 `RenderFrame`，主通道 + 深度偏移变体 + 天空）",
+                        effective);
+        } catch (const std::exception& error) {
+            // 本函数是 `noexcept`：失败只记 ERROR，`RenderFrame` 的 `EnsureMainPipeline` 会再试一次
+            //（那条路径要抛就得抛 —— 没有管线的帧必须显式失败，不能默默画出空画面）。
+            VX_LOG_ERROR("MSAA 管线预建失败（%u×）：%s", effective, error.what());
+        }
+    }
 }
 
 void MeshRenderer::EnsureDepthTarget(std::uint32_t width, std::uint32_t height, std::uint32_t sampleCount) {
@@ -1698,7 +1715,8 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
     EnsureHdrTarget(width, height);
     // T23：档位 > 1 时创建多采样颜色目标；档位 = 1 时不创建（直接渲进单采样 HDR 目标）。
     EnsureMsaaColorTarget(width, height, m_msaaSampleCount);
-    // 主通道管线的采样数必须与渲进的目标一致：档位变化时用常驻 Shader 重建。
+    // 主通道管线的采样数必须与渲进的目标一致。T79⑥ 起这条路径**通常什么都不做**：管线已在
+    // `SetMsaaSampleCount`（设置生效点）预建好；这里保留为**幂等保险**（档位已一致 ⇒ 立即返回）。
     EnsureMainPipeline(m_msaaSampleCount);
     EnsureShadowTarget();
     UploadCameraUniform(commandBuffer);

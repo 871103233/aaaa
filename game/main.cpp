@@ -49,6 +49,7 @@
 #include "dig/volume_collapse.hpp"
 #include "dig/volume_collision.hpp"
 #include "streaming/dig_volume_residency.hpp"
+#include "streaming/volume_build_pipeline.hpp"
 
 #include <SDL3/SDL.h>
 
@@ -65,6 +66,7 @@
 #include <exception>
 #include <filesystem>
 #include <limits>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -257,13 +259,24 @@ void UploadTileMesh(vx::MeshRenderer& renderer, vx::MeshHandle& handle, const vx
             return;
         }
         // 容量不够（该 tile 曾被体积接管、网格变小，现在恢复成整张地表）⇒ 重建；**不静默**。
+        // T82 之后这里应当**不可达**（见下"按满地表上界预留"）——保留为安全网。
         VX_LOG_WARN("地表 tile (%d, %d) 网格超出上传时的容量 ⇒ 重建 GPU 缓冲（T75 兜底路径；此后该 tile 回到快路径）",
                     coord.x, coord.z);
         renderer.ReleaseMesh(handle);
         handle = vx::MeshHandle {};
     }
+    // **按满地表上界预留（T82）**：只有**索引数**会随层间接管（ADR 0011）升降，上界 = `kTerrainTileIndexCount`；
+    // 只要本次网格是"部分地表"（被接管），就按这个上界建缓冲 ⇒ 该 tile 之后无论接管如何翻转都走快路径、**永不重建**。
+    // 为什么不在**所有** tile 上预留：tile 全量常驻，289 × 上界 ≈ 28 MB 未记账几何显存（ADR 0008 的 300 MB 预算
+    // 当前已用 262.42 MB）。而"部分地表"的 tile 只可能落在可挖区（区域 = 中心 4×4 tile）内 ⇒ **至多 16 个**
+    // （≈ 16 × 98 KB ≈ 1.6 MB），代价有上界。满地表时 `reserve = 0` 等价（capacity 恰好等于上界）。
+    // 口径提醒：`reserve*Count` 是**总容量**（实现取 `max(本次数量, reserve)`），不是"额外预留"。
+    const std::uint32_t reserveIndices =
+        (tileMesh->mesh.indices.size() < static_cast<std::size_t>(vx::kTerrainTileIndexCount))
+            ? static_cast<std::uint32_t>(vx::kTerrainTileIndexCount)
+            : 0U;
     handle = renderer.UploadMesh(tileMesh->mesh, tileOrigin, /*emissive=*/false,
-                                 /*reserveVertexCount=*/0, /*reserveIndexCount=*/0, /*depthBiased=*/true);
+                                 /*reserveVertexCount=*/0, reserveIndices, /*depthBiased=*/true);
 }
 
 /// 把绝对世界空间相机求值结果平移到渲染原点附近：`eye` / `target` / `view` 全部减去渲染原点。
@@ -574,9 +587,101 @@ struct VolumeSlot {
     WorldAabb      bounds {};  ///< T39：世界空间 AABB（视锥剔除用；上传时更新）
 };
 
-/// 常驻体积块表：`std::map` ⇒ 按块坐标升序、可增删、查找 O(log n)。
-/// **键存在 == 该块常驻**（T61：层间交接过滤与碰撞同步都以它为唯一事实来源）。
-using VolumeSlotTable = std::map<vx::BlockCoord, VolumeSlot>;
+/// `BlockCoord` 的坐标哈希（T79⑤）：三个整数分量各按大素数混合后再异或。
+///
+/// 为什么不用 `std::hash` 组合：块坐标只有 ±32 量级（1 km / 32 格），分量取值域很小，
+/// 简单的"左移 + 异或"会在这类规整坐标上产生大量冲突（同一 tile 里的块会挤进同一个桶）。
+/// 大素数乘法的散列质量对这种"规则网格"足够，且**确定性**（不含随机种子 ⇒ `unordered_map` 的
+/// 桶序在同一进程内可复现；本表的迭代顺序另由稠密数组保证，见 `VolumeSlotTable`）。
+struct BlockCoordHash {
+    [[nodiscard]] std::size_t operator()(const vx::BlockCoord& coord) const noexcept {
+        const std::size_t hx = static_cast<std::size_t>(static_cast<std::uint32_t>(coord.x)) * 73856093U;
+        const std::size_t hy = static_cast<std::size_t>(static_cast<std::uint32_t>(coord.y)) * 19349663U;
+        const std::size_t hz = static_cast<std::size_t>(static_cast<std::uint32_t>(coord.z)) * 83492791U;
+        return hx ^ (hy << 1U) ^ (hz << 2U);
+    }
+};
+
+/// 常驻体积块槽位表（T61 建立，T79⑤ 换实现）：**按坐标升序的稠密数组 + 坐标哈希索引**。
+///
+/// 为什么换掉 `std::map`（T77 清单第 14 条）：这张表的两个热点都是"每次查一个块坐标"——
+///   ① `ResidentQuadFilter::SkipQuad` 对**每个地表四边形的 4 个角**各查一次（一次 tile 重网格 = 64×64×4 ≈ 1.6 万次）；
+///   ② 每帧剔除对全部常驻块各查一次。
+/// `std::map` 在这里是 O(log n) + 树节点指针追逐；换成 **O(1) 哈希查 + 连续内存**后两处都变便宜。
+///
+/// **迭代顺序不变**（关键，红线 7）：稠密数组恒按 `BlockCoord` 升序（插入用 `lower_bound` 保序），
+/// 与 `std::map` 的遍历顺序**完全一致** ⇒ 剔除与提交顺序、以及所有以本表为输入的日志与统计
+/// **逐位不变**。删除按数组搬移（O(n)，n = 常驻块数，本阶段 441）—— 与一次建块（≈22 ms）相比可忽略，
+/// 且建 / 卸本来就按每帧 1 个动作推进（ADR 0020 决策四）。
+class VolumeSlotTable {
+public:
+    using Entry     = std::pair<vx::BlockCoord, VolumeSlot>;
+    using Container = std::vector<Entry>;
+    using iterator  = Container::iterator;
+    using const_iterator = Container::const_iterator;
+
+    /// 查找：未命中返回 `end()`。O(1)（哈希）。
+    [[nodiscard]] iterator Find(const vx::BlockCoord& coord) noexcept {
+        const auto found = m_index.find(coord);
+        return (found == m_index.end()) ? m_entries.end()
+                                        : (m_entries.begin() + static_cast<std::ptrdiff_t>(found->second));
+    }
+    [[nodiscard]] const_iterator Find(const vx::BlockCoord& coord) const noexcept {
+        const auto found = m_index.find(coord);
+        return (found == m_index.end()) ? m_entries.end()
+                                        : (m_entries.begin() + static_cast<std::ptrdiff_t>(found->second));
+    }
+
+    /// 是否常驻（`SkipQuad` 的判据；O(1)）。
+    [[nodiscard]] bool Contains(const vx::BlockCoord& coord) const noexcept {
+        return m_index.find(coord) != m_index.end();
+    }
+
+    /// **按坐标升序插入**（已存在则无操作）—— 表内**键存在 == 该块常驻**（T61 的唯一事实来源）。
+    void Insert(const vx::BlockCoord& coord) {
+        if (Contains(coord)) {
+            return;
+        }
+        const auto position = std::lower_bound(m_entries.begin(), m_entries.end(), coord,
+                                               [](const Entry& entry, const vx::BlockCoord& key) {
+                                                   return entry.first < key;
+                                               });
+        const std::size_t index = static_cast<std::size_t>(position - m_entries.begin());
+        m_entries.insert(position, Entry { coord, VolumeSlot {} });
+        ReindexFrom(index);
+    }
+
+    /// 按坐标删除；未命中返回 false。
+    bool Erase(const vx::BlockCoord& coord) {
+        const auto found = m_index.find(coord);
+        if (found == m_index.end()) {
+            return false;
+        }
+        const std::size_t index = found->second;
+        m_entries.erase(m_entries.begin() + static_cast<std::ptrdiff_t>(index));
+        m_index.erase(found);
+        ReindexFrom(index);
+        return true;
+    }
+
+    [[nodiscard]] std::size_t Size() const noexcept { return m_entries.size(); }
+    [[nodiscard]] bool        Empty() const noexcept { return m_entries.empty(); }
+    [[nodiscard]] iterator       begin() noexcept { return m_entries.begin(); }
+    [[nodiscard]] iterator       end() noexcept { return m_entries.end(); }
+    [[nodiscard]] const_iterator begin() const noexcept { return m_entries.begin(); }
+    [[nodiscard]] const_iterator end() const noexcept { return m_entries.end(); }
+
+private:
+    /// 从 `index` 起重建哈希索引（插入 / 删除后，其后每一项的下标都会平移）。
+    void ReindexFrom(std::size_t index) {
+        for (std::size_t i = index; i < m_entries.size(); ++i) {
+            m_index[m_entries[i].first] = i;
+        }
+    }
+
+    Container                                                     m_entries;  ///< 按坐标升序（= `std::map` 的遍历顺序）
+    std::unordered_map<vx::BlockCoord, std::size_t, BlockCoordHash> m_index;   ///< 坐标 → 稠密下标
+};
 
 /// 世界列 / 高度 → 所属体积块坐标（块边长 32 格；向下取整，负坐标也正确）。
 [[nodiscard]] vx::BlockCoord BlockOfWorldPoint(int worldX, int worldY, int worldZ) noexcept {
@@ -592,7 +697,7 @@ using VolumeSlotTable = std::map<vx::BlockCoord, VolumeSlot>;
 /// 上传（或重传）表里某个体积块的 GPU 网格；块不在表里 ⇒ 无操作。
 void UploadVolumeMeshAt(VolumeSlotTable& slots, vx::MeshRenderer& renderer, const vx::DigVolumeWorld& volumes,
                         const vx::BlockCoord& coord) {
-    const auto found = slots.find(coord);
+    const auto found = slots.Find(coord);  // T79⑤：O(1) 哈希查（原 `std::map::find`）
     if (found == slots.end()) {
         return;
     }
@@ -612,7 +717,7 @@ public:
             const vx::BlockCoord block =
                 BlockOfWorldPoint(quad.columnX[corner], static_cast<int>(std::floor(quad.height[corner])),
                                   quad.columnZ[corner]);
-            if (m_slots.find(block) == m_slots.end()) {
+            if (!m_slots.Contains(block)) {
                 return false;  // 有一角不常驻 ⇒ 地表照旧画（层间接管只发生在常驻集合内）
             }
         }
@@ -978,6 +1083,13 @@ constexpr int kDigVolumeWindowRadiusTiles = 2;
 /// 新建块的**碰撞体**与因此受影响的 **tile 重网格**不在这里同步做 —— 它们入 `PendingDestruction` 队列，
 /// 由既有的每帧预算（`kDestructionBudgetMs`）摊平（ADR 0020 决策四）。
 constexpr std::size_t kVolumeResidencyActionsPerFrame = 1;
+
+/// T81 / ADR 0022：每帧最多**安装**几个 worker 算好的块。
+///
+/// 安装本身很便宜（几次 `move` + 一次 GPU 网格上传 + 入延后队列），成本的大头是随后的上传与
+/// 碰撞体 / tile 重网格（都走既有预算队列）⇒ 取 4 与 `kMeshUploadsPerSlice` 同口径。
+/// 上界明确 ⇒ 主线程单帧成本有界（SKILL 第四节：新增每帧工作必须"有上界"）。
+constexpr std::size_t kVolumeBuildsInstalledPerFrame = 4;
 
 /// 网格上传的**每批个数**：单个网格的上传是一次阻塞拷贝，取 4 使其 ≲ 5 ms。
 constexpr std::size_t kMeshUploadsPerSlice = 4;
@@ -1440,23 +1552,29 @@ int main(int argc, char** argv) {
         // ---- T61 / ADR 0020 决策二：**常驻集合 = 玩家窗口 ∩ 可挖区域** ----
         // 启动只常驻"出生点窗口"那批块；之后由 `DigVolumeScheduler` 随玩家移动建立 / 卸载。
         // 必须**先于** `LoadTile`：层间交接过滤器（ADR 0011）的输入已由"静态区域"换成"当前常驻集合"。
+        // T80 / ADR 0020 决策二修订：启动常驻集合按**预取窗口**（= 活动窗口 + 预取环）算，
+        // 与运行期调度器（构造时传入同一个预取宽度）口径一致 ⇒ 不会在第一步就出现"先建再卸"的抖动。
         const vx::DigVolumeWindow spawnWindow =
             vx::WindowForPlayerBlocks(preset.spawnX, preset.spawnZ, kDigVolumeWindowRadiusTiles);
+        const vx::DigVolumeWindow spawnResidencyWindow = vx::WindowForPlayerBlocks(
+            preset.spawnX, preset.spawnZ, kDigVolumeWindowRadiusTiles + vx::kResidencyPrefetchTiles);
         std::vector<vx::BlockCoord> initialVolumeCoords;
         for (const vx::BlockCoord& coord : digRegions.Blocks()) {
-            if (spawnWindow.ContainsBlock(coord)) {
+            if (spawnResidencyWindow.ContainsBlock(coord)) {
                 initialVolumeCoords.push_back(coord);
             }
         }
         VolumeSlotTable volumeSlots;
         for (const vx::BlockCoord& coord : initialVolumeCoords) {
-            volumeSlots.emplace(coord, VolumeSlot {});
+            volumeSlots.Insert(coord);
         }
         ResidentQuadFilter    residentQuadFilter(volumeSlots);
-        vx::DigVolumeScheduler volumeScheduler(digRegions, kDigVolumeWindowRadiusTiles);
-        VX_LOG_INFO("可挖体积常驻窗口（ADR 0020）：玩家 tile (%d, %d) ± %d ⇒ 目标 %zu 块（区域表共 %zu 块）",
+        vx::DigVolumeScheduler volumeScheduler(digRegions, kDigVolumeWindowRadiusTiles, vx::kResidencyPrefetchTiles);
+        VX_LOG_INFO("可挖体积常驻窗口（ADR 0020 决策二 + T80 预取）：玩家 tile (%d, %d)：**活动窗口** ± %d（能挖三维洞）"
+                    "、**常驻窗口** ± %d（含预取环宽 %d 格块）；启动常驻 %zu 块（区域表共 %zu 块）",
                     spawnWindow.centerTileX, spawnWindow.centerTileZ, spawnWindow.radiusTiles,
-                    initialVolumeCoords.size(), digRegions.Blocks().size());
+                    spawnResidencyWindow.radiusTiles, vx::kResidencyPrefetchTiles, initialVolumeCoords.size(),
+                    digRegions.Blocks().size());
         std::vector<vx::BlockCoord> volumeResidencyChanged;  ///< 每帧调度产生的"建 / 卸"块（复用缓冲）
         std::vector<vx::BlockCoord> volumeCreated;           ///< 本帧新建的块（入延后队列，复用缓冲）
         std::vector<vx::TileCoord>  volumeTouchedTiles;      ///< 本帧接管状态翻转的 tile（入延后队列，复用缓冲）
@@ -1514,12 +1632,25 @@ int main(int argc, char** argv) {
         vx::RigidCollapseRuntime rigidCollapse;
         rigidCollapse.Init(renderer, kCollapseMeshSlots, kCollapseMeshCapacityVerts);
 
+        // T81 / [ADR 0022](../../docs/adr/0022-volume-build-worker-pipeline.md)：**块构建任务池**。
+        // 声明顺序刻意放在 `digVolumes` **之前** ⇒ 它的生命周期覆盖后者（后者持裸指针，须"后建先毁"）。
+        // 线程池不可用时构造会 WARN 一次，`CreateBlock` 自动走同步路径（结果不变、只是尖峰回到从前）。
+        vx::VolumeBuildPipeline volumeBuildPipeline;
+        VX_LOG_INFO("可挖体积块构建（T81 / ADR 0022）：%s（worker 线程 %u 个；主线程只做「采快照 + 收包 + 上传」）",
+                    volumeBuildPipeline.HasWorkers()
+                        ? "**下沉 worker**（FillBlockDensity + MeshBlock 不再占用渲染帧）"
+                        : "**不可用 ⇒ 回退同步构建**（见上方 WARN）",
+                    volumeBuildPipeline.WorkerThreadCount());
+
         // T8：**可挖体积世界**（ADR 0004 层 ②）——只在标记区域内存在。初始密度由地表高度场推导
         // （地下实心 / 空中空），块集合与 `digRegions.Blocks()` 一一对应。
         //
         // T36：块数可达数百（每块 33³ 采样 + 一次等值面网格化），一次跑完要停下等好几秒 ⇒ 分步推进：
         // 每帧在预算内做一步（填一块密度 / 网格化一块），两次之间照常出加载画面。
         vx::DigVolumeWorld digVolumes(world, digRegions);
+        // T81：运行期"按需建块"（常驻调度）改走 worker；**加载期分步初始化仍走同步路径**（它本来就在
+        // 加载画面之间按帧推进、且要求与批量初始化逐位一致，不动它风险最低）。
+        digVolumes.SetBuildPipeline(&volumeBuildPipeline);
         // T61：**只初始化常驻集合**（玩家窗口 ∩ 区域表），而不是整张区域表（ADR 0020 决策二）。
         digVolumes.BeginInitFromHeightField(initialVolumeCoords);
         if (!loading.Run(LoadStage::DiggableVolumes, [&digVolumes]() {
@@ -1611,6 +1742,21 @@ int main(int argc, char** argv) {
                     preset.tileRadiusX, preset.tileRadiusZ, bounds.min.x, bounds.min.y, bounds.min.z, bounds.max.x,
                     bounds.max.y, bounds.max.z, boundaryWallBodies, vx::kBoundaryWallThickness,
                     vx::kOutOfBoundsMargin);
+
+        // T79③：**加载期静态体已全部加完**（地表高度场 + 可挖体积三角网 + 4 面围墙）⇒ 在**首个 `Update`
+        // 之前**调用一次 `OptimizeBroadPhase()`（Jolt 官方文档："needed only if you've added many bodies
+        // prior to calling `Update()` for the first time"）。不调用的话，同一份"建造包围体树"的工作会被
+        // `PhysicsSystem::Update` **摊到随后若干帧**上（每帧多花一点 CPU，正是帧尖峰打点里的"未计时"）。
+        // **不得每帧调用**（文档原文："Don't call this every frame"）—— 那是把已摊平的工作重新集中。
+        {
+            vx::Clock broadPhaseClock;
+            physics.OptimizeBroadPhase();
+            VX_LOG_INFO("物理宽相位已优化（T79③ / Jolt `OptimizeBroadPhase`）：静态体共 %zu 个"
+                        "（地表高度场 %zu + 可挖体积三角网 %zu + 围墙 %zu），耗时 %.2f ms；"
+                        "此后 `Update` 的建树工作不再摊到随后若干帧",
+                        physics.BodyCount(), collisionTiles, volumeBodies, boundaryWallBodies,
+                        broadPhaseClock.Tick() * 1000.0);
+        }
 
         // T36：加载到了收尾段 —— 下面都是毫秒级的设置（出生点 / 角色 / 相机 / 面板数据 / 渲染原点），
         // 但仍照常出帧，保证"任何一步都不让画面停下等待"这条规则在这里也成立。
@@ -1723,7 +1869,7 @@ int main(int argc, char** argv) {
                         } else {
                             const std::size_t index = unit - tileCount;
                             UploadVolumeMeshAt(volumeSlots, renderer, digVolumes, initialVolumeCoords[index]);
-                            const auto uploaded = volumeSlots.find(initialVolumeCoords[index]);
+                            const auto uploaded = volumeSlots.Find(initialVolumeCoords[index]);
                             if (uploaded != volumeSlots.end() && uploaded->second.handle.IsValid()) {
                                 ++volumeMeshCount;
                             }
@@ -1736,7 +1882,7 @@ int main(int argc, char** argv) {
             }
         }
         VX_LOG_INFO("可挖体积网格已上传：%zu/%zu 个块有可见表面（其余块全实心或全空，无等值面）", volumeMeshCount,
-                    volumeSlots.size());
+                    volumeSlots.Size());
 
         // T13：主角**可视**胶囊体（装饰用，尺寸与碰撞胶囊一致；不参与任何物理）。
         // 一次性上传局部网格（脚底为原点），此后每帧只就地刷新顶点位置；绘制顺序由每帧的绘制列表决定。
@@ -1794,7 +1940,7 @@ int main(int argc, char** argv) {
 
         // 每帧的绘制列表（tile + 体积 + 主角 + 活动光球 + **倒塌整体**）：容量固定，稳态零分配。
         std::vector<vx::MeshHandle> frameHandles;
-        frameHandles.reserve(tileHandles.size() + volumeSlots.size() + 1 + orbHandles.size() +
+        frameHandles.reserve(tileHandles.size() + volumeSlots.Size() + 1 + orbHandles.size() +
                              static_cast<std::size_t>(collapseSpec.maxActiveUnits));
 
         /// T33：本帧**落定**（倒了、停住了）的倒塌整体 —— 帧末统一体素化回写（缓冲复用，稳态零分配）。
@@ -1813,9 +1959,21 @@ int main(int argc, char** argv) {
         PhaseTimer   dynamicUploadTimer;
         PhaseTimer   uniformTimer;
         PhaseTimer   throttleTimer;
-        /// T45：上一帧的**限帧**耗时（本帧日志在限帧之前打印，故读上一帧的值；与 `cpuCost` 同一处理方式）。
+        // T79②（T74 打点拆分）：把剩下三段**原先没被计量的每帧工作**也量出来 ——
+        // **输入与事件**（`pump_events` + `input.BeginFrame`）、**剔除与绘制列表构建**、**渲染原点重定基**。
+        // 这三段就是尖峰日志里"未计时"的主要来源（实测出现过 100+ ms 的未计时，见 `docs/devlog.md` T72 条目）。
+        PhaseTimer   inputTimer;
+        PhaseTimer   cullTimer;
+        PhaseTimer   rebaseTimer;
+        /// T79②：**本帧**计时器（帧首 → 帧末，含限帧）—— 尖峰日志的 `frameMs` 用它，保证与各段**同一区间**。
+        PhaseTimer   frameTimer;
+        /// 本帧各段耗时（毫秒）。尖峰日志移到**帧末**打印 ⇒ 读到的都是本帧的值（见帧首的采样点说明）。
+        double       inputMs  = 0.0;
+        double       cullMs   = 0.0;
+        double       rebaseMs = 0.0;
+        /// 本帧的**限帧**耗时（毫秒；日志在帧末打印 ⇒ 是本帧的值）。
         double       throttleMs = 0.0;
-        CpuFrameCost cpuCost;  // 上一帧的值（面板早于本帧渲染构建，与 frameSeconds 同源）
+        CpuFrameCost cpuCost;  // 本帧的值（帧末的尖峰日志与下一帧的面板共用）
 
         // ---- 加载结束（T36）：恢复玩家设置的帧率上限 / 呈现模式，并撤下加载画面。----
         // 自此进入稳态主循环：加载期"先给画面、再给结果"的阶段到此结束。
@@ -1884,7 +2042,6 @@ int main(int argc, char** argv) {
                     static_cast<double>(orbSpec.explosionDepthBlocks), static_cast<double>(orbSpec.explosionRimBlocks));
 
         // T38：帧尖峰打点所需的状态（跨帧保持）。
-        std::size_t         submittedMeshCount = 0;  ///< **上一帧**提交的网格数（与 `cpuCost` / 面板同源）
         vx::Clock           hitchLogClock;           ///< 尖峰日志的节流时钟（最多每 `kHitchLogMinIntervalMs` 一条）
         bool                cullingLogged = false;   ///< T39：剔除结果只打一条日志（启动后第一次提交时）
 
@@ -1896,8 +2053,22 @@ int main(int argc, char** argv) {
             return (length > 0.0F) ? (direction / length) : glm::vec3(0.0F, 1.0F, 0.0F);
         }();
 
-        while (window.pump_events(input)) {
+        while (true) {
+            // T79②（T74 打点拆分，**先量后改**）：帧周期的采样点必须在**帧首**。
+            // 原实现在**逻辑相位内**采样（`clock.Tick()` 在 `logicTimer` 里），于是 frameMs 恒覆盖
+            // "上一帧尾 + 本帧头"、却**跳过本帧的逻辑相位**（实测表现为"逻辑 116 ms 与未计时 108 ms 交替出现"）
+            // ⇒ 打印出来的"未计时"是两帧错位后的残差，不能用来定位。
+            // 现在：帧首采样（供固定步推进）+ **另起一个本帧计时器**（帧首 → 帧末）⇒ 尖峰日志里的
+            // 各段之和与 `frameMs` **同一区间**，残差才是真的没被计量的部分。
+            const double frameDeltaSeconds = clock.Tick();
+            frameTimer.Begin();
+
+            inputTimer.Begin();
+            if (!window.pump_events(input)) {
+                break;  // 窗口关闭 / 收到退出事件（与旧 `while (window.pump_events(...))` 等价）
+            }
             input.BeginFrame();  // 每帧采样一次，且只在固定步循环之外
+            inputMs = inputTimer.EndMs();
 
             // T14：平台层在窗口失焦时会自动释放相对模式（见 `Window::pump_events`）；这里把 game 的意图同步过来并记日志。
             // **不**在此自动重新捕获：焦点恢复必须靠用户的显式点击，否则光标会自己消失，令人困惑。
@@ -2025,7 +2196,9 @@ int main(int argc, char** argv) {
 
             // T24：逻辑步相位（固定步循环：物理 + 相机 + 光球 + 出界检查）。
             logicTimer.Begin();
-            const vx::StepPlan plan = accumulator.Advance(clock.Tick());
+            // T79②：帧间隔在**帧首**采到（`frameDeltaSeconds`）⇒ 固定步推进与帧时间同源，
+            // 不再依赖"逻辑相位内再采一次"（那会让帧时间与相位分解错位一帧）。
+            const vx::StepPlan plan = accumulator.Advance(frameDeltaSeconds);
             bool                 terrainExplosionSeen  = false;
             settledCollapseUnits.clear();
             for (int step = 0; step < plan.steps; ++step) {
@@ -2136,8 +2309,19 @@ int main(int argc, char** argv) {
             // 为什么跟着窗口走：静态全图在 1 km 下要 69~549 MB，而窗口内只需 ≈ 7~10 MB（ADR 0020）。
             {
                 const vx::PhysicsWorld::CharacterState playerState = physics.GetCharacterState(character);
-                const bool wasBusy = volumeScheduler.HasPendingWork();
+                // T81：`在飞` 也算"忙"（异步建块期间 `Step` 不会报告动作，但窗口调整并未真正结束）。
+                const bool wasBusy =
+                    volumeScheduler.HasPendingWork() || digVolumes.PendingBuildCount() > 0U;
                 volumeResidencyChanged.clear();
+                // T81 / ADR 0022：**先收包** —— 把 worker 算好的块安装进世界；安装之后的后续流程
+                // （入表 / 上传 / 碰撞体 / tile 重网格）与"同步创建"**完全同源**，故复用同一段代码。
+                if (digVolumes.PollBlockBuildsAndInstall(volumeResidencyChanged, kVolumeBuildsInstalledPerFrame) > 0U) {
+                    VX_LOG_DEBUG("可挖体积块构建收包（T81）：本帧安装 %zu 块（在飞 %zu 块、worker 已完成 %zu 块、"
+                                 "单块 worker 计算峰值 %.2f ms）",
+                                 volumeResidencyChanged.size(), digVolumes.PendingBuildCount(),
+                                 volumeBuildPipeline.SnapshotStats().completed,
+                                 volumeBuildPipeline.SnapshotStats().computeMsMax);
+                }
                 if (volumeScheduler.Update(digVolumes, playerState.position.x, playerState.position.z)) {
                     (void)volumeScheduler.Step(digVolumes, kVolumeResidencyActionsPerFrame,
                                                volumeResidencyChanged);
@@ -2146,13 +2330,13 @@ int main(int argc, char** argv) {
                     volumeCreated.clear();
                     volumeTouchedTiles.clear();
                     for (const vx::BlockCoord& coord : volumeResidencyChanged) {
-                        const auto slot = volumeSlots.find(coord);
+                        const auto slot = volumeSlots.Find(coord);  // T79⑤：O(1)
                         if (digVolumes.Blocks().find(coord) != digVolumes.Blocks().end()) {
                             if (slot == volumeSlots.end()) {
                                 // 新建：**先入表**（层间交接过滤器读的就是这张表，ADR 0011 / 0020 决策三），
                                 // 再立刻上传它的网格 —— 本帧稍后处理 tile 重网格时，体积面**已经在画**，
                                 // 因此不会出现"地表已被跳过、体积还没画"的破洞。
-                                volumeSlots.emplace(coord, VolumeSlot {});
+                                volumeSlots.Insert(coord);
                                 UploadVolumeMeshAt(volumeSlots, renderer, digVolumes, coord);
                                 volumeCreated.push_back(coord);
                             }
@@ -2161,7 +2345,7 @@ int main(int argc, char** argv) {
                             if (slot->second.handle.IsValid()) {
                                 renderer.ReleaseMesh(slot->second.handle);
                             }
-                            volumeSlots.erase(slot);
+                            (void)volumeSlots.Erase(coord);
                             volumeCollision.RemoveBlock(coord);
                         } else {
                             continue;  // 世界与表里都没有 ⇒ 无变化（防御性）
@@ -2179,14 +2363,18 @@ int main(int argc, char** argv) {
                         pendingDestruction.MergeTiles(volumeTouchedTiles);
                     }
                 }
-                if (wasBusy && !volumeScheduler.HasPendingWork()) {
+                if (wasBusy && !volumeScheduler.HasPendingWork() && digVolumes.PendingBuildCount() == 0U) {
                     // 一次"窗口调整"**收尾后**记一条（每次跨越 tile 边界一条，不逐帧刷屏）——走动验收的可观测证据。
                     // 必须放在上面的同步之后：否则本帧那一个动作还没落到 `volumeSlots` 上，打印出来的计数会差一个。
-                    VX_LOG_INFO("可挖体积常驻集合已随窗口调整完毕（ADR 0020）：玩家 tile (%d, %d) ⇒ 常驻 %zu 块"
-                                "（世界内 %zu 块、窗口目标 %zu 块、**留驻脏块 %zu 块**）",
+                    // T81：同时给出块构建的观测数据（worker 完成数 / 单块计算峰值）——"尖峰去哪了"的可复现证据。
+                    const vx::VolumeBuildPipeline::Stats buildStats = volumeBuildPipeline.SnapshotStats();
+                    VX_LOG_INFO("可挖体积常驻集合已随窗口调整完毕（ADR 0020 窗口 + T81 worker 构建）：玩家 tile (%d, %d) ⇒ 常驻 %zu 块"
+                                "（世界内 %zu 块、窗口目标 %zu 块、**留驻脏块 %zu 块**；"
+                                "**worker 已构建 %zu 块、单块计算峰值 %.2f ms**、worker %u 个）",
                                 volumeScheduler.Window().centerTileX, volumeScheduler.Window().centerTileZ,
-                                volumeSlots.size(), digVolumes.Blocks().size(), volumeScheduler.DesiredCount(),
-                                volumeScheduler.KeptDirtyCount());
+                                volumeSlots.Size(), digVolumes.Blocks().size(), volumeScheduler.DesiredCount(),
+                                volumeScheduler.KeptDirtyCount(), buildStats.completed, buildStats.computeMsMax,
+                                volumeBuildPipeline.WorkerThreadCount());
                 }
             }
 
@@ -2202,6 +2390,8 @@ int main(int argc, char** argv) {
             // `renderer.SetRenderOrigin` 每帧下发的偏移（网格原点 − 渲染原点）在绘制时补上，
             // 因此重定基**不再重传任何网格**（旧做法在这里逐个 `ReleaseMesh` + `UploadMesh` 137 个网格，
             // 每次阻塞到 GPU 完成，debug 下当帧停顿 ≈70~140 ms —— 那正是"走动时周期性卡顿"的根因）。
+            // T79②：本段独立计时（原先落在"未计时"里，是那颗 1339 ms 首帧尖峰的候选之一）。
+            rebaseTimer.Begin();
             const glm::vec3 focus = camera.TargetCurrent();
             const glm::dvec3 focusDouble(static_cast<double>(focus.x), static_cast<double>(focus.y),
                                          static_cast<double>(focus.z));
@@ -2211,6 +2401,7 @@ int main(int argc, char** argv) {
                 VX_LOG_INFO("渲染原点重定基到 (%.0f, %.0f, %.0f)（T41：只更新 uniform，零重传）", renderOrigin.x,
                             renderOrigin.y, renderOrigin.z);
             }
+            rebaseMs = rebaseTimer.EndMs();
 
             // T13：每帧把主角胶囊改写为**渲染相对**顶点并就地刷新。位置取相机目标的插值位置，
             // 与渲染插值一致（alpha 只用于渲染，绝不回写模拟状态，红线 11）；装饰用，不影响碰撞。
@@ -2245,6 +2436,8 @@ int main(int argc, char** argv) {
             // 渲染原点相对视图：顶点上传时已减去渲染原点，故**相机与剔除必须用同一坐标系**（红线 6）。
             // 提前到这里是因为下面的绘制列表要用它的 `viewProjection` 做视锥剔除（T39）。
             const vx::CameraView relativeView = RelativeCameraView(view, renderOrigin);
+            // T79②：**剔除与绘制列表构建**独立计时（原先落在"未计时"里）。
+            cullTimer.Begin();
 
             // T39：**先剔除再提交**（`references/performance-and-hitches.md` §1.3 硬规则 3）。
             // 判据 = 相机视锥 ∩（物体 ∪ 其影子落点）：前者去掉"背后 / 侧向"的网格，后者保证不丢阴影。
@@ -2286,6 +2479,7 @@ int main(int argc, char** argv) {
             // 提交量（T38）：在 `RenderFrame` 之后记录，**下一帧**的尖峰日志才能与同批实测值（draw call /
             // 三相耗时 / 帧时长）对齐 —— 三者都取"最近一次"的实测值，混帧会让定位结论失真。
             const std::size_t submittedThisFrame = frameHandles.size();
+            cullMs = cullTimer.EndMs();  // T79②：剔除相位到此结束（下面的一次性日志不计入）
 
             // T39：剔除结果**首次可观测**（`references/performance-and-hitches.md` §3"提交量必须由剔除结果
             // 决定"）：只打一条，用于确认剔除真的在起作用（而不是把整个世界都提交了）。
@@ -2293,14 +2487,14 @@ int main(int argc, char** argv) {
                 cullingLogged = true;
                 VX_LOG_INFO("首帧视锥剔除（T39）：地表 tile %zu/%zu、可挖体积块 %zu/%zu 通过（含阴影扫掠余量）；"
                             "本帧提交网格 %zu 个",
-                            visibleTiles, tileHandles.size(), visibleVolumes, volumeSlots.size(),
+                            visibleTiles, tileHandles.size(), visibleVolumes, volumeSlots.Size(),
                             submittedThisFrame);
             }
 
             // 调试面板：统计经独立接口采集，只在渲染线程构建，不进世界层热路径。
             vx::DebugStats stats;
             const vx::PhysicsWorld::CharacterState characterState = physics.GetCharacterState(character);
-            stats.frameSeconds      = clock.DeltaSeconds();
+            stats.frameSeconds      = frameDeltaSeconds;  // T79②：帧首采样（= 上一帧的完整周期）
             stats.stepsThisFrame     = plan.steps;
             stats.frameRateCap       = panelContext.settings.frameRateCap;  // T17：F1 面板显示当前目标
             stats.characterPosition = characterState.position;
@@ -2312,7 +2506,7 @@ int main(int argc, char** argv) {
             stats.explosionRadius   = orbSpec.explosionRadiusBlocks;
             stats.orbActiveCount    = orbPool.ActiveCount();
             stats.orbCapacity       = orbPool.Capacity();
-            stats.volumeBlockCount  = volumeSlots.size();
+            stats.volumeBlockCount  = volumeSlots.Size();
             stats.carvedBlockCount  = digVolumes.CarvedBlockCount();
             // T61：常驻调度的可观测量 —— "待办"回落说明窗口已跟上玩家，"留驻"增长说明玩家改造的洞被保住。
             stats.volumePendingActions = volumeScheduler.PendingActionCount();
@@ -2432,34 +2626,7 @@ int main(int argc, char** argv) {
                 VX_LOG_DEBUG("本帧未取得交换链纹理（窗口最小化？），跳过渲染");
             }
             const double renderMs = renderTimer.EndMs();
-            cpuCost = CpuFrameCost { logicMs, uiMs, renderMs };  // 供下一帧面板显示
-            submittedMeshCount = submittedThisFrame;             // T38：同上，供下一帧尖峰日志使用
-
-            // ---- T38 / T45 帧尖峰打点（`references/performance-and-hitches.md` §2 的第一步）----
-            // 与面板同源：`stats.frameSeconds` / `cpuCost` / `renderStats` 都取"最近一次"的实测值。
-            // 一条日志里同时给出各段 CPU + draw call + 提交网格数 + 等交换链耗时，据此可立刻区分
-            // 「CPU 忙 / GPU 忙 / 在空等」——这正是本轮之前缺失、导致误判（把 GPU 侧成本判到 CPU）的那一步。
-            //
-            // T45：**必须给出"未计时合计"** —— 各段之和与帧时间之差就是"还没有归属的那部分"，
-            // 原先它被无声吞掉（61.4 ms 的尖峰里 ≈39 ms 由此漏掉）。`stats.frameSeconds` 由面板的帧计时器
-            // 在 `BeginFrame` 时喂入（≈本帧的循环周期），故各段和与它可能相差一次限帧时长；因此下面把
-            // **限帧**也单独计量，并显式打印 `未计时`（钳到 ≥ 0，不假装它是 0）。
-            const double frameMs = stats.frameSeconds * 1000.0;
-            if (frameMs > kHitchThresholdMs && hitchLogClock.Tick() * 1000.0 >= kHitchLogMinIntervalMs) {
-                (void)hitchLogClock.Tick();  // 重置节流窗口（节流口径不变，观测本身不制造新卡顿）
-                const double measuredMs = cpuCost.logicMs + cpuCost.uiMs + cpuCost.renderMs + dynamicUploadMs +
-                                          uniformMs + throttleMs;
-                const double untimedMs = std::max(0.0, frameMs - measuredMs);
-                VX_LOG_WARN("帧尖峰 %.1f ms（阈值 %.0f ms）：逻辑 %.2f + UI %.2f + 渲染提交 %.2f + 动态上传 %.2f + "
-                            "uniform %.2f + 限帧 %.2f = %.2f，**未计时 %.2f** ms；"
-                            "draw call %u、提交网格 %zu、固定步 %d、等交换链 %.2f ms ⇒ 主要受限在 %s",
-                            frameMs, kHitchThresholdMs, cpuCost.logicMs, cpuCost.uiMs, cpuCost.renderMs,
-                            dynamicUploadMs, uniformMs, throttleMs, measuredMs, untimedMs, renderStats.drawCalls,
-                            submittedMeshCount, plan.steps, renderStats.swapchainWaitMs,
-                            (renderStats.swapchainWaitMs > cpuCost.renderMs * 0.5)
-                                ? "等交换链（GPU / 呈现）"
-                                : "CPU 侧（逻辑 / UI / 提交）");
-            }
+            cpuCost = CpuFrameCost { logicMs, uiMs, renderMs };  // 本帧值：面板在下一帧读、尖峰日志在帧末读
 
             // T17：帧末补睡到目标间隔，限制帧率。垂直同步档 `TargetFps() == 0`，本调用立即返回。
             // 只用睡眠、绝不忙等（见 FrameLimiter 注释）。
@@ -2467,6 +2634,30 @@ int main(int argc, char** argv) {
             throttleTimer.Begin();
             (void)frameLimiter.Throttle();
             throttleMs = throttleTimer.EndMs();
+
+            // ---- T38 / T45 / T79② 帧尖峰打点（`references/performance-and-hitches.md` §2 的第一步）----
+            // **帧末打印**（T79② 起）：本帧的全部相位都已量完（输入 / 逻辑 / UI / 剔除 / 动态上传 / uniform /
+            // 提交 / 限帧），且 `frameMs` 由**帧首启动的 `frameTimer`** 量出 ⇒ 与各段**同源同区间**，
+            // 各段之和与它之差才是真正的"未计时"（旧实现在逻辑相位内采样 + 帧中打印，读数错位一帧，
+            // 会打出 100+ ms 的假未计时）。
+            // 一条日志里同时给出各段 CPU + draw call + 提交网格数 + 等交换链耗时，据此可立刻区分
+            // 「CPU 忙 / GPU 忙 / 在空等」。
+            const double frameMs = frameTimer.EndMs();
+            if (frameMs > kHitchThresholdMs && hitchLogClock.Tick() * 1000.0 >= kHitchLogMinIntervalMs) {
+                (void)hitchLogClock.Tick();  // 重置节流窗口（节流口径不变，观测本身不制造新卡顿）
+                const double measuredMs = inputMs + cpuCost.logicMs + cpuCost.uiMs + cullMs + rebaseMs +
+                                          dynamicUploadMs + uniformMs + cpuCost.renderMs + throttleMs;
+                const double untimedMs = std::max(0.0, frameMs - measuredMs);
+                VX_LOG_WARN("帧尖峰 %.1f ms（阈值 %.0f ms）：输入 %.2f + 逻辑 %.2f + UI %.2f + 剔除 %.2f + "
+                            "重定基 %.2f + 动态上传 %.2f + uniform %.2f + 渲染提交 %.2f + 限帧 %.2f = %.2f，"
+                            "**未计时 %.2f** ms；draw call %u、提交网格 %zu、固定步 %d、等交换链 %.2f ms ⇒ 主要受限在 %s",
+                            frameMs, kHitchThresholdMs, inputMs, cpuCost.logicMs, cpuCost.uiMs, cullMs, rebaseMs,
+                            dynamicUploadMs, uniformMs, cpuCost.renderMs, throttleMs, measuredMs, untimedMs,
+                            renderStats.drawCalls, submittedThisFrame, plan.steps, renderStats.swapchainWaitMs,
+                            (renderStats.swapchainWaitMs > cpuCost.renderMs * 0.5)
+                                ? "等交换链（GPU / 呈现）"
+                                : "CPU 侧（逻辑 / UI / 提交）");
+            }
         }
 
         // 设置落盘：正常退出、窗口关闭、面板退出游戏都走这里（落盘失败只告警，不阻断退出）。

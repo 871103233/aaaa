@@ -230,6 +230,9 @@ public:
     /// `UpdateMeshGeometry` 时变大；容量不够就只能走"重建"兜底（等价于旧路径）。
     /// **本方法不做同步等待**（内部走 `UpdateMeshGeometry` 的"提交即走"路径）⇒ 可用于生成 / 加载帧；
     /// 真正的热路径成本控制靠"预留容量 + 逐帧上传预算"（见 `references/performance-and-hitches.md`）。
+    /// `reserveVertexCount` / `reserveIndexCount` 是**总容量**（实现取 `max(本次数量, reserve)`），
+    /// **不是"在本次数量之上额外留出"** ⇒ 想要 2× 容量必须传 `数量 × 2`；传与数量相等的值等于**不预留**
+    /// （后续 `UpdateMeshGeometry` 只要网格长一点点就会被拒）。`T82` 的 tile 兜底与 `T76` 的体积块均按 `× 2` 传。
     [[nodiscard]] MeshHandle UploadMesh(const MeshData& mesh, const glm::dvec3& origin, bool emissive = false,
                                        std::uint32_t reserveVertexCount = 0,
                                        std::uint32_t reserveIndexCount = 0, bool depthBiased = false);
@@ -345,7 +348,7 @@ public:
     /// 引擎不在此解释语义（ADR 0010：参数进配置，改值不需重编 Shader）。
     void SetExposure(float exposure) noexcept { m_exposure = exposure; }
 
-    /// 设置 MSAA 档位（T23 / ADR 0010 P3）；下一次 `RenderFrame` 生效。
+    /// 设置 MSAA 档位（T23 / ADR 0010 P3）；**管线在同一调用内按新档位预建**（T79⑥）。
     ///
     /// 取值来自上层（`game/` 读 `settings.toml` 的 `msaa_samples` 后传入，**引擎层不读配置文件**）。
     /// `1` = 关闭 MSAA（**零额外开销**：不创建 MSAA 纹理，直接渲进单采样 HDR 目标 + 单采样深度）；
@@ -356,6 +359,11 @@ public:
     /// 若请求档位不被当前设备支持（`SDL_GPUTextureSupportsSampleCount`），会向下取受支持的最高档，
     /// 以保证**管线采样数与渲染目标采样数一致**（否则 `SDL_BeginGPURenderPass` 会报错）。
     /// 档位变化与硬件降级都会记一条日志（含生效档位）。
+    ///
+    /// **PSO 预建（T79⑥）**：档位真的变化时，主通道（含 T78 的深度偏移变体）与天空管线的重建
+    /// **就在本调用内**发生，不再落到下一帧的 `RenderFrame`（SKILL 第四节硬规则 4"资源与管线创建
+    /// 不得发生在渲染热路径"）。预建失败只记 ERROR（本函数 `noexcept`），`RenderFrame` 内的
+    /// `EnsureMainPipeline` 仍是幂等保险。渲染目标（尺寸相关）仍在 `RenderFrame` 里按需重建。
     void SetMsaaSampleCount(std::uint32_t sampleCount) noexcept;
 
     /// 只读：渲染开销统计与纹理显存记账（见 `RenderStats`）。
@@ -399,6 +407,8 @@ private:
 
     /// 保证主通道图形管线与请求的 MSAA 档位一致（档位变化时用常驻 Shader 重建）。
     /// T67 起**同时**重建天空管线：它在主通道的同一个渲染通道里绘制，采样数必须与目标一致。
+    /// T79⑥ 起**通常不在渲染帧内创建**：档位变化时管线已在 `SetMsaaSampleCount` 预建；
+    /// 这里只是幂等保险（档位一致 ⇒ 立即返回，不创建任何 GPU 资源）。
     void EnsureMainPipeline(std::uint32_t sampleCount);
 
     /// 保证一块**常驻暂存缓冲**的容量 ≥ `bytes`（容量够则**不重新分配** ⇒ 稳态零堆分配 / 零 GPU 资源创建）。

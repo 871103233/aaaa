@@ -67,11 +67,16 @@ public:
 
     /// 读取世界列 `(worldX, worldZ)` 的当前高度。
     /// 返回 false 表示该列未被任何已加载 tile 持有。
+    ///
+    /// **成本 O(1)**（T79①）：由整数除法算出**最多 4 个**候选 tile 再查表，不遍历全部已加载 tile
+    ///（`QueryHeight` 是每帧热路径 —— 相机避障 / 弹道 / 材质派生）。
+    /// **共享边界列**（tile 原点与原点 + 64 那两列）会被两个 tile 同时持有，二者内容恒等（红线 12）。
     [[nodiscard]] bool ReadColumnHeight(int worldX, int worldZ, Height& outHeight) const noexcept;
 
     /// 写入世界列高度：更新**所有**含该列的已加载 tile（含共享边界层），
     /// 并把被改动的 tile 坐标追加到 `dirtyOut`（可能重复，调用方负责去重）。
     /// 传入值会被钳制到世界垂直范围（ADR 0008）。
+    /// **成本 O(1)**（T79①，候选 tile 同 `ReadColumnHeight`）。
     void WriteColumnHeight(int worldX, int worldZ, Height height, std::vector<TileCoord>& dirtyOut);
 
     // ---- 重网格 ----

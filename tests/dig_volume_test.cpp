@@ -10,6 +10,7 @@
 #include "dig/destruction_table.hpp"
 #include "dig/dig_region.hpp"
 #include "dig/dig_volume.hpp"
+#include "streaming/volume_build_pipeline.hpp"
 
 #include "terrain/material_table.hpp"
 #include "terrain/terrain_types.hpp"
@@ -18,6 +19,7 @@
 #include <glm/glm.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -27,6 +29,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -1216,6 +1219,135 @@ TEST(DigVolumeRegression, OptimizedCarveByDamageMatchesNaiveReference) {
         EXPECT_EQ(actualChanged, refChanged);
         EXPECT_EQ(actualDirty, refDirty) << "脏块集合（含顺序）必须相同";
         ExpectSameDensity(actual.volumes, reference, "CarveByDamage");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T81 / ADR 0022：**worker 侧构建 == 主线程构建，逐位一致**（确定性红线 7 的硬判据）
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// 逐值比较两个网格（顶点位置 / 法线 / 材质 + 索引）——**精确相等**：两条路径共用同一条公式 ⇒ 必须逐位一致。
+/// 返回空串表示一致；否则给出**第一个差异**的可读描述（便于定位）。
+[[nodiscard]] std::string MeshDifference(const vx::MeshData& left, const vx::MeshData& right) {
+    if (left.vertices.size() != right.vertices.size()) {
+        return "顶点数不同：" + std::to_string(left.vertices.size()) + " vs " + std::to_string(right.vertices.size());
+    }
+    if (left.indices.size() != right.indices.size()) {
+        return "索引数不同：" + std::to_string(left.indices.size()) + " vs " + std::to_string(right.indices.size());
+    }
+    for (std::size_t i = 0; i < left.vertices.size(); ++i) {
+        const vx::MeshVertex& a = left.vertices[i];
+        const vx::MeshVertex& b = right.vertices[i];
+        for (int axis = 0; axis < 3; ++axis) {
+            if (a.position[axis] != b.position[axis]) {
+                return "顶点 " + std::to_string(i) + " 位置[" + std::to_string(axis) + "] 不同：" +
+                       std::to_string(a.position[axis]) + " vs " + std::to_string(b.position[axis]);
+            }
+            if (a.normal[axis] != b.normal[axis]) {
+                return "顶点 " + std::to_string(i) + " 法线[" + std::to_string(axis) + "] 不同：" +
+                       std::to_string(a.normal[axis]) + " vs " + std::to_string(b.normal[axis]);
+            }
+        }
+        if (a.material != b.material) {
+            return "顶点 " + std::to_string(i) + " 材质不同：" + std::to_string(a.material) + " vs " +
+                   std::to_string(b.material);
+        }
+    }
+    for (std::size_t i = 0; i < left.indices.size(); ++i) {
+        if (left.indices[i] != right.indices[i]) {
+            return "索引 " + std::to_string(i) + " 不同：" + std::to_string(left.indices[i]) + " vs " +
+                   std::to_string(right.indices[i]);
+        }
+    }
+    return {};
+}
+
+/// 密度数组的逐位比较；不同则写出**第一个不同的下标**（避免 gtest 打印 33³ 个元素）。
+[[nodiscard]] bool SameDensity(const std::vector<std::int8_t>& left, const std::vector<std::int8_t>& right,
+                               std::size_t& firstDifference) {
+    if (left.size() != right.size()) {
+        firstDifference = 0;
+        return false;
+    }
+    for (std::size_t i = 0; i < left.size(); ++i) {
+        if (left[i] != right[i]) {
+            firstDifference = i;
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+TEST(DigVolumeWorker, PipelineBuildMatchesMainThreadBuildBitForBit) {
+    const MapPreset preset = FlatPreset();
+
+    TerrainWorld world(preset.seed, TerrainMaterialTable::Default());
+    world.SetMapPreset(preset);
+    for (int tileZ = -1; tileZ <= 1; ++tileZ) {
+        for (int tileX = -1; tileX <= 1; ++tileX) {
+            world.LoadTile(tileX, tileZ);
+        }
+    }
+
+    // 区域覆盖目标块 + 它的 7 个"负方向"邻居（含 y 方向）⇒ 两种情况都能构造：
+    //   ① 邻居**都不存在**（壳层走"按列高度推导"分支）；
+    //   ② 邻居**都已存在**（壳层走"取邻块数组"分支）。
+    const DigRegionTable regions = DigRegionTable::FromRegions(
+        { MakeRegion("worker", true, 0, BlockCoord { -1, 2, -1 }, BlockCoord { 1, 3, 1 }) });
+
+    const BlockCoord              target { 0, 3, 0 };
+    const std::vector<BlockCoord> neighbours { BlockCoord { -1, 3, 0 },  BlockCoord { 0, 3, -1 },
+                                               BlockCoord { -1, 3, -1 }, BlockCoord { 0, 2, 0 },
+                                               BlockCoord { -1, 2, 0 },  BlockCoord { 0, 2, -1 },
+                                               BlockCoord { -1, 2, -1 } };
+
+    for (const bool withNeighbours : { false, true }) {
+        // 两个独立世界，同种子同编辑 ⇒ 地表完全相同；差异只在"块由谁构建"。
+        DigVolumeWorld syncWorld(world, regions);
+        DigVolumeWorld asyncWorld(world, regions);
+
+        if (withNeighbours) {
+            for (const BlockCoord& neighbour : neighbours) {
+                ASSERT_TRUE(syncWorld.CreateBlock(neighbour));   // 未装任务池 ⇒ 同步
+                ASSERT_TRUE(asyncWorld.CreateBlock(neighbour));  // 同上
+            }
+        }
+
+        // ① 主线程（同步）构建目标块。
+        ASSERT_TRUE(syncWorld.CreateBlock(target));
+
+        // ② worker 构建同一个块：装了任务池 ⇒ `CreateBlock` 变成**提交**（返回 false = 尚未就位）。
+        vx::VolumeBuildPipeline pipeline(2U);
+        asyncWorld.SetBuildPipeline(&pipeline);
+        ASSERT_TRUE(pipeline.HasWorkers()) << "单测环境应有可用 worker（本用例的核心是异步路径）";
+        EXPECT_FALSE(asyncWorld.CreateBlock(target)) << "异步提交后块**尚不存在**";
+        EXPECT_EQ(asyncWorld.PendingBuildCount(), 1U);
+        EXPECT_EQ(asyncWorld.ResidentBlocks().size(), withNeighbours ? neighbours.size() : 0U);
+
+        std::vector<BlockCoord> installed;
+        for (int spin = 0; spin < 20000 && installed.empty(); ++spin) {
+            (void)asyncWorld.PollBlockBuildsAndInstall(installed, 4U);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ASSERT_EQ(installed.size(), 1U) << "worker 未在超时内完成（邻居=" << withNeighbours << "）";
+        EXPECT_EQ(installed[0], target);
+        EXPECT_EQ(asyncWorld.PendingBuildCount(), 0U) << "安装后必须清掉在飞记录";
+
+        // ③ 逐位比较：密度 / 填充分类 / 网格（顶点与索引逐值）。
+        const vx::VolumeBlock& syncBlock  = syncWorld.Blocks().at(target);
+        const vx::VolumeBlock& asyncBlock = asyncWorld.Blocks().at(target);
+        std::size_t            firstDiff  = 0;
+        EXPECT_TRUE(SameDensity(asyncBlock.density, syncBlock.density, firstDiff))
+            << "密度必须逐位一致（邻居=" << withNeighbours << "，首个不同的采样下标 " << firstDiff << "）";
+        EXPECT_EQ(asyncBlock.fill, syncBlock.fill) << "填充分类必须一致";
+        const std::string meshDiff = MeshDifference(asyncBlock.mesh, syncBlock.mesh);
+        EXPECT_TRUE(meshDiff.empty()) << "网格必须逐值一致（邻居=" << withNeighbours << "）：" << meshDiff;
+        EXPECT_FALSE(asyncBlock.carved) << "新建块未挖过";
+        EXPECT_TRUE(asyncBlock.material.empty()) << "新建块从未写过材质（懒分配语义不变）";
     }
 }
 

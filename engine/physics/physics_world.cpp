@@ -332,6 +332,12 @@ void PhysicsWorld::SetGravity(const glm::vec3& gravity) noexcept {
     m_impl->system->SetGravity(JPH::Vec3(gravity.x, gravity.y, gravity.z));
 }
 
+void PhysicsWorld::OptimizeBroadPhase() {
+    // T79③：把"加载期一次性加了几百个静态体"的建造树工作提前做完（详见头文件注释）。
+    // 这是**加载期收口**的一次性调用，不是每帧工作 ⇒ 不违反"每帧工作不得与总量成正比"。
+    m_impl->system->OptimizeBroadPhase();
+}
+
 PhysicsWorld::BodyHandle PhysicsWorld::AddHeightField(const HeightFieldDesc& desc) {
     const JPH::ShapeRefC shape = build_height_field_shape(desc);
     if (shape == nullptr) {
