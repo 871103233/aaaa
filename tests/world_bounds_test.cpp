@@ -1,7 +1,8 @@
-// T18 世界边界的**纯函数**测试：
+// T18 / T84 世界边界的**纯函数**测试：
 //   - 边界盒由 tile 半径推导（两个不同半径、两轴不等半径、单 tile 退化）；
 //   - 四周墙的放置（数量 / 与边界盒表面齐平 / 四角封口 / 竖直覆盖地形范围）；
-//   - 出界判定（内 / 外 / 恰好落在余量边界），以及"救援一次后下一帧不再触发"这一性质。
+//   - **顶盖**（T84 六面封闭）：底面齐平边界盒上沿、与四周墙顶部四角交叠；
+//   - 出界判定（内 / 外 / 高于上沿 / 恰好落在余量边界），以及"救援一次后下一帧不再触发"这一性质。
 
 #include "out_of_bounds.hpp"
 #include "terrain/terrain_types.hpp"
@@ -15,6 +16,7 @@
 namespace {
 
 using vx::BoundaryWall;
+using vx::ComputeBoundaryCeiling;
 using vx::ComputeBoundaryWalls;
 using vx::ComputeWorldBounds;
 using vx::IsCharacterOutOfBounds;
@@ -145,8 +147,11 @@ TEST(OutOfBounds, RescuesOnlyBeyondMarginAndIsExactAtBoundary) {
     EXPECT_TRUE(IsCharacterOutOfBounds(glm::dvec3(0.0, bounds.min.y - kOutOfBoundsMargin - 0.001, 0.0), bounds,
                                        kOutOfBoundsMargin));
 
-    // 高于上沿**不**救援：飞行模式允许升到边界盒之上。
-    EXPECT_FALSE(IsCharacterOutOfBounds(glm::dvec3(0.0, bounds.max.y + 1000.0, 0.0), bounds, kOutOfBoundsMargin));
+    // T84：边界**六面封闭**后，"高于上沿"同样是越界（原"飞行允许升到盒上"的口径已作废）。
+    EXPECT_FALSE(IsCharacterOutOfBounds(glm::dvec3(0.0, bounds.max.y + kOutOfBoundsMargin, 0.0), bounds,
+                                        kOutOfBoundsMargin));
+    EXPECT_TRUE(IsCharacterOutOfBounds(glm::dvec3(0.0, bounds.max.y + kOutOfBoundsMargin + 0.001, 0.0), bounds,
+                                       kOutOfBoundsMargin));
 
     // 余量为非正时按 0 处理：仍只对"盒外"救援。
     EXPECT_FALSE(IsCharacterOutOfBounds(bounds.max, bounds, -5.0));
@@ -216,6 +221,31 @@ TEST(WorldBounds, OneKilometerWallsAreFlushAndCoverTheVerticalRange) {
     EXPECT_NEAR(walls[2].halfExtents.x, 546.0, kTolerance);
     EXPECT_NEAR(walls[0].center.y, 256.0, kTolerance);
     EXPECT_NEAR(walls[0].halfExtents.y, 264.0, kTolerance);
+}
+
+// T84：顶盖把边界封成**六面体** —— 底面与边界盒上沿齐平、X / Z 各外扩一个墙厚（与四周墙顶部四角交叠）。
+TEST(WorldBounds, CeilingSealsTheTopAndOverlapsTheWalls) {
+    const WorldBounds  bounds  = ComputeWorldBounds(8, 8);
+    const BoundaryWall ceiling = ComputeBoundaryCeiling(bounds, kBoundaryWallThickness);
+
+    const double halfThickness = kBoundaryWallThickness * 0.5;
+    const double centerX       = (bounds.min.x + bounds.max.x) * 0.5;
+    const double centerZ       = (bounds.min.z + bounds.max.z) * 0.5;
+    const double halfX         = (bounds.max.x - bounds.min.x) * 0.5;
+    const double halfZ         = (bounds.max.z - bounds.min.z) * 0.5;
+
+    // 底面齐平于边界盒上沿（厚度向上）：`center.y - halfExtents.y == bounds.max.y`。
+    EXPECT_NEAR(ceiling.center.y - ceiling.halfExtents.y, bounds.max.y, kTolerance);
+    EXPECT_NEAR(ceiling.center.y, bounds.max.y + halfThickness, kTolerance);
+
+    // 与四周墙在顶部四角交叠封口：X / Z 各外扩一个墙厚。
+    EXPECT_NEAR(ceiling.halfExtents.x, halfX + kBoundaryWallThickness, kTolerance);
+    EXPECT_NEAR(ceiling.halfExtents.z, halfZ + kBoundaryWallThickness, kTolerance);
+    EXPECT_NEAR(ceiling.center.x, centerX, kTolerance);
+    EXPECT_NEAR(ceiling.center.z, centerZ, kTolerance);
+
+    // 退化厚度：非正厚度按默认厚度处理（与四周墙同一口径）。
+    EXPECT_NEAR(ComputeBoundaryCeiling(bounds, 0.0).halfExtents.y, halfThickness, kTolerance);
 }
 
 // 1 km 世界里的出界救援：贴着墙**内侧**不救援（玩家能沿边走），越过余量才送回出生点（T18 口径不变）。

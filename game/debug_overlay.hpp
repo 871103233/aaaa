@@ -2,6 +2,7 @@
 
 #include "render/mesh_renderer.hpp"
 #include "system_panel.hpp"
+#include "test_mode.hpp"
 #include "ui_text.hpp"
 
 #include <SDL3/SDL.h>
@@ -9,6 +10,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 
 struct ImGuiContext;
 
@@ -88,6 +90,10 @@ public:
     void               ToggleSystemPanel() noexcept { m_systemPanel.Toggle(); }
     [[nodiscard]] bool SystemPanelOpen() const noexcept { return m_systemPanel.IsOpen(); }
 
+    /// 设置**测试模式**（T85）：驱动调试面板顶部的只读横幅（自动测试 / 人工测试 + 人工验收项）。
+    /// 全运行期不变，启动时设置一次。
+    void SetTestMode(TestModeInfo mode) { m_testMode = std::move(mode); }
+
     /// 本帧 ImGui 是否想接管鼠标 / 键盘（`io.WantCaptureMouse` / `WantCaptureKeyboard`）。
     ///
     /// 只在**本帧已开始 ImGui 帧**时有效；未开始（面板与调试面板都隐藏）时恒为 false。
@@ -144,6 +150,9 @@ private:
     bool m_cjkFontLoaded = false;
 
     SystemPanel m_systemPanel;
+
+    /// 测试模式（T85）：由 `SetTestMode` 在启动时设置一次，面板顶部据此显示只读横幅。
+    TestModeInfo m_testMode;
 
     /// 本帧是否已调用 `ImGui::NewFrame`（调试面板或系统面板可见时为 true）。
     bool m_frameActive = false;

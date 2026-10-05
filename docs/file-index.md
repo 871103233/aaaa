@@ -5,7 +5,7 @@
 
 - **粒度**：目录 + 模块入口（公共头 / `CMakeLists.txt` / 脚本）。实现文件（`.cpp`）与测试用例不逐个登记。
 - **更新时机**：任何目录或模块入口发生增删改时，与代码**同一次提交内**更新本文件。
-- **最后核对**：2026-09-30（对照 `git ls-files`）
+- **最后核对**：2026-10-05（对照 `git ls-files`；T68 新增 `engine/render/model_loader.*` 与 `tests/fixtures/`）
 
 ---
 
@@ -117,6 +117,7 @@ voxel-engine/
 | --- | --- | --- | --- |
 | `tests/` | 单元测试（GoogleTest + CTest） | 可依赖所有被测模块 | 只放测试，不放产品代码 |
 | `tests/CMakeLists.txt` | 测试目标与 `add_test` 注册 | — | 新增测试文件须在此登记 |
+| `tests/fixtures/` | **进仓库的测试夹具**（不放运行时资源）：`skinned_triangle.gltf`（T68 用的最小蒙皮模型：3 顶点 / 1 三角面 / 2 关节 / 1 条旋转动画）+ 其生成脚本 `generate_skinned_triangle.ps1`（纯 ASCII） | — | 与 `assets/models/` 不同：**夹具必须入库**（`.gitignore` 只排除 `assets/models/`）；改动夹具须重跑生成脚本并保持单测绿 |
 
 ---
 
@@ -129,7 +130,7 @@ voxel-engine/
 | `assets/maps/` | 预设固定地图（TOML）：种子 / 覆盖范围 / 出生点 / 地形编辑区（flatten · raise · carve） | — | 带 `schema_version`；**非法文件必须显式报错，不得静默回退**；同一文件必须得到同一世界 |
 | `assets/shaders/` | GLSL 源（`.vert` / `.frag` / `.comp`） | — | 只放源；`.spv` / `.dxil` 由构建生成到 `<build>/assets/shaders/`；新增须在 `game/CMakeLists.txt` 里 `add_shader` |
 | `assets/textures/` | **CC0 美术贴图**（**不入库**；T65 起由脚本取回）：`terrain/<材质>/{albedo,normal,roughness,ao}.jpg`（草 / 土 / 岩 / 沙，2048²）、`env/*.hdr`（环境贴图，等距柱状；**T67 起被天空通道与 IBL 烘焙消费**） | — | **被 `.gitignore` 排除** ⇒ 干净克隆后需执行 `tools/fetch_assets.ps1`；来源 / 许可 / SHA-256 逐项登记在 `NOTICE.md`「美术资源台账」；校验和清单 = `tools/assets.sha256`（**该文件进仓库**）。**缺文件时上层必须 WARN + 回落**（贴图 → 程序生成；HDRI → 半球天空光），不得崩、不得静默 |
-| `assets/models/` | 3D 模型（**不入库**，规划中）：主角与后续道具 / NPC 的 glTF / .glb | — | 与 `assets/textures/` 同口径：由 `tools/fetch_assets.ps1` 取回并登记台账；**消费者 = `engine/render/model_loader.*`（T68 落地后）** |
+| `assets/models/` | 3D 模型（**不入库**）：主角与后续道具 / NPC 的 glTF / .glb。**T69 起首个真实模型** = `character/Casual_Female.glb`（Quaternius，CC0 占位主角） | — | 与 `assets/textures/` 同口径：由 `tools/fetch_assets.ps1` 取回并登记台账；**消费者 = `engine/render/model_loader.*`（T68 落地：glTF/.glb 静态与蒙皮网格 + 骨骼动画采样；T69 接渲染）** |
 
 ---
 
@@ -138,7 +139,7 @@ voxel-engine/
 | 条目 | 职责 | 依赖方向 | 约束 |
 | --- | --- | --- | --- |
 | `cmake/` | 自写构建辅助模块 | — | 不放业务逻辑；工具缺失时降级为**警告**，不阻断配置 |
-| `tools/` | 仓库级脚本（不入构建）：**`fetch_assets.ps1`**（取回 CC0 美术资源，幂等 + SHA-256 校验；资源不入库见 `assets/textures/` 行）、`assets.sha256`（**进仓库**的校验和清单） | — | 脚本须**纯 ASCII 或带 BOM 的 UTF-8**（Windows PowerShell 5.1 按系统代码页读 `.ps1`）；不得写入 `assets/` 之外的目录；重复运行必须幂等 |
+| `tools/` | 仓库级脚本（不入构建）：**`fetch_assets.ps1`**（取回 CC0 美术资源，幂等 + SHA-256 校验；资源不入库见 `assets/textures/` 行）、**`vx_perf_input.ps1`**（性能冒烟：自动操控键鼠跑固定档 —— `stand`/`rot`/`fly`/`flyfwd`/`walk`/`walkback`/`flybound`/`settle`/`shot`，产 `build/perf/input_<mode>.{out,err}.log` 与一行 `RESULT`；证据口径见 `docs/plans/v0.2.md` §4 与 `docs/plans/v0.3.md` §3。**T83 起入库**，由 `$PSScriptRoot` 推导仓库根）、`assets.sha256`（**进仓库**的校验和清单） | — | 脚本须**纯 ASCII 或带 BOM 的 UTF-8**（Windows PowerShell 5.1 按系统代码页读 `.ps1`）；**资源脚本**不得写入 `assets/` 之外的目录；重复运行必须幂等 |
 | `cmake/Shaders.cmake` | 两段式 Shader 编译：GLSL →(glslc) SPIR-V →(shadercross) DXIL | — | 两种格式**都必须产出**：Vulkan 用 SPIR-V，D3D12 用 DXIL |
 | `.github/workflows/` | CI：门禁 → 构建 → 测试 | — | 文件与 CI 脚本保持**纯 ASCII**（原因见 `ci.yml` 顶部注释）；新增步骤须本地可复现 |
 | `docs/` | 方案文档、ADR、文件索引、开发记录、学习笔记、阶段计划、**内容基线文档** | — | 与代码同步 |
@@ -164,7 +165,8 @@ voxel-engine/
 | `engine/input/input_map.hpp` | 输入动作状态层（上层只消费动作；鼠标按键与键盘对称） |
 | `engine/platform/window.hpp` | 窗口与事件循环；**唯一**把 SDL 事件翻译进 `InputMap` 的地方；相对鼠标模式（捕获 / 释放）在此封装 |
 | `engine/render/triangle_renderer.hpp` | PoC 冒烟测试路径（保留可编译，未接线） |
-| `engine/render/mesh_renderer.hpp` | 通用网格渲染路径（顶点/索引缓冲、相机 UBO、索引绘制、纹理数组、HDR 目标 + 色调映射通道、渲染开销记账、**自发光网格**：片元 uniform 槽 3 逐网格推送、**变长几何就地更新**：`UpdateMeshGeometry` 只上传用到的顶点 / 索引前缀 + 每网格 `usedIndexCount`（T42）、**天空管线 + IBL 烘焙 + 环境纹理绑定**（T67：`BakeEnvironment` / `EnvironmentReady` / 全屏通道辅助 `DrawFullscreenPass`）） |
+| `engine/render/mesh_renderer.hpp` | 通用网格渲染路径（顶点/索引缓冲、相机 UBO、索引绘制、纹理数组、HDR 目标 + 色调映射通道、渲染开销记账、**自发光网格**：片元 uniform 槽 3 逐网格推送、**变长几何就地更新**：`UpdateMeshGeometry` 只上传用到的顶点 / 索引前缀 + 每网格 `usedIndexCount`（T42）、**天空管线 + IBL 烘焙 + 环境纹理绑定**（T67：`BakeEnvironment` / `EnvironmentReady` / 全屏通道辅助 `DrawFullscreenPass`）、**蒙皮网格路径（T69）**：`SkinnedVertex` / `SkinnedMeshData` / `UploadSkinnedMesh` / `SetSkinningMatrices` —— 骨骼矩阵走**顶点只读 storage buffer**，每网格每帧**一次整块**上传；另有蒙皮阴影管线） |
+| `engine/render/model_loader.hpp` | **模型导入**（T68）：glTF / `.glb` 的静态与蒙皮网格 + 骨骼动画（TRS 通道）**加载与采样**。公共头**不含 Assimp 类型**（Assimp 只在 `.cpp` 内出现）；`LoadModel` 为纯 CPU 路径（可从工作线程调用）、失败即抛不静默回退；`SampleJointLocalTransforms` / `ComputeSkinningMatrices` 为**确定性纯函数**。**只到"加载 + 采样"，不接线渲染**（蒙皮着色器与主角替换属 T69） |
 | `engine/render/environment.hpp` | **环境贴图口径**（T67 / [ADR 0021](adr/0021-environment-ibl.md)）：天空 / irradiance / 预过滤 / BRDF LUT 的尺寸与级数（**唯一事实来源**）+ 纯函数（`PrefilterRoughnessForMip` / `EstimateTextureMipChainBytes` / `HalfFromFloat`）。不含 GPU 与 SDL 类型 |
 | `engine/render/lighting_table.hpp` | `assets/config/lighting.toml` 的加载与校验（含**可选** `[environment]` 段，T67）；**光照 → GPU 的唯一投影入口**（`LightingUniform` / `BuildLightingUniform`，后者按"实际烘焙成的预过滤 mip 级数"给出 IBL 启用位） |
 | `engine/render/shadow_cascade.hpp` | CSM **纯函数**：级联分割、texel 对齐的光空间矩阵、`ShadowUniform`（无世界 / 游戏专有类型） |
@@ -173,7 +175,7 @@ voxel-engine/
 | `world/terrain/terrain_world.hpp` | 地表世界入口：tile 容器、网格、脏重网格，并实现 `ITerrainQuery` |
 | `world/terrain/material_table.hpp` | `assets/config/materials.toml` 的加载与校验；**CPU→GPU 材质参数唯一投影入口**（`MaterialUniform` / `BuildMaterialUniform`）。**T43 起每层另有四个物理字段**（`density` / `friction` / `restitution` / `indestructible`，见 [ADR 0016](adr/0016-collapse-realism-impulse-material-debris.md)）与 **T46 的落地口径字段 `rigid_debris`**（刚性碎块落地后保留几何体，见 [ADR 0017](adr/0017-landing-by-material-rigid-vs-granular.md)）：**都不参与地表着色、因此不进 GPU uniform**，只决定倒塌整体的质量 / 摩擦 / 弹性、小碎片清除的守卫与落地后的表示；五个字段**可选**、缺省值等价于引入前的口径 ⇒ `schema_version` 保持 4 |
 | `world/terrain/material_textures.hpp` | 程序生成占位材质贴图（albedo + 法线，确定性、可平铺；ADR 0009） |
-| `world/terrain/world_bounds.hpp` | 世界边界盒与四周**空气墙**放置（**纯函数**，由 tile 范围推导；对任意地图尺寸生效） |
+| `world/terrain/world_bounds.hpp` | 世界边界盒、四周**空气墙**与**顶盖**的放置（**纯函数**，由 tile 范围推导；对任意地图尺寸生效）。**T84 起边界为"六面封闭"**：`ComputeBoundaryWalls`（4 堵）+ `ComputeBoundaryCeiling`（1 块顶盖） |
 | `world/dig/dig_region.hpp` | 可挖区域标记表（`assets/config/dig_regions.toml`，ADR 0006 的**数据文件**部分；含包围盒**向外吸附**、优先级 / sealed 合并、块数上限校验），并实现**层间交接过滤器** `ITerrainQuadFilter`（ADR 0011） |
 | `world/dig/dig_volume.hpp` | 可挖体积世界（ADR 0004 层 ②）：33³ `int8` 密度块（由高度场初始化）、球体挖除、脏块重网格、区域外密度回退；**只在标记区域内存在**；**体素材质持久化**（T42 / ADR 0014 修订：`VolumeBlock::material` 33³ **懒分配**、`0xFF` = 未写入回落列派生、`ReadMaterialRegion` / `SetMaterialSlot` / `MaterialBytes`）。**T81 增**（[ADR 0022](adr/0022-volume-build-worker-pipeline.md)）：`BlockBuildInput` / `BlockBuildResult` + **纯函数** `BuildBlockFromInput`（填密度 + Surface Nets + 分类，可在任意线程跑）、`CaptureBlockBuildInput`（主线程采快照）、`InstallBuiltBlock` / `PollBlockBuildsAndInstall`（主线程收包安装）、`SetBuildPipeline`（装了任务池后 `CreateBlock` 变为**异步提交**）；`CreateBlock` 未装任务池时仍是同步路径（单测 / 工具 / 降级） |
 | `world/dig/volume_mesher.hpp` | Surface Nets 等值面网格化（ADR 0007）：块内局部顶点 + 密度梯度法线 + 块间共享边界采样；纯函数（只依赖采样器接口）。**T42 增 `BuildRegionMesh(sampler, sizeX, sizeY, sizeZ)`**：同一套数学用于**任意尺寸区域**（倒塌整体的外观与地形同源的口径）。**T47 增 `CountBoundaryEdges(MeshData)`**：水密自检的**唯一实现**（"不是恰被 2 个三角形共用"的无向边条数；闭合曲面恒 0）—— 生产代码与单测共用，见 [ADR 0018](adr/0018-structural-support-and-representation-preserving-destruction.md) 决策五。**T55 增**（[ADR 0019](adr/0019-ambiguous-cell-vertex-splitting.md)）：**歧义 cell / 歧义面**按**实体侧连通分量拆顶点**（`cellEdgeVertex` + `kQuadCellLocalEdge`）⇒ 外观网格重新成为**流形**；**单分量 cell 的输出逐位不变** |
@@ -188,7 +190,9 @@ voxel-engine/
 | `game/rigid_collapse.hpp` | 倒塌整体的运行时（T33 / ADR 0015）：网格池（**只在启动时**建 GPU 资源）、`Spawn` 用 `UpdateMeshGeometry` 写一次**与地形同源的等值面**（T42；只上传用到的前缀，超容量按整个四边形截断）、每步读刚体位姿 + 落定检测、每帧只推 `mat4`、落定后 `Writeback` + 清空槽位（索引数 0 = 不可见）。**T46 / [ADR 0017](adr/0017-landing-by-material-rigid-vs-granular.md)**：刚性整体落定后**保留几何体**（`retained`，不回写 ⇒ 形状不变）；池 **16 槽**；`RetireOldestRetained`（池满腾位 ⇒ 惰性回写）/ `AwakenIntersecting`（块碰撞体重建后唤醒相交残骸）。**T47 增**：`BuildUnitMesh` 在**截断前 / 截断后**各做一次**外观网格闭合自检**（`vx::CountBoundaryEdges`），非 0 即 WARN 出**体素数 / patch 尺寸 / 两处边数 / 是否被容量截断**并把成因指名到候选 ①②③（`Spawn` 记入 `ActiveCollapseUnit`，`RetireRetained` 回报）；容量截断 WARN 补体素数与原始规模。**T48 / [ADR 0018](adr/0018-structural-support-and-representation-preserving-destruction.md) 决策三**：命中判定改由 `PhysicsWorld::RayCastDynamic` 回答（句柄 + 真实凸包表面）⇒ `ContainsRetainedPoint` / `RetireRetainedAt` **下线**。**T50 / ADR 0018 决策二**：命中动态刚体改走 **`CarveBody`**（在碎块**自身补丁**上雕刻 → 按剩余体素在**当前姿态**下原地重建刚体 → 复用同一网格槽位；剩余过少 / 凸包不足 / 重建失败 ⇒ `RetireCarved` 删除整体）⇒ 命中路径的"惰性体素化"**下线**；`CollapseCarveResult` / `TotalCarved` / `TotalCarvedVoxels` |
 | `game/out_of_bounds.hpp` | 出界判定（**纯函数**）+ 救援余量；越界/坠落时送回出生点 |
 | `game/character_movement.hpp` | 主角移动基向量（**纯函数**：由相机 yaw 得前向 / 右向；方向语义有单测钉死） |
-| `game/character_mesh.hpp` | 主角**程序化胶囊代理网格**（可见占位体，尺寸同碰撞胶囊） |
+| `game/character_mesh.hpp` | 主角**程序化胶囊代理网格**（T69 起是**缺模型时的回落**占位体，尺寸同碰撞胶囊） |
+| `game/character_model.hpp` | **纯函数**（T69）：`BuildSkinnedMeshFromModel`（把 `vx::Model` 的所有网格拼成一个 `SkinnedMeshData`，并给出绑定姿态的"脚底中心"`localPivot`）+ `FindAnimationClip`（按名字查 clip，区分大小写）。可直接单测（用 `tests/fixtures/skinned_triangle.gltf`） |
+| `game/character_animation.hpp` | 主角**动画状态机**（T69，**纯函数**）：`SelectCharacterAnimState`（由"是否着地 / 水平速度 / 竖直速度"选 `Idle`/`Run`/`Jump`/`Fall`）+ `ClipNameForCharacterState`（状态 → clip 名；`Fall` **复用 `Jump`**，属已登记取舍） |
 | `game/mouse_capture.hpp` | 鼠标捕获状态机（**纯函数**：`Esc` 释放 / 点击重捕获；**重捕获点击先于笔刷判定被消费**，避免误挖） |
 | `game/gameplay_input.hpp` | 游戏输入抑制决策（**纯函数**：面板打开 / ImGui 要鼠标键盘 → 抑制视角 / 笔刷 / 键盘玩法） |
 | `game/system_panel.hpp` | ESC 系统面板（显示模式 / 分辨率 / 音量 / 退出）；**不碰 SDL、不写文件**，只回报"用户做了什么" |

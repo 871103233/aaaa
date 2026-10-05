@@ -10,6 +10,7 @@
     "tomlplusplus",
     "joltphysics",
     "enkits",
+    "assimp",
     "stb",
     { "name": "imgui", "features": [ "sdl3-binding", "sdlgpu3-binding" ] },
     { "name": "shaderc", "host": true },

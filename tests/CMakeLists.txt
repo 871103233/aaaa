@@ -14,7 +14,10 @@
 find_package(GTest CONFIG REQUIRED)
 
 add_executable(voxel_tests
+    character_animation_test.cpp
+    character_facing_test.cpp
     character_jump_test.cpp
+    character_model_test.cpp
     character_test.cpp
     destruction_queue_test.cpp
     dig_volume_test.cpp
@@ -27,9 +30,11 @@ add_executable(voxel_tests
     input_map_test.cpp
     lighting_table_test.cpp
     map_preset_test.cpp
+    model_loader_test.cpp
     mouse_capture_test.cpp
     orb_test.cpp
     system_settings_test.cpp
+    test_mode_test.cpp
     physics_test.cpp
     render_camera_test.cpp
     render_stats_test.cpp

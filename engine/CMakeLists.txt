@@ -8,6 +8,7 @@ find_package(Jolt CONFIG REQUIRED)
 find_package(tomlplusplus CONFIG REQUIRED)
 find_package(Stb REQUIRED)   # 纹理资源加载（T57）；只用其头，实现编在 texture_loader.cpp 内
 find_package(enkiTS CONFIG REQUIRED)  # 任务调度（T81 起真正启用；ADR 0003：端口名 `enkits`）
+find_package(assimp CONFIG REQUIRED)  # 模型导入（T68；Assimp 头只在 model_loader.cpp 内出现）
 
 add_library(voxel_engine STATIC
     core/clock.cpp
@@ -17,6 +18,7 @@ add_library(voxel_engine STATIC
     core/task_scheduler.cpp
     input/input_map.cpp
     physics/physics_world.cpp
+    platform/command_line.cpp
     platform/settings.cpp
     platform/window.cpp
     render/camera.cpp
@@ -24,6 +26,7 @@ add_library(voxel_engine STATIC
     render/frustum.cpp
     render/lighting_table.cpp
     render/mesh_renderer.cpp
+    render/model_loader.cpp
     render/shadow_cascade.cpp
     render/texture_loader.cpp
     render/triangle_renderer.cpp
@@ -42,4 +45,5 @@ target_link_libraries(voxel_engine
     PRIVATE Jolt::Jolt              # 只在 physics_world.cpp 内出现 Jolt 头，故为 PRIVATE
     PRIVATE enkiTS::enkiTS          # 只在 core/task_scheduler.cpp 内出现 enkits 头，故为 PRIVATE
     PRIVATE tomlplusplus::tomlplusplus  # 只在 settings.cpp 内出现 toml++ 头，故为 PRIVATE
+    PRIVATE assimp::assimp             # 只在 render/model_loader.cpp 内出现 Assimp 头，故为 PRIVATE
 )

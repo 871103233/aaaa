@@ -3139,4 +3139,262 @@
   3. 技术债与 TSan 缺口的登记不变（见上一条 T81 条目的「下一步 / 遗留」第 2、3 条）。
   4. **本批（T57 … T81）尚未提交**。
 
+## 2026-10-05  T68 落地：**模型导入能力**（Assimp + 蒙皮网格 + 骨骼动画采样；仅加载 / 采样，不接渲染）
+
+- 做了什么（范围见 `docs/plans/v0.3.md` §1.2；**只做"加载 + 采样"，不接线渲染**）：
+  1. **依赖入库**：`vcpkg.json` 增 **`assimp`**（实测 **6.0.4#3**，连带 zlib / utfcpp / rapidjson / pugixml / minizip / kubazip / poly2tri 等）；同步
+     `NOTICE.md`（"尚未引入" → "T68 已引入"）、`docs/file-index.md`、`docs/engine-capabilities.md`（"资源管理"行）。
+  2. **新增** `engine/render/model_loader.{hpp,cpp}`：glTF / `.glb` 的**静态与蒙皮网格**；关节表按**层级 DFS 顺序**生成
+     （硬保证 `parent < 自身索引`，合成全局变换一次正向遍历即可、与遍历顺序无关）；绑定 / 逆绑定矩阵；动画 TRS 通道（时间换算成**秒**）。
+     **公共头不含 Assimp 类型**（Assimp 只在 `.cpp` 内，与 `physics_world` 隔离 Jolt 同口径）。`LoadModel` 为**纯 CPU 路径**、失败即抛（不静默回退）；
+     `SampleJointLocalTransforms` / `ComputeSkinningMatrices` 为**确定性纯函数**（缺轨道的分量回落该关节的绑定姿态；四元数用 slerp）。
+  3. **测试夹具** `tests/fixtures/skinned_triangle.gltf`（3 顶点 / 1 三角面 / 2 关节 / 1 条旋转动画；**进仓库**，缓冲 base64 内嵌）
+     + 生成脚本 `tests/fixtures/generate_skinned_triangle.ps1`（纯 ASCII）。
+  4. **新增** `tests/model_loader_test.cpp` **6 项**。
+- 为什么（含两处踩坑）：
+  1. T68 是 ⓒ 阶段"主角换成模型"的**前置能力**，且所有者 2026-09-29 已把 Assimp 由 V0.5 **前移**；先打通"解析在加载期、运行期只做骨骼矩阵更新"的标准形态，
+     再把渲染接线（T69）独立出来，符合**业界标准优先**（参照 Assimp 官方 loader / UE5 Skeletal Mesh 与 AnimSequence 分离 / Unity `AnimationClip` 采样 /《原神》资源分包）。
+  2. **坑 1（构建）**：本机 shell 每次 `RunCommand` 是**独立进程** ⇒ VS DevShell 的环境**不会跨命令保留**；只查 `cl` 可用不够，
+     必须在**同一条命令内**先 `Launch-VsDevShell.ps1` 再 `cmake --build`，否则以 `C1083: 无法打开 cstdint / cassert` 成批失败（`INCLUDE` 缺失）。
+  3. **坑 2（GLM）**：`glm/gtx/matrix_decompose.hpp` 属实验性扩展，须在包含前 `#define GLM_ENABLE_EXPERIMENTAL`（仅用于拆分绑定姿态的 TRS）。
+- 验证（命令 + 真实结果）：
+  1. **configure**：`cmake --preset debug` → vcpkg `All requested installations completed successfully in: 2.6 min`；`assimp:x64-windows@6.0.4#3` 已装。
+  2. **构建**：同一命令内 `Launch-VsDevShell.ps1` → `cmake --build --preset debug` → **零警告**（`/W4 /WX`）；`assimp-vc143-mtd.dll` 等已部署到 `build/debug/bin`。
+  3. **测试**：`ctest --preset debug -j 6` → **366/366 passed**（360 → 366，新增 6 项 `ModelLoader.*` 全绿）。
+  4. **门禁**：`check-banned-identifiers.ps1` → `scanned 133 file(s), 0 violation(s)` / `PASS`（130 → 133）。
+- 下一步 / 遗留：
+  1. **T69（当前主线）**：主角模型落地 —— **需所有者先指定 CC0 占位人形模型**（候选网站：Quaternius / KayKit / Kenney / Poly Pizza / Sketchfab 的 CC0 筛选项）。
+     T68 只到"加载 + 采样"，T69 还需**蒙皮网格渲染接线**（顶点格式 / 蒙皮着色器）+ 主角替换（碰撞胶囊与手感不变）。
+  2. **已登记冲突不变**：CC0 范围内几乎无写实人形 ⇒ 占位模型为低多边形卡通风格，与"写实"不一致，待外形设定后重做外观（管道不变）。
+  3. **本批（T68）尚未提交**。
+
+## 2026-10-05  T78 人工目视验收**通过**（边界那一圈不再闪烁）
+
+- 做了什么：仅**记录验收结论**，未改代码。所有者（2026-10-05）确认 T78（2026-09-29 用光栅化 depth bias 修的那次）在深入可挖区再返回后，中心平台**边界那一圈不再闪烁**、地表无可见下沉。
+- 为什么：T78 自 2026-09-29 起只剩这一条**人工目视**项（自动侧当时已闭环：构建零警告、`ctest` 355/355、门禁 126 文件 0 违规、冒烟无 ERROR）。
+  该验收项需要"人眼看 z-fighting 闪烁"，无法自动化 ⇒ 只能由所有者判定；本次判定补齐了 T78 的最后一条依据。
+- 验证：所有者目视确认（边界一圈不再闪烁；地表无可见下沉）。自动侧证据沿用 T78 条目（无需重跑）。
+- 下一步 / 遗留：
+  1. **T78 至此完全闭环**（`docs/plans/v0.3.md` 的 T78 行与 §3 已回填"已通过"）。
+  2. **仍是人工待验的是 ⓐ（V0.2）的 T63 收尾项**（走到 1 km 四边被挡 / 飞越越界被送回 / 挖洞进出且洞不消失 / 窗口边缘裂缝与穿模），清单见 `docs/plans/v0.2.md` §4；
+     T80 / T81 已由自动化取证闭环（复跑 = `tools\vx_perf_input.ps1 -Mode flybound`，T83 起已入库）。
+
+## 2026-10-05  T83：**冒烟脚本入库**（`tools/vx_perf_input.ps1`）+ T80/T81 证据在新位置**复跑成功**
+
+- 做了什么（所有者 2026-10-05 指示）：
+  1. 把只存在于 `build/` 的性能冒烟脚本迁入库：**新增** `tools/vx_perf_input.ps1`，**删除** `build/vx_perf_input.ps1`（避免两份漂移）。
+  2. 脚本改为由 **`$PSScriptRoot` 推导仓库根**（`Split-Path -Parent $PSScriptRoot`）⇒ 去掉硬编码 `D:\aaaaaaaaaaaaaaaaaaaaaaa`，可从任意工作目录调用；
+     并对缺失的 exe 直接抛出可读错误（提示先构建 debug 预设）。
+  3. 按 `tools/` 约定把脚本整理成**纯 ASCII**（原 `build/` 版含中文注释 —— 该目录不受"纯 ASCII"约束，入库后必须满足；已实测 `nonAscii=0`）；
+     其余逻辑（`Ensure-GameForeground` / `WM_CLOSE` 优雅退出 / 各 `-Mode` 时序）**逐字保留**。
+  4. 同步 `docs/file-index.md` 的 `tools/` 行（新增脚本条目；并把"不得写入 `assets/` 之外的目录"限定为**资源脚本**，因为冒烟脚本要写 `build/perf/`）。
+- 为什么：
+  1. 证据工具放在 `build/`（被 `.gitignore` 排除）⇒ **清理构建目录即丢失**，"可复跑证据"就退化成不可复跑 ⇒ 必须入库才成立（呼应所有者上一轮问的"可复跑证据"）。
+  2. 硬编码绝对路径使脚本只能在开发机原样使用 ⇒ 用 `$PSScriptRoot` 推导根，配合 `tools/` 的"纯 ASCII"约定，脚本才真正可交付。
+- 验证（`tools\vx_perf_input.ps1 -Mode flybound`，**全程无人操作**，`focus(initial/fly-out/fly-back)=True` 三次）：
+  1. **纯 ASCII**：`bytes=13270 nonAscii=0`；`Test-Path build\vx_perf_input.ps1` = `False`（旧副本已删）。
+  2. **RESULT**：`hitches=6 hitchMaxMs=36.2 logicMaxMs=34.39 unaccMaxMs=0.11 residencyEvents=14 explosions=0 inputRegistered=2 errLines=6 swingchain=2560x1440`
+     ⇒ **无 > 50 ms 单帧**（判据达标）；6 条尖峰全在**逻辑相位**（`err.log` 逐行：33.4~36.2 ms，未计时 ≤ 0.11 ms）。
+  3. **T81 证据（`out.log`）**：去程 `(-1,-2) ⇒ 378` → … → `(-4,-5) ⇒ 0 块`（`worker 已构建 0 块`，卸载不建块）；
+     回程 `36 → 72 → 144 → 324 → **441 块**`，末条为 **`worker 已构建 441 块、单块计算峰值 12.20 ms`、worker 11 个**
+     ⇒ **441 块全部由 worker 池建成**，同步回落路径未走到。
+  4. **输入确已送达**：`[27.368] 飞行模式：开`（`inputRegistered=2`）。
+- 与历史记录的对照（如实）：本次 `hitches=6 / 峰值 36.2 ms / worker 峰值 12.20 ms`，与 2026-09-30 首次取证（`4 条 / 37.2 ms / 13.14 ms`）**同量级**；
+  `flybound` 档尾部本就有运行间波动（历史四次实测 4 / 7 / 8 条）⇒ **不构成回归**，判据（无 > 50 ms 单帧）稳定达成。
+- 下一步 / 遗留：
+  1. **T83 闭环**；`docs/plans/v0.3.md` 的 T83 行与 §3 已回填实测值。
+  2. **其余活跃文档中的脚本路径已改指 `tools/`**（`plans/v0.3.md` §3、`learning-notes.md`）；`devlog` 的**历史条目保持原文不改**（append-only）。
+  3. 本批（T68 + T83 + T78 验收记录）**尚未提交**。
+
+## 2026-10-05  T63 人工验收**四条全通过** ⇒ **ⓐ（V0.2 世界成立）阶段收口（冻结）**
+
+- 做了什么：仅**记录验收结论 + 冻结阶段计划**，未改代码。所有者（2026-10-05）逐条给出结论：
+  ① 走到 1 km 四边被挡 ✓；② 飞越越界被送回 ✓；③ 挖洞进出且洞不消失 ✓；④ 窗口边缘无裂缝与穿模 ✓。
+  据此把 `docs/plans/v0.2.md` 标为**已完成（冻结）**、`docs/adr/README.md` 决策索引同步、`docs/plans/v0.3.md` 的 P1 回填。
+- 为什么：T63 是 ⓐ 阶段最后一条未闭环项（自 2026-09-29 起只剩"人工目视 / 手感"）；四条通过 ⇒ ⓐ 收口、ⓒ 成为唯一的当前阶段。
+- 验证：所有者目视 / 手感确认（四条，逐条对应 `docs/plans/v0.2.md` §4 的"人工（所有者 2026-10-05）"依据）。
+  **不阻塞收口的已知遗留（已在 §4 登记）**：① **卡顿消除在 debug 下未达成**（建块爆发期 / 挖洞当帧）—— 所有者 2026-09-29 已裁定**登记为体验债**；
+  ② **V0.1 的 I1（Linux CI 作业）** 仍待外部证据。
+- 下一步 / 遗留：
+  1. **新需求（待所有者选定后开工）**：所有者提出"**世界边界能否改成避免玩家越界**"（现在是"越界后被送回"，见 `game/out_of_bounds.hpp` 的 `kOutOfBoundsMargin = 16` + `world/terrain/world_bounds.*` 的 4 堵墙）。
+     已登记为 `docs/game-design.md` §6 **第 13 问**（候选 a 六面封闭 / b 飞行高度上限 / c 软性推回 / d 保持现状；并需一并定"救援是否保留为兜底"）。**未获裁定前不动代码。**
+     现状机制（已读代码，供裁定参考）：墙的竖直范围 = 边界盒 `[-8, 520]`，**无顶盖** ⇒ 飞行可升到 520 之上再横向越过 ⇒ 救援介入；`IsCharacterOutOfBounds` **只判"水平越界"与"低于下沿"**，不判"高于上沿"。
+  2. **当前阶段仍是 ⓒ**：主线 = **T69**（主角模型，待所有者指定 CC0 占位模型）+ **T70**（阶段验收）。
+
+## 2026-10-05  T84 落地：**世界边界改为"六面封闭"**（加不可见顶盖；救援降为纯兜底）
+
+- 做了什么（所有者 2026-10-05 裁定 = **(a) 六面封闭 + 保留救援兜底**；见 `docs/game-design.md` §6 第 13 问）：
+  1. `world/terrain/world_bounds.{hpp,cpp}` 新增**纯函数** `ComputeBoundaryCeiling`：**底面与边界盒上沿 `bounds.max.y` 齐平**（厚度向上），X/Z 各外扩一个墙厚 ⇒ 与四周墙在**顶部四角**交叠封口。
+  2. `game/main.cpp`：四周墙之后**再加 1 个不可见静态盒（顶盖）**；日志新增 `边界顶盖（T84 六面封闭）：…`，并把汇总行改为 `不可见围墙 4 堵 + 顶盖 1 块 = %zu/5 个盒体（**六面封闭**）…（仅兜底）`。
+  3. `game/out_of_bounds.hpp`：`IsCharacterOutOfBounds` **补上"高于上沿 + 余量"**（原口径"飞行允许升到边界盒之上"已随顶盖作废，否则"从上方逃逸"无法被兜底）；注释同步为"救援降为纯兜底"。
+  4. `tests/world_bounds_test.cpp`：新增 `WorldBounds.CeilingSealsTheTopAndOverlapsTheWalls`；原"高于上沿**不**救援"的反向断言改为正向（恰好落在余量不救 / 多一毫米即救）。
+  5. `docs/game-design.md`：G10 的备注改为"六面封闭（四周墙 + 顶盖，均不可见）⇒ 任意方式都无法越界；救援保留为兜底"；§6 第 13 问标记**已定**。
+- 为什么：
+  1. 现状与 G10 承诺的"**不可穿越的边界**"存在落差：四周墙竖直范围 = 边界盒 `[-8, 520]`、**无顶盖** ⇒ 飞行可升到 520 之上再横向越过 ⇒ 只能靠"救援送回"。
+  2. 业界标准（第一步判据）就是"**挡住 + 兜底**并存"：Minecraft 世界边界（无限高硬边界 + 位置钳制）、《原神》（空气墙含高度上限 + 越界自动传送）、《塞尔达》（边缘物理阻挡 + 越界回退）⇒ 选**六面封闭**，救援不删、只降为兜底。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`cmake --build --preset debug` → **零警告**（`/W4 /WX`）。（首次链接 `LNK1168` = 残留 `voxel_game.exe` 占用，停进程后重链通过。）
+  2. **测试**：`ctest --preset debug -j 6` → **367/367 passed**（366 → 367）。
+  3. **门禁**：`check-banned-identifiers.ps1` → `scanned 133 file(s), 0 violation(s)` / `PASS`。
+  4. **运行时（`tools\vx_perf_input.ps1 -Mode stand`，无人操作）**：`边界顶盖（T84 六面封闭）：中心 (32.0, 521.0, 32.0)，半长 (546.0, 1.0, 546.0)`
+     （底面 = 521 − 1 = **520 = `bounds.max.y`** ✓；X/Z 半长 546 = 544 + 墙厚 2 ✓）+ `不可见围墙 4 堵 + 顶盖 1 块 = **5/5** 个盒体（**六面封闭**）`；
+     静置档 `RESULT … hitches=0 … errLines=0`（加载与静置无尖峰、无 ERROR）。
+- 下一步 / 遗留：
+  1. **人工待验（T84 的第 4 条判据）**：进游戏 → `F` 飞行 + `Space` 升空到最高 → 朝地图边缘飞，应**撞到看不见的顶盖 / 侧墙、无法越界**（不再被"送回"）；正常走动与挖洞不受影响。
+  2. 若之后要给边界**可见 / 有设定的表现**（天穹 / 结界 / 雾墙），属**世界观设定** ⇒ 须由所有者提供（AI 不得代拟）。
+  3. 本批（T68 + T83 + T84 + T78/T63 验收记录）**尚未提交**。
+
+## 2026-10-05  T69 / S1：占位主角模型**入库**（Quaternius《Casual Female》，CC0）+ 修 `fetch_assets.ps1` 编码违规
+
+- 做了什么：
+  1. **模型裁定落地**：所有者 2026-10-05 选定候选 **A = Quaternius《Casual Female》**（Cinevva 分发）：**CC0 / 23 关节 / 6,624 三角面 / 单文件无外部贴图 / 17 条动画含 `Idle`·`Walk`·`Run`·`Jump`**。
+     施工细则与 3A 三问已写入 `docs/plans/v0.3.md` §1.3；`fall` 处置经所有者裁定 = **(a) 空中统一播 `Jump`**（§1.4，登记为已知取舍）。
+  2. `tools/fetch_assets.ps1`：新增 `Kind = 'model'` 分支（单文件 GLB **不解压**，直接落 `assets/models/<OutDir>/`）+ 条目 `character-casual-female`。
+  3. **顺带修复（发现的既有违规）**：该脚本原为 **无 BOM 的 UTF-8 且含中文**（`nonAscii=2318`）⇒ 违反 `tools/` 的"纯 ASCII 或**带 BOM 的 UTF-8**"约定、且正是 devlog **Q8** 记录过的那类解析事故来源 ⇒ 已补 **UTF-8 BOM**（`EF BB BF`）。
+  4. `NOTICE.md` 美术资源台账（表 1 来源与许可 / 表 2 逐文件 SHA-256 / 新增"T69 消费者规格"）与 `docs/file-index.md` 的 `assets/models/` 行同步。
+- 为什么：T68 只做了"加载与采样"（无消费者）；T69 要让主角**真的变成模型**，第一步就是把 CC0 模型按既定口径（**资源不入库**：脚本 + 校验和 + 台账）取回，之后引擎侧才有东西可渲染。
+- 验证（命令 + 真实结果）：
+  1. `powershell -ExecutionPolicy Bypass -File tools\fetch_assets.ps1 -Record` ⇒ 下载成功；`已写入校验和：tools\assets.sha256（共 18 项）`（原 17 + 模型）。
+  2. **交叉校验**：模型哈希 = `3b4f39d27dc8a5f3b42d023f88a928679e7b1b0ea49ddb4857a07399bc4d8332`，与 Cinevva 逐文件清单公布值**逐位一致**；既有 17 项哈希**逐项未变**（说明 `-Record` 未误改上游资产）。
+  3. **幂等复跑**（不带 `-Record`）：退出码 **0**（逐项校验通过，无抛错）。
+  4. 编码：`tools/fetch_assets.ps1` 首字节 = `239,187,191`（UTF-8 BOM）。
+- 下一步 / 遗留：
+  1. **S2（下一步）**：**引擎 GPU 蒙皮渲染路径** —— 蒙皮顶点格式（position/normal/uv/joints/weights）、**骨骼矩阵单次 storage buffer 上传**、蒙皮顶点着色器、`mesh_renderer` 的 `UploadSkinnedMesh` + 每帧 `UpdateSkinningMatrices`。
+  2. **S3**：游戏接线（替换胶囊代理体）+ 动画状态机 `idle/run/jump/fall`（纯函数可单测）；**碰撞胶囊与手感不变**。
+  3. **S4**：构建零警告 + `ctest` 全绿 + 门禁 0 违规 + 帧时间不劣化。
+  4. 本批（T68 + T83 + T84 + T69/S1 + T78/T63 验收记录）**尚未提交**。
+
+## 2026-10-05  T69：主角**占位模型落地**（GPU 蒙皮 + 状态机 + 替换胶囊；S1→S4 全绿）
+
+- 做了什么（四步，每步可独立验证）：
+  1. **S1 资源**：`tools/fetch_assets.ps1` 增 `Kind='model'`（单文件 GLB 直落 `assets/models/character/`）+ 条目 `character-casual-female`；`NOTICE.md` 台账与 `tools/assets.sha256`（18 项）同批。
+  2. **S2 引擎（GPU 蒙皮 / LBS）**：`engine/render/mesh_renderer.hpp/.cpp` 新增 `SkinnedVertex` / `SkinnedMeshData` / `kMaxSkinJoints`(64) / `UploadSkinnedMesh` / `SetSkinningMatrices` / `UploadSkinningMatrices`；新增着色器 `assets/shaders/mesh_skinned.vert`（片元复用 `mesh.frag`）与 `shadow_skinned.vert`（复用 `shadow.frag`），并在 `game/CMakeLists.txt` 注册。**形态**：蒙皮在**顶点着色器**；骨骼矩阵是**顶点只读 storage buffer**（`set 0 / binding 1`，相机在 binding 0）；**每个蒙皮网格每帧一次整块上传**（与关节数、与世界总量无关）；缓冲容量在建网格时定死 ⇒ **渲染帧内零资源创建**（SKILL 硬规则 4）。`DrawMeshes` 的管线 / 绑定选择改为"只在选择结果变化时重绑"（0 基础 / 1 深度偏移 / 2 蒙皮；storage buffer 数 1↔2），**不逐网格绑定**。**必须补蒙皮阴影管线**：否则换成模型后主角"影子消失"＝可见回退。
+  3. **S3 游戏**：新增 `game/character_model.hpp`（**纯函数**：合并全部网格为一个蒙皮网格 + 绑定姿态"脚底中心" `localPivot`；按名字查 clip）与 `game/character_animation.hpp`（**纯函数**：`SelectCharacterAnimState` + `ClipNameForCharacterState`）；`game/main.cpp` 加载模型 → `UploadSkinnedMesh` → 每帧 `SetMeshTransform`（原点 = 世界脚底 − `localPivot`）+ `SetSkinningMatrices`；动画状态与局部时间在**固定步循环**内推进（红线 11）。**不做朝向**（旋转取单位四元数）＝已知取舍。
+  4. **S4 验收**：见下"验证"。
+- 为什么：
+  1. T68 只做了"加载 + 采样"（无消费者）；T69 让主角**真的变成模型**，是 ⓒ 阶段"主角"这一条的主线。
+  2. 选 **GPU 蒙皮**而不是 CPU 蒙皮：UE5 / Unity 的角色管线都是 GPU 蒙皮，且 **V0.4 的 NPC 会放大 CPU 蒙皮的代价**（每角色每帧要重烘焙并上传整份顶点）；GPU 形态下每帧成本只随**网格数**增长。
+  3. **脚底对齐靠网格变换、不烘进顶点**：顶点要先进蒙皮 `Σ wᵢ·Mᵢ·v`，把偏移烘进 `v` 会被每个关节各自搬运 ⇒ 角色随动画整体漂移；把它放进 `modelToRender` 的平移项才是"整体平移"。
+- 验证（命令 + 真实结果）：
+  1. **S1**：`-Record` 后 `assets.sha256` 共 **18 项**；模型哈希 `3b4f39d2…4d8332` 与 Cinevva 公布值**逐位一致**；不带 `-Record` 复跑退出码 **0**。
+  2. **构建**：`/W4 /WX` **零警告**（构建日志无 `warning`）。
+  3. **单测**：`ctest --preset debug -j 6` ⇒ **373/373 全绿**（367 → 373；新增 `CharacterAnimation.*` 4 项 + `CharacterModel.*` 2 项，后者用 T68 的夹具 `skinned_triangle.gltf` 钉住"合并逐值 + 脚底中心 + 大小写敏感查 clip"）。
+  4. **门禁**：**137 文件 0 违规**（133 → 137）。
+  5. **运行时**（`tools/vx_perf_input.ps1`）：
+     - `-Mode stand`：`hitches=0 / errLines=0`；日志 `模型已加载：…（网格 6 / 顶点 8958 / 索引 19872 / 关节 23 / 动画 17，蒙皮）` + `占位主角模型已启用：顶点 8958 / 索引 19872 / 关节 23`；**无"缺少动画"告警** ⇒ `Idle` / `Run` / `Jump` 三段都在。
+     - `-Mode flybound`（帧时间不劣化对照）：**5 条尖峰、最大 36.9 ms**（T83 基线 6 条 / 36.2 ms ⇒ **同量级、无回归**）；T80/T81 证据仍在（`worker 已构建 441 块、单块计算峰值 11.93 ms`）。
+     - **回落验证（P6）**：把模型文件改名后启动 ⇒ `stderr` 出现 `[WARN] 占位主角模型不可用 ⇒ **回落程序化胶囊**（资源不入库，请先执行 tools/fetch_assets.ps1）：模型加载失败：…`，游戏照常运行 22 s 无崩溃；恢复文件后正常。
+  6. **过程中修掉一个真实缺陷（值得记下）**：蒙皮阴影管线最初建在 `SDL_ReleaseGPUShader(shadowVertex/shadowFragment)` **之后** ⇒ SDL_gpu 不持有 shader 引用，构成 **use-after-free**，D3D12 后端直接断言 `CreateGraphicsPipeline was passed a vertex shader for the fragment stage`（`stand` 冒烟 `errLines=5`）。把两条释放挪到**两条管线都建完之后**即消除（`errLines=0`）。教训：**同一批 shader 建多条管线时，释放必须放在最后一条管线建成之后**。
+- 下一步 / 遗留：
+  1. **交所有者人工目视（不阻塞 ⓒ 后续）**：① 脚底贴地无悬浮 / 无陷入；② 跑动无滑步；③ 相机不穿模。
+  2. **已知取舍（已在文档登记，非缺陷）**：占位模型走**地表材质路径**（无角色 PBR 贴图 ⇒ 外观偏地表色）；**不做朝向**；**无独立 `Fall` 动画**（复用 `Jump`）；**模型身高未必等于碰撞胶囊 1.80 格**（未做缩放）。
+  3. **下一步候选**：T70（阶段验收逐行取证）／正式主角外形设定（需所有者给内容）／`retarget`（外部 CC0 动作库，属**新增引擎能力**，未启动）。
+  4. 本批（T68 + T83 + T84 + T69 + T78/T63 验收记录）**尚未提交**。
+
+## 2026-10-05  T69 缺陷修复：主角**"完全看不见"** = 渲染原点重复相加
+
+- 现象：所有者目视反馈"测试时完全看不到角色"（S4 冒烟全绿，但画面里没有主角）。
+- 排查（一次性诊断，事后已移除）：
+  1. **排除 CPU 几何**：绑定姿态 AABB 尺寸 3.240×3.204×1.529、蒙皮后 AABB 尺寸 1.268×3.159×1.510、脚底 y≈-0.019 ⇒ 网格与蒙皮正常。
+  2. **排除绘制路径**：日志确认蒙皮网格**进了绘制**（槽位 409 / 顶点 8958 / 索引 19872 / 骨骼缓冲已绑 / 走蒙皮管线）⇒ 属于"画了但看不见"。
+  3. **定位坐标**：日志 `网格原点(0.000,240.519,-0.003)；渲染原点(0,120,0)` —— 网格原点 y ≈ **2 × 渲染原点 y**，呈**重复相加**特征。
+- 根因：`game/main.cpp` 模型路径 `feetWorld = feetRender + renderOrigin`，而 `feetRender` 取的是 `camera.TargetCurrent()`、
+  **本身就是世界坐标**（对照胶囊路径 `UpdateCharacterRenderVertices` ＝ `feet + local − renderOrigin`，可见 `feet` 即世界坐标）。
+  `SetMeshTransform` 内部已会**再减一次**渲染原点（`mesh_renderer.cpp` 的 `modelToRender[3] = origin − m_renderOrigin`）
+  ⇒ 角色被额外抬高 `renderOrigin.y`（≈120 格）到相机上方、落在视野外。
+- 修复：改为**直接以 `feetRender` 作世界脚底**（`feetWorld = glm::dvec3(feetRender)`）。
+- 同批**排除**的两条并列假设：
+  - **背面剔除 / 绕序**：蒙皮矩阵 `det[0]=1.0`、`det<0` 的关节 **0/23** ⇒ 无镜像、绕序未被翻转；据此把临时设的 `cull_mode = NONE`
+    **回退为与主通道一致的 `BACK`**（glTF 正面为 CCW，与引擎约定一致）。
+  - **权重异常**：权重和为 0 的顶点 **0** 个。
+- 清理：移除 `game/main.cpp` 的几何 / 行列式诊断块与 `characterDiagnosticsLogged`、`mesh_renderer.cpp` 的绘制路径诊断块。
+- 验证：构建 `/W4 /WX` **零警告**；`ctest` **373/373**；门禁 **137 文件 0 违规**；`stand` 与 `walk` 冒烟 `hitches=0 / errLines=0`
+  （诊断行已从日志消失，`模型已加载…蒙皮` 与 `角色落地自检…着地=是` 仍在）。
+- 遗留：三条人工目视项（脚底贴地 / 跑动无滑步 / 相机不穿模）仍待所有者确认；本批仍未提交。
+
+## 2026-10-05  T69 目视缺陷②修复：跑动**动画不循环** ⇒ 看起来"滑步"
+
+- 现象（所有者目视）：① 脚底贴地通过；③ 相机不穿模通过；② **无滑步不通过** —— 原话"动画只会播放一次，播放完成后人物静止不动在滑步"。
+- 根因：动画局部时间 `characterAnimTime` 在固定步里**一直累加**，而采样 `SampleJointLocalTransforms` 把 `t` **钳位**到 `[0, clip.duration]`
+  ⇒ 第一次播完就**定格在末帧**，角色不再摆腿但位置仍在前移 ⇒ 看着像"原地滑步"。
+- 修复：新增**纯函数** `vx::LoopsCharacterAnimation(state)`（`Idle` / `Run` ⇒ **循环**；`Jump` / `Fall` ⇒ **一次性**），
+  在时间推进处对循环状态做 `std::fmod(t, duration)` 回绕。**为什么 Jump / Fall 不循环**：它们是一次性空中姿态，
+  循环会出现"空中重复起跳"的怪象；播完定格在末帧符合"长时间下落保持该姿态"的占位口径。
+- 单测：`tests/character_animation_test.cpp` 新增 `CharacterAnimation.LoopOnlyAppliesToGroundLocomotion`（4 断言）。
+- 验证：构建 `/W4 /WX` **零警告**；`ctest` **374/374**（373 → 374）；门禁 **137 文件 0 违规**；`walk` 冒烟 `hitches=0 / errLines=0 / inputRegistered=2`。
+- 遗留：仍待所有者复看②（跑动循环是否已消除"滑步"观感）；本批仍未提交。
+
+## 2026-10-05  T85：测试模式指示（F1 面板横幅）+ 交付必附运行命令（规范）
+
+- 需求（所有者）：① 每次完成任务后给出**可直接复制**的运行命令，便于自己调试；② 测试环境须在 **F1 面板**标明"当前是**自动测试**（勿动键鼠）"或"当前需**人工确认哪些项**"。
+- 做了什么：
+  1. **规范**（`.trae/skills/voxel-engine-dev-standards/SKILL.md`）：§7.6 增"运行命令须带 `--manual-test`"一条；
+     **新增 §7.7「测试模式指示（F1 面板）」**（自动 `--auto-test` / 人工 `--manual-test="项1;项2"` + UTF-8 取参 + 日志兜底 + 只读 + 标签缝 + 与 7.6 **三处一致**）；DoD 增 1 条核对项。
+  2. **引擎**：新增 `engine/platform/command_line.{hpp,cpp}` 的 `CommandLineArgumentsUtf8` —— Windows 经
+     `GetCommandLineW` + `CommandLineToArgvW` + `WideCharToMultiByte(CP_UTF8)` 还原，避免 CRT 的 ANSI `argv` 把中文变 `?`；
+     其它平台直接拷贝。登记 `docs/engine-capabilities.md` §1.1。
+  3. **游戏**：新增**纯函数** `game/test_mode.hpp`（`TestMode` / `TestModeInfo` / `ParseTestModeFromArguments` / `IsOptionArgument`）；
+     `game/debug_overlay.*` 置顶**只读横幅**（自动=橙、人工=蓝；无 CJK 字体时**不渲染非 ASCII 动态项**）；
+     `game/ui_text.hpp` 新增 5 条标签（中英两表）；`game/main.cpp` 解析参数 + 打日志 + 注入面板；位置参数（着色器目录）**不再吞开关**。
+  4. **脚本**：`tools/vx_perf_input.ps1` 以 `--auto-test` 启动。
+- 为什么：把"谁在测 / 测什么"从口头与文档搬到**屏幕上**，消歧"自动化运行期间被误操作"与"人工测试时不知该看什么"；
+  UTF-8 取参是为了中文项**在命令行与面板都不乱码**（Windows CRT `argv` 的已知坑）。
+- 验证（命令 + 真实结果）：
+  1. 构建 `/W4 /WX` **零警告**；`ctest --preset debug` ⇒ **380/380**（374 → 380，新增 `TestMode.*` 6 项）；门禁 **141 文件 0 违规**。
+  2. **自动**（`stand` 冒烟，脚本传 `--auto-test`）：`build/perf/input_stand.out.log` **第 1 行** =
+     `测试模式：**自动测试**（--auto-test）—— 请勿操作键盘 / 鼠标`；`hitches=0 / errLines=0`。
+  3. **人工**（直启 `--manual-test=脚底贴地;跑动无滑步;相机不穿模`）：日志 = `测试模式：**人工测试** —— 本次需人工确认 3 项：`
+     + 逐条 `人工验收项：脚底贴地 / 跑动无滑步 / 相机不穿模`（中文经宽字符还原**无乱码**）。
+- 下一步 / 遗留：
+  1. **面板横幅本身为人工目视项**（原生 SDL 窗口，无法自动截图）：不带参数启动 ⇒ 面板顶部"测试模式"分区应显示
+     "人工测试：请逐项确认以下内容" + 通用提示；带 `--manual-test` ⇒ 逐条显示。
+  2. 本批（T69 两处修复 + T85）**尚未提交**。
+
+## 2026-10-05  T86：角色朝向跟随移动方向（补做业界默认项）
+
+- 背景（所有者提问"为什么不做角色转向"）：T69 占位期把"**不做朝向**"登记为**已知取舍**，于是第三人称角色**始终朝固定方向**。
+  按 SKILL「需求受理 / 业界标准优先」，**第三人称角色面向移动方向是业界默认项**（不做即体验残缺）—— 当初就应做，不该等提出。
+- 做了什么：新增**纯函数** `game/character_facing.hpp`：
+  - `TryComputeTargetYaw(vx, vz, out)`：速度平方 ≤ 阈值²（`0.25` 格/秒）⇒ `false`（**保持当前朝向**）；否则 `out = atan2(vx, vz)`
+    （与相机同口径：yaw 为 0 ⇒ 前向 `+Z`，`+π/2` ⇒ `+X`）。
+  - `AdvanceYawTowards(cur, target, maxStep)`：`std::remainder` 取**最短有符号差** ⇒ 跨 ±π 不绕远路；单次最多转 `maxStep`，
+    差在上限内则**精确落到目标**（避免目标附近抖动）。
+  - 常量 `kCharacterTurnRateRadPerSec = 640°/s ≈ 11.17`（参照 **UE `CharacterMovementComponent` 默认 `RotationRate`**）、
+    `kCharacterModelForwardOffsetRad`（模型前向修正，默认 0）。
+  `game/main.cpp`：固定步内按**水平速度**推进 `characterYaw`（红线 11：不随帧率漂移）；渲染时 `SetMeshTransform` 的旋转
+  由单位四元数改为 `angleAxis(characterYaw + 偏移, +Y)`；**阴影通道共用同一 `modelToRender`** ⇒ 影子同步转向。
+- 为什么用"速度方向 + 角速度上限"：这是业界标准形态（UE `bOrientRotationToMovement` + `RotationRate`；Unity 第三人称模板
+  `Quaternion.RotateTowards`）；瞬时对齐显得生硬，而**不做朝向则明显残缺**。
+- 验证（命令 + 真实结果）：
+  1. 构建 `/W4 /WX` **零警告**；`ctest --preset debug` ⇒ **385/385**（380 → 385，新增 `CharacterFacing.*` 5 项）；门禁 **143 文件 0 违规**。
+  2. `walk` 冒烟：`hitches=0 / errLines=0`（无回归）。
+- 下一步 / 遗留：
+  1. **人工目视**：朝不同方向走动 / 冲刺 ⇒ 角色**面向移动方向**且转身有可见过渡；静止时保持朝向。
+  2. **若目视发现角色"背对行进方向"** ⇒ 把 `kCharacterModelForwardOffsetRad` 由 `0` 改为 `π`（占位模型的局部前向轴未在数据层确认）。
+  3. 本批（T69 两修复 + T85 + T86）**尚未提交**。
+
+## 2026-10-05  核查"角色没有贴图" + 所有者裁定（暂不处理）
+
+- 现象（所有者提问）：角色身上看不到贴图。
+- 核查（证据）：直接解析 `assets/models/character/Casual_Female.glb` 的 JSON 块 ⇒ **`images = 0` / `textures = 0` / `baseColorTexture = 0` / `COLOR_0 = 0`**，
+  只有 **6 个材质**（各带 `baseColorFactor` 纯色：`Skin` / `Shirt` / `Pants` …）⇒ **该模型本就是"低多边形纯色"，没有贴图可加**。
+  另两处叠加：`T68` 的加载器只取几何 + 蒙皮 + 动画、**不读材质**；`mesh_skinned.vert` 把 `v_material = -1` 走**地表材质路径**
+  ⇒ 角色按世界高度 / 坡度被染成草 / 土 / 岩 / 沙（看起来"没有自己的颜色"）。
+- 判定：属 T69 **已登记的已知取舍**（"占位模型走地表材质路径"），**非缺陷**；能做的只有"还原它的**纯色配色**（材质导入）"，**不能加贴图**（模型无纹理）。
+- **所有者裁定（2026-10-05）：暂不处理** —— 等换一个**自带贴图**的角色模型后，把"材质 / 贴图导入"一并做。
+- 下一步 / 遗留：
+  1. 该项作为**已登记的已知限制**保留，**切换条件 = 选定带贴图的新角色模型**。
+  2. 本批（T69 两修复 + T85 + T86）**尚未提交**。
+
+## 2026-10-05  交接收口：T86 目视通过 + 本批提交
+
+- **T86 人工目视（所有者 2026-10-05）**：角色**面向移动方向**正确、转身有可见过渡、静止保持朝向 ⇒ **无需翻转**
+  （`kCharacterModelForwardOffsetRad` 保持 `0`）。T86 的"待人工目视"遗留**关闭**。
+- **本批一次提交入库**，含：**T68**（Assimp 模型导入）、**T83**（冒烟脚本入库 `tools/vx_perf_input.ps1`）、
+  **T84**（世界边界六面封闭）、**T69**（主角占位模型：S1 资源 / S2 GPU 蒙皮 / S3 接线与状态机 / S4 验收 + 两处缺陷修复
+  ["角色不可见" 坐标重复相加、跑动动画不循环]）、**T85**（F1 测试模式指示 + 交付附运行命令规范）、
+  **T86**（角色朝向跟随移动方向）、**角色贴图核查**（裁定"暂不处理"，模型无贴图）及对应文档（plans / devlog / SKILL / game-design / ui-inventory / engine-capabilities）。
+- **本批后状态**：阶段 ⓒ 仅余 **T70（阶段验收）**；构建**零警告**、`ctest` **385/385**、门禁 **143 文件 0 违规**。
+- **下一步**：T70 阶段验收（§4 逐行取证 + 回填人工目视结论 + release 帧时间对照）⇒ 冻结 `plans/v0.3.md` ⇒ 进入 **ⓑ 玩法骨架（V0.4 玩法与动态实体）**。
+
 

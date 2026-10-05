@@ -19,7 +19,7 @@
 | EnTT | ECS | MIT | V0.4 |
 | Jolt Physics（`joltphysics`） | 刚体物理 / 角色碰撞与地形碰撞 | MIT | V0.1 |
 | zstd | 存档压缩 | BSD-3-Clause（另有 GPLv2 双许可） | V0.3 |
-| Assimp | 3D 模型加载 | BSD-3-Clause | **V0.3（ⓒ T68）** —— 所有者 2026-09-29 指示由 V0.5 **前移**；**尚未引入** |
+| Assimp | 3D 模型加载 | BSD-3-Clause | **V0.3（ⓒ T68）** —— 所有者 2026-09-29 指示由 V0.5 **前移**；**T68 已引入**：`vcpkg.json` 依赖 `assimp`；唯一引用点 = `engine/render/model_loader.cpp`（Assimp 头只在该 `.cpp` 内出现，公共头不含） |
 | Tracy | 性能分析 | BSD-3-Clause | V0.2 |
 | RenderDoc | 图形调试（外部工具，不随产物分发） | MIT | V0.1 |
 | Lua 5.4 \* | 脚本 | MIT | V1.0+ |
@@ -35,6 +35,7 @@
 > 校验和清单 = **`tools/assets.sha256`**（进仓库）；重复运行脚本会**逐项校验**，上游文件变化即**报错**（不静默接受）。
 >
 > **许可口径**：ambientCG 全部内容与 Poly Haven 全部内容均为 **CC0 1.0 Universal**（可商用、可修改、**无需署名**）；
+> **角色模型**（T69 起）：Quaternius 的模型亦为 **CC0 1.0 Universal**（由 Cinevva 分发，其逐文件元数据标注 `license: CC0`）。
 > 本项目仍**逐项登记**来源与作者，便于追溯与发布核对。
 > **Quixel Megascans 不可用**（UE-Only Content，与自研引擎不兼容）—— 这也是本项目只从 CC0 源取材的原因。
 
@@ -47,6 +48,7 @@
 | ambientCG | Rock 030（地表-岩） | 同上 | CC0 1.0 Universal | <https://ambientcg.com/view?id=Rock030> | 2026-09-29 |
 | ambientCG | Ground 093 C（地表-沙 / 沙漠沙丘） | 同上 | CC0 1.0 Universal | <https://ambientcg.com/view?id=Ground093C> | 2026-09-29 |
 | Poly Haven | Kloofendal 48d Partly Cloudy（环境 HDRI，户外晴天） | Greg Zaal | CC0 1.0 Universal | <https://polyhaven.com/a/kloofendal_48d_partly_cloudy> | 2026-09-29 |
+| Quaternius（经 Cinevva 分发） | Casual Female（**T69 占位主角**；含 `Idle`/`Walk`/`Run`/`Jump`） | Quaternius | CC0 1.0 Universal | <https://quaternius.com/>（分发页 <https://app.cinevva.com/game-assets/free-3d-character-models>） | 2026-10-05 |
 
 ### 表 2：文件与校验和（`SHA-256`，逐文件）
 
@@ -69,6 +71,7 @@
 | `assets/textures/terrain/sand/roughness.jpg` | Ground 093 C | `ab402c7d1c773b26a860d8b0e976407a0663ea3b509d45ba7a26ea9baaeca707` |
 | `assets/textures/terrain/sand/ao.jpg` | Ground 093 C | `b327c1c436e1cdf40e85c71ea0dacac4beb647c9e54a1962a95887ba044298a6` |
 | `assets/textures/env/kloofendal_48d_partly_cloudy_2k.hdr` | Kloofendal 48d Partly Cloudy | `3fbd33f279f29bd64925c1dd3214fd46c627493d21f1100248b6b1098da4d06e` |
+| `assets/models/character/Casual_Female.glb` | Casual Female（Quaternius；经 Cinevva 分发） | `3b4f39d27dc8a5f3b42d023f88a928679e7b1b0ea49ddb4857a07399bc4d8332` |
 
 **取回命令**（资源不入库 ⇒ 干净克隆后需执行一次）：
 
@@ -79,6 +82,8 @@ powershell -ExecutionPolicy Bypass -File tools\fetch_assets.ps1            # 之
 
 **规格**（T66 消费者需要）：地表贴图 = **2048×2048 JPG**（albedo / normal(GL) / roughness / AO 四件套，共 4 套 ≈ 79 MB）；
 环境贴图 = **`.hdr`（2K 等距柱状）**；文件名统一为 `albedo` / `normal` / `roughness` / `ao`（扩展名保留上游 `.jpg`）。
+
+**规格**（T69 消费者需要）：角色模型 = **单文件 GLB** —— `Casual_Female.glb`（**23 关节 / 6,624 三角面 / 17 条动画**，含 `Idle` / `Walk` / `Run` / `Jump`；**无外部贴图依赖**）。
 
 ## 待办
 

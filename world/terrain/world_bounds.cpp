@@ -54,4 +54,21 @@ std::array<BoundaryWall, 4> ComputeBoundaryWalls(const WorldBounds& bounds, doub
     return walls;
 }
 
+BoundaryWall ComputeBoundaryCeiling(const WorldBounds& bounds, double thickness) noexcept {
+    const double wallThickness = (thickness > 0.0) ? thickness : kBoundaryWallThickness;
+    const double halfThickness = wallThickness * 0.5;
+
+    const double centerX = (bounds.min.x + bounds.max.x) * 0.5;
+    const double centerZ = (bounds.min.z + bounds.max.z) * 0.5;
+    const double halfX   = (bounds.max.x - bounds.min.x) * 0.5;
+    const double halfZ   = (bounds.max.z - bounds.min.z) * 0.5;
+
+    // 底面与边界盒上沿齐平（`center.y - halfExtents.y == bounds.max.y`），厚度向上；
+    // X / Z 各外扩一个墙厚 ⇒ 与四周墙（其外表面也各外扩一个墙厚）在顶部四角交叠封口。
+    BoundaryWall ceiling;
+    ceiling.center      = glm::dvec3(centerX, bounds.max.y + halfThickness, centerZ);
+    ceiling.halfExtents = glm::dvec3(halfX + wallThickness, halfThickness, halfZ + wallThickness);
+    return ceiling;
+}
+
 }  // namespace vx

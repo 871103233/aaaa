@@ -55,6 +55,35 @@ struct MeshData {
     std::vector<std::uint32_t> indices;
 };
 
+/// **蒙皮**网格顶点（T69）：与 `MeshVertex` 并列的第二套顶点格式。
+///
+/// 多出**关节索引与权重**；`position` / `normal` 是**绑定姿态下的网格局部坐标**（脚底为原点）。
+/// 顶点先经骨骼矩阵做**线性混合蒙皮（LBS）**（在顶点着色器里，见 `mesh_skinned.vert`），
+/// 再由逐网格 `modelToRender` 补成渲染相对坐标 —— 因此**每帧不需要重传任何顶点**，
+/// 只更新骨骼矩阵与网格变换（对照 CPU 蒙皮：每帧要重烘焙并上传整份顶点）。
+///
+/// 布局与 `mesh_skinned.vert` / `shadow_skinned.vert` 的输入一一对应（pitch = `sizeof(SkinnedVertex)`）：
+///   location 0 `vec3 position`、1 `vec3 normal`、2 `uvec4 joints`、3 `vec4 weights`。
+/// 前置条件：`joints` 各分量 < 骨骼矩阵数量；`weights` **已归一化**（由 `model_loader` 取前 4 路后重归一）。
+struct SkinnedVertex {
+    float         position[3] = { 0.0F, 0.0F, 0.0F };
+    float         normal[3]   = { 0.0F, 1.0F, 0.0F };
+    std::uint32_t joints[4]   = { 0U, 0U, 0U, 0U };
+    float         weights[4]  = { 1.0F, 0.0F, 0.0F, 0.0F };
+};
+
+/// 一份待上传的**蒙皮**网格（顶点 + 32 位索引）。
+struct SkinnedMeshData {
+    std::vector<SkinnedVertex> vertices;
+    std::vector<std::uint32_t> indices;
+};
+
+/// 单个蒙皮网格允许的最大关节数（骨骼矩阵数组的**容量上界**；数组元素 = `mat4`）。
+///
+/// 取 64：远超当前占位模型（23 关节），同时把每网格的骨骼缓冲上界定为 `64 × 64 B = 4 KB`
+/// （每帧每网格一次上传，与网格数 —— 而不是与关节数或世界总量 —— 成正比）。
+inline constexpr std::uint32_t kMaxSkinJoints = 64;
+
 /// 每帧相机常量：与 Shader 中的相机 storage buffer 布局一一对应。
 /// `mat4` 在 std140 下为 4 个 `vec4`，无隐式填充，可直接整块上传。
 struct CameraUniform {
@@ -237,6 +266,27 @@ public:
                                        std::uint32_t reserveVertexCount = 0,
                                        std::uint32_t reserveIndexCount = 0, bool depthBiased = false);
 
+    /// 创建并按容量上传一个**蒙皮**网格（T69）。
+    ///
+    /// 与 `UploadMesh` 的差别：顶点是 `SkinnedVertex`（含关节索引 / 权重）、走**独立的蒙皮管线**
+    /// （`mesh_skinned.vert`：由顶点着色器做线性混合蒙皮），并额外分配一块**骨骼矩阵 storage buffer**。
+    ///
+    /// `jointCapacity` 是骨骼矩阵数组的**容量**（元素 = `mat4`），调用方传模型的关节数。
+    /// 容量在**创建时定死**：之后既不重建也不扩容 ⇒ 满足 SKILL 硬规则 4（资源创建不得发生在渲染热路径）。
+    /// 顶点是**绑定姿态下的局部坐标**（脚底为原点）⇒ 之后每帧只需 `SetMeshTransform` + `SetSkinningMatrices`，
+    /// **不必重传顶点**。
+    /// 前置条件：`0 < jointCapacity <= kMaxSkinJoints`；索引都在顶点范围内。空网格返回无效句柄。
+    [[nodiscard]] MeshHandle UploadSkinnedMesh(const SkinnedMeshData& mesh, const glm::dvec3& origin,
+                                               std::uint32_t jointCapacity);
+
+    /// 设置一个**蒙皮**网格本帧的骨骼矩阵（`jointCount` 个 `mat4`；引擎只做**整块**拷贝到 GPU）。
+    ///
+    /// 语义：**每个蒙皮网格每帧一次**上传（不是逐关节推送）⇒ 上传次数与网格数成正比、与关节数无关，
+    /// 下帧 `RenderFrame` 生效。矩阵 = `Global(joint) × inverseBind(joint)`（由 `ComputeSkinningMatrices` 算好）。
+    /// 前置条件：`matrices` 非空且 `jointCount <= 上传时的 jointCapacity`；越界时忽略并 WARN。
+    /// 无效句柄或非蒙皮网格为无操作。
+    void SetSkinningMatrices(MeshHandle handle, const float* matrices, std::uint32_t jointCount);
+
     /// 用一个**顶点数不变**的新顶点数组就地刷新已上传网格的顶点缓冲；索引缓冲保持不变。
     ///
     /// 与 `UploadMesh` 的区别：复用既有 GPU 缓冲与一个常驻暂存缓冲，**不创建 GPU 资源、不做同步等待**，
@@ -403,6 +453,20 @@ private:
         double origin[3] = { 0.0, 0.0, 0.0 };
         /// 该网格的**旋转**（T33：倒塌中的刚体；其余网格恒为单位四元数）。
         glm::quat rotation { 1.0F, 0.0F, 0.0F, 0.0F };
+
+        // ---- 蒙皮网格（T69）----
+        /// 是否为**蒙皮**网格：走独立的蒙皮管线（顶点着色器做线性混合蒙皮），并持有骨骼矩阵缓冲。
+        bool          skinned           = false;
+        /// 骨骼矩阵数组的**容量**（元素 = `mat4`；= `UploadSkinnedMesh` 传入的 `jointCapacity`）。
+        std::uint32_t jointCapacity     = 0;
+        /// 骨骼矩阵 storage buffer（`mat4 × jointCapacity`）；非蒙皮网格恒为 `nullptr`。
+        SDL_GPUBuffer* boneMatrixBuffer = nullptr;
+        /// 本帧已设置的骨骼矩阵数（`SetSkinningMatrices` 写入）。
+        std::uint32_t boneMatrixCount   = 0;
+        /// 本帧待上传的骨骼矩阵（`jointCapacity × 16` 个 float；**上传时一次分配**，之后只 memcpy）。
+        std::vector<float> pendingBoneMatrices;
+        /// 本帧是否有待上传的骨骼矩阵（`RenderFrame` 消费后清零）。
+        bool          boneMatricesDirty = false;
     };
 
     /// 保证主通道图形管线与请求的 MSAA 档位一致（档位变化时用常驻 Shader 重建）。
@@ -491,8 +555,14 @@ private:
     };
 
     void DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURenderPass* pass, const MeshHandle* meshes,
-                    std::size_t meshCount, bool pushEmissive, SDL_GPUGraphicsPipeline* depthBiasedPipeline,
-                    EmissivePushState& emissiveState, MeshTransformPushState& transformState);
+                    std::size_t meshCount, bool pushEmissive, SDL_GPUGraphicsPipeline* basePipeline,
+                    SDL_GPUGraphicsPipeline* depthBiasedPipeline, SDL_GPUGraphicsPipeline* skinnedPipeline,
+                    SDL_GPUBuffer* primaryStorageBuffer, EmissivePushState& emissiveState,
+                    MeshTransformPushState& transformState);
+
+    /// 上传本帧所有**脏**蒙皮网格的骨骼矩阵：一次 map + 一次 copy pass，**不创建任何 GPU 资源**
+    /// （缓冲容量在上传网格时已定死）。
+    void UploadSkinningMatrices(SDL_GPUCommandBuffer* commandBuffer);
 
     /// 把纹理显存**按项**打到日志（材质数组 / 深度 / HDR / 阴影），供预算核对（ADR 0010 记账义务）。
     void LogTextureAccounting(std::uint32_t width, std::uint32_t height) const;
@@ -517,6 +587,27 @@ private:
     /// 由**地表 tile** 之类的共面重叠网格使用（见 `UploadMesh` 的 `depthBiased`）；**随 MSAA 档位与
     /// `m_pipeline` 在 `CreateMainPipeline` 里同生共死**。**`RenderFrame` 热路径绝不创建它**。
     SDL_GPUGraphicsPipeline* m_pipelineDepthBiased = nullptr;
+
+    // ---- 蒙皮网格（T69）----
+
+    /// 蒙皮主通道管线：顶点布局 = `SkinnedVertex`、顶点着色器 = `mesh_skinned.vert`
+    /// （声明 **2 个顶点 storage buffer**：相机 + 骨骼矩阵）；片元阶段复用 `mesh.frag`。
+    /// 与 `m_pipeline` **同生共死**（随 MSAA 档位在 `CreateMainPipeline` 里重建）。
+    SDL_GPUGraphicsPipeline* m_skinnedPipeline = nullptr;
+
+    /// 常驻的蒙皮顶点着色器（与 `m_meshVertexShader` 同理由：档位变化要重建管线）。
+    SDL_GPUShader* m_skinnedVertexShader = nullptr;
+
+    /// 蒙皮**阴影**通道管线：`shadow_skinned.vert` + 空入口 `shadow.frag`（无颜色目标、只写深度）。
+    /// 与采样数无关（阴影目标恒为单采样）⇒ 构造期创建一次。
+    SDL_GPUGraphicsPipeline* m_shadowSkinnedPipeline = nullptr;
+
+    /// 蒙皮阴影顶点着色器（常驻）。
+    SDL_GPUShader* m_shadowSkinnedVertexShader = nullptr;
+
+    /// 骨骼矩阵上传的**常驻**暂存缓冲：所有蒙皮网格共用，一次 map + 逐块 copy。
+    SDL_GPUTransferBuffer* m_boneStagingBuffer   = nullptr;
+    std::uint32_t          m_boneStagingCapacity = 0;
 
     /// 色调映射管线：全屏三角形，HDR 颜色目标 → 交换链（无深度、不剔除）。
     SDL_GPUGraphicsPipeline* m_tonemapPipeline = nullptr;

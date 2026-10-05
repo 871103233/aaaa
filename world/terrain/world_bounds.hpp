@@ -53,4 +53,13 @@ inline constexpr double kBoundaryWallThickness = 2.0;
 [[nodiscard]] std::array<BoundaryWall, 4> ComputeBoundaryWalls(const WorldBounds& bounds,
                                                                double thickness) noexcept;
 
+/// 由边界盒推导**顶盖**（纯函数）。T84（2026-10-05，所有者裁定）起边界为**六面封闭**，这是第 5 个盒体。
+///
+/// 与四周墙同型（轴对齐盒，见 `BoundaryWall`）：**底面与边界盒上沿 `bounds.max.y` 齐平**，厚度向上；
+/// X / Z 各向外铺一个墙厚 ⇒ 与四周墙在**顶部四角**交叠封口。作用：玩家**无法再"升到墙顶之上再横向越过"**
+/// （此前只能靠"出界救援"送回，与 G10「不可穿越的边界」有落差）。顶盖与四周墙一样**不可见**。
+///
+/// 前置条件：`bounds.min <= bounds.max`。`thickness <= 0` 时按 `kBoundaryWallThickness` 处理。
+[[nodiscard]] BoundaryWall ComputeBoundaryCeiling(const WorldBounds& bounds, double thickness) noexcept;
+
 }  // namespace vx

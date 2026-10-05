@@ -29,6 +29,7 @@
 | 显示模式与分辨率控制（窗口 / 桌面无边框全屏；档位取自 SDL） | **已实现** | `engine/platform/window.hpp`（`SetFullscreen` / `SetWindowSize` / `SupportedResolutions`） |
 | 系统设置持久化（TOML：显示模式 / 分辨率 / 主音量 / 帧率上限） | **已实现** | `engine/platform/settings.hpp`；落盘 `SDL_GetPrefPath`；缺文件用默认、非法**明确报错**、越界钳制 |
 | 显示器刷新率查询 | **已实现** | `engine/platform/window.hpp`（`DisplayRefreshRate`：`SDL_GetDisplayForWindow` → 桌面显示模式）；未知时回退并记日志 |
+| **命令行参数按 UTF-8 取回** | **已实现** | `engine/platform/command_line.hpp`（`CommandLineArgumentsUtf8`：Windows 经 `GetCommandLineW` + `CommandLineToArgvW` + UTF-16→UTF-8 还原，避免 CRT 的 ANSI `argv` 把中文变乱码；其它平台直接拷贝 `argv`）。供 `game/` 解析测试模式等启动参数 |
 | 帧率上限（垂直同步 / 睡眠限帧，**零忙等**） | **已实现** | `engine/platform/window.hpp`（`SetVSync`，唯一呈现模式路径）+ `engine/core/frame_limiter.hpp`（纯函数决定模式；下限档用一次 `SDL_DelayNS`） |
 | 输入 → 动作（键鼠 → 命名动作，每帧采样一次） | **已实现** | `engine/input/`；上层只消费动作 |
 | 固定步长主循环（1/60，单帧补步 ≤ 5，插值 alpha） | **已实现** | `engine/core/fixed_step.hpp` |
@@ -42,7 +43,8 @@
 | --- | --- | --- |
 | GPU 抽象（SDL3_gpu 薄封装） | **已实现** | `engine/render/` |
 | 双格式 Shader 管线（GLSL → SPIR-V **与** DXIL，两者都必须产出） | **已实现** | `cmake/Shaders.cmake`（ADR 0002） |
-| 通用网格渲染路径（顶点/索引缓冲、相机常量、**逐网格原点偏移**、索引绘制） | **已实现** | `engine/render/mesh_renderer.hpp`；顶点只承载**网格局部**坐标，绘制时按网格推送"网格原点 − 渲染原点"（顶点 uniform `set = 1` / slot 0，含推送去重）。**T78（2026-09-29）起支持按网格的"深度偏移变体"**：`UploadMesh(..., depthBiased=true)` 的网格走一条**带光栅化 depth bias 的主通道管线变体**（用于**层间共面重叠**，即地表 tile 与可挖体积网格在接管边界环上重合的 z-fighting），`DrawMeshes` 按标记聚成连续区间绘制、绑定次数只随标记切换增长（≤ 2，绝不逐网格绑定）；**阴影通道不使用**该变体 |
+| **蒙皮网格渲染路径（GPU 蒙皮 / LBS）** | **已实现**（2026-10-05 T69） | `engine/render/mesh_renderer.hpp`（`SkinnedVertex` / `SkinnedMeshData` / `UploadSkinnedMesh` / `SetSkinningMatrices`）+ `assets/shaders/mesh_skinned.vert` 与 `shadow_skinned.vert`（片元阶段复用 `mesh.frag` / `shadow.frag`）。**线性混合蒙皮在顶点着色器完成**（骨骼矩阵 = `Global × inverseBind`，由 `engine/render/model_loader.hpp` 的 `ComputeSkinningMatrices` 算好）；骨骼矩阵是**顶点只读 storage buffer**（绑定 `set 0 / binding 1`），**每个蒙皮网格每帧一次整块上传**（不是逐关节推送；无蒙皮更新时零上传）。缓冲容量在**建网格时定死**（关节数 ≤ `kMaxSkinJoints` = 64）⇒ 渲染帧内**不创建 / 不扩容** GPU 资源。阴影通道另有蒙皮变体（否则换模型后主角"影子消失"= 可见回退）。**已知取舍（占位阶段）**：走**地表材质路径**（占位模型无角色 PBR 贴图）、**不做朝向 / 动画混合 / IK / root motion** |
+| **通用网格渲染路径（顶点/索引缓冲、相机常量、**逐网格原点偏移**、索引绘制）** | **已实现** | `engine/render/mesh_renderer.hpp`；顶点只承载**网格局部**坐标，绘制时按网格推送"网格原点 − 渲染原点"（顶点 uniform `set = 1` / slot 0，含推送去重）。**T78（2026-09-29）起支持按网格的"深度偏移变体"**：`UploadMesh(..., depthBiased=true)` 的网格走一条**带光栅化 depth bias 的主通道管线变体**（用于**层间共面重叠**，即地表 tile 与可挖体积网格在接管边界环上重合的 z-fighting），`DrawMeshes` 按标记聚成连续区间绘制、绑定次数只随标记切换增长（≤ 2，绝不逐网格绑定）；**阴影通道不使用**该变体 |
 | 纹理数组（多层 `SDL_GPUTexture`，每层独立 mipmap；`sampler2DArray` 采样） | **已实现** | 同上；地表材质按 ADR 0009 使用（**禁止**改用纹理图集，见 `references/meshing-and-render.md` §3） |
 | 片元 uniform 块（材质参数，std140；CPU→GPU **唯一投影入口**） | **已实现** | `world/terrain/material_table.hpp`（`MaterialUniform` / `BuildMaterialUniform`，`static_assert` 钉死布局）+ `engine/render/mesh_renderer.hpp`（上传） |
 | 程序生成占位材质贴图（**材质四件套 albedo / normal / roughness / AO + 宏观变化**，确定性、可平铺） | **已实现** | `world/terrain/material_textures.*`（ADR 0009 / ADR 0010 P2）；5 张 `R8G8B8A8_UNORM` 纹理数组（四件套各 4 层 + macro **1 层**）× 256²，含 mip 约 **5.67 MB** 显存。多尺度（双频段）且**逐字节确定性** |
@@ -94,7 +96,7 @@
 | 地表高度场碰撞体（逐 tile，挖掘后按脏 tile 重建） | **已实现** | `world/terrain/terrain_collision.*`。**被体积接管的 tile 不再建此碰撞体**（[ADR 0012](adr/0012-collision-takeover-by-volumes.md)）：否则隐形高度场会把角色挡在洞口外 |
 | **通用三角网静态碰撞体**（任意顶点 / 索引，用于可挖体积的等值面网格） | **已实现** | `engine/physics/physics_world.hpp`（`MeshDesc` / `AddMesh` / `UpdateMesh`，Jolt `MeshShape`；公共头不含 Jolt 类型） |
 | **碰撞接管**（体积绘制的地表由体积提供碰撞；挖除后按脏块重建） | **已实现** | [ADR 0012](adr/0012-collision-takeover-by-volumes.md)；`world/dig/volume_collision.*` + `game/main.cpp`。判据与 ADR 0011 同源（同一份 `DigRegionTable`），粒度 = tile。**已知限制**：部分覆盖的 tile 仍保留高度场（该 tile 内的洞进不去）；体积无存档 ⇒ 重进游戏洞与碰撞体一起消失 |
-| 通用静态盒体（供世界边界等使用；公共头不含 Jolt 类型） | **已实现** | `engine/physics/physics_world.hpp`（`AddStaticBox`）；由上层按地图范围推导放置 |
+| 通用静态盒体（供世界边界等使用；公共头不含 Jolt 类型） | **已实现** | `engine/physics/physics_world.hpp`（`AddStaticBox`）；由上层按地图范围推导放置。**T84 起**世界边界用它做**六面封闭**（四周墙 + 顶盖 = 5 个盒体，见 `world/terrain/world_bounds.hpp`） |
 | 角色胶囊控制器（走 / 冲刺 / 跳 / 上坡 / 自动上台阶） | **已实现** | `CharacterVirtual`；重力 24 / **跳跃初速 7.20（由身高推导，最高点 = 身高 60% = 1.08 格）** / 最大坡度 50° / 上台阶 1.0 格 |
 | 角色位置纠正（被地形埋住时顶回地表并清零速度） | **已实现** | `engine/physics/physics_world.hpp`（`SetCharacterPosition`）；静态高度场不会把角色顶出，须由上层在改地形后纠正 |
 | 飞行模式（角色可控竖直移动，碰撞仍生效） | **已实现** | 当前作为测试设施（`FreeFly` 开关） |
@@ -111,7 +113,7 @@
 | 配置表加载（TOML + toml++，启动期校验、非法即报错） | **已实现** | `world/terrain/material_table.*`、`world/generation/map_preset.*`、**`engine/render/lighting_table.*`**、**`world/dig/terrain_brush.*`（`brush.toml`）**、`engine/platform/settings.*` |
 | 音频（播放 / 混音 / 音源） | **未开始** | 仅保留**唯一增益入口** `engine/platform/settings.hpp::ApplyMasterVolumeGain`（设置值已接通，**当前无声源 ⇒ 听不到**）；要能听到还需音频流 + 混音器 + 音源 |
 | 存档 / 读档（只存脏数据，自定义二进制 + zstd） | **未开始** | 内容模型见 ADR 0006 / `references/save-and-serialization.md` |
-| 资源管理（纹理 / 模型加载） | **部分实现**（2026-09-29 T66：**纹理加载已有消费者**；模型导入未开始） | **纹理**：`engine/render/texture_loader.*`（LDR → RGBA8 / HDR `.hdr` → **线性 RGB32F**；**解码前**尺寸守卫；失败即抛、不静默回退；接 `stb_image`）。**消费者（T66）**：`world/terrain/material_textures.*` 的 `MaterialTextureAssetLoader`（分步：每步一张贴图 ⇒ 不冻结画面）+ `ResolveMapFile`（固定扩展名顺序）+ `DownscaleBoxRgba8`（**整数倍** box 降采样，确定性）⇒ 地表四件套换真实 CC0 贴图（资源不入库，见 `assets/textures/` 行与 `NOTICE.md` 台账）。**模型导入**（Assimp）未引入（T68） |
+| 资源管理（纹理 / 模型加载） | **部分实现**（2026-09-29 T66：**纹理加载已有消费者**；2026-10-05 T68：**模型导入能力已落地**、尚未接渲染） | **纹理**：`engine/render/texture_loader.*`（LDR → RGBA8 / HDR `.hdr` → **线性 RGB32F**；**解码前**尺寸守卫；失败即抛、不静默回退；接 `stb_image`）。**消费者（T66）**：`world/terrain/material_textures.*` 的 `MaterialTextureAssetLoader`（分步：每步一张贴图 ⇒ 不冻结画面）+ `ResolveMapFile`（固定扩展名顺序）+ `DownscaleBoxRgba8`（**整数倍** box 降采样，确定性）⇒ 地表四件套换真实 CC0 贴图（资源不入库，见 `assets/textures/` 行与 `NOTICE.md` 台账）。**模型导入（T68）**：`engine/render/model_loader.*`（Assimp 6.0.4；glTF / `.glb` 的**静态与蒙皮网格** + 骨骼（层级 / 绑定 / 逆绑定矩阵）+ 动画 TRS 通道）；公共头**不含 Assimp 类型**；`LoadModel` 纯 CPU 路径、失败即抛；`SampleJointLocalTransforms` / `ComputeSkinningMatrices` 为**确定性纯函数**（单测逐值钉住，夹具 `tests/fixtures/skinned_triangle.gltf`）。**T69 起已有消费者与渲染**：`game/main.cpp` 加载占位主角模型（`assets/models/character/Casual_Female.glb`，**资源不入库 ⇒ 缺文件时 WARN 并回落程序化胶囊**）→ `game/character_model.hpp` 合并成一个蒙皮网格 → `MeshRenderer::UploadSkinnedMesh` + 每帧骨骼矩阵（见 §1.2 的"蒙皮网格渲染路径"）；动画状态机在 `game/character_animation.hpp`（纯函数，有单测） |
 
 ### 1.6 调试与工程质量
 
@@ -120,9 +122,9 @@
 | UI 可交互（ImGui + SDL3/SDL3_gpu 后端，事件转发已接） | **已实现** | `game/debug_overlay.*`、`game/system_panel.*`；面板交互与游戏输入抑制分离（`game/gameplay_input.hpp`） |
 | UI 字体解析与标签缝（命中 CJK 字体用中文，否则**整表英文、绝不缺字**） | **已实现** | `game/ui_font.*`（三级解析：仓库 `assets/fonts/` → 系统 CJK → 无）、`game/ui_text.hpp`（唯一取词缝；有单测 + 源码扫描防绕过） |
 | UI 主题（统一暗色样式，单一样式入口） | **已实现** | `game/ui_theme.*`（`ApplyUiTheme`） |
-| 单元测试 | **已实现** | `tests/`，**360 项**（`ctest --preset debug -j`，**360/360 全绿**；**T79~T81 新增 5 项**：`TerrainQuery.ColumnLookupIsDirectAndCoversSharedBoundaryColumns` / `TerrainQuery.ColumnLookupFloorsNegativeColumns`（列查询 O(1) 且共享边界列不漏）、`DigVolumeResidency.ResidencyWindowIsASupersetOfTheActivityWindow` / `DigVolumeResidency.PrefetchRemovesTheCreateBurstWhenCrossingATileBoundary`（T80 预取：跨界零建块，含"环宽 0 ⇒ 建 4 块"的对照）、`DigVolumeWorker.PipelineBuildMatchesMainThreadBuildBitForBit`（T81：worker 构建与主线程构建**逐位一致**，含邻块存在 / 不存在两条壳层路径）；另含 T60 的常驻调度、T59 竖向带宽、T57 纹理加载、T55 歧义面拆顶点、T36~T39、T33、T42、T43、T46 等既有用例） |
+| 单元测试 | **已实现** | `tests/`，**385 项**（`ctest --preset debug`，**385/385 全绿**；**T86 新增 5 项**：`CharacterFacing.*`（由水平速度求目标 yaw 与阈值 / 角步进上限与到点吸附 / 跨 ±π 走最短弧 / 反复推进收敛）；**T85 新增 6 项**：`TestMode.*`（启动参数解析：默认人工无项 / `--auto-test` 且优先于人工项 / `--manual-test=a;b;c` 分号切分并丢空项与可累加 / UTF-8 按字节保留 / `--` 前缀识别为开关）；**T69 新增 6 项**：`CharacterAnimation.*` 4 项（状态选择：静止/地面移动/上升/下降 + 状态→clip 名与 `Fall` 复用 `Jump` 的已登记取舍）、`CharacterModel.*` 2 项（合并夹具网格逐值与"脚底中心"、按名字查 clip 区分大小写）；**T68 新增 6 项** `ModelLoader.*`；**T79~T81 新增 5 项**：`TerrainQuery.ColumnLookupIsDirectAndCoversSharedBoundaryColumns` / `TerrainQuery.ColumnLookupFloorsNegativeColumns`（列查询 O(1) 且共享边界列不漏）、`DigVolumeResidency.ResidencyWindowIsASupersetOfTheActivityWindow` / `DigVolumeResidency.PrefetchRemovesTheCreateBurstWhenCrossingATileBoundary`（T80 预取：跨界零建块，含"环宽 0 ⇒ 建 4 块"的对照）、`DigVolumeWorker.PipelineBuildMatchesMainThreadBuildBitForBit`（T81：worker 构建与主线程构建**逐位一致**）；另含 T60 的常驻调度、T59 竖向带宽、T57 纹理加载、T55 歧义面拆顶点、T36~T39、T33、T42、T43、T46 等既有用例） |
 | **卡顿消除（hitch-free）施工标准** | **已实现**（规范） | `.trae/skills/voxel-engine-dev-standards/references/performance-and-hitches.md`（三类卡顿判据 / 四层手段与业界参照 / 观测义务 / 自查清单 / 伪优化反例）+ `SKILL.md` 第四节「卡顿消除」与 DoD 勾选。**这是规范、不是引擎能力**：它约束今后所有性能改动（见阶段计划 M8） |
-| 结构门禁（禁止标识符扫描） | **已实现** | `.trae/skills/voxel-engine-dev-standards/scripts/check-banned-identifiers.ps1`（2026-09-29 T81：当前扫 **130** 文件，0 违规） |
+| 结构门禁（禁止标识符扫描） | **已实现** | `.trae/skills/voxel-engine-dev-standards/scripts/check-banned-identifiers.ps1`（2026-10-05 T86：当前扫 **143** 文件，0 违规） |
 | CI（Windows debug/release 全绿） | **部分实现** | Linux 作业受 runner 系统依赖影响，见阶段计划 I1 |
 
 ## 2. 引擎**不**包含什么（分层边界）

@@ -8,7 +8,10 @@
 //     上传 GPU 前做**相机相对偏移**转 float（红线 6）；
 //   - 逻辑与物理按固定步长 1/60 s 推进，渲染只用插值系数 alpha，绝不把它写回模拟状态（红线 11）。
 
+#include "character_animation.hpp"
+#include "character_facing.hpp"
 #include "character_mesh.hpp"
+#include "character_model.hpp"
 #include "character_movement.hpp"
 #include "core/clock.hpp"
 #include "core/fixed_step.hpp"
@@ -23,6 +26,7 @@
 #include "orb.hpp"
 #include "out_of_bounds.hpp"
 #include "physics/physics_world.hpp"
+#include "platform/command_line.hpp"
 #include "platform/settings.hpp"
 #include "platform/window.hpp"
 #include "render/camera.hpp"
@@ -30,6 +34,7 @@
 #include "render/frustum.hpp"
 #include "render/lighting_table.hpp"
 #include "render/mesh_renderer.hpp"
+#include "render/model_loader.hpp"
 #include "render/shadow_cascade.hpp"
 #include "render/texture_loader.hpp"
 #include "rigid_collapse.hpp"
@@ -39,6 +44,7 @@
 #include "terrain/terrain_types.hpp"
 #include "terrain/terrain_world.hpp"
 #include "terrain/world_bounds.hpp"
+#include "test_mode.hpp"
 #include "ui_text.hpp"
 #include "dig/collapse_table.hpp"
 #include "dig/destruction_table.hpp"
@@ -55,6 +61,7 @@
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 #include <algorithm>
 #include <array>
@@ -1187,9 +1194,29 @@ struct LoadingScreen {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::filesystem::path shaderDir = ResolveShaderDir(argv[0]);
-    if (argc > 1) {
-        shaderDir = argv[1];
+    // T85：以 **UTF-8** 取回启动参数（Windows 经宽字符命令行还原，见 `platform/command_line.*`），
+    // 解析测试模式（自动 / 人工 + 人工验收项）；**开关参数（`--` 前缀）绝不能当成位置参数**。
+    const std::vector<std::string> arguments = vx::CommandLineArgumentsUtf8(argc, argv);
+    const vx::TestModeInfo         testMode  = vx::ParseTestModeFromArguments(arguments);
+    std::filesystem::path          shaderDir = ResolveShaderDir(argv[0]);
+    for (std::size_t i = 1; i < arguments.size(); ++i) {
+        if (!vx::IsOptionArgument(arguments[i])) {
+            shaderDir = std::filesystem::u8path(arguments[i]);
+            break;
+        }
+    }
+
+    // T85：把测试模式打进日志（自动测试 ⇒ 勿动键鼠；人工测试 ⇒ 逐条列出验收项）。
+    // 即便本机未加载 CJK 字体、面板不渲染非 ASCII 动态文本，日志里仍有完整信息。
+    if (testMode.mode == vx::TestMode::Auto) {
+        VX_LOG_INFO("测试模式：**自动测试**（--auto-test）—— 请勿操作键盘 / 鼠标；F1 面板显示对应横幅");
+    } else if (!testMode.manualItems.empty()) {
+        VX_LOG_INFO("测试模式：**人工测试** —— 本次需人工确认 %zu 项：", testMode.manualItems.size());
+        for (const std::string& item : testMode.manualItems) {
+            VX_LOG_INFO("  人工验收项：%s", item.c_str());
+        }
+    } else {
+        VX_LOG_INFO("测试模式：**人工测试**（未提供 --manual-test 项；可用 --manual-test=\"项1;项2\" 指定）");
     }
 
     try {
@@ -1347,6 +1374,7 @@ int main(int argc, char** argv) {
         // T15：系统面板与它共用同一个 ImGui 上下文（由本对象托管），并通过事件转发变为**可交互**。
         // 它同时是**加载画面**的绘制者，故必须先于任何长任务建立。
         vx::DebugOverlay debugOverlay(window.device(), window.handle());
+        debugOverlay.SetTestMode(testMode);  // T85：F1 面板顶部的测试模式横幅（自动 / 人工 + 验收项）
 
         // T15：把 SDL 事件转发给 ImGui 后端（全生命周期只安装一次）。平台层仍是唯一读事件队列的地方，
         // game/ 只是注册回调；未接这一步之前面板只读，正是因为事件从未到达 ImGui。
@@ -1719,12 +1747,14 @@ int main(int argc, char** argv) {
                     "（其高度场碰撞体已交出）；可挖体积三角网碰撞体 %zu 个",
                     collisionTiles, takenOverTiles, tileCoords.size(), volumeBodies);
 
-        // T18：世界边界由**地图范围自动推导**（tile_radius → 世界列范围），不硬编码：换地图或将来
-        // 改由程序化决定大小时自动跟随。四周建**不可见**的静态墙挡住地面行走；出界救援（见主循环）
-        // 另兜住"飞越墙后坠落"。
+        // T18 / T84：世界边界由**地图范围自动推导**（tile_radius → 世界列范围），不硬编码：换地图或将来
+        // 改由程序化决定大小时自动跟随。**六面封闭**（T84，所有者 2026-10-05 裁定）：四周建**不可见**静态墙
+        // 挡住地面行走，**再加一块不可见顶盖** ⇒ 飞行也无法"升到墙顶之上再横向越过"；
+        // 出界救援（见主循环）**降为纯兜底**（防边界漏洞与意外坠落），不再是正常的越界出口。
         const vx::WorldBounds                 bounds = vx::ComputeWorldBounds(preset.tileRadiusX, preset.tileRadiusZ);
         const std::array<vx::BoundaryWall, 4> boundaryWalls =
             vx::ComputeBoundaryWalls(bounds, vx::kBoundaryWallThickness);
+        const vx::BoundaryWall boundaryCeiling = vx::ComputeBoundaryCeiling(bounds, vx::kBoundaryWallThickness);
         std::size_t boundaryWallBodies = 0;
         for (std::size_t i = 0; i < boundaryWalls.size(); ++i) {
             vx::PhysicsWorld::BoxDesc box;
@@ -1737,13 +1767,23 @@ int main(int argc, char** argv) {
                         i, (i == 0) ? "-X" : ((i == 1) ? "+X" : ((i == 2) ? "-Z" : "+Z")), box.center.x, box.center.y,
                         box.center.z, box.halfExtents.x, box.halfExtents.y, box.halfExtents.z);
         }
+        {
+            vx::PhysicsWorld::BoxDesc box;
+            box.center      = boundaryCeiling.center;
+            box.halfExtents = boundaryCeiling.halfExtents;
+            if (physics.AddStaticBox(box) != 0) {
+                ++boundaryWallBodies;
+            }
+            VX_LOG_INFO("边界顶盖（T84 六面封闭）：中心 (%.1f, %.1f, %.1f)，半长 (%.1f, %.1f, %.1f)", box.center.x,
+                        box.center.y, box.center.z, box.halfExtents.x, box.halfExtents.y, box.halfExtents.z);
+        }
         VX_LOG_INFO("世界边界（由 tile 半径 [%d, %d] 自动推导）：范围 (%.1f, %.1f, %.1f) ~ (%.1f, %.1f, %.1f)；"
-                    "不可见围墙 %zu/4 个，厚 %.1f 格；出界救援余量 %.1f 格",
+                    "不可见围墙 4 堵 + 顶盖 1 块 = %zu/5 个盒体（**六面封闭**），厚 %.1f 格；出界救援余量 %.1f 格（仅兜底）",
                     preset.tileRadiusX, preset.tileRadiusZ, bounds.min.x, bounds.min.y, bounds.min.z, bounds.max.x,
                     bounds.max.y, bounds.max.z, boundaryWallBodies, vx::kBoundaryWallThickness,
                     vx::kOutOfBoundsMargin);
 
-        // T79③：**加载期静态体已全部加完**（地表高度场 + 可挖体积三角网 + 4 面围墙）⇒ 在**首个 `Update`
+        // T79③：**加载期静态体已全部加完**（地表高度场 + 可挖体积三角网 + 4 面围墙 + 1 块顶盖）⇒ 在**首个 `Update`
         // 之前**调用一次 `OptimizeBroadPhase()`（Jolt 官方文档："needed only if you've added many bodies
         // prior to calling `Update()` for the first time"）。不调用的话，同一份"建造包围体树"的工作会被
         // `PhysicsSystem::Update` **摊到随后若干帧**上（每帧多花一点 CPU，正是帧尖峰打点里的"未计时"）。
@@ -1884,16 +1924,63 @@ int main(int argc, char** argv) {
         VX_LOG_INFO("可挖体积网格已上传：%zu/%zu 个块有可见表面（其余块全实心或全空，无等值面）", volumeMeshCount,
                     volumeSlots.Size());
 
-        // T13：主角**可视**胶囊体（装饰用，尺寸与碰撞胶囊一致；不参与任何物理）。
-        // 一次性上传局部网格（脚底为原点），此后每帧只就地刷新顶点位置；绘制顺序由每帧的绘制列表决定。
-        // T41：该网格每帧按**当前渲染原点**烘焙渲染相对顶点，故原点传当前渲染原点（偏移恒 0；
-        // 首次绘制前必被 `UpdateMeshVertices` 刷新，故初始值只求自洽，不求精确）。
+        // T13 / T69：主角**可视**体（装饰用，不参与任何物理，尺寸与碰撞胶囊一致）。
+        // T69：优先用 CC0 **占位模型**（Quaternius《Casual Female》，蒙皮 + 骨骼动画，见 plans/v0.3.md §1.3）；
+        // **资源不入库** ⇒ 干净克隆 / 缺文件时**回落到程序化胶囊**（P6 的硬要求：缺资源也必须照常启动）。
         vx::CapsuleMeshSpec capsuleSpec;
         capsuleSpec.radius             = kCharacterRadius;
         capsuleSpec.cylinderHalfHeight = kCharacterCylinderHalfHeight;
-        const vx::MeshData  capsuleLocalMesh = vx::BuildCapsuleMesh(capsuleSpec);
-        const vx::MeshHandle characterMesh   = renderer.UploadMesh(capsuleLocalMesh, renderOrigin);
+        const vx::MeshData          capsuleLocalMesh  = vx::BuildCapsuleMesh(capsuleSpec);
         std::vector<vx::MeshVertex> characterVertices = capsuleLocalMesh.vertices;
+
+        vx::MeshHandle           characterMesh;
+        bool                     characterUsesModel = false;
+        vx::Model                characterModel;
+        vx::CharacterSkinnedMesh characterSkinned;
+        glm::vec3                characterLocalPivot { 0.0F };
+        // 四个动画状态各对应的 clip（名字由 `ClipNameForCharacterState` 决定；查不到时为 nullptr）。
+        const vx::AnimationClip* characterClips[4] = { nullptr, nullptr, nullptr, nullptr };
+        std::vector<float>       characterBoneMatrices;  // 每帧待上传的骨骼矩阵（一次分配、之后只 memcpy）
+        float                    characterAnimTime  = 0.0F;
+        vx::CharacterAnimState   characterAnimState = vx::CharacterAnimState::Idle;
+        // T86：角色朝向（绕 +Y 的 yaw，与相机同口径）。只在**检测到移动**时按角速度上限靠拢；
+        // 静止时保持不变。在固定步内推进（红线 11），渲染时作为蒙皮网格的旋转下发。
+        float                    characterYaw      = 0.0F;
+        {
+            const std::filesystem::path modelPath = SourceAssetPath("assets/models/character/Casual_Female.glb");
+            try {
+                characterModel   = vx::LoadModel(modelPath);
+                characterSkinned = vx::BuildSkinnedMeshFromModel(characterModel);
+                if (characterSkinned.mesh.vertices.empty() || characterSkinned.mesh.indices.empty() ||
+                    characterModel.joints.empty() || characterModel.joints.size() > vx::kMaxSkinJoints) {
+                    throw std::runtime_error("模型无可用网格或骨架（或关节数超出 kMaxSkinJoints）");
+                }
+                characterMesh = renderer.UploadSkinnedMesh(characterSkinned.mesh, renderOrigin,
+                                                           static_cast<std::uint32_t>(characterModel.joints.size()));
+                characterUsesModel  = characterMesh.IsValid();
+                characterLocalPivot = characterSkinned.localPivot;
+            } catch (const std::exception& error) {
+                characterUsesModel = false;
+                VX_LOG_WARN("占位主角模型不可用 ⇒ **回落程序化胶囊**（资源不入库，请先执行 tools/fetch_assets.ps1）：%s",
+                            error.what());
+            }
+        }
+        if (characterUsesModel) {
+            for (int state = 0; state < 4; ++state) {
+                const char* clipName  = vx::ClipNameForCharacterState(static_cast<vx::CharacterAnimState>(state));
+                characterClips[state] = vx::FindAnimationClip(characterModel, clipName);
+                if (characterClips[state] == nullptr) {
+                    VX_LOG_WARN("占位主角模型缺少动画 `%s` ⇒ 该状态保持绑定姿态（占位口径，见 plans/v0.3.md §1.4）",
+                                clipName);
+                }
+            }
+            VX_LOG_INFO("占位主角模型已启用：顶点 %zu / 索引 %zu / 关节 %zu（**占位、外形待定**；来源见 NOTICE.md 台账）",
+                        characterSkinned.mesh.vertices.size(), characterSkinned.mesh.indices.size(),
+                        characterModel.joints.size());
+        } else if (!characterMesh.IsValid()) {
+            // 回落路径：程序化胶囊（先上传局部网格；之后每帧就地刷渲染相对顶点）。
+            characterMesh = renderer.UploadMesh(capsuleLocalMesh, renderOrigin);
+        }
         if (!characterMesh.IsValid()) {
             VX_LOG_WARN("主角可视网格上传失败（网格为空），本帧起将看不到角色");
         }
@@ -2209,6 +2296,36 @@ int main(int argc, char** argv) {
                 physics.Update(static_cast<float>(vx::kFixedDt));
                 rigidCollapse.Step(physics, collapseSpec, settledCollapseUnits);
 
+                // T69：主角动画状态与局部时间按**固定步**推进（红线 11：动画不随帧率漂移）。
+                // 换状态 ⇒ 局部时间归零（占位口径：不做动画混合 / 过渡）。
+                if (characterUsesModel) {
+                    const vx::PhysicsWorld::CharacterState animationSource = physics.GetCharacterState(character);
+                    const float horizontalSpeed = std::sqrt(animationSource.velocity.x * animationSource.velocity.x +
+                                                            animationSource.velocity.z * animationSource.velocity.z);
+                    // T86：朝向跟随移动方向 —— 由**水平速度方向**求目标 yaw，按角速度上限平滑靠拢；
+                    // 静止（低于阈值）时**保持当前朝向**。固定步推进 ⇒ 与帧率无关（红线 11）。
+                    float targetYaw = 0.0F;
+                    if (vx::TryComputeTargetYaw(animationSource.velocity.x, animationSource.velocity.z, targetYaw)) {
+                        characterYaw = vx::AdvanceYawTowards(
+                            characterYaw, targetYaw, vx::kCharacterTurnRateRadPerSec * static_cast<float>(vx::kFixedDt));
+                    }
+                    const vx::CharacterAnimState nextState = vx::SelectCharacterAnimState(
+                        animationSource.onGround, horizontalSpeed, animationSource.velocity.y);
+                    if (nextState != characterAnimState) {
+                        characterAnimState = nextState;
+                        characterAnimTime  = 0.0F;
+                    } else {
+                        characterAnimTime += static_cast<float>(vx::kFixedDt);
+                        // 循环动作（Idle / Run）在 `[0, duration)` 上回绕；否则采样会把时间钳位到末尾，
+                        // 角色停在最后一帧 ⇒ 走动时看着像"原地滑步"（一次性动作不循环，见 `LoopsCharacterAnimation`）。
+                        const vx::AnimationClip* currentClip = characterClips[static_cast<int>(characterAnimState)];
+                        if (vx::LoopsCharacterAnimation(characterAnimState) && currentClip != nullptr &&
+                            currentClip->duration > 0.0F) {
+                            characterAnimTime = std::fmod(characterAnimTime, currentClip->duration);
+                        }
+                    }
+                }
+
                 // T28 自检：2 秒后打一次角色落地状态（见 `groundCheckLogged` 的说明）。
                 simulatedSeconds += static_cast<float>(vx::kFixedDt);
                 if (!groundCheckLogged && simulatedSeconds >= 2.0F) {
@@ -2411,11 +2528,47 @@ int main(int argc, char** argv) {
             if (characterMesh.IsValid()) {
                 const glm::vec3 feetRender =
                     glm::mix(camera.TargetPrevious(), camera.TargetCurrent(), static_cast<float>(plan.alpha));
-                const glm::dvec3 feetRenderDouble(static_cast<double>(feetRender.x), static_cast<double>(feetRender.y),
-                                                  static_cast<double>(feetRender.z));
-                UpdateCharacterRenderVertices(characterVertices, capsuleLocalMesh, feetRenderDouble, renderOrigin);
-                // 唯一可能的失败是句柄失效或顶点数变化，这里两者都不会发生（已在上面校验句柄）。
-                (void)renderer.UpdateMeshVertices(characterMesh, characterVertices, renderOrigin);
+                if (characterUsesModel) {
+                    // T69：蒙皮网格每帧只做两件事 —— ①更新网格变换（原点 = 世界脚底 − 脚底中心偏移；
+                    // 旋转 = **T86 的朝向 yaw**，绕 +Y、作用于脚底中心）；
+                    // ②上传骨骼矩阵（**每个蒙皮网格一次整块**上传）。**不重传任何顶点**（对照下面的胶囊路径）。
+                    // `feetRender` 取的是 `camera.TargetCurrent()`（**世界坐标**）⇒ `SetMeshTransform` 的
+                    // 世界原点直接用它，`renderer` 内部再减渲染原点（见 mesh_renderer.cpp 的 modelToRender）。
+                    const glm::dvec3 feetWorld(static_cast<double>(feetRender.x), static_cast<double>(feetRender.y),
+                                               static_cast<double>(feetRender.z));
+                    const glm::dvec3 meshOrigin = feetWorld - glm::dvec3(characterLocalPivot);
+                    // T86：朝向四元数 = 绕 +Y 转 `characterYaw`（+ 模型前向修正）。旋转作用于网格原点（脚底中心），
+                    // 故角色绕自身脚底中心转向、不产生额外位移。
+                    const glm::quat characterRotation =
+                        glm::angleAxis(characterYaw + vx::kCharacterModelForwardOffsetRad, glm::vec3(0.0F, 1.0F, 0.0F));
+                    renderer.SetMeshTransform(characterMesh, meshOrigin, characterRotation);
+
+                    const vx::AnimationClip* clip = characterClips[static_cast<int>(characterAnimState)];
+                    if (clip != nullptr) {
+                        const std::vector<glm::mat4> skinning =
+                            vx::ComputeSkinningMatrices(characterModel, *clip, characterAnimTime);
+                        if (skinning.size() == characterModel.joints.size() &&
+                            skinning.size() <= static_cast<std::size_t>(vx::kMaxSkinJoints)) {
+                            characterBoneMatrices.resize(skinning.size() * 16U);
+                            for (std::size_t joint = 0; joint < skinning.size(); ++joint) {
+                                for (int element = 0; element < 16; ++element) {
+                                    // glm::mat4 是列主序（element = col * 4 + row）⇒ 与 std430 的 mat4[] 一致。
+                                    characterBoneMatrices[joint * 16U + static_cast<std::size_t>(element)] =
+                                        skinning[joint][element / 4][element % 4];
+                                }
+                            }
+                            renderer.SetSkinningMatrices(characterMesh, characterBoneMatrices.data(),
+                                                         static_cast<std::uint32_t>(skinning.size()));
+                        }
+                    }
+                } else {
+                    const glm::dvec3 feetRenderDouble(static_cast<double>(feetRender.x),
+                                                      static_cast<double>(feetRender.y),
+                                                      static_cast<double>(feetRender.z));
+                    UpdateCharacterRenderVertices(characterVertices, capsuleLocalMesh, feetRenderDouble, renderOrigin);
+                    // 唯一可能的失败是句柄失效或顶点数变化，这里两者都不会发生（已在上面校验句柄）。
+                    (void)renderer.UpdateMeshVertices(characterMesh, characterVertices, renderOrigin);
+                }
             }
 
             // T27：活动光球每帧就地刷新顶点（球心 = 弹道位置，取渲染插值；与主角同一套约定）。

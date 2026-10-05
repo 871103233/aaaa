@@ -187,6 +187,28 @@ void DebugOverlay::BuildUI(const DebugStats& stats, SystemPanelContext& panelCon
     ImGui::Begin(UiText(UiLabel::DebugPanelTitle, cjk), nullptr,
                  ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings);
 
+    // T85：测试模式横幅（**置顶、只读**）——由启动参数决定，全运行期不变，供所有者一眼判断
+    // "该不该动键鼠 / 本次要人工确认什么"。动态文本不经标签缝，故在无 CJK 字体时**不渲染非 ASCII 项**
+    // （沿用"面板上绝不出现缺字 `?`"的口径，见 ui_text.hpp）。
+    ImGui::SeparatorText(UiText(UiLabel::SectionTestMode, cjk));
+    if (m_testMode.mode == TestMode::Auto) {
+        ImGui::TextColored(ImVec4(1.0F, 0.78F, 0.25F, 1.0F), "%s", UiText(UiLabel::TestModeAuto, cjk));
+    } else {
+        ImGui::TextColored(ImVec4(0.45F, 0.85F, 1.0F, 1.0F), "%s", UiText(UiLabel::TestModeManual, cjk));
+        if (m_testMode.manualItems.empty()) {
+            ImGui::TextUnformatted(UiText(UiLabel::TestModeNoItems, cjk));
+        } else {
+            for (const std::string& item : m_testMode.manualItems) {
+                if (cjk || IsAsciiOnly(item.c_str())) {
+                    ImGui::BulletText("%s", item.c_str());
+                } else {
+                    ImGui::BulletText("%s", UiText(UiLabel::TestModeItemNonAscii, cjk));
+                    break;
+                }
+            }
+        }
+    }
+
     ImGui::SeparatorText(UiText(UiLabel::SectionTiming, cjk));
     StatRow(UiText(UiLabel::FrameTime, cjk), UiText(UiLabel::FrameTimeFormat, cjk), frameMs, p50Ms, p95Ms, p99Ms);
     StatRow(UiText(UiLabel::Fps, cjk), UiText(UiLabel::FpsFormat, cjk), fps);

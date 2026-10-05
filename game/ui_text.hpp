@@ -89,6 +89,13 @@ enum class UiLabel : int {
     GpuPassTime,                  ///< 行标签：各 pass GPU 时间
     GpuTimeUnavailable,           ///< 取值：GPU 时间不可用（SDL3_gpu 无时间戳查询）
 
+    // ---- 调试面板：测试模式横幅（T85）----
+    SectionTestMode,          ///< 分区：测试模式
+    TestModeAuto,             ///< 取值：自动测试（勿动键鼠）
+    TestModeManual,           ///< 取值：人工测试
+    TestModeNoItems,          ///< 取值：未提供人工验收项
+    TestModeItemNonAscii,     ///< 取值：该项含非 ASCII 且无 CJK 字体（回退提示）
+
     // ---- 加载画面（启动加载；见 SKILL「不冻结画面」）----
     LoadingTitle,             ///< 标题：正在生成世界
     LoadingHint,              ///< 提示：画面不会卡住，可继续操作窗口
@@ -179,6 +186,11 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsEnglish = {
     "GPU passes",
     "Pass GPU time",
     "unavailable (SDL3_gpu has no timestamp queries)",
+    "Test mode",
+    "AUTOMATED TEST RUNNING - do NOT touch the keyboard or mouse",
+    "MANUAL TEST - please verify the items below",
+    "(no manual test items; see the launch command)",
+    "(item is non-ASCII and no CJK font is loaded; see the launch command or console log)",
     "Generating world",
     "The view keeps updating while the world is generated; the window stays responsive",
     "%.0f%%",
@@ -263,6 +275,11 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsChinese = {
     "各 pass GPU 时间",
     "各 pass GPU 时间",
     "不可用（SDL3_gpu 无时间戳查询）",
+    "测试模式",
+    "自动测试进行中：请勿操作键盘 / 鼠标",
+    "人工测试：请逐项确认以下内容",
+    "（未提供人工验收项，请见启动命令）",
+    "（该项含非 ASCII 文本且未加载 CJK 字体；请见启动命令或控制台日志）",
     "正在生成世界",
     "生成期间画面持续刷新、窗口保持响应；世界就绪后自动进入",
     "%.0f%%",

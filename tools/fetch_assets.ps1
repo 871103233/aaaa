@@ -9,10 +9,12 @@
   行为（**幂等**）：
     1. 逐项把压缩包下载到 `build/_assets_cache/`（已存在且**校验通过**则跳过）；
     2. 解压并只抽出需要的贴图（地表 PBR = albedo / normal / roughness / AO 四件套；HDRI = 单文件）；
+       角色模型 = **单文件 GLB**（不解压，直接落到 `assets/models/`）；
     3. 校验 `tools/assets.sha256`（**这份校验和文件进仓库**）；`-Record` 为首次运行：写入该校验和文件；
     4. 打印台账（路径 + SHA-256），供 `NOTICE.md` 的「美术资源台账」引用。
 
   许可：ambientCG 与 Poly Haven 的资源均为 **CC0 1.0**（可商用、无需署名；本项目仍逐项登记来源）。
+  **角色模型**（T69 起）：Quaternius（经 Cinevva 分发）为 **CC0**；同样逐项登记来源与 SHA-256。
   **Quixel Megascans 不可用**（UE-Only Content）—— 见 NOTICE.md。
 
 .EXAMPLE
@@ -46,6 +48,7 @@ $Root = (Resolve-Path -LiteralPath $Root).Path
 $cacheDir    = Join-Path $Root 'build\_assets_cache'
 $hashFile    = Join-Path $Root 'tools\assets.sha256'
 $textureRoot = Join-Path $Root 'assets\textures'
+$modelRoot   = Join-Path $Root 'assets\models'
 
 # ---------------------------------------------------------------
 # 资源清单（唯一事实来源：URL + 目标位置 + 抽取规则）
@@ -98,6 +101,18 @@ $items = @(
         Kind     = 'env'
         OutDir   = 'env'
         OutName  = 'kloofendal_48d_partly_cloudy_2k.hdr'
+    }
+    [pscustomobject]@{
+        # T69 占位主角：Quaternius《Casual Female》，CC0，23 关节，含 Idle/Walk/Run/Jump。
+        Id       = 'character-casual-female'
+        Display  = 'Casual Female（占位人形；含 Idle/Walk/Run/Jump）'
+        Source   = 'Quaternius（经 Cinevva 分发）'
+        Page     = 'https://quaternius.com/'
+        Url      = 'https://cdn.cinevva.com/assets/packs/quaternius/ultimate-animated-characters/Casual_Female.glb'
+        Archive  = 'Casual_Female.glb'
+        Kind     = 'model'
+        OutDir   = 'character'
+        OutName  = 'Casual_Female.glb'
     }
 )
 
@@ -159,6 +174,17 @@ foreach ($item in $items) {
     $archiveHash = Assert-Hash $archivePath ("压缩包 " + $item.Archive)
 
     # ---- 2) 产出 ----
+    if ($item.Kind -eq 'model') {
+        # 单文件模型（GLB）：不解压，直接落到 assets/models/<OutDir>/。
+        $outDir = Join-Path $modelRoot $item.OutDir
+        New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+        $outPath = Join-Path $outDir $item.OutName
+        Copy-Item -LiteralPath $archivePath -Destination $outPath -Force
+        $produced.Add($outPath)
+        $ledger.Add([pscustomobject]@{ Item = $item; File = $outPath; Hash = (Get-Sha256 $outPath) })
+        continue
+    }
+
     if ($item.Kind -eq 'env') {
         $outDir = Join-Path $textureRoot $item.OutDir
         New-Item -ItemType Directory -Force -Path $outDir | Out-Null

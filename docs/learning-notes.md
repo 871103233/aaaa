@@ -1063,7 +1063,7 @@ Naive Surface Nets 每个 cell **只放一个顶点**。当一个 cell 的实心
 3. 附带：`build/*.ps1` 必须**纯 ASCII**（见 Q8）—— 中文注释在 PowerShell 5.1 下按 GBK 误码，会引发
    **语法错误**，以及"正则匹配不到中文"这类看起来毫不相干的怪现象。
 
-**相关**：`build/vx_perf_input.ps1`（`flybound` 档、`Ensure-GameForeground`、`WM_CLOSE` 收尾）、`docs/devlog.md` 2026-09-30 第二条。
+**相关**：`tools/vx_perf_input.ps1`（`flybound` 档、`Ensure-GameForeground`、`WM_CLOSE` 收尾；**T83 起仓库内**）、`docs/devlog.md` 2026-09-30 第二条。
 
 ### Q34 "大世界是不是只加载附近的？把地图扩大，内存和卡顿会明显变差吗？"
 

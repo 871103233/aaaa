@@ -7,6 +7,8 @@
 # Shader 在构建期编译为 SPIR-V 与 DXIL **双格式**（见 ADR 0002 与 cmake/Shaders.cmake）：
 #   triangle.* —— 冒烟路径（TriangleRenderer）用；
 #   mesh.*     —— 真正的网格渲染路径（MeshRenderer）用；
+#   mesh_skinned.vert / shadow_skinned.vert —— 蒙皮网格（T69）：主通道与阴影通道各一条，
+#               片元阶段复用 mesh.frag / shadow.frag；
 #   shadow.vert/.frag —— 阴影深度通道（T21b / ADR 0010 P1）用（纯深度写入，片元为空入口）；
 #   tonemap.*  —— HDR 色调映射通道（T20 / ADR 0010 P0）用（其 .vert 亦为全屏三角，T67 起被天空与烘焙共用）。
 #   sky.frag / ibl_irradiance.frag / ibl_prefilter.frag / ibl_brdf_lut.frag
@@ -41,7 +43,9 @@ add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/triangle.vert)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/triangle.frag)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/mesh.vert)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/mesh.frag)
+add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/mesh_skinned.vert)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/shadow.vert)
+add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/shadow_skinned.vert)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/shadow.frag)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/tonemap.vert)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/tonemap.frag)

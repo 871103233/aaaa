@@ -263,6 +263,13 @@ MeshRenderer::MeshRenderer(SDL_GPUDevice* device, SDL_Window* window, std::files
                                 SDL_GPU_SHADERSTAGE_FRAGMENT, artifact.format,
                                 ShaderResourceCounts { /*samplers=*/9, 0, 0, /*uniformBuffers=*/4 });
 
+    // T69：**蒙皮**顶点着色器 —— 与 mesh.vert 同源，但声明 **2 个**顶点 storage buffer
+    // （binding 0 = 相机、binding 1 = 骨骼矩阵数组）并多消费关节索引 / 权重；片元阶段仍复用 mesh.frag。
+    // 常驻到析构（与 `m_meshVertexShader` 同理由：蒙皮主通道管线随 MSAA 档位重建）。
+    m_skinnedVertexShader =
+        create_shader_from_file(m_device, shader_dir / ("mesh_skinned.vert" + extension), SDL_GPU_SHADERSTAGE_VERTEX,
+                                artifact.format, ShaderResourceCounts { 0, 0, /*storageBuffers=*/2, /*uniformBuffers=*/1 });
+
     // 全屏三角的**顶点阶段**（T20 的 `tonemap.vert`）：色调映射、天空（T67）与三条 IBL 烘焙管线共用。
     // 常驻到析构 —— 天空管线要随 MSAA 档位重建，重建时复用同一个 Shader 对象（与 m_meshVertexShader 同理由）。
     m_fullscreenVertexShader =
@@ -391,12 +398,47 @@ MeshRenderer::MeshRenderer(SDL_GPUDevice* device, SDL_Window* window, std::files
         shadowInfo.target_info.has_depth_stencil_target  = true;
 
         m_shadowPipeline = SDL_CreateGPUGraphicsPipeline(m_device, &shadowInfo);
-        SDL_ReleaseGPUShader(m_device, shadowVertex);
-        SDL_ReleaseGPUShader(m_device, shadowFragment);
-
         if (m_shadowPipeline == nullptr) {
             throw std::runtime_error(std::string("创建阴影深度管线失败：") + SDL_GetError());
         }
+
+        // T69：**蒙皮阴影管线**（顶点布局 = `SkinnedVertex`；着色器声明 2 个 storage buffer：
+        // binding 0 = 本级光空间矩阵、binding 1 = 骨骼矩阵）。除了顶点布局与着色器，其余状态与
+        // `m_shadowPipeline` 完全相同。**为什么必须补这一条**：主角胶囊原本会投影；若蒙皮网格在
+        // 阴影通道缺席，主角就会"影子消失" —— 那是**可见回退**（见 docs/plans/v0.3.md §1.3）。
+        m_shadowSkinnedVertexShader =
+            create_shader_from_file(m_device, shader_dir / ("shadow_skinned.vert" + extension),
+                                    SDL_GPU_SHADERSTAGE_VERTEX, artifact.format,
+                                    ShaderResourceCounts { 0, 0, /*storageBuffers=*/2, /*uniformBuffers=*/1 });
+        SDL_GPUVertexBufferDescription skinnedShadowVertexBuffer {};
+        skinnedShadowVertexBuffer.slot               = 0;
+        skinnedShadowVertexBuffer.pitch              = static_cast<Uint32>(sizeof(SkinnedVertex));
+        skinnedShadowVertexBuffer.input_rate         = SDL_GPU_VERTEXINPUTRATE_VERTEX;
+        skinnedShadowVertexBuffer.instance_step_rate = 0;
+        // 只消费位置（法线不参与深度写入）——但关节索引 / 权重必须声明，否则蒙皮算不出来。
+        const SDL_GPUVertexAttribute skinnedShadowAttribute[] = {
+            { 0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, static_cast<Uint32>(offsetof(SkinnedVertex, position)) },
+            { 2, 0, SDL_GPU_VERTEXELEMENTFORMAT_UINT4, static_cast<Uint32>(offsetof(SkinnedVertex, joints)) },
+            { 3, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, static_cast<Uint32>(offsetof(SkinnedVertex, weights)) },
+        };
+        SDL_GPUVertexInputState skinnedShadowVertexInput {};
+        skinnedShadowVertexInput.vertex_buffer_descriptions = &skinnedShadowVertexBuffer;
+        skinnedShadowVertexInput.num_vertex_buffers         = 1;
+        skinnedShadowVertexInput.vertex_attributes          = skinnedShadowAttribute;
+        skinnedShadowVertexInput.num_vertex_attributes      = static_cast<Uint32>(std::size(skinnedShadowAttribute));
+
+        SDL_GPUGraphicsPipelineCreateInfo skinnedShadowInfo = shadowInfo;
+        skinnedShadowInfo.vertex_shader                     = m_shadowSkinnedVertexShader;
+        skinnedShadowInfo.vertex_input_state                = skinnedShadowVertexInput;
+        m_shadowSkinnedPipeline = SDL_CreateGPUGraphicsPipeline(m_device, &skinnedShadowInfo);
+        if (m_shadowSkinnedPipeline == nullptr) {
+            throw std::runtime_error(std::string("创建蒙皮阴影管线失败：") + SDL_GetError());
+        }
+        // **顺序要紧**：两条阴影管线都从 `shadowVertex` / `shadowFragment` 建好之后才能释放它们。
+        // （SDL_gpu 不持有 shader 引用 ⇒ 先释放再用就是 use-after-free：实测会触发 D3D12 后端的
+        //   `CreateGraphicsPipeline was passed a vertex shader for the fragment stage` 断言。）
+        SDL_ReleaseGPUShader(m_device, shadowVertex);
+        SDL_ReleaseGPUShader(m_device, shadowFragment);
     }
 
     // 色调映射采样 HDR 目标：clamp 寻址（屏幕空间后处理不留接缝）+ 线性过滤，单级纹理。
@@ -598,6 +640,43 @@ void MeshRenderer::CreateMainPipeline(std::uint32_t sampleCount) {
         throw std::runtime_error(std::string("创建带深度偏移的主通道管线失败：") + SDL_GetError());
     }
 
+    // T69：**蒙皮主通道管线** —— 顶点布局换 `SkinnedVertex`、顶点着色器换 `mesh_skinned.vert`
+    // （声明 2 个顶点 storage buffer），其余（片元着色器 / 目标格式 / 采样数 / 剔除 / 深度状态）与
+    // `m_pipeline` 完全相同，故与它**同生共死**（档位变化时一起重建）。**绝不在 `RenderFrame` 里创建**。
+    if (m_skinnedPipeline != nullptr) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_skinnedPipeline);
+        m_skinnedPipeline = nullptr;
+    }
+    SDL_GPUVertexBufferDescription skinnedVertexBufferDescription {};
+    skinnedVertexBufferDescription.slot               = 0;
+    skinnedVertexBufferDescription.pitch              = static_cast<Uint32>(sizeof(SkinnedVertex));
+    skinnedVertexBufferDescription.input_rate         = SDL_GPU_VERTEXINPUTRATE_VERTEX;
+    skinnedVertexBufferDescription.instance_step_rate = 0;
+
+    const SDL_GPUVertexAttribute skinnedAttributes[] = {
+        { 0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, static_cast<Uint32>(offsetof(SkinnedVertex, position)) },
+        { 1, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, static_cast<Uint32>(offsetof(SkinnedVertex, normal)) },
+        { 2, 0, SDL_GPU_VERTEXELEMENTFORMAT_UINT4, static_cast<Uint32>(offsetof(SkinnedVertex, joints)) },
+        { 3, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, static_cast<Uint32>(offsetof(SkinnedVertex, weights)) },
+    };
+
+    SDL_GPUVertexInputState skinnedVertexInput {};
+    skinnedVertexInput.vertex_buffer_descriptions = &skinnedVertexBufferDescription;
+    skinnedVertexInput.num_vertex_buffers         = 1;
+    skinnedVertexInput.vertex_attributes          = skinnedAttributes;
+    skinnedVertexInput.num_vertex_attributes      = static_cast<Uint32>(std::size(skinnedAttributes));
+
+    SDL_GPUGraphicsPipelineCreateInfo skinnedInfo = info;
+    skinnedInfo.vertex_shader                     = m_skinnedVertexShader;
+    skinnedInfo.vertex_input_state                = skinnedVertexInput;
+    // `info` 上一步被改成了"带深度偏移"变体 ⇒ 这里必须**显式关掉**，否则蒙皮网格会继承该偏移。
+    skinnedInfo.rasterizer_state.enable_depth_bias = false;
+    m_skinnedPipeline = SDL_CreateGPUGraphicsPipeline(m_device, &skinnedInfo);
+    if (m_skinnedPipeline == nullptr) {
+        m_pipelineSampleCount = 0;
+        throw std::runtime_error(std::string("创建蒙皮主通道管线失败：") + SDL_GetError());
+    }
+
     // T67：天空管线与主通道**共用同一个渲染通道**（天空先画、网格覆盖其上）⇒ 采样数必须与目标一致，
     // 因此与主通道同生共死：这里一并（重）建，`EnsureMainPipeline` 的两个判断即覆盖两者。
     if (m_skyPipeline != nullptr) {
@@ -760,6 +839,13 @@ MeshRenderer::~MeshRenderer() {
     if (m_pipelineDepthBiased != nullptr) {
         SDL_ReleaseGPUGraphicsPipeline(m_device, m_pipelineDepthBiased);
     }
+    // T69：蒙皮主通道管线（与 m_pipeline 同生共死）与蒙皮阴影管线。
+    if (m_skinnedPipeline != nullptr) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_skinnedPipeline);
+    }
+    if (m_shadowSkinnedPipeline != nullptr) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_shadowSkinnedPipeline);
+    }
     if (m_tonemapPipeline != nullptr) {
         SDL_ReleaseGPUGraphicsPipeline(m_device, m_tonemapPipeline);
     }
@@ -784,6 +870,17 @@ MeshRenderer::~MeshRenderer() {
     }
     if (m_meshFragmentShader != nullptr) {
         SDL_ReleaseGPUShader(m_device, m_meshFragmentShader);
+    }
+    // T69：蒙皮顶点着色器（主通道 + 阴影通道各一条）同样常驻到析构。
+    if (m_skinnedVertexShader != nullptr) {
+        SDL_ReleaseGPUShader(m_device, m_skinnedVertexShader);
+    }
+    if (m_shadowSkinnedVertexShader != nullptr) {
+        SDL_ReleaseGPUShader(m_device, m_shadowSkinnedVertexShader);
+    }
+    // 骨骼矩阵上传的常驻暂存缓冲（若有）。
+    if (m_boneStagingBuffer != nullptr) {
+        SDL_ReleaseGPUTransferBuffer(m_device, m_boneStagingBuffer);
     }
     // T67：全屏三角的顶点 / 天空片元阶段同样常驻到析构（天空管线随 MSAA 档位重建）。
     if (m_fullscreenVertexShader != nullptr) {
@@ -984,6 +1081,194 @@ bool MeshRenderer::UpdateMeshGeometry(MeshHandle handle, const MeshData& mesh, c
     return true;
 }
 
+MeshHandle MeshRenderer::UploadSkinnedMesh(const SkinnedMeshData& mesh, const glm::dvec3& origin,
+                                           std::uint32_t jointCapacity) {
+    if (mesh.vertices.empty() || mesh.indices.empty()) {
+        return MeshHandle {};
+    }
+    if (jointCapacity == 0U || jointCapacity > kMaxSkinJoints) {
+        throw std::runtime_error("UploadSkinnedMesh：jointCapacity 非法（须满足 0 < capacity <= kMaxSkinJoints）");
+    }
+
+    MeshResources resources;
+    resources.skinned        = true;
+    resources.jointCapacity  = jointCapacity;
+    resources.vertexBuffer   = create_buffer(m_device, SDL_GPU_BUFFERUSAGE_VERTEX,
+                                             static_cast<std::uint32_t>(mesh.vertices.size()) *
+                                                 static_cast<std::uint32_t>(sizeof(SkinnedVertex)));
+    resources.indexBuffer    = create_buffer(m_device, SDL_GPU_BUFFERUSAGE_INDEX,
+                                             static_cast<std::uint32_t>(mesh.indices.size()) *
+                                                 static_cast<std::uint32_t>(sizeof(std::uint32_t)));
+    // 骨骼矩阵数组（顶点阶段只读 storage buffer）：**容量在创建时定死** ⇒ 之后每帧只覆盖写入，
+    // 不在渲染帧里创建 / 扩容任何 GPU 资源（SKILL 第四节硬规则 4）。
+    resources.boneMatrixBuffer = create_buffer(m_device, SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ,
+                                               jointCapacity * static_cast<std::uint32_t>(sizeof(float)) * 16U);
+    resources.vertexCount     = static_cast<std::uint32_t>(mesh.vertices.size());
+    resources.indexCount      = static_cast<std::uint32_t>(mesh.indices.size());
+    resources.usedIndexCount  = 0;
+    // 世界原点登记（T41）：蒙皮网格的顶点是**网格局部坐标** ⇒ 每帧用 `SetMeshTransform` 推"原点 − 渲染原点"。
+    resources.origin[0] = origin.x;
+    resources.origin[1] = origin.y;
+    resources.origin[2] = origin.z;
+    // 待上传矩阵的 CPU 侧缓冲：**一次分配**（大小 = jointCapacity × 16），之后只 memcpy，零每帧分配。
+    resources.pendingBoneMatrices.assign(static_cast<std::size_t>(jointCapacity) * 16U, 0.0F);
+
+    std::uint32_t slot = 0;
+    if (!m_freeSlots.empty()) {
+        slot           = m_freeSlots.back();
+        m_freeSlots.pop_back();
+        m_meshes[slot] = resources;
+    } else {
+        slot = static_cast<std::uint32_t>(m_meshes.size());
+        m_meshes.push_back(resources);
+    }
+    const MeshHandle handle { slot + 1 };
+
+    // 初始几何上传：与 `UpdateMeshGeometry` 同一套"提交即走"路径（复用常驻暂存缓冲，不建 transfer buffer、不等 fence）。
+    const std::uint32_t vertexBytes = static_cast<std::uint32_t>(mesh.vertices.size() * sizeof(SkinnedVertex));
+    const std::uint32_t indexBytes  = static_cast<std::uint32_t>(mesh.indices.size() * sizeof(std::uint32_t));
+    const std::uint32_t boneBytes   = jointCapacity * static_cast<std::uint32_t>(sizeof(float)) * 16U;
+    if (!EnsureStagingBuffer(m_vertexStagingBuffer, m_vertexStagingCapacity, vertexBytes) ||
+        !EnsureStagingBuffer(m_indexStagingBuffer, m_indexStagingCapacity, indexBytes) ||
+        !EnsureStagingBuffer(m_boneStagingBuffer, m_boneStagingCapacity, boneBytes)) {
+        ReleaseMesh(handle);
+        throw std::runtime_error("UploadSkinnedMesh：暂存缓冲分配失败");
+    }
+    void* mappedVertices = SDL_MapGPUTransferBuffer(m_device, m_vertexStagingBuffer, /*cycle=*/true);
+    if (mappedVertices == nullptr) {
+        ReleaseMesh(handle);
+        throw std::runtime_error("UploadSkinnedMesh：映射顶点暂存缓冲失败");
+    }
+    std::memcpy(mappedVertices, mesh.vertices.data(), vertexBytes);
+    SDL_UnmapGPUTransferBuffer(m_device, m_vertexStagingBuffer);
+
+    void* mappedIndices = SDL_MapGPUTransferBuffer(m_device, m_indexStagingBuffer, /*cycle=*/true);
+    if (mappedIndices == nullptr) {
+        ReleaseMesh(handle);
+        throw std::runtime_error("UploadSkinnedMesh：映射索引暂存缓冲失败");
+    }
+    std::memcpy(mappedIndices, mesh.indices.data(), indexBytes);
+    SDL_UnmapGPUTransferBuffer(m_device, m_indexStagingBuffer);
+
+    // 骨骼缓冲的**初值 = 绑定姿态**（每个关节一个单位矩阵 ⇒ 顶点保持绑定姿态）。
+    // **为什么必须显式写一次**：GPU 缓冲的初始内容是未定义的；若在首次 `SetSkinningMatrices` 之前
+    // 就被绘制，着色器会把顶点乘上零 / 垃圾矩阵 ⇒ 整份几何塌成一点 ⇒ **角色完全看不见**。
+    // 写入绑定姿态后，"第一帧之前"与"没有动画"两种情形都有确定外观。
+    {
+        std::vector<float> identity(static_cast<std::size_t>(jointCapacity) * 16U, 0.0F);
+        for (std::uint32_t joint = 0; joint < jointCapacity; ++joint) {
+            identity[static_cast<std::size_t>(joint) * 16U + 0U]  = 1.0F;   // 列主序：对角元
+            identity[static_cast<std::size_t>(joint) * 16U + 5U]  = 1.0F;
+            identity[static_cast<std::size_t>(joint) * 16U + 10U] = 1.0F;
+            identity[static_cast<std::size_t>(joint) * 16U + 15U] = 1.0F;
+        }
+        void* mappedBones = SDL_MapGPUTransferBuffer(m_device, m_boneStagingBuffer, /*cycle=*/true);
+        if (mappedBones == nullptr) {
+            ReleaseMesh(handle);
+            throw std::runtime_error("UploadSkinnedMesh：映射骨骼暂存缓冲失败");
+        }
+        std::memcpy(mappedBones, identity.data(), boneBytes);
+        SDL_UnmapGPUTransferBuffer(m_device, m_boneStagingBuffer);
+    }
+
+    SDL_GPUCommandBuffer* commandBuffer = SDL_AcquireGPUCommandBuffer(m_device);
+    if (commandBuffer == nullptr) {
+        ReleaseMesh(handle);
+        throw std::runtime_error("UploadSkinnedMesh：获取命令缓冲失败");
+    }
+    SDL_GPUCopyPass* copyPass = SDL_BeginGPUCopyPass(commandBuffer);
+    SDL_GPUTransferBufferLocation vertexSource { m_vertexStagingBuffer, 0 };
+    SDL_GPUBufferRegion           vertexDestination { resources.vertexBuffer, 0, vertexBytes };
+    SDL_UploadToGPUBuffer(copyPass, &vertexSource, &vertexDestination, /*cycle=*/false);
+    SDL_GPUTransferBufferLocation indexSource { m_indexStagingBuffer, 0 };
+    SDL_GPUBufferRegion           indexDestination { resources.indexBuffer, 0, indexBytes };
+    SDL_UploadToGPUBuffer(copyPass, &indexSource, &indexDestination, /*cycle=*/false);
+    SDL_GPUTransferBufferLocation boneSource { m_boneStagingBuffer, 0 };
+    SDL_GPUBufferRegion           boneDestination { resources.boneMatrixBuffer, 0, boneBytes };
+    SDL_UploadToGPUBuffer(copyPass, &boneSource, &boneDestination, /*cycle=*/false);
+    SDL_EndGPUCopyPass(copyPass);
+    SDL_SubmitGPUCommandBuffer(commandBuffer);
+
+    m_meshes[slot].usedIndexCount = resources.indexCount;
+    return handle;
+}
+
+void MeshRenderer::SetSkinningMatrices(MeshHandle handle, const float* matrices, std::uint32_t jointCount) {
+    if (!handle.IsValid() || handle.id > m_meshes.size() || matrices == nullptr || jointCount == 0U) {
+        return;
+    }
+    MeshResources& resources = m_meshes[handle.id - 1];
+    if (!resources.skinned || resources.boneMatrixBuffer == nullptr) {
+        return;
+    }
+    if (jointCount > resources.jointCapacity) {
+        VX_LOG_WARN("SetSkinningMatrices：关节数 %u 超出该网格容量 %u ⇒ 忽略本次更新（不扩容，见 UploadSkinnedMesh）",
+                    jointCount, resources.jointCapacity);
+        return;
+    }
+    std::memcpy(resources.pendingBoneMatrices.data(), matrices, static_cast<std::size_t>(jointCount) * 16U * sizeof(float));
+    resources.boneMatrixCount   = jointCount;
+    resources.boneMatricesDirty = true;
+}
+
+void MeshRenderer::UploadSkinningMatrices(SDL_GPUCommandBuffer* commandBuffer) {
+    // 统计本帧要上传的总字节（只有**脏**的蒙皮网格才算）。
+    std::uint32_t totalBytes = 0;
+    for (const MeshResources& resources : m_meshes) {
+        if (resources.skinned && resources.boneMatricesDirty && resources.boneMatrixBuffer != nullptr) {
+            totalBytes += resources.boneMatrixCount * static_cast<std::uint32_t>(sizeof(float)) * 16U;
+        }
+    }
+    if (totalBytes == 0U) {
+        return;  // 本帧没有蒙皮更新：零上传、零拷贝（"没有角色"时也不付出成本）
+    }
+    if (!EnsureStagingBuffer(m_boneStagingBuffer, m_boneStagingCapacity, totalBytes)) {
+        VX_LOG_WARN("骨骼矩阵暂存缓冲分配失败（%u 字节）⇒ 本帧跳过蒙皮矩阵上传", totalBytes);
+        return;
+    }
+
+    // 一次 map：把所有脏网格的矩阵按序拷进暂存缓冲，并记下各自的（偏移, 目标缓冲）。
+    struct PendingUpload {
+        SDL_GPUBuffer* buffer = nullptr;
+        std::uint32_t  offset = 0;
+        std::uint32_t  bytes  = 0;
+    };
+    std::vector<PendingUpload> uploads;
+    uploads.reserve(4);
+    {
+        void* mapped = SDL_MapGPUTransferBuffer(m_device, m_boneStagingBuffer, /*cycle=*/true);
+        if (mapped == nullptr) {
+            VX_LOG_WARN("骨骼矩阵暂存缓冲映射失败 ⇒ 本帧跳过蒙皮矩阵上传");
+            return;
+        }
+        auto* base       = static_cast<std::uint8_t*>(mapped);
+        std::uint32_t offset = 0;
+        for (MeshResources& resources : m_meshes) {
+            if (!resources.skinned || !resources.boneMatricesDirty || resources.boneMatrixBuffer == nullptr) {
+                continue;
+            }
+            const std::uint32_t bytes = resources.boneMatrixCount * static_cast<std::uint32_t>(sizeof(float)) * 16U;
+            std::memcpy(base + offset, resources.pendingBoneMatrices.data(), bytes);
+            uploads.push_back(PendingUpload { resources.boneMatrixBuffer, offset, bytes });
+            offset += bytes;
+        }
+        SDL_UnmapGPUTransferBuffer(m_device, m_boneStagingBuffer);
+    }
+
+    // 一次 copy pass：逐网格拷到各自的骨骼缓冲（**不**新建任何 GPU 资源）。
+    SDL_GPUCopyPass* copyPass = SDL_BeginGPUCopyPass(commandBuffer);
+    for (const PendingUpload& upload : uploads) {
+        SDL_GPUTransferBufferLocation source { m_boneStagingBuffer, upload.offset };
+        SDL_GPUBufferRegion           destination { upload.buffer, 0, upload.bytes };
+        SDL_UploadToGPUBuffer(copyPass, &source, &destination, /*cycle=*/false);
+    }
+    SDL_EndGPUCopyPass(copyPass);
+
+    for (MeshResources& resources : m_meshes) {
+        resources.boneMatricesDirty = false;
+    }
+}
+
 void MeshRenderer::SetMeshTransform(MeshHandle handle, const glm::dvec3& origin, const glm::quat& rotation) noexcept {
     if (!handle.IsValid() || handle.id > m_meshes.size()) {
         return;
@@ -1010,6 +1295,10 @@ void MeshRenderer::ReleaseMesh(MeshHandle handle) noexcept {
     }
     if (resources.indexBuffer != nullptr) {
         SDL_ReleaseGPUBuffer(m_device, resources.indexBuffer);
+    }
+    // T69：蒙皮网格还有一块骨骼矩阵 storage buffer（非蒙皮网格恒为 nullptr）。
+    if (resources.boneMatrixBuffer != nullptr) {
+        SDL_ReleaseGPUBuffer(m_device, resources.boneMatrixBuffer);
     }
     resources = MeshResources {};
     m_freeSlots.push_back(slot);
@@ -1564,18 +1853,21 @@ void MeshRenderer::LogTextureAccounting(std::uint32_t width, std::uint32_t heigh
 }
 
 void MeshRenderer::DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURenderPass* pass, const MeshHandle* meshes,
-                              std::size_t meshCount, bool pushEmissive, SDL_GPUGraphicsPipeline* depthBiasedPipeline,
-                              EmissivePushState& emissiveState, MeshTransformPushState& transformState) {
+                              std::size_t meshCount, bool pushEmissive, SDL_GPUGraphicsPipeline* basePipeline,
+                              SDL_GPUGraphicsPipeline* depthBiasedPipeline, SDL_GPUGraphicsPipeline* skinnedPipeline,
+                              SDL_GPUBuffer* primaryStorageBuffer, EmissivePushState& emissiveState,
+                              MeshTransformPushState& transformState) {
     if (meshes == nullptr) {
         return;
     }
 
-    // T78：当前绑定的管线是否为"带深度偏移变体"。进入时调用方已绑定**基础**管线（主通道 `m_pipeline` /
-    // 阴影通道 `m_shadowPipeline`）⇒ 初值 false。`depthBiasedPipeline == nullptr`（阴影通道）时下面的
-    // 判断恒为 false ⇒ **不切换管线**、保持阴影现状。
-    // 切换只在"该网格的标记与当前绑定不一致"时发生 ⇒ 绑定次数 = 标记切换次数（调用方把地表 tile 全部
-    // 排在绘制列表最前 ⇒ 至多 1 次切换）⇒ 最多 2 条管线，**绝不逐网格绑定**、也不重排网格（保持既有确定序）。
-    bool biasPipelineBound = false;
+    // 管线与 storage buffer 的**当前绑定状态**（只在选择结果变化时才重新绑定 ⇒ 绑定次数 = 分组数）：
+    //   管线 0 = `basePipeline`（调用方进入时已绑好：主通道 `m_pipeline` / 阴影通道 `m_shadowPipeline`）
+    //   管线 1 = `depthBiasedPipeline`（T78：仅地表 tile 这类共面重叠网格；阴影通道传 nullptr ⇒ 永不选中）
+    //   管线 2 = `skinnedPipeline`（T69：蒙皮网格，顶点着色器做线性混合蒙皮）
+    // storage buffer 数：非蒙皮 = 1（binding 0 = 相机 / 光空间矩阵）；蒙皮 = 2（+ binding 1 = 骨骼矩阵）。
+    int boundPipeline       = 0;
+    int boundStorageBuffers = 1;
 
     for (std::size_t i = 0; i < meshCount; ++i) {
         const MeshHandle handle = meshes[i];
@@ -1592,11 +1884,22 @@ void MeshRenderer::DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURender
             continue;
         }
 
-        // T78：按网格标记选择管线（只在标记变化时绑定）。
-        const bool wantsBiased = (depthBiasedPipeline != nullptr) && resources.depthBiased;
-        if (wantsBiased != biasPipelineBound) {
-            SDL_BindGPUGraphicsPipeline(pass, wantsBiased ? depthBiasedPipeline : m_pipeline);
-            biasPipelineBound = wantsBiased;
+        // 管线选择（只在**选择结果变化**时绑定）：2 = 蒙皮、1 = 带深度偏移变体、0 = 基础管线。
+        const int wanted = resources.skinned ? 2 : (((depthBiasedPipeline != nullptr) && resources.depthBiased) ? 1 : 0);
+        if (wanted == 2 && skinnedPipeline == nullptr) {
+            continue;  // 蒙皮管线不可用（不应发生）⇒ 跳过而不是绑空管线
+        }
+        if (wanted != boundPipeline) {
+            SDL_BindGPUGraphicsPipeline(pass, wanted == 2 ? skinnedPipeline
+                                                          : (wanted == 1 ? depthBiasedPipeline : basePipeline));
+            boundPipeline = wanted;
+        }
+        // 顶点 storage buffer：蒙皮网格多一块骨骼矩阵（binding 1）。绑定数变化时才重绑。
+        const int wantedStorageBuffers = resources.skinned ? 2 : 1;
+        if (wantedStorageBuffers != boundStorageBuffers) {
+            SDL_GPUBuffer* storageBuffers[2] = { primaryStorageBuffer, resources.boneMatrixBuffer };
+            SDL_BindGPUVertexStorageBuffers(pass, 0, storageBuffers, static_cast<Uint32>(wantedStorageBuffers));
+            boundStorageBuffers = wantedStorageBuffers;
         }
 
         // 逐网格模型变换（T41 起；T33 由 `vec4` 偏移泛化为 `mat4`）：把**网格局部坐标**变成渲染相对坐标。
@@ -1720,6 +2023,9 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
     EnsureMainPipeline(m_msaaSampleCount);
     EnsureShadowTarget();
     UploadCameraUniform(commandBuffer);
+    // T69：把本帧所有**脏**蒙皮网格的骨骼矩阵整块上传（每个蒙皮网格一次；无蒙皮更新时零成本）。
+    // 放在这里（主 / 阴影通道之前）⇒ 两个通道读到的都是本帧同一份矩阵。
+    UploadSkinningMatrices(commandBuffer);
     // 阴影关闭时不上传矩阵（省一次每帧的小拷贝；着色器也整体跳过采样）。
     if (m_shadowUniformValid && m_shadowUniform.enabled > 0.5F) {
         UploadShadowMatrices(commandBuffer);
@@ -1769,8 +2075,12 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
             SDL_BindGPUVertexStorageBuffers(shadowPass, 0, matrixBuffers, 1);
 
             // T78：阴影通道**不使用**深度偏移变体（传 nullptr）⇒ 保持阴影现状、逐网格不切管线。
+            // T69：蒙皮网格（主角）在阴影通道走蒙皮阴影管线 —— 否则换成模型后主角会不再投影（可见回退）。
             DrawMeshes(commandBuffer, shadowPass, meshes, meshCount, /*pushEmissive=*/false,
-                       /*depthBiasedPipeline=*/nullptr, shadowEmissiveState, shadowTransformState);
+                       /*basePipeline=*/m_shadowPipeline, /*depthBiasedPipeline=*/nullptr,
+                       /*skinnedPipeline=*/m_shadowSkinnedPipeline,
+                       /*primaryStorageBuffer=*/m_shadowMatrixBuffers[cascade], shadowEmissiveState,
+                       shadowTransformState);
             SDL_EndGPURenderPass(shadowPass);
         }
     }
@@ -1895,8 +2205,10 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
     EmissivePushState      emissiveState;
     MeshTransformPushState transformState;
     // T78：主通道传入带深度偏移的管线变体 —— `DrawMeshes` 只在地表 tile（标记为 true）那一段切换过去。
-    DrawMeshes(commandBuffer, pass, meshes, meshCount, /*pushEmissive=*/true, m_pipelineDepthBiased, emissiveState,
-               transformState);
+    // T69：蒙皮网格（主角）走 `m_skinnedPipeline`，其骨骼矩阵经顶点 storage buffer 的 binding 1 绑定。
+    DrawMeshes(commandBuffer, pass, meshes, meshCount, /*pushEmissive=*/true, /*basePipeline=*/m_pipeline,
+               /*depthBiasedPipeline=*/m_pipelineDepthBiased, /*skinnedPipeline=*/m_skinnedPipeline,
+               /*primaryStorageBuffer=*/m_cameraUniformBuffer, emissiveState, transformState);
 
     SDL_EndGPURenderPass(pass);
 
