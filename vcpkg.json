@@ -12,6 +12,7 @@
     "enkits",
     "assimp",
     "stb",
+    "zstd",
     { "name": "imgui", "features": [ "sdl3-binding", "sdlgpu3-binding" ] },
     { "name": "shaderc", "host": true },
     { "name": "sdl3-shadercross", "host": true }

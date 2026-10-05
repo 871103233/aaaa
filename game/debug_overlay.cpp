@@ -104,8 +104,8 @@ void DebugOverlay::OnSdlEvent(void* userData, const SDL_Event& event) {
 }
 
 void DebugOverlay::BeginFrame() {
-    // 只要还有任一 ImGui 窗口可见就必须起帧（系统面板打开时调试面板可能隐藏；加载画面同样要出帧）。
-    m_frameActive = m_visible || m_systemPanel.IsOpen() || m_loadingActive;
+    // 只要还有任一 ImGui 窗口可见就必须起帧（系统面板打开时调试面板可能隐藏；加载画面 / 常驻 HUD 同样要出帧）。
+    m_frameActive = m_visible || m_systemPanel.IsOpen() || m_loadingActive || m_hudVisible;
     if (!m_frameActive) {
         m_wantCaptureMouse    = false;
         m_wantCaptureKeyboard = false;
@@ -161,6 +161,29 @@ void DebugOverlay::BuildLoadingUI() {
     ImGui::End();
 }
 
+void DebugOverlay::BuildHud(const DebugStats& stats) {
+    const bool cjk = m_cjkFontLoaded;
+
+    // 左上角常驻、只读：不接管鼠标 / 键盘（`NoInputs`），不可移动 / 缩放 / 折叠，不落盘布局。
+    ImGui::SetNextWindowPos(ImVec2(8.0F, 8.0F), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.55F);
+    ImGui::Begin(UiText(UiLabel::HudCoordinates, cjk), nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing |
+                     ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+    ImGui::Text(UiText(UiLabel::HudCoordinatesFormat, cjk), stats.characterPosition.x, stats.characterPosition.y,
+                stats.characterPosition.z);
+    ImGui::Text(UiText(UiLabel::HudCellFormat, cjk), static_cast<int>(std::floor(stats.characterPosition.x)),
+                static_cast<int>(std::floor(stats.characterPosition.y)),
+                static_cast<int>(std::floor(stats.characterPosition.z)));
+
+    // 记录实际高度：F1 面板据此把初始位置排在 HUD 下方（避免左上角重叠）。
+    m_hudHeight = ImGui::GetWindowSize().y;
+    ImGui::End();
+}
+
 void DebugOverlay::BuildUI(const DebugStats& stats, SystemPanelContext& panelContext) {
     if (!m_frameActive) {
         return;
@@ -170,6 +193,11 @@ void DebugOverlay::BuildUI(const DebugStats& stats, SystemPanelContext& panelCon
     const bool cjk = m_cjkFontLoaded;
 
     m_systemPanel.Build(panelContext, cjk);
+
+    // 常驻坐标 HUD（屏幕左上角，只读）：与 F1 面板相互独立，不需要开面板就能看到当前位置。
+    if (m_hudVisible) {
+        BuildHud(stats);
+    }
 
     if (!m_visible) {
         return;
@@ -183,6 +211,10 @@ void DebugOverlay::BuildUI(const DebugStats& stats, SystemPanelContext& panelCon
     const double p99Ms   = Percentile(0.99) * 1000.0;  // T38：尾部（hitch）判据，见 references/performance-and-hitches.md
     const double fps     = (stats.frameSeconds > 0.0) ? (1.0 / stats.frameSeconds) : 0.0;
 
+    // 让 F1 面板初始位置落在常驻 HUD 下方，避免两者在左上角重叠（之后仍可由用户拖动）。
+    // `m_hudHeight` 首帧可能尚未测出 ⇒ 用下界兜底，保证至少不压住 HUD。
+    const float hudBottom = 8.0F + std::max(m_hudHeight, 46.0F) + 4.0F;
+    ImGui::SetNextWindowPos(ImVec2(8.0F, m_hudVisible ? hudBottom : 8.0F), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowBgAlpha(0.88F);
     ImGui::Begin(UiText(UiLabel::DebugPanelTitle, cjk), nullptr,
                  ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings);

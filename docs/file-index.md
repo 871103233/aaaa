@@ -5,7 +5,7 @@
 
 - **粒度**：目录 + 模块入口（公共头 / `CMakeLists.txt` / 脚本）。实现文件（`.cpp`）与测试用例不逐个登记。
 - **更新时机**：任何目录或模块入口发生增删改时，与代码**同一次提交内**更新本文件。
-- **最后核对**：2026-10-05（对照 `git ls-files`；T68 新增 `engine/render/model_loader.*` 与 `tests/fixtures/`）
+- **最后核对**：2026-10-05（对照 `git ls-files`；阶段 W 期间新增 `world/premade/`、`world/shell/`、`tools/baker/` 与相应测试）
 
 ---
 
@@ -46,7 +46,7 @@ voxel-engine/
 ├── world/                     世界层（分层混合，见 ADR 0004）
 │   ├── dig/                   笔刷挖掘 / 堆建与脏 tile 收集
 │   ├── generation/            确定性种子与噪声（FastNoiseLite 封装）
-│   ├── streaming/             可挖体积的常驻调度（V0.2 起；见 ADR 0020）
+│   ├── streaming/             常驻调度：可挖体积（ADR 0020）与地表 tile（ADR 0024）
 │   └── terrain/               地表高度场 tile / 网格化 / 材质混合 / ITerrainQuery 实现
 ├── CMakeLists.txt             根构建
 ├── CMakePresets.json          构建预设
@@ -93,10 +93,13 @@ voxel-engine/
 | 条目 | 职责 | 依赖方向 | 约束 |
 | --- | --- | --- | --- |
 | `world/` | 世界层：生成、地表网格化、材质、挖掘、流式加载、可挖体积、存档 | 可依赖 `engine` | 硬件访问一律经引擎核心 / 平台抽象，**不直接调用平台 API** |
-| `world/terrain/` | 地表高度场 tile（64×64、`int16` 1/16 格）、网格化与梯度法线、材质混合、`ITerrainQuery` 实现、**碰撞体采样构建**（`terrain_collision`） | 可依赖 `engine` | tile 网格须多采样一行/列（65×65），保证相邻 tile 边界**逐位相等、无裂缝**；世界定位用整数 / `double` |
-| `world/generation/` | 确定性种子派生与噪声（FastNoiseLite 封装，pimpl 隔离）、**预设固定地图加载**（`map_preset`：种子 / 范围 / 出生点 / 地形编辑区，TOML） | 可依赖 `engine` | 生成必须是**纯函数**（种子 + 整数坐标）；预设编辑叠加在噪声之上，**同一文件必须得到同一世界**；禁止 `rand()` / 时间 / 线程顺序 |
+| `world/terrain/` | 地表高度场 tile（64×64、`int16` 1/16 格）、网格化与梯度法线、材质混合、`ITerrainQuery` 实现、**碰撞体采样构建**（`terrain_collision`）。tile 生命周期：`LoadTile`（生成 + 网格）/ **`UnloadTile`（W7-S2：释放高度与网格，返回是否原本常驻）** / `ResidentTiles`（升序）/ `ResidentTileCount`（O(1)）——供流式调度与"常驻量只随窗口变化"的核对 | 可依赖 `engine` | tile 网格须多采样一行/列（65×65），保证相邻 tile 边界**逐位相等、无裂缝**；世界定位用整数 / `double`；**"是否被玩家改过"不由本层记录**（编辑块留驻由流式层按 ADR 0020 决策五判定） |
+| `world/generation/` | 确定性种子派生与噪声（FastNoiseLite 封装，pimpl 隔离）、**预设固定地图加载**（`map_preset`：种子 / 范围 / 出生点 / 地形编辑区，TOML）、**地表生成参数与地貌分区**（`terrain_params.*`：`TerrainGenerationParams` / `TerrainLandformParams` / `ClassifyLandform` / `EvaluateLandformModulation` / `LoadFromFile`；W3）、**悬垂 / 洞穴 / 河流噪声**（`TerrainOverhangParams` / `TerrainCaveParams` / `TerrainRiverParams` + `TerrainNoiseGenerator::OverhangAt` / `CaveCarveAt` / `RiverJitterAt`；W4 / W5 / W6） | 可依赖 `engine` | 生成必须是**纯函数**（种子 + 整数坐标）；预设编辑叠加在噪声之上，**同一文件必须得到同一世界**；禁止 `rand()` / 时间 / 线程顺序；`landform.enabled` / `caves.enabled` / `river.enabled` 关闭时**不进入该路径**（与引入前逐位一致） |
 | `world/dig/` | 地形笔刷：平整填平 / 削平（`Level`）、平滑爆破（`Crater`）、球笔刷挖 / 堆，与脏 tile 收集；**可挖区域标记表**（`dig_region`：ADR 0006 的数据文件部分 + 层间交接过滤器）与**可挖体积**（`dig_volume` + `volume_mesher`：33³ `int8` 密度、Surface Nets 等值面）；**弹丸规格表**（`projectile_table`：弹道 + 爆炸破坏 + 自发光，`[[projectile]]` 数组留多类型扩展）；**破坏表**（`destruction_table`：伤害预算的换算系数，T31 / ADR 0013）与**倒塌规则表**（`collapse_table`，T29 / ADR 0015 / 0018） | 可依赖 `engine` | 只标脏**受影响**的 tile / 体积块；重网格与 GPU 上传不得阻塞主线程；爆破 / 平整剖面**边界一阶连续**；**体积只在标记区域内存在**（ADR 0004 硬约束 2）；体积块与地表网格的交接口径见 ADR 0011 |
-| `world/streaming/` | **可挖体积的常驻调度**（V0.2 起，[ADR 0020](adr/0020-dig-volume-vertical-band-and-dynamic-residency.md)）：`dig_volume_residency.*` = 玩家窗口（tile ± K）→ **纯函数集合差**（要建 / 要卸 / 脏块留驻 / 超限淘汰）→ **分帧推进**的建块与卸块（`DigVolumeWorld::CreateBlock` / `UnloadBlock`） | 可依赖 `engine` 与 `world/terrain`、`world/dig` | **不做**主线程同步重活（建 / 卸必须分帧或下沉 worker）；**已改动的（脏）块不得卸载**；LOD 与存档 IO 不在此阶段 |
+| `world/streaming/` | **常驻调度（流式）**：① **可挖体积**（V0.2 起，[ADR 0020](adr/0020-dig-volume-vertical-band-and-dynamic-residency.md)）：`dig_volume_residency.*` = 玩家窗口（tile ± K）→ **纯函数集合差**（要建 / 要卸 / 脏块留驻 / 超限淘汰）→ **分帧推进**的建块与卸块（`DigVolumeWorld::CreateBlock` / `UnloadBlock`）；② **地表 tile 常驻策略与调度**（W7-S1 / S2，[ADR 0024](adr/0024-terrain-streaming-and-lod.md)）：`terrain_tile_residency.*` = `TerrainTileWindow` / `TerrainTileRange`（活动 / 常驻含预取环）+ **滞回**推进中心 tile + `PlanTerrainTileResidency`（建 / 卸 / **编辑块留驻** / 超限淘汰；**纯函数**、确定序、范围版 O(窗口)）+ `TerrainTileScheduler`（幂等 `Update` + **分帧 `Step`** 先加载后卸载） | 可依赖 `engine` 与 `world/terrain`、`world/dig` | **不做**主线程同步重活（建 / 卸必须分帧或下沉 worker）；**已改动的（脏 / 编辑）块不得卸载**；地表 tile 的**游戏层接入与 LOD 分环**属 W7-S3（尚未接入），存档 IO 不在此阶段 |
+| `world/premade/` | **预制地图**（[ADR 0026](adr/0026-premade-map-format-and-bake-tool.md)）：`premade_map.*` = 容器格式（魔数 + `schema_version` + 世界范围 + 定长索引 + **逐块 zstd** + 按块**随机访问**）；`premade_bake.*` = 离线烘焙库函数（把地图预设的宏地形高度场写成预制文件，**与运行时同源**、逐字节可复现）。**zstd 只在本目录的 `.cpp` 内出现**（公共头不泄漏） | 可依赖 `engine` 与 `world/generation`、`world/terrain` | 生成 / 烘焙必须**确定性**（红线 7）；非法 / 版本不符 / 块缺失**即抛**（不静默回退） |
+| `world/shell/` | **地表体积壳**（世界表示 v2 层②，[ADR 0023](adr/0023-world-representation-v2-hybrid-shell.md)，W4 / W5 / W6）：`surface_shell.*` = 贴着地表的**有界 SDF**（`(y − 宏地表高度) + 悬垂 3D 噪声 × 幅度 × 边界淡出 + 洞穴隧道雕刻量 × 边界/深度淡出 + 河道下切量 × 边界淡出`）+ `SurfaceShellSampler`（`IVolumeSampler`）+ `BuildShellBlockMesh`；复用**与可挖体积同一套** Surface Nets（`world/dig/volume_mesher.*`） | 可依赖 `engine` 与 `world/generation`、`world/dig`、`world/water`（**只前置声明** `RiverCarveField`） | 与运行时**同源**（同一份 `terrain.toml`）；跨块共享面顶点**逐位一致**（无裂缝）、**退化三角形 = 0**；渲染与 `Jolt MeshShape` **共用同一份 `MeshData`**。`caves.enabled == false` / 不传河道场 ⇒ 各自**逐位一致**地退化。**W4~W6 只在近场有界区域铺开**，全图流式属 W7 |
+| `world/water/` | **水体（河流）**（[ADR 0027](adr/0027-water-representation.md)，W6）：`river.*` = `RiverPath` / `RiverNode` + `GenerateRiverPath`（多候选源取最长、沿**最陡下降 + 确定性抖动**行进、**水位单调不升**）+ `RiverCarveField`（1 格分辨率下切场 + 双线性查询、河岸线性衰减）+ `BuildRiverWaterMesh`（水面 ribbon） | 可依赖 `engine` 与 `world/generation` | 纯函数、确定性（红线 7）；**不做**流体模拟 / 游泳 / 动态水位（ADR 0027）；河道**只刻进地表壳**（不写宏高度场）⇒ 碰撞随壳自动承担；水面渲染是**独立的** `water.frag` 管线（引擎层不认识"河"） |
 | `world/CMakeLists.txt` | 世界层构建目标 | — | 新增源文件 / 子目录须在此登记 |
 
 ---
@@ -126,9 +129,9 @@ voxel-engine/
 | 条目 | 职责 | 依赖方向 | 约束 |
 | --- | --- | --- | --- |
 | `assets/` | 运行时资源源文件 | — | 生成物放 `assets/generated/`（已忽略）；**美术资源（`assets/textures/`、`assets/models/`）不入库**，由 `tools/fetch_assets.ps1` 取回（见下方两行） |
-| `assets/config/` | 配置表：`materials.toml`（地表材质槽与权重规则）、`lighting.toml`（太阳 / 天空光 / 雾 / 阴影 / **环境贴图 `[environment]`（T67，可选段）**）、`brush.toml`（平整 / 削平 / 爆破笔刷参数；**T27 起未绑定按键**）、`dig_regions.toml`（可挖区域标记，ADR 0006）、`projectiles.toml`（弹丸：弹道 + 爆炸破坏 + 自发光，T27）等 | — | 带 `schema_version`；由 toml++ 在**启动期**加载，失败即明确报错（ADR 0005）。**唯一例外**：`dig_regions.toml` 缺失按 ADR 0006 返回空表（不报错） |
-| `assets/maps/` | 预设固定地图（TOML）：种子 / 覆盖范围 / 出生点 / 地形编辑区（flatten · raise · carve） | — | 带 `schema_version`；**非法文件必须显式报错，不得静默回退**；同一文件必须得到同一世界 |
-| `assets/shaders/` | GLSL 源（`.vert` / `.frag` / `.comp`） | — | 只放源；`.spv` / `.dxil` 由构建生成到 `<build>/assets/shaders/`；新增须在 `game/CMakeLists.txt` 里 `add_shader` |
+| `assets/config/` | 配置表：`materials.toml`（地表材质槽与权重规则）、`lighting.toml`（太阳 / 天空光 / 雾 / 阴影 / **环境贴图 `[environment]`（T67，可选段）**）、`brush.toml`（平整 / 削平 / 爆破笔刷参数；**T27 起未绑定按键**）、`dig_regions.toml`（可挖区域标记，ADR 0006）、`projectiles.toml`（弹丸：弹道 + 爆炸破坏 + 自发光，T27）、**`terrain.toml`（地表生成参数 + 地貌分区：山川 / 平原 / 丘陵 + 悬垂 `[overhang]` + 洞穴 `[caves]` + 河流 `[river]`，W3~W6）** 等 | — | 带 `schema_version`；由 toml++ 在**启动期**加载，失败即明确报错（ADR 0005）。**唯一例外**：`dig_regions.toml` 缺失按 ADR 0006 返回空表（不报错） |
+| `assets/maps/` | 预设固定地图（TOML）：种子 / 覆盖范围 / 出生点 / 地形编辑区（flatten · raise · carve）。含 `test_range.toml`（1×1 km 手工测试场）与 **`world_10km.toml`**（阶段 W 的 10×10 km 大世界；`tile_radius` 上限已由 W7-S3a 从 8 放到 **78**） | — | 带 `schema_version`；**非法文件必须显式报错，不得静默回退**；同一文件必须得到同一世界；**地图不入库的是烘焙产物**（见下 `assets/maps/**` 行），TOML 定义本身入库 |
+| `assets/shaders/` | GLSL 源（`.vert` / `.frag` / `.comp`）：`mesh.*`（地表 / 体积 / 光球）、`mesh_skinned.vert` / `shadow_skinned.vert`（蒙皮）、`shadow.*`、`tonemap.*`、`sky.frag` 与 `ibl_*.frag`（环境 / IBL）、**`water.frag`（水面：flow 滚动波 + 半透明；W6）** | — | 只放源；`.spv` / `.dxil` 由构建生成到 `<build>/assets/shaders/`；新增须在 `game/CMakeLists.txt` 里 `add_shader` |
 | `assets/textures/` | **CC0 美术贴图**（**不入库**；T65 起由脚本取回）：`terrain/<材质>/{albedo,normal,roughness,ao}.jpg`（草 / 土 / 岩 / 沙，2048²）、`env/*.hdr`（环境贴图，等距柱状；**T67 起被天空通道与 IBL 烘焙消费**） | — | **被 `.gitignore` 排除** ⇒ 干净克隆后需执行 `tools/fetch_assets.ps1`；来源 / 许可 / SHA-256 逐项登记在 `NOTICE.md`「美术资源台账」；校验和清单 = `tools/assets.sha256`（**该文件进仓库**）。**缺文件时上层必须 WARN + 回落**（贴图 → 程序生成；HDRI → 半球天空光），不得崩、不得静默 |
 | `assets/models/` | 3D 模型（**不入库**）：主角与后续道具 / NPC 的 glTF / .glb。**T69 起首个真实模型** = `character/Casual_Female.glb`（Quaternius，CC0 占位主角） | — | 与 `assets/textures/` 同口径：由 `tools/fetch_assets.ps1` 取回并登记台账；**消费者 = `engine/render/model_loader.*`（T68 落地：glTF/.glb 静态与蒙皮网格 + 骨骼动画采样；T69 接渲染）** |
 
@@ -139,7 +142,7 @@ voxel-engine/
 | 条目 | 职责 | 依赖方向 | 约束 |
 | --- | --- | --- | --- |
 | `cmake/` | 自写构建辅助模块 | — | 不放业务逻辑；工具缺失时降级为**警告**，不阻断配置 |
-| `tools/` | 仓库级脚本（不入构建）：**`fetch_assets.ps1`**（取回 CC0 美术资源，幂等 + SHA-256 校验；资源不入库见 `assets/textures/` 行）、**`vx_perf_input.ps1`**（性能冒烟：自动操控键鼠跑固定档 —— `stand`/`rot`/`fly`/`flyfwd`/`walk`/`walkback`/`flybound`/`settle`/`shot`，产 `build/perf/input_<mode>.{out,err}.log` 与一行 `RESULT`；证据口径见 `docs/plans/v0.2.md` §4 与 `docs/plans/v0.3.md` §3。**T83 起入库**，由 `$PSScriptRoot` 推导仓库根）、`assets.sha256`（**进仓库**的校验和清单） | — | 脚本须**纯 ASCII 或带 BOM 的 UTF-8**（Windows PowerShell 5.1 按系统代码页读 `.ps1`）；**资源脚本**不得写入 `assets/` 之外的目录；重复运行必须幂等 |
+| `tools/` | 仓库级工具：**脚本**（不入构建）：**`fetch_assets.ps1`**（取回 CC0 美术资源，幂等 + SHA-256 校验；资源不入库见 `assets/textures/` 行）、**`vx_perf_input.ps1`**（性能冒烟：自动操控键鼠跑固定档 —— `stand`/`rot`/`fly`/`flyfwd`/`walk`/`walkback`/`flybound`/`settle`/`shot`，产 `build/perf/input_<mode>.{out,err}.log` 与一行 `RESULT`；证据口径见 `docs/plans/v0.2.md` §4 与 `docs/plans/v0.3.md` §3。**T83 起入库**，由 `$PSScriptRoot` 推导仓库根）、`assets.sha256`（**进仓库**的校验和清单）；**`baker/`（`voxel_bake`，阶段 W2-S2b 起**进入构建**）** = 离线烘焙 CLI（读地图预设 TOML → 调 `world/premade/premade_bake.*` → 写预制地图文件） | — | 脚本须**纯 ASCII 或带 BOM 的 UTF-8**（Windows PowerShell 5.1 按系统代码页读 `.ps1`）；**资源脚本**不得写入 `assets/` 之外的目录；重复运行必须幂等；**C++ 工具**（`baker/`）须纳入门禁扫描（`tools` 已在门禁默认 `IncludeDir` 内） |
 | `cmake/Shaders.cmake` | 两段式 Shader 编译：GLSL →(glslc) SPIR-V →(shadercross) DXIL | — | 两种格式**都必须产出**：Vulkan 用 SPIR-V，D3D12 用 DXIL |
 | `.github/workflows/` | CI：门禁 → 构建 → 测试 | — | 文件与 CI 脚本保持**纯 ASCII**（原因见 `ci.yml` 顶部注释）；新增步骤须本地可复现 |
 | `docs/` | 方案文档、ADR、文件索引、开发记录、学习笔记、阶段计划、**内容基线文档** | — | 与代码同步 |
@@ -185,6 +188,8 @@ voxel-engine/
 | `world/dig/projectile_table.hpp` | 弹丸规格表（`assets/config/projectiles.toml`）：弹道 / 爆炸破坏 / 自发光；`[[projectile]]` 数组留出多类型扩展 |
 | `world/dig/destruction_table.hpp` | **破坏表**（`assets/config/destruction.toml`，`schema_version = 1`，T31 / [ADR 0013](adr/0013-destructible-elements.md)）：`points_per_cubic_block`（伤害预算的**唯一手感旋钮**）+ `prop_damage_threshold` / `prop_broken_tint`（**器物参数先落表**，待 ADR 0004 层 ③ 消费）；缺失 / 越界 / 版本不符一律抛异常（不静默回退） |
 | `world/streaming/dig_volume_residency.hpp` | **可挖体积的常驻调度**（T60 / [ADR 0020](adr/0020-dig-volume-vertical-band-and-dynamic-residency.md)）：`TileOfBlockIndex`（块→tile **精确**映射）/ `DigVolumeWindow` + `WindowForPlayerBlocks`（玩家窗口）/ `ResidencyWindowForPlayerBlocks`（**预取窗口** = 活动半径 + `kResidencyPrefetchTiles`，T80 修订）/ `PlanDigVolumeResidency`（**纯函数**：要建 / 要卸 / **脏块留驻** / 超限淘汰最远者）/ `DigVolumeScheduler`（`Update` 幂等 + `Step` 先建后卸、确定序、分帧；**活动窗口 `Window()` 与常驻窗口 `ResidencyWindow()` 分离**） |
+| `world/streaming/terrain_tile_residency.hpp` | **地表 tile 的常驻策略与调度**（W7-S1 / S2 / S3b，[ADR 0024](adr/0024-terrain-streaming-and-lod.md)）：`TerrainTileWindow`（中心 tile ± R；`TileCount()` = `(2R+1)²`）/ `TerrainTileRange`（世界内存在的 tile 矩形范围）/ `TerrainWindowForPlayerBlocks`（活动窗口）/ `TerrainResidencyWindowForPlayerBlocks`（**常驻窗口** = 活动半径 + `kTerrainResidencyPrefetchTiles`）/ `TerrainHysteresisCenterTile`（**滞回**推进中心 tile）/ `PlanTerrainTileResidency`（**纯函数**：要加载 / 要卸载 / **编辑块留驻** / 超限淘汰最远者；**范围版成本 O(窗口)**）/ `TerrainTileScheduler`（**幂等 `Update`** 重算计划 + **分帧 `Step`** 先加载后卸载、确定序、编辑块超限 **WARN**；**W7-S3b 增分环构造**：`TerrainLodRings`（8/16/32 tile → LOD 0/1/2）、`TerrainLodLevelForTileDistance`、`TerrainLodMorphRangeForLevel`（morph 恰在环边界取 1）、`LodLevelForTile`、`PendingRelodCount` / `StepRelod`（relod **只改网格、不碰世界数据**）、`CollectPendingLoadTiles`（供预取）。**单半径构造下 relod 恒为 0 ⇒ 与从前逐位一致**）。**只含策略与调度，不做网格 / 物理**（接入在 `game/`） |
+| `world/streaming/terrain_tile_build_pipeline.hpp` | **地表 tile 构建任务池**（W7-S3b，照 T81 / [ADR 0022](adr/0022-volume-build-worker-pipeline.md) 形态）：worker 跑**纯函数** `GenerateTerrainTileData`（噪声 + 预设编辑）+ `BuildTerrainMesh`（**不带四边形过滤**）⇒ 主线程只做「收包 → `ApplyQuadFilterToMesh`（按**当前**常驻集合过滤）→ 装进 `TerrainWorld` → GPU 上传 → 碰撞体同步」。**为什么过滤不在 worker**：过滤器依赖"当前常驻集合"这一可变状态，放 worker 就要做快照、会引入"结果随快照陈旧"的歧义；两条路径共用同一份过滤实现 ⇒ **逐位一致**（单测钉死）。worker 不碰世界数据 / 图形 API / Jolt；线程池不可用 ⇒ WARN 一次并回退同步路径（结果不变） |
 | `world/streaming/volume_build_pipeline.hpp` | **块构建任务池**（T81 / [ADR 0022](adr/0022-volume-build-worker-pipeline.md)）：`Submit(BlockBuildInput)`（非阻塞）+ `TakeCompleted(BlockBuildResult&)`（主线程收包）+ worker 观测统计。worker 跑**纯函数** `BuildBlockFromInput`；**唯一互斥量只保护完成队列**（不保护世界数据）；worker 不碰图形 API |
 | `game/orb.hpp` | 光球（T27）：弹道推进与命中检测（**纯函数**，只依赖 `IOrbWorldQuery`）、程序化球网格、固定容量弹丸池 |
 | `game/rigid_collapse.hpp` | 倒塌整体的运行时（T33 / ADR 0015）：网格池（**只在启动时**建 GPU 资源）、`Spawn` 用 `UpdateMeshGeometry` 写一次**与地形同源的等值面**（T42；只上传用到的前缀，超容量按整个四边形截断）、每步读刚体位姿 + 落定检测、每帧只推 `mat4`、落定后 `Writeback` + 清空槽位（索引数 0 = 不可见）。**T46 / [ADR 0017](adr/0017-landing-by-material-rigid-vs-granular.md)**：刚性整体落定后**保留几何体**（`retained`，不回写 ⇒ 形状不变）；池 **16 槽**；`RetireOldestRetained`（池满腾位 ⇒ 惰性回写）/ `AwakenIntersecting`（块碰撞体重建后唤醒相交残骸）。**T47 增**：`BuildUnitMesh` 在**截断前 / 截断后**各做一次**外观网格闭合自检**（`vx::CountBoundaryEdges`），非 0 即 WARN 出**体素数 / patch 尺寸 / 两处边数 / 是否被容量截断**并把成因指名到候选 ①②③（`Spawn` 记入 `ActiveCollapseUnit`，`RetireRetained` 回报）；容量截断 WARN 补体素数与原始规模。**T48 / [ADR 0018](adr/0018-structural-support-and-representation-preserving-destruction.md) 决策三**：命中判定改由 `PhysicsWorld::RayCastDynamic` 回答（句柄 + 真实凸包表面）⇒ `ContainsRetainedPoint` / `RetireRetainedAt` **下线**。**T50 / ADR 0018 决策二**：命中动态刚体改走 **`CarveBody`**（在碎块**自身补丁**上雕刻 → 按剩余体素在**当前姿态**下原地重建刚体 → 复用同一网格槽位；剩余过少 / 凸包不足 / 重建失败 ⇒ `RetireCarved` 删除整体）⇒ 命中路径的"惰性体素化"**下线**；`CollapseCarveResult` / `TotalCarved` / `TotalCarvedVoxels` |
@@ -207,5 +212,5 @@ voxel-engine/
 
 | 规划路径 | 用途 | 备注 |
 | --- | --- | --- |
-| `tools/` | 离线工具：纹理打包、可挖区域标记生成、资源生成 | 目录结构待 `tech-plan-v2.0.md` 定稿；创建时须在此登记 |
+| `assets/maps/**`（预制数据目录） | 离线烘焙产物（**不入库**；`tools/` 生成 / 取回 + 校验和 + 台账） | 与 `assets/textures/`、`assets/models/` 同口径；可读定义（种子 / 范围 / 参数）入库，大数据不入库 |
 | `editor/` | 场景编辑器 | POST-V0.5 暂缓项，默认不创建 |

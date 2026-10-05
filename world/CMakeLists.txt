@@ -9,6 +9,7 @@
 # 第三方：FastNoiseLite（vendored，生成用，PRIVATE）；toml++（配置表，PRIVATE）。
 
 find_package(tomlplusplus CONFIG REQUIRED)
+find_package(zstd CONFIG REQUIRED)
 
 add_library(voxel_world STATIC
     dig/collapse_table.cpp
@@ -22,7 +23,13 @@ add_library(voxel_world STATIC
     dig/volume_mesher.cpp
     generation/map_preset.cpp
     generation/terrain_noise.cpp
+    generation/terrain_params.cpp
+    premade/premade_bake.cpp
+    premade/premade_map.cpp
+    shell/surface_shell.cpp
     streaming/dig_volume_residency.cpp
+    streaming/terrain_tile_build_pipeline.cpp
+    streaming/terrain_tile_residency.cpp
     streaming/volume_build_pipeline.cpp
     terrain/material_blender.cpp
     terrain/material_table.cpp
@@ -32,6 +39,7 @@ add_library(voxel_world STATIC
     terrain/terrain_tile.cpp
     terrain/terrain_world.cpp
     terrain/world_bounds.cpp
+    water/river.cpp
 )
 
 target_include_directories(voxel_world
@@ -39,8 +47,10 @@ target_include_directories(voxel_world
     PRIVATE ${CMAKE_SOURCE_DIR}/third_party/FastNoiseLite
 )
 
+# zstd 只在 premade_map.cpp 内出现（公共头不泄漏）⇒ PRIVATE（vcpkg 提供的目标名 = `zstd::libzstd`）。
 target_link_libraries(voxel_world
     PUBLIC  voxel_build_options
     PUBLIC  voxel_engine              # 公共头暴露 MeshVertex / ITerrainQuery，故为 PUBLIC
     PRIVATE tomlplusplus::tomlplusplus
+    PRIVATE zstd::libzstd
 )

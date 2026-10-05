@@ -3397,4 +3397,673 @@
 - **本批后状态**：阶段 ⓒ 仅余 **T70（阶段验收）**；构建**零警告**、`ctest` **385/385**、门禁 **143 文件 0 违规**。
 - **下一步**：T70 阶段验收（§4 逐行取证 + 回填人工目视结论 + release 帧时间对照）⇒ 冻结 `plans/v0.3.md` ⇒ 进入 **ⓑ 玩法骨架（V0.4 玩法与动态实体）**。
 
+## 2026-10-05  W0 落盘：**10km×10km 大世界（架构路线 A）** 决策与阶段计划
+
+- 背景（所有者 2026-10-05 裁定）：需求 = **10km×10km 大世界**、**本地预制地图 + 流式加载**、**暂不做破坏**、
+  **山川/平原/丘陵**、**河流 + 水体**、**真三维洞穴 + 悬垂**、**10km 下物理与渲染精度**；并明确两条口径：
+  ① "**未用到的能力不删除代码**（如世界可破坏，暂时不做但保留能力代码）"；
+  ② 水系与洞窟设定"**仿照现实世界的水和洞窟做即可**"；先落盘、再动工。
+- 做了什么（**只写文档，未改代码**）：
+  1. **五篇 ADR（先落盘再施工）**：
+     - **[ADR 0023](adr/0023-world-representation-v2-hybrid-shell.md)** 世界表示 v2 ——
+       宏高度场（全图）+ **全图预烘焙只读地表体积壳**（近场真三维：洞穴/悬垂）+ 水体层；破坏**休眠保留**。
+       **扩展** ADR 0004 层② 的覆盖与读写口径（触发其「何时重新审视」第 1、2 条）。
+     - **[ADR 0024](adr/0024-terrain-streaming-and-lod.md)** 流式 + LOD 分环（**收敛待收敛项 4**）——
+       窗口常驻 + 预取 + CDLOD 顶点过渡；Ring0 512 m 体积壳 / Ring1 1 km 高模 / Ring2 2 km 低模 / 雾盖 2 km 外；
+       把 ADR 0008 §7.3 的"Draw Call 与视距内存只记录"**改为有预算**。
+     - **[ADR 0025](adr/0025-large-world-coordinate-precision.md)** 大世界坐标精度（**收敛待收敛项 7**）——
+       渲染沿用相机相对；物理引入**原点重定基**（`PhysicsWorld` 持世界原点，进出 Jolt 的位置减/加原点，跨阈值整体平移；
+       **默认原点 ⇒ 与现状逐位等价**）。备选（双精度构建 / 分区物理 / 不处理）已留档。
+     - **[ADR 0026](adr/0026-premade-map-format-and-bake-tool.md)** 预制地图格式与离线烘焙 ——
+       分块 + 索引 + zstd + `schema_version`；块坐标随机访问；`tools/` 确定性烘焙（SDF → Surface Nets 网格）；数据不入库。
+     - **[ADR 0027](adr/0027-water-representation.md)** 水体 —— 样条河 + 静态水位 + flow 着色，**不做流体模拟**
+       （业界标准：UE5 Water Body / Unity HDRP Water / RDR2 flow map）；河床刻蚀进地表体积壳。
+  2. **新增阶段计划** `docs/plans/v0.4.md`（**阶段 W：10km 大世界**，任务 W0~W9，含范围/落点/验收/3A 对照）。
+  3. **权威文档同步**：`tech-plan-v2.0.md §8` 加「阶段对齐（2026-10-05）」段；`game-design.md §2.4` 增六行需求
+     （大世界 / 真三维 / 水体 / 地貌分区 / 破坏休眠 / 10km 精度）并更新「引擎范围」；
+     `world-setting.md §1.2` 登记口径（地貌/水系/洞窟）；`engine-capabilities.md` 增多行能力（未开始）并把
+     LOD 与坐标精度两行改为"方案已定、未实现"；`file-index.md` 的"规划中"登记 `world/premade/`、`world/shell/`、
+     `world/water/`、烘焙工具与预制数据目录；`adr/README.md` 增 0023~0027 与阶段计划 v0.4。
+  4. **规范同步**：`SKILL.md` 待收敛项 4 / 7 标为**已收敛**（指向 ADR 0024 / 0025）；唯一口径表的「世界表示」
+     与「可挖范围」两行更新到 v2 口径（**破坏休眠、代码不删**）。
+- 为什么（决策依据，详见各 ADR）：
+  1. 10km 全量常驻 ≈ **4.8 GB** 网格 / **200 MB** 高度数据，超预算（VRAM ≤ 300 MB / CPU ≤ 150 MB）⇒ 必须流式 + LOD。
+  2. 真三维若要"处处成立"，等价于换世界表示；ADR 0004 已否决"全图任意深度 SDF/SVDAG"（代价数十 GB）⇒
+     采**有限厚度体积壳**：近场真三维、深层为岩、远景高度场 LOD（**明确的已知限制**）。
+  3. 水体与洞穴在业界**普遍不做流体求解**；采用样条 + 静态水位 + flow 贴图是标准做法，成本与确定性均可控。
+  4. 大坐标下 Jolt 为单精度 ⇒ 原点重定基（Unity Origin Shifting / UE LWC 的局部化思路）；默认原点逐位等价，不破坏既有测试。
+- 验证：本轮**未改代码** ⇒ 构建 / `ctest` / 门禁状态不变（最近一次：零警告、**385/385**、门禁 **143 文件 0 违规**）。
+  文档侧自检：五篇 ADR 均已落盘、`adr/README.md` 与阶段计划已互链、内容基线文档已同步。
+- 下一步 / 遗留：
+  1. **W1（下一步，已开工）**：`PhysicsWorld` 加世界原点 + 原点重定基（默认原点逐位等价）+ 跨界回归测试 + 构建/ctest。
+  2. **待补设定**：大区划 / 地名 / 命名规范（不影响技术实现）。
+  3. **本批（W0 文档）尚未提交**；W1 代码完成后与之一并提交。
+
+## 2026-10-05  W1 落地：**物理原点重定基**（大世界坐标精度；收敛待收敛项 7）
+
+- 背景：`docs/plans/v0.4.md` 的 W1；决策 = [ADR 0025](adr/0025-large-world-coordinate-precision.md)（**默认原点逐位等价**是硬要求）。
+- 做了什么（`engine/physics/physics_world.{hpp,cpp}`）：
+  1. **新增 `WorldOrigin()` / `SetWorldOrigin(dvec3)`**：`PhysicsWorld` 内部持有**水平世界原点** `(originX, originZ)`；
+     进出 Jolt 的位置按"世界 − 原点 / Jolt + 原点"换算（对调用方**完全透明**，对外仍是 `double` 世界坐标）。
+  2. **新增纯函数 `QuantizeHorizontalWorldOrigin(position, quantum)`**：`x` / `z` 向下取整到 `quantum` 的整数倍、`y = 0`；
+     `quantum ≤ 0` ⇒ `(0,0,0)`。由玩家位置决定原点挡位 ⇒ 只在跨挡位时才整表平移。
+  3. **`SetWorldOrigin` 语义**：`delta = 旧 − 新`，对**全部刚体（静态 + 动态）与角色** `SetPosition(pos + delta)`；
+     `JPH::EActivation::DontActivate`（只改位置，**不改速度与姿态、不唤醒休眠体**）；新旧一致 ⇒ 无操作（幂等）。
+     依据：Jolt `BodyInterface::SetPosition` 对静态体同样有效（改位置 + 通知宽相，见其实现）。
+  4. **改造全部位置出入口**：`AddHeightField` / `AddStaticBox` / `AddMesh` / `AddDynamicConvexHull` / `GetRigidBodyState` /
+     `RayCastDynamic` / `CreateCharacter` / `SetCharacterPosition` / `GetCharacterState` 一律经 `ToLocalPosition` / `ToWorldPosition`。
+- 为什么（含一处实现细化）：
+  1. 需求把世界扩到 10km（世界坐标 10,000 格），而 vcpkg 的 `joltphysics` 未开 `JPH_DOUBLE_PRECISION`（`RVec3 = float`）
+     ⇒ 大坐标下宽相 / 求解退化；**原点重定基**把送进 Jolt 的坐标压回原点附近的小数值（业界：Unity Origin Shifting / UE LWC 的局部化思路）。
+  2. **只重定基水平方向（X / Z），Y 保持世界值** —— **实现细化，已回填 ADR 0025 决策四**：
+     ① 垂直范围仅 0~512 格，`float32` 足够；② **高度场采样是绝对高度**（刚体 y 恒为 0），对 Y 偏移会把绝对高度采样整体平移、**改变地形形状**。
+     故 `SetWorldOrigin` 忽略 `origin.y`。
+  3. **默认原点 ⇒ 与引入前逐位等价**：所有换算在原点为 `(0,0,0)` 时是恒等，保证既有 385 项测试**一项不改**全绿。
+- 验证（命令 + 真实结果）：
+  1. **构建**（VS DevShell + `VCPKG_ROOT` 后 `cmake --build --preset debug`）：退出码 **0**、13 目标、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug -j 6` → **387/387 passed**（385 → 387，新增
+     `PhysicsBody.QuantizeHorizontalWorldOriginSnapsDownToGrid` 与 `PhysicsBody.SetWorldOriginKeepsWorldPositionsAndSimulationStable` 全绿）。
+  3. **门禁**：`check-banned-identifiers.ps1` → `scanned 143 file(s), 0 violation(s)` / `PASS`。
+- 下一步 / 遗留：
+  1. **W2（下一步）**：预制地图格式 + 离线烘焙工具（[ADR 0026](adr/0026-premade-map-format-and-bake-tool.md)）——
+     先落 `world/premade/` 读取器骨架（分块 / 索引 / `schema_version` / 随机访问）。
+  2. **W1 的 60 s 长稳实测**（10km 处）挂在 W7 大世界场景上回填；当前由单测的"重定基前后世界位置逐值不变 + 之后照常落地"覆盖。
+  3. **本批（W0 文档 + W1 代码）尚未提交**。
+
+## 2026-10-05  W2-S1/S2 落地：**预制地图容器格式 + 离线烘焙库函数**（分块 / 索引 / zstd / 随机访问）
+
+- 背景：`docs/plans/v0.4.md` 的 W2；决策 = [ADR 0026](adr/0026-premade-map-format-and-bake-tool.md)
+  （分块 + 索引 + zstd + `schema_version` + 按块随机访问；烘焙确定性且与运行时同源）。
+- 做了什么：
+  1. **依赖**：`vcpkg.json` 增 **`zstd`**（实测 **1.5.7**）；`NOTICE.md` 台账更新；`world/CMakeLists.txt` 接入
+     （`find_package(zstd CONFIG REQUIRED)` + `zstd::libzstd`，**PRIVATE**）。
+  2. **容器与读写器**（**新增** `world/premade/premade_map.{hpp,cpp}`）：
+     - 文件布局 = 魔数 `"VXPREMAP"` + `u32 schema_version` + 世界范围（tile 半径）+ 种子 + 定长索引 +
+       **逐块 zstd** 数据段；整数一律**小端**（跨平台确定性）。
+     - `PremadeChunkKind` / `PremadeChunkKey`（类型 + 三维块坐标）；`operator<` 钉死写盘顺序。
+     - `PremadeMapWriter`：`SetChunk`（**空块即抛**）→ `WriteToFile`（按 key 升序 + 逐块压缩 ⇒ **逐字节可复现**）。
+     - `PremadeMapReader`：`Open` 校验魔数 / `schema_version` / 索引范围 / 重复键（**非法即抛**），索引常驻 ⇒
+       `ReadChunk` **按索引 seek 只读该块**（O(log n) 查找）。zstd 只在 `.cpp` 内出现（公共头不泄漏）。
+  3. **烘焙库函数**（**新增** `world/premade/premade_bake.{hpp,cpp}`）：
+     `SerializeMacroHeightTile` / `DeserializeMacroHeightTile`（65×65 `int16` 小端）+ `BakeMacroHeightTilesIntoPremadeMap`
+     —— 直接调用运行时的 `GenerateTerrainTile` + `ApplyMapEditsToTile` ⇒ **预制数据与运行时生成同源**（红线 7）。
+  4. **单测 9 项**（`tests/premade_map_test.cpp`）：往返逐位一致 / 随机访问与缺失抛错 / 写盘确定性 /
+     `schema_version` 拒绝 / 魔数拒绝 / 缺失文件拒绝 / 空块拒绝 / 烘焙确定性 / **预制高度与运行时生成逐位一致**。
+- 为什么：
+  1. 流式加载（[ADR 0024](adr/0024-terrain-streaming-and-lod.md)）要求"**只读窗口那一块**" ⇒ 地图数据必须**分块 + 可随机访问**，
+     整份 blob 无法做到（ADR 0026 的核心判断）。
+  2. 烘焙必须**复用运行时生成**而不是另写一套，否则预制世界与"同种子随机世界"会漂移；单测用"逐位一致"把这条钉死。
+  3. **确定性优先**：块按 key 升序 + 固定压缩级别 + 小端 ⇒ 同一输入两次产物逐字节相同（单测覆盖）。
+- 验证（命令 + 真实结果）：
+  1. **configure**：`cmake --preset debug` → vcpkg `zstd:x64-windows@1.5.7` 安装成功（`All requested installations completed in: 14 s`）。
+  2. **构建**：`cmake --build --preset debug` → 退出码 **0**、**零警告**（`/W4 /WX`）。
+  3. **测试**：`ctest --preset debug -j 6` → **396/396 passed**（387 → 396，新增 9 项 `PremadeMap.*` 全绿）。
+  4. **门禁**：`check-banned-identifiers.ps1` → `scanned 148 file(s), 0 violation(s)` / `PASS`。
+- 下一步 / 遗留：
+  1. **W2-S2b（下一步）**：新建 `tools/baker/`（**构建目标**）+ 薄 CLI（读地图预设 TOML → 调烘焙库 → 写文件）；
+     需同时更新 `CMakeLists.txt`（挂子目录）与 `docs/file-index.md`（`tools/` 下首个进入构建的子目录）。
+  2. **仍缺（W4~W6）**：体积壳网格 / 水体的块类型与烘焙（本 ADR 的 `PremadeChunkKind` 已留扩展位）。
+  3. **预制数据的发行（脚本 / 校验和 / `.gitignore`）** 待 W2 实测体积后再定（plan §3 已登记）。
+  4. **本批（W0 + W1 + W2-S1/S2）尚未提交**。
+
+## 2026-10-05  W2-S2b 落地：**离线烘焙 CLI**（`voxel_bake`）+ 门禁覆盖补齐 `tools/`
+
+- 背景：`docs/plans/v0.4.md` 的 W2-S2b（W2 的收尾步骤）。
+- 做了什么：
+  1. **新增 `tools/baker/`（构建目标）**：`CMakeLists.txt`（`add_executable(voxel_bake ...)`，链 `voxel_world`）
+     + `main.cpp`：`voxel_bake <地图预设 .toml> <输出的预制地图文件>`。
+     - 命令行经 `CommandLineArgumentsUtf8` 取回（Windows 中文路径不丢字）；自动创建输出目录；
+       `MapPreset::LoadFromFile` / 烘焙 / 写盘的异常统一捕获 ⇒ **错误即非零退出**（无参 `2`、失败 `1`）。
+     - 日志走统一 `VX_LOG_*`（不散落 `std::cout` / `printf`）。
+  2. **接入构建**：根 `CMakeLists.txt` 增 `add_subdirectory(tools/baker)`（在 `game` 之后；不进游戏产物）。
+  3. **门禁覆盖补齐（顺带修一个真实缺口）**：`tools/` 下**首次出现 C++**，而 `check-banned-identifiers.ps1`
+     的默认 `IncludeDir` 不含 `tools` ⇒ 新工具**不受门禁覆盖**。已把 `tools` 纳入默认扫描目录
+     （并修正其过期的帮助文本：原文写的是 "voxel"、实际是 "world"）。
+  4. **文档**：`docs/file-index.md`（`tools/` 行 + 移除"规划中"的 `tools/baker/`）、`docs/engine-capabilities.md`、
+     `docs/plans/v0.4.md`（W2 标为已完成）、本文件。
+- 为什么：
+  1. W2 的验收要求"**工具**对同一输入逐位可复现" ⇒ 只做完库函数还不闭环，CLI 是"工具"的落点。
+  2. 门禁覆盖必须与"新增进入构建的目录"同步 —— 否则质量门禁在 `tools/` 上留下盲区（`tools` 此前只有 `.ps1`，
+     本就不在扫描扩展名内，所以这是**新引入的**缺口，不能留）。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`cmake --preset debug` + `cmake --build --preset debug` → 退出码 **0**、**零警告**（`/W4 /WX`），
+     产出 `build/debug/bin/voxel_bake.exe`。
+  2. **烘焙 + 确定性**：对 `assets/maps/test_range.toml`（289 tile、20 条编辑）跑两次 ⇒
+     两次均 `289 个块`、**1,806,526 字节**（原始 289×8450 = 2,441,050 ⇒ zstd 约省 26%）；
+     两次产物 **SHA-256 相同** = `E80A353E984CD1D8308D2D85ED3D773F309EE1C58B7C26123480CB9F0F3D9560`。
+  3. **错误路径**：无参数 ⇒ `[ERROR] 用法：…` + `exit=2`；地图文件不存在 ⇒ `烘焙失败：无法加载地图预设 …` + `exit=1`。
+  4. **回归**：`ctest --preset debug -j 6` → **396/396 passed**；门禁 `-SelfTest` 18 项通过、
+     `-RepoRoot .` → `scanned 149 file(s), 0 violation(s)` / `PASS`（148 → 149，`tools/baker/main.cpp` 已纳入）。
+- 下一步 / 遗留：
+  1. **W3（下一步）**：地貌分区生成（山川 / 平原 / 丘陵）。
+  2. **预制数据的发行（脚本 / 校验和 / `.gitignore` 排除）** 仍待定（plan §3 已登记；本次产物写在 `build/premade/`，
+     不污染仓库）。
+  3. **本批（W0 + W1 + W2）尚未提交**。
+
+## 2026-10-05  W3 落地：**地貌分区（山川 / 平原 / 丘陵）** + 生成参数外提为配置
+
+- 背景：`docs/plans/v0.4.md` §1.2（W3 施工细则）；决策与验收判据见该节（**无 ADR**：属既有"生成参数全部来自 TOML"
+  决策（方案 §3.1 / ADR 0005）的落地，未引入新选型）。
+- 做了什么：
+  1. **参数外提（S1）**：新增 `world/generation/terrain_params.{hpp,cpp}` —— `TerrainGenerationParams`（三层噪声数值 +
+     地貌段）+ `TerrainLandformParams` + `LoadFromFile`（toml++，**缺失 / 非法即抛**）。
+     **`Default()` 的数值 == 历史常量、且 `landform.enabled = false`** ⇒ 既有调用方与既有世界**逐位不变**。
+  2. **生成器接入（S2）**：`TerrainNoiseGenerator(seed, params)`；`HeightUnits` 增加**低频地貌掩罩**分支
+     （`mask ∈ [0,1]` → 幅度倍数 + 基线平移，段间 smoothstep 过渡）；**关闭时保留原表达式、不走调制路径**
+     （保证逐位一致）。同时暴露纯函数 `LandformMaskAt`（供内容放置与统计验收）。
+  3. **配置与接线（S3）**：新增 **`assets/config/terrain.toml`**（**启用**地貌分区）；`game/main.cpp` 加载并传给
+     `TerrainWorld`（`TerrainWorld(seed, materials, params = Default())`）；`premade_bake` 增 params 形参、
+     `tools/baker` 增地形参数参数 ⇒ **游戏世界与预制地图同源**（同一份 terrain.toml）。
+  4. **验收与文档（S4）**：新增 `tests/landform_test.cpp` **6 项**；同步 `file-index` / `engine-capabilities` / `plans` / 本文件。
+- 为什么：
+  1. 需求"山川 / 平原 / 丘陵"= 地形**幅度与基线**随大区域变化 ⇒ 标准做法是加一层**低频掩罩**分档调制
+     （UE5 Landscape 分层 / Wildlands 程序化地貌分区 / Terragen 的 landform mask）。
+  2. **默认关闭**是关键取舍：`TerrainWorld` 被大量**非世界生成的测试**复用（物理 / 挖掘 / 常驻），
+     把它们的高度一并改掉会引入无关回归 ⇒ 让地貌成为**配置启用**的行为，而不是改默认。
+  3. 游戏与烘焙**同源加载同一份配置**：否则"预制地图"与"同种子世界"会不一致（红线 7 的工程口径）。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`cmake --preset debug` + `cmake --build --preset debug` → 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug -j 6` → **402/402 passed**（396 → 402，新增 6 项 `Landform.*` 全绿，
+     含"三类面积占比非空 + 平均高度/坡度 平原 < 丘陵 < 山川"的统计判据）。
+  3. **门禁**：`check-banned-identifiers.ps1` → `scanned 152 file(s), 0 violation(s)` / `PASS`（149 → 152）。
+  4. **端到端烘焙**（新 3 参数形式）：`voxel_bake assets/config/terrain.toml assets/maps/test_range.toml ...` ⇒
+     日志 `地貌分区 **启用**`、289 个块、**1,640,326 字节**（启用后地形更平缓 ⇒ 比未启用的 1,806,526 更易压缩）；
+     两次运行 **SHA-256 相同** = `B2E5509FA4D839B4DD053A0210AE438DAA1B5CDFF64DED8D95A90D22A28EB0E4`；
+     参数不足 ⇒ `[ERROR] 用法：…` + `exit=2`。
+- 下一步 / 遗留：
+  1. **W4（下一步）**：地表体积壳（只读、含悬垂）—— 新增 `world/shell/`。
+  2. **登记取舍**：地貌掩罩为**单通道低频**（不含域扭曲）；更自然的边界留待追加（plan §1.2 已登记）。
+  3. **本批（W0 + W1 + W2 + W3）尚未提交**。
+
+---
+
+## 2026-10-05  W4 落地：**地表体积壳（只读、含悬垂）** —— 世界表示 v2 的层②（近场有界区域）
+
+- 背景：`docs/plans/v0.4.md` §1.3（W4 施工细则）；决策 [ADR 0023](../docs/adr/0023-world-representation-v2-hybrid-shell.md)
+  （世界表示 v2：宏高度场 + 预烘焙只读地表体积壳），接管口径沿用 [ADR 0011](../docs/adr/0011-layer-transition-volume-takeover.md) / [0012](../docs/adr/0012-collision-takeover-by-volumes.md)。
+- 做了什么：
+  1. **表示与网格（S1）**：`TerrainGenerationParams` 增 `[overhang]`（3D 噪声频率 / 幅度 / 通道），
+     `TerrainNoiseGenerator::OverhangAt(x,y,z)`；**新增** `world/shell/surface_shell.{hpp,cpp}` ——
+     `SurfaceShellRegion` / `SurfaceShellParams` / `SurfaceShellSampler`（`IVolumeSampler`）/ `BuildShellBlockMesh`。
+     密度 = `(y − 宏地表高度) + 悬垂 3D 噪声 × 幅度 × 边界淡出`，**不取整**（保留浮点值），复用**与可挖体积同一套** Surface Nets。
+  2. **渲染 + 碰撞接管（S2）**：`game/main.cpp` 新增 `ShellQuadFilter` + `CompositeQuadFilter`（resident ∪ shell 跳过壳区域地表四边形）
+     ⇒ 该区域 tile 网格变空 ⇒ 既有"空网格 ⇒ 交出高度场碰撞"路径**自动**生效；加载阶段逐块网格化，
+     **同一份 `MeshData`** 同时用于 `MeshRenderer::UploadMesh`（渲染）与 `PhysicsWorld::AddMesh`（Jolt `MeshShape` 碰撞）；
+     加入每帧绘制列表 + 视锥剔除。近场区域 = tile `[3,5]²`（世界列 `[192, 384)²`），**与可挖区域 `[-64,160)` 不重叠**。
+  3. **验收与文档（S3）**：新增 `tests/surface_shell_test.cpp` **5 项**；同步 `file-index` / `engine-capabilities` / `plans` / `adr/README` / 本文件。
+- 为什么：
+  1. "真三维洞穴 + 悬垂"要求近场**不再是高度场**，而是**真三维等值面** ⇒ 用贴着地表的**有界 SDF 体积壳**
+     （Astroneer / No Man's Sky 的近场 SDF 地表口径）；远场仍为宏高度场 LOD（W7 分环）。
+  2. **不新增接管逻辑**：地表壳与可挖体积走**同一套** ADR 0011/0012 路径 ⇒ "谁画谁挡"由既有代码保证（零分叉）。
+  3. **两块区域不重叠**是刻意的：避免"resident 接管"与"shell 接管"在同一 tile 上打架（登记为取舍）。
+  4. **悬垂为程序化噪声**形态（非手工造型）：满足"真三维"的表示与验收，精细造型属内容（W5+）。
+- **判据②口径修正（所有者 2026-10-05 裁定）**：原写"外观网格**水密**（`CountBoundaryEdges == 0`）"**对地表壳不可达**
+  —— 地表壳是**贴着地形、必然穿出任何有限区域的**开曲面，`== 0` 只在**闭合体**上成立。修正为 **「无裂缝 + 内部无孔」**：
+  以**跨块共享面顶点逐位相同**（无裂缝）+ **退化三角形 = 0** 验证；`CountBoundaryEdges == 0` 留作 W5 洞穴 / 有界闭合体的判据。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`cmake --preset debug` + `cmake --build --preset debug` → 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug -j 6` → **407/407 passed**（402 → 407，新增 5 项 `SurfaceShell.*` 全绿：
+     悬垂折叠 / 无悬垂时贴合宏高度 / 跨块共享面采样逐位一致 / 相邻块三角形守恒且无退化 / 确定性）。
+  3. **门禁**：`check-banned-identifiers.ps1` → `scanned 155 file(s), 0 violation(s)` / `PASS`（152 → 155）。
+  4. **运行冒烟**（`build\w4_smoke.log`）：日志确认"地表壳（W4 / ADR 0023）：区域列 `[192, 384)²`，待建 **110** 个块"、
+     "**54/110** 个块有等值面；网格已作为**三角网静态碰撞体**登记（与渲染同源）"、
+     "**13/289** 个 tile 的可见面已全由体积绘制（其高度场碰撞体已交出）"、
+     "首帧视锥剔除（T39）：地表 tile 106/289、可挖体积块 88/441、地表壳块 54/110 通过"。
+- 关键踩坑（已修复）：**密度取整导致退化三角形**。首版 `Sample` 对密度做 `std::lround`，
+  使相邻 cell 的棱交点**精确重合** ⇒ 单块出现 6 个退化三角形（测试 `AdjacentBlockMeshesTileTheRegionWithoutDuplicationOrLoss` 报 `CountDegenerateTriangles = 6`）。
+  修复 = **去掉取整、保留浮点值**（同时把 `kShellDensityUnitsPerBlock` 由 127 降到 32 减少饱和）⇒ 5 项全绿。
+- 下一步 / 遗留：
+  1. **W5（下一步）**：洞穴网络 + 悬垂内容 —— 在 `world/shell/` 的 SDF 上叠加**洞穴网络**（3D 噪声 / 连通域雕刻），
+     验收 = 洞口可进入且能在其中行走（碰撞）、与地表入口连通、确定性。
+  2. **登记取舍**：W4 只在**近场有界区域**铺开（全图铺开 + 流式属 W7，**不是降级**）；悬垂为**程序化噪声**形态（非手工造型）。
+  3. **本批（W0 + W1 + W2 + W3 + W4）尚未提交**。
+
+---
+
+## 2026-10-06  W4b：**屏幕左上角常驻坐标 HUD**（只读、不接管输入）
+
+- 背景：所有者要求"将地图左上角显示当前坐标"；`docs/plans/v0.4.md` §1.4（W4b 施工细则）。
+- 做了什么：
+  1. `game/ui_text.hpp` 新增 3 条标签（`HudCoordinates` / `HudCoordinatesFormat` / `HudCellFormat`），**经标签缝**取值。
+  2. `game/debug_overlay.*` 新增 `DebugOverlay::BuildHud` —— 左上角 **(8,8)** 常驻窗口，
+     `ImGuiWindowFlags_NoInputs`（**不接管鼠标 / 键盘**）、`NoTitleBar`/`NoMove`/`NoResize`/`NoSavedSettings`/`AlwaysAutoResize`；
+     显示世界坐标 `X/Y/Z`（1 位小数）+ 所在整数格。`BeginFrame` 的 `m_frameActive` 纳入 `m_hudVisible`。
+  3. F1 调试面板**初始位置自动排到 HUD 下方**（用上一帧实测的 HUD 高度，首帧用下界兜底），避免左上角重叠。
+- 为什么：
+  1. F1 面板**已有**位置行，但需要按键才能看到；10km 世界下需要**随时**知道坐标（导航 / 汇报位置 / 复现问题）⇒
+     按业界标准（Minecraft `F3` 坐标、Valheim 调试 HUD、UE5 `Stat` HUD）做成**常驻只读读数**。
+  2. **只读 + `NoInputs`**：不改变玩法输入，也不违反"面板打开才释放鼠标"的既有约定（相对鼠标模式下 ImGui 已置 `NoMouse`）。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`cmake --build --preset debug` → 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug -j 6` → **413/413 passed**（含 `ui_text` 全标签 ASCII / 表长一致 / 反绕缝扫描）。
+  3. **门禁**：`check-banned-identifiers.ps1` → `scanned 156 file(s), 0 violation(s)` / `PASS`。
+  4. **运行冒烟**（`build\w5_smoke.log`）：启动进入主循环、无 ERROR / 断言；HUD 走与 F1 面板相同的 `DebugStats`。
+- 下一步 / 遗留：
+  1. **待人工目视确认**：进游戏后**左上角常驻**可见 `X/Y/Z` 与所在格；按 F1 时面板出现在 HUD **下方**、不重叠。
+  2. **登记取舍**：HUD **不提供开关**（如需隐藏可后续再加，属可选增强）。
+
+---
+
+## 2026-10-06  W5 落地：**洞穴网络（真三维隧道）+ 与地表连通**（地表体积壳层②）
+
+- 背景：`docs/plans/v0.4.md` §1.5（W5 施工细则）；决策 [ADR 0023](../docs/adr/0023-world-representation-v2-hybrid-shell.md)
+  （层② 地表体积壳）。
+- 做了什么：
+  1. **S1 参数与噪声**：`world/generation/terrain_params.{hpp,cpp}` 新增 `TerrainCaveParams`（`[caves]`：`enabled` /
+     `frequency` / `tunnel_radius` / `carve_strength_blocks` / `depth_fade_blocks` / `seed_channel`，**必填 + 非法即抛**）；
+     `terrain_noise.*` 新增 `TerrainNoiseGenerator::CaveCarveAt(x,y,z)` —— 两条**互不相关**的 3D 噪声 `a`、`b`
+     （第二条把种子过一遍 `SplitMix64` 再派生 ⇒ 只占一个通道号），在 `sqrt(a²+b²) < tunnelRadius` 处返回
+     雕刻量（格，`0 ~ carveStrengthBlocks`）。
+  2. **S2 壳接入**：`world/shell/surface_shell.cpp` 的密度 = `(signedDistance + overhang + carve) × 单位`，
+     `carve` 按**边界淡出**（与悬垂同源 ⇒ 区域边界不出现半截洞口）与**深度淡出**（壳底附近衰减到 0 ⇒ 隧道不穿出壳的可视边界）。
+     **`caves.enabled == false` ⇒ `CaveCarveAt` 恒 0 ⇒ 与 W4 逐位一致**（既有 5 项 `SurfaceShell.*` 未改）。
+  3. **S3 验收与文档**：新增 `tests/cave_test.cpp` **6 项**；`assets/config/terrain.toml` 增 `[caves]`（启用）；
+     `game/main.cpp` 启动日志打印洞穴参数。
+- 为什么：
+  1. 需求"真三维洞穴"要求地表壳不只是"折叠的薄壳"，而是**隧道网络** ⇒ 采业界标准 **Minecraft *spaghetti carver***：
+     `a=0` / `b=0` 各是一张曲面，两曲面**交线**是一条曲线，加粗成管 ⇒ 连续、分叉、四通八达的隧道网
+     （对照 Deep Rock Galactic 的程序化洞穴网络、UE5 的 3D 噪声体积雕刻）。
+  2. **`carve_strength_blocks` 是"最大雕刻量"**：只有它超过"该点到地表的深度"时才真正挖空 ⇒ 越深越难成洞、
+     隧道**自然收敛**，不会把整块壳挖穿（深度淡出进一步保证壳底边界完整）。
+  3. **不新增接管逻辑**：洞穴随壳**同一份 `MeshData`** 渲染 + 生成 `Jolt MeshShape` ⇒ "洞口可进入"由 W4 已落地的路径
+     **自动满足**（真实世界一致性：洞是通道，进得去、站得住）。
+- **世界内一致性**：真实世界 —— 洞 = 通道，碰撞由壳网格承担（已满足）；修仙世界 —— 洞穴属**自然地貌**
+  （所有者裁定"仿照现实世界的水和洞窟做即可"）⇒ **不引入新的世界观问题**，未新增设定。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`cmake --build --preset debug` → 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug -j 6` → **413/413 passed**（407 → 413，新增 6 项 `Caves.*`：
+     地下空气出现 / **地表—地下体素洪泛连通** / 关闭时雕刻恒 0 且网格确定 / 无退化三角形与共享面一致 /
+     发布配置启用 / 非法隧道半径即抛）。
+  3. **门禁**：`check-banned-identifiers.ps1` → `scanned 156 file(s), 0 violation(s)` / `PASS`（155 → 156）。
+  4. **运行冒烟**（`build\w5_smoke.log`）：启动日志 `洞穴网络（W5 地表壳）：**启用**（频率 0.0200；隧道半径 0.32；最大雕刻 22.0 格）`；
+     `地表壳（W4 / ADR 0023）：区域列 [192, 384)²，待建 110 个块` ⇒ **65/110 个块有等值面**（W4 为 **54** ⇒
+     洞穴额外产生 **11** 块等值面）；`地表壳网格已上传：65/110 个块（与碰撞体同一份数据）`；无 ERROR / 断言。
+- 下一步 / 遗留：
+  1. **W6（下一步）**：河流 + 水体（[ADR 0027](../docs/adr/0027-water-representation.md)）。
+  2. **待人工目视确认**：飞至壳区域（世界列 `[192, 384)²`，中心 ≈ (288, 288)）查看**洞口可进入**、洞内可站立行走；
+     左上角 HUD 可用于定位。
+  3. **登记取舍**：洞穴为**程序化噪声**形态（非手工造型）；范围 = 壳厚内（ADR 0023 已登记的"壳厚以外无悬垂 / 洞穴"）。
+  4. **本批（W0 + W1 + W2 + W3 + W4 + W4b + W5）尚未提交**。
+
+---
+
+## 2026-10-06  W6 落地：**河流 + 水体**（样条河道 + 静态水位 + flow 着色 + 河床随壳碰撞）
+
+- 背景：`docs/plans/v0.4.md` §1.6（W6 施工细则）；决策 [ADR 0027](../docs/adr/0027-water-representation.md)
+  （样条河 + 静态水位 + flow 着色；**不做**流体模拟 / 游泳 / 动态水位 / 潮汐 / 海）。
+- 做了什么：
+  1. **S1 河道与下切场**：**新增** `world/water/river.{hpp,cpp}` —— `GenerateRiverPath`（**多候选源点取最长**，
+     沿**最陡下降 + 确定性抖动**行进；**水位单调不升**；走出边界 / 自交即止）、`RiverCarveField`（区域上 1 格分辨率的
+     下切场 + 双线性查询，河岸线性衰减）、`BuildRiverWaterMesh`（沿路径的水面 ribbon）。
+  2. **S2 壳接入**：`SurfaceShellSampler` 的密度 = `(signedDistance + overhang + cave + riverCarve) × 单位`；
+     河道下切同样按**边界淡出**（区域边界不出现半截河岸）。**不传河道场 ⇒ 与 W5 逐位一致**（既有测试不改）。
+  3. **S3 水面渲染**：新增 `assets/shaders/water.frag`（按世界坐标 + 时间的**滚动波**扰法线 + 菲涅尔 + alpha 混合）；
+     `engine/render/mesh_renderer.*` 增**水面管线**（复用 `mesh.vert`、开 alpha 混合、关背面剔除 / 不写深度）与
+     **水面通道**（主通道**最后**绘制、**不投影阴影**），`UploadMesh(..., water)` + `SetWaterTime`。
+  4. **S4 验收与文档**：新增 `tests/river_test.cpp` **10 项**；`assets/config/terrain.toml` 增 `[river]`（启用）；
+     `game/main.cpp` 接线（生成 → 传入壳 → 上传水面 → 每帧推时间）。
+- 为什么：
+  1. 需求"河流 + 水体"按 ADR 0027 的**样条 + 静态水位 + flow 着色**落地（UE5 Water Body / Unity HDRP Water /
+     RDR2 flow map 的通行做法；三者均**不做**实时流体求解）。
+  2. **水位由河床反推**：`水位 = min(上游水位, 当地地表 − channel_depth + water_depth)`，**下切深度 = 地表 − 水位 + 水深**
+     ⇒ ① 水位沿程**单调不升**（水往低处流）；② 水位**不高于当地地表**（不漫岸）；③ 河床**恒在水位之下**（地形回升处河道更深，
+     形成峡谷）⇒ 三条自洽性**由构造保证**，不靠"看着像"。
+  3. **河道只刻进地表壳**（不写宏高度场）：近场区域**整块由壳绘制** ⇒ 与周围地表无接缝；河床碰撞随壳的三角网**自动承担**
+     （W4 路径，"谁画谁挡"零分叉）；全图铺开 + 流式属 W7（已登记）。
+  4. **水面是独立管线**：`water.frag` 的唯一 uniform 在**片元槽 0**（平时被材质占用）⇒ 水面在主通道**最后**单独绘制一遍，
+     用完即结束本通道；水面**不投影阴影**（阴影通道按 `waterPass=false` 自动跳过）。
+- 世界内一致性：真实世界 —— 水往低处流（水位单调不升）、水在低处（不高于当地地表）、河是通道（河床随壳提供碰撞，
+  角色可走进水道站在河床上；**不做**游泳，ADR 0027 已登记）；修仙世界 —— 水系属**自然地貌**，**不引入新的世界观问题**。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`cmake --build --preset debug` → 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug -j 6` → **423/423 passed**（413 → 423，新增 10 项 `River.*`）。
+  3. **门禁**：`check-banned-identifiers.ps1` → `scanned 159 file(s), 0 violation(s)` / `PASS`（156 → 159）。
+  4. **运行冒烟**（`build\w6_smoke.log`）：`河流（W6 / ADR 0027）：**启用**；河道 13 个节点（下切场 192×192 格；
+     中心下切 4.0 格、水深 2.0 格）`、`水面网格（W6 / ADR 0027）：24 个三角形（flow 滚动波 + 半透明；河床碰撞随地表壳承担）`；无 ERROR。
+- 关键踩坑（已修复）：
+  1. **河道原地打转**：首版把抖动的**结果**写回前进方向 ⇒ 在平地上方向累积旋转成螺旋（跑到 512 节点上限）。
+     修复 = 抖动只作用于**下坡方向**（`baseDir`），不写回。
+  2. **河道过短**：单一起点常贴在区域边界 ⇒ 刚生成就出界。修复 = **多候选源点**（离边界 ≥ 32 格、按高度取前 16）+ **取最长的一条**。
+  3. **水位落到河床之下**：地形回升时 `min(上游水位, 河床+水深)` 可能低于当地河床。修复 = 下切深度**由水位反推**
+     （地形回升 ⇒ 河道更深），使"水在河床之上"由构造保证。
+- 下一步 / 遗留：
+  1. **W7（下一步）**：流式加载 + LOD 分环（[ADR 0024](../docs/adr/0024-terrain-streaming-and-lod.md)）—— 把近场铺开到全图。
+  2. **待人工目视确认**：飞至壳区域（世界列 `[192, 384)²`，中心 ≈ (288, 288)）看**河道**与**流动水面**（HUD 可定位）。
+  3. **登记取舍**：河道只近场（全图属 W7）；无湖泊 / 海（无设定）；无水下后处理 / 泡沫 / 折射（表现阶段长尾）。
+  4. **本批（W0 + W1 + W2 + W3 + W4 + W4b + W5 + W6）尚未提交**。
+
+---
+
+## 2026-10-06  W6b 缺陷修复：**第三人称相机在狭小空间**（看穿洞顶 / 看到人物内部）
+
+- 背景：所有者实测报告"处于狭小空间时相机有时看到地图外、有时看到人物内部"；`docs/plans/v0.4.md` §1.7。
+- **缺陷判定（契约 + 机制，先判后修）**：
+  - **契约**（`references/gameplay-v0.1.md` §3）：第三人称相机**必须**具备避障（**不穿地形**）。
+  - **机制①（"看到地图外"）**：`ThirdPersonCamera::Evaluate` 的"不得埋在实心内"安全网只会**沿 +Y 向上顶**
+    （`eye.y += 0.25`，最多 16 格）。洞穴 / 水道里相机被身后岩壁挤进实心后，被**顶穿洞顶**、一路抬到地表之上
+    ⇒ 从"地图外 / 上方"看世界（既有测试只覆盖"洞内**无**遮挡"，有遮挡时即顶穿）。
+  - **机制②（"看到人物内部"）**：最小距离托底把相机压到 `kCameraMinDistance = 0.5` 格，而角色胶囊半径 0.3、
+    总高 1.8 ⇒ 相机**落进角色体内**，近裁剪面切开模型；当时**没有**"相机过近时隐藏 / 淡出主角"的机制。
+- 做了什么：
+  1. **`camera.{hpp,cpp}`**：安全网改为**两步** —— ① 首选**沿视线收缩悬臂**（`kSolidPullStepBlocks`，朝注视点收，
+     相机始终留在角色所在的空间）；② 收缩到最小距离仍为实心（整根悬臂都在实心里，如"仰视时悬臂扎进平坦地面"）
+     才回落为**向上顶出** + `groundClearance`。
+  2. **`CameraSettings::targetHideDistance`（默认 1.5 格）+ 纯函数 `ShouldHideFollowTarget`**：相机过近 ⇒ 判定隐藏主角。
+  3. **`game/main.cpp`**：据此**不提交**主角网格（隐藏）。
+  4. **回归测试 2 项**：`PullsCameraAlongTheBoomInsteadOfLiftingItThroughACeiling`（带洞顶的洞穴桩：相机必须停在洞内、
+     `eye.y < 洞顶`）、`HidesFollowTargetWhenTheCameraIsJammedClose`（窄隧道桩：过近 ⇒ 隐藏；开阔地 ⇒ 不隐藏）。
+- 为什么：
+  1. **业界口径**：**UE5 `USpringArmComponent`**（悬臂做碰撞、被挤近时隐藏 pawn）、**Unity Cinemachine `CinemachineCollider`**
+     （球投射 + 距离不足时淡出角色）——都是"沿悬臂收缩 + 过近时处理主角"，而不是"把相机向上顶"。
+  2. **收缩优于上顶**：注视点在角色头部（空气），沿视线收缩**一定能**回到空气，且相机不离开角色所在的空间
+     （洞 / 水道）；向上顶则是把相机**瞬移到另一个空间**（地表之上），必然穿帮。
+  3. **过近必须处理主角**：相机进到角色体内时无论怎么调几何都会看到模型内部 ⇒ 只能隐藏 / 淡出主角。
+- **降级确认（按 SKILL「降级必须先问」）**：过近处理在"**隐藏**"与"**淡出**"之间取舍 ——
+  **已由所有者 2026-10-06 选定"隐藏主角（推荐）"**（淡出需给蒙皮管线加 alpha 变体、并让 `mesh.frag` 拿到**逐网格 alpha**，
+  而片元 4 个 uniform 槽已用满、需重构统一块 ⇒ 改动面明显更大）。**备注**：若日后判定"极近距下主角突然消失"可见，
+  再补淡出（登记为遗留 + 切换条件）。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`cmake --build --preset debug` → 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug -j 6` → **425/425 passed**（423 → 425，新增 2 项）；既有 8 项 `ThirdPersonCamera.*`
+     全部不回归（最小距离托底 / 有限视图矩阵 / 洞内不被顶出 / 俯仰钳制 / 插值不回写 等）。
+  3. **门禁**：`check-banned-identifiers.ps1` → `scanned 159 file(s), 0 violation(s)` / `PASS`。
+  4. **运行冒烟**（`build\w6b_smoke.log`）：启动进入主循环、无 ERROR（狭小空间需人工进洞 / 进水道复验）。
+- 下一步 / 遗留：
+  1. **待人工目视确认**：走进**洞穴**（壳区域 `[192, 384)²`）与**水道**后 —— ① 相机**不再**跑到地表之上；② 相机被挤近时
+     主角**被隐藏**（不再看到人物内部）。
+  2. **登记取舍**：过近时是**隐藏**（非淡出）；`ITerrainQuery` 仍是**线段**查询（未加球投射半径）——
+     本次未发现因此穿帮，若日后出现"薄墙仍被看穿"再评估。
+  3. **本批（W0 + W1 + W2 + W3 + W4 + W4b + W5 + W6 + W6b）尚未提交**。
+
+---
+
+## 2026-10-06  W6c 缺陷修复：**窄处相机不得切为俯视**（删除"向上顶"兜底）
+
+- 背景：所有者在 W6b 修复后实测报告"当前进入狭窄地方会锁定镜头为俯视"，并追问"这个合理吗，业界规范怎么做的"；
+  `docs/plans/v0.4.md` §1.8（W6c 施工细则）。
+- 缺陷判定（契约 + 机制）：
+  1. **契约**：第三人称相机**只应沿悬臂（注视点 → 相机）收缩拉近**，朝向始终由玩家的 yaw / pitch 决定，
+     **不得因避障改变视线方向**（`references/gameplay-v0.1.md` §3）。
+  2. **机制**（W6b 的残留）：窄缝里"头后 < 0.5 格即岩壁"时 —— ① `QueryObstruction` 首个采样点（步长 0.5）已被挡
+     ⇒ `safeT = 0` ⇒ `distance = 0`，被最小距离托底抬到 `kCameraMinDistance = 0.5`；② 该点**仍在岩壁内**（`IsSolid` 为真），
+     而收缩循环要求 `distance > 0.5` 才继续收 ⇒ **卡死**；③ 落到 W6b 保留的兜底"**向上顶**" ⇒ 相机被抬到注视点**正上方**
+     ⇒ 视线变为**垂直向下（俯视）**，且每帧重复 ⇒"锁定俯视"。
+- 做了什么：
+  1. **删除"改变朝向"的兜底**：`engine/render/camera.cpp` 去掉 `kSolidLiftStepBlocks` / `kMaxSolidLiftSteps` 与
+     `IsSolid(eye)` 仍为真时的**沿 +Y 顶出**整块；安全网只剩"**沿视线朝注视点收缩悬臂**" ⇒ 相机**只许停在悬臂线上**。
+  2. **`kCameraMinDistance` 0.5 → 0.2**：对齐 Unity Cinemachine `CinemachineCollider::MinimumDistanceFromTarget` 默认值，
+     使相机能收到**比身后岩壁更近**（旧值 0.5 与首采样步长相等 ⇒ 收缩循环无法再收，正是卡死的直接原因）。
+  3. **删除 `CameraSettings::groundClearance`**（其唯一用途就是给"向上顶"留间隙）；`engine/render/camera.hpp` 同步。
+  4. **测试改写**：新增 `ThirdPersonCamera.KeepsTheCameraOnTheBoomLineInATightPocket`（**朝向不变**成为可判定不变量：
+     `normalize(eye − target)` 必须与 `backward` 平行同向，且**不得**变垂直俯视）；把 W6b 依赖"向上顶"的
+     `NeverDropsBelowGroundClearance` 改写为 `PullsTheCameraOntoTheGroundAlongTheBoomWhenLookingUp`
+     （向上看扎地时**沿悬臂拉近到地面之上**）；余下两处 `groundClearance` 赋值删除。
+- 为什么：
+  1. **业界口径**：**UE5 `USpringArmComponent`** 用 sphere sweep **缩短 arm**（**无上抬**）、**Unity Cinemachine
+     `CinemachineCollider`** 是 `PullCameraForward` + `MinimumDistanceFromTarget`（默认 0.2）——都是"只沿悬臂收缩、
+     绝不动朝向"，没有"把相机抬到注视点上方"这一步。
+  2. **"向上顶"必然改变朝向**：注视点在角色头部，向上顶后相机落在注视点正上方 ⇒ 视线垂直向下；在洞顶处则穿越洞顶
+     ⇒ 从地图外看世界。两种情况都是**把相机瞬移到另一个空间**，与"避障只应把相机拉近"矛盾。
+  3. **收缩一定可行**：注视点在空气里，沿悬臂收缩到足够近时 `eye` 必然回到空气 ⇒ 不需要任何"改变朝向"的兜底。
+- 降级确认（按 SKILL「降级必须先问」）：**无降级** —— 被删除的"向上顶"与 `groundClearance` 正是缺陷本身；
+  `kCameraMinDistance` 降到 0.2 是**恢复**业界默认口径。`ITerrainQuery` 仍为**线段**查询（未加球投射半径），
+  本次未发现因此穿帮，登记为遗留。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`cmake --build --preset debug` → 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug -j 6` → **426/426 passed**（425 → 426，新增 1 项；W6b 的"顶穿洞顶"用例改写为
+     "沿悬臂收缩"口径）；全部 `ThirdPersonCamera.*` 不回归。
+  3. **门禁**：`check-banned-identifiers.ps1` → `scanned 159 file(s), 0 violation(s)` / `PASS`。
+  4. **运行冒烟**（`build\w6c_smoke.log` / `.err.log`）：58 行启动日志、进入主循环、**无 ERROR / WARN**、`stderr` 为空。
+- 下一步 / 遗留：
+  1. **待人工目视确认**：走进**洞穴**（壳区域 `[192, 384)²`）与**水道**后，镜头**不再**锁定为俯视（可自由环视）。
+  2. **登记取舍**：`ITerrainQuery` 仍是**线段**查询（未加球投射半径）；过近时仍为**隐藏**主角（非淡出）。
+  3. **本批（W0 + W1 + W2 + W3 + W4 + W4b + W5 + W6 + W6b + W6c）尚未提交**。
+
+---
+
+## 2026-10-06  W6d 变更：**取消"相机过近时隐藏主角"**（能力代码保留）
+
+- 背景：所有者裁定 ——"**取消镜头拉近时隐藏角色的设置，不删除相关能力代码**"；`docs/plans/v0.4.md` §1.9（W6d 施工细则）。
+- 做了什么：
+  1. **关闭该行为**：`game/main.cpp` 的相机设置置 `CameraSettings::targetHideDistance = 0.0F`
+     （`0` = 关闭判据：`view.distance < 0` 恒 false，而 `view.distance` 恒 `>= kCameraMinDistance = 0.2`）⇒ 主角**恒可见**。
+  2. **保留能力代码**：`CameraSettings::targetHideDistance` 字段、纯函数 `ShouldHideFollowTarget`、
+     `main.cpp` 中的调用点、以及单测 `ThirdPersonCamera.HidesFollowTargetWhenTheCameraIsJammedClose` **一律不删除**。
+  3. `camera.hpp` 的字段注释补上 **`0 = 关闭（永不隐藏）`** 与**重新启用方式**（改回 `1.5`）。
+- 为什么：
+  1. **需求**：所有者不再希望在相机被挤近时主角突然消失（"镜头拉近时隐藏角色"要被取消）。
+  2. **保留能力的价值**：判据是纯函数、由**一个设置**驱动 ⇒ 关闭与重新启用都只改一个值，无需改任何逻辑代码。
+- **已知后果（随显式请求一并成立）**：极近距（悬臂收缩到 `kCameraMinDistance = 0.2`）时**近裁剪面会切开角色模型**
+  ⇒ 玩家可能重新看到"人物内部"（W6b 的机制②）。若要恢复该保护，把 `targetHideDistance` 改回 `1.5`（默认值）即可。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`cmake --build --preset debug` → 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug -j 6` → **426/426 passed**（能力代码与其单测保留 ⇒ 用例数不变）。
+  3. **门禁**：`check-banned-identifiers.ps1` → `scanned 159 file(s), 0 violation(s)` / `PASS`。
+  4. **运行冒烟**（`build\w6d_smoke.log` / `.err.log`）：启动进入主循环、**无 ERROR / WARN**、`stderr` 为空。
+- 下一步 / 遗留：
+  1. **待人工目视确认**：走进洞穴 / 水道，镜头拉近时主角**不再消失**（同伴随"极近距可能看到人物内部"的已知后果）。
+  2. **重新启用开关**：`game/main.cpp` 的 `settings.targetHideDistance = 0.0F` → `1.5F`。
+  3. **本批（W0 + W1 + W2 + W3 + W4 + W4b + W5 + W6 + W6b + W6c + W6d）尚未提交**。
+
+---
+
+## 2026-10-06  W6e / W6f / W6g 落地：**窄处镜头与角色显示三件套**（淡出主角 / 球投射探针 / 肩位偏移）
+
+- 背景：所有者问"业界如何应对狭窄空间的镜头和角色显示"，评审业界做法（UE5 `USpringArmComponent`、Unity Cinemachine
+  `CinemachineDeoccluder`、TPS 贴脸 dither 淡出主角、肩位偏移）后**多选全中**三项；`docs/plans/v0.4.md` §1.10。
+- 做了什么：
+  1. **W6e 淡出主角（dither）**：`MeshTransformUniform` 增 `vec4 meshParams`（`x` = 逐网格不透明度；推送 64 → **80 字节**，
+     去重键含该值）；4 个顶点着色器（`mesh` / `mesh_skinned` / `shadow` / `shadow_skinned`）同步块布局；`mesh*.vert` 经
+     `v_fade` 传值；`mesh.frag` 按 **4×4 Bayer 抖动 `discard`** 淡出（**不引入 alpha 混合** ⇒ 保持不透明管线与深度写入）；
+     新增 `MeshRenderer::SetMeshOpacity` 与纯函数 `FollowTargetFadeOpacity`；`main.cpp` 每帧据 `view.distance` 设角色不透明度。
+  2. **W6f 球投射探针**：`ITerrainQuery` 增 `QueryObstructionWithRadius`（**带默认实现** ⇒ 默认退回线段，既有实现/桩不受影响）；
+     `GameCameraQuery` 覆盖为**半径感知步进**（每步查**中心 + 垂直于轴的 4 个环点**，任一实心即视为遮挡）；
+     `CameraSettings::cameraProbeRadius = 0.25`，`Evaluate` 改走带半径查询。
+  3. **W6g 肩位偏移**：`CameraSettings::shoulderOffset`；`PivotAt` 把注视点沿**相机右方** `(cos yaw, 0, −sin yaw)` 平移；
+     `main.cpp` 取 `0.6` 格。**只平移注视点，不改变朝向**。
+- 为什么：
+  1. **W6d 关闭"隐藏"后留下的"看到人物内部"**：业界标准解不是"硬隐藏"（有 pop 感）而是**淡出**；用 **dither discard**
+     实现可保持在**不透明管线**内（写深度、无排序），与 UE "Fade Anything" / RE 系同形态。
+  2. **单线段遮挡会漏检薄墙**：Cinematic/UE 都用**带体积**的探针（`CameraRadius` / probe 扫描）；本仓库用"步进 + 4 环点"
+     复用既有 `IsSolid` 点查询，**不新增世界层接口**且确定（固定步长 / 固定环方向，红线 7）。
+  3. **肩位偏移**把角色移出画面中心，半封闭空间不必把悬臂塌到角色身上（TPS 通行做法）。
+- 验收（可判定）：① `FollowTargetFadeOpacity` 开阔处 = 1、极近处 = 0 且单调；② 相机确实走**带半径**查询（半径 0 退回线段）；
+  ③ 肩位偏移后 `view.target` 沿相机右方平移该值，且 `normalize(eye − target)` **仍 = 悬臂方向**。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`cmake --build --preset debug` → 退出码 **0**、**零警告**（`/W4 /WX`）；着色器（SPIR-V + DXIL）双格式编过。
+  2. **测试**：`ctest --preset debug -j 6` → **429/429 passed**（426 → 429，新增 3 项：`FadeOpacityDropsMonotonicallyWithCameraDistance` /
+     `UsesRadiusAwareObstructionWhenProbeRadiusIsSet` / `ShoulderOffsetShiftsThePivotWithoutChangingFacing`）；既有相机用例不回归。
+  3. **门禁**：`check-banned-identifiers.ps1` → `scanned 159 file(s), 0 violation(s)` / `PASS`。
+  4. **运行冒烟**（`build\w6efg_smoke.log` / `.err.log`）：58 行、进入主循环、**无 ERROR / WARN**、`stderr` 为空；
+     首帧提交 261 个网格 ⇒ **图形管线（含加宽后的顶点 uniform 块）创建成功**（否则会在管线创建时报错）。
+- 下一步 / 遗留：
+  1. **待人工目视确认**：走近窄处 / 洞穴 / 水道 —— ① 主角**平滑淡出**而非消失或穿模；② 贴墙时镜头**不穿薄墙**；③ 角色偏出画面中心（肩位）。
+  2. **登记未做**：**遮挡物**透明化（环境 dither，让挡视线的墙淡出）未做（另立任务）；`ITerrainQuery` 的球探针为**步进 + 4 环点**近似（非解析胶囊）。
+  3. **本批（W0 + W1 + W2 + W3 + W4 + W4b + W5 + W6 + W6b + W6c + W6d + W6e + W6f + W6g）尚未提交**。
+
+---
+
+## 2026-10-06  W6h 修复：**避障阻尼 + 迟滞**（治临界点抖动 / 画面闪烁）
+
+- 背景：所有者报告"处于**临界点**时镜头模式会**瞬间切换**；在临界点**反复横跳**，画面会**闪烁**"；`docs/plans/v0.4.md` §1.11。
+- 缺陷判定（契约 + 机制）：
+  1. **契约**：相机距离的变化应**连续**（无可见跳变）；临界点附近反复横跳**不得**闪烁。
+  2. **机制**：`Evaluate` 每帧按**当帧**的遮挡查询结果**瞬时**决定跟随距离 —— 遮挡判定在临界点是**布尔翻转**的
+     （进 / 出各一次），于是距离在 `followDistance` 与"被拉近值"之间**瞬间跳变**；玩家往复 ⇒ 逐帧翻转 ⇒
+     ① 相机瞬移；② 由 `view.distance` 驱动的**主角淡出不透明度（W6e）**跟着跳 ⇒ dither 图案跳变 ⇒ **闪烁**。
+     （`safeT` 本身还按步长量化 ⇒ 另有 0.5 格级台阶。）
+- 做了什么（业界口径，全部新增、不改朝向）：
+  1. **`ThirdPersonCamera::UpdateAvoidance(frameDt, alpha, terrain)`**（新增）：**每渲染帧推进一次**避障平滑。
+     `Evaluate` 保持 `const` / 幂等，只**读**平滑结果（红线 11；`Evaluate` 每帧被调用多次：渲染 + 瞄准）。
+  2. **非对称阻尼 + 迟滞**：**拉近立即**（安全优先，相机绝不留墙内）；**推远先迟滞** `avoidanceClearHold`（默认 0.2 s）
+     再**指数平滑** `avoidanceExtendDamping`（默认 0.25 s，帧率无关 `1 − exp(−dt/τ)`）+ `avoidanceExtendMaxSpeed` 限速。
+     对齐 Cinemachine `Damping` / `DampingWhenOccluded` / `MinimumOcclusionTime`。
+  3. **向后兼容**：`m_avoidanceDistance < 0`（从未调用 `UpdateAvoidance`）⇒ `Evaluate` 退回**瞬时避障**旧路径 ⇒
+     既有 429 项单测**逐值不变**；`SnapTo`（传送）重置平滑状态（直接吸附）。
+- 为什么：
+  1. **临界点横跳的本质是"布尔翻转驱动几何"**：不引入**时间维度的迟滞**，任何"精确阈值"都必然抖 —— 迟滞是标准解。
+  2. **进快出慢**：拉近若也做阻尼，相机会在墙外停留过久 ⇒ 穿帮；推远若立即，则与迟滞矛盾 ⇒ 非对称才是正解。
+  3. **平滑不改变朝向**：仅作用于**距离**，朝向仍紧跟输入（符合 W6c 已定的不变量）。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`cmake --build --preset debug` → 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug -j 6` → **431/431 passed**（429 → 431，新增 2 项：`AvoidanceHoldsThenExtendsSmoothlyAfterOcclusionClears`
+     （迟滞内不回推 / 越过后平滑推远 / 最终收敛）/ `AvoidancePullsInImmediatelyWhenOcclusionAppears`（遮挡出现当帧立即拉近））。
+  3. **门禁**：`check-banned-identifiers.ps1` → `scanned 159 file(s), 0 violation(s)` / `PASS`。
+  4. **运行冒烟**（`build\w6h_smoke.log` / `.err.log`）：58 行、进入主循环、**无 ERROR / WARN**、`stderr` 为空。
+- 下一步 / 遗留：
+  1. **待人工目视确认**：在墙 / 洞穴口边**反复前后**移动 —— 镜头应**平滑**（不再瞬间跳变、不闪烁）。
+  2. **登记取舍**：`avoidanceExtendDamping` / `avoidanceClearHold` / `avoidanceExtendMaxSpeed` 为可调旋钮；
+     避障平滑依赖**渲染帧 `dt`**（渲染侧表现，不影响逻辑/世界确定性）；`AimDirection` 读的是**上一帧**的平滑距离（差 1 帧，可忽略）。
+  3. **本批（W0 + W1 + W2 + W3 + W4 + W4b + W5 + W6 + W6b + W6c + W6d + W6e + W6f + W6g + W6h）尚未提交**。
+
+---
+
+## 2026-10-06  W7-S1：**地表 tile 常驻策略层**（流式 + LOD 分环的第一步）
+
+- 背景：所有者"进行下一步开发" ⇒ 按计划推进 **W7（流式加载 + LOD 分环）**。依据
+  [ADR 0024](../docs/adr/0024-terrain-streaming-and-lod.md)：10km 全量常驻要 ≈4.8 GB 显存（超预算 300 MB）、启动要数分钟 ⇒
+  必须"以玩家为中心、只常驻窗口、远景降级"。**W7 拆为 S1~S4**（细则见 `docs/plans/v0.4.md` §1.12）。
+- 做了什么（**S1 = 纯策略层**，不改游戏行为）：
+  1. **新增** `world/streaming/terrain_tile_residency.{hpp,cpp}`：
+     `TerrainTileWindow`（中心 tile ± R；`TileCount() = (2R+1)²`，用来核对"常驻量只随窗口变化"）、
+     `TerrainWindowForPlayerBlocks`（活动窗口）/ `TerrainResidencyWindowForPlayerBlocks`（常驻窗口 = 活动半径 + 预取环）、
+     `TerrainHysteresisCenterTile`（**滞回**推进中心 tile）、`PlanTerrainTileResidency`（**纯函数**：要加载 / 要卸载 / **编辑块留驻** / 超限淘汰最远者）。
+  2. **口径唯一**：本模块的 `kTerrainResidencyPrefetchTiles` / `kTerrainWindowHysteresisBlocks` 在 `.cpp` 里用
+     `static_assert` 与 ADR 0020 的 `kResidencyPrefetchTiles` / `kWindowHysteresisBlocks` **钉死相等**（防两处漂移）；
+     滞回实现直接**复用** `HysteresisCenterTile`（公共头不泄漏任何 `dig` 类型）。
+  3. **新增** `tests/terrain_tile_residency_test.cpp` **7 项**。
+- 为什么：
+  1. **常驻有界是硬不变量**：ADR 0024 决策一 —— 常驻集合只由窗口决定，**与世界总大小无关**（禁止每帧 O(总量) 扫描）。
+     把策略做成**纯函数**（红线 7）⇒ 可单测、可确定复现，且与"实际加载 / 网格 / 物理"解耦（S2 才接素材层）。
+  2. **滞回 + 预取环**：出生点常压在 tile 边界上，亚格级抖动会让中心 tile 反复翻（每次一整圈建 / 卸）⇒ 复用 ADR 0020 已验证的
+     16 格滞回；预取环让"将要进入"的 tile 提前备好（Horizon / Minecraft 类流式的 load radius > active radius）。
+  3. **编辑块不得卸载**：玩家改过的地形不能因为走远而消失（「世界内一致性」硬要求，ADR 0020 决策五口径）。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`cmake --build --preset debug` → 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug -j 6` → **438/438 passed**（431 → 438，新增 7 项 `TerrainTileResidency.*`）。
+  3. **门禁**：`check-banned-identifiers.ps1` → `scanned 162 file(s), 0 violation(s)` / `PASS`（159 → 162）。
+  4. **未跑运行冒烟**：本步**不改变游戏行为**（新增静态库 TU，游戏层尚未引用）⇒ 冒烟留待 S2/S3 接入时执行。
+- 下一步 / 遗留：
+  1. **S2（下一步）**：`TerrainWorld::UnloadTile`（当前**没有**卸载 API）+ `TerrainTileScheduler`（每帧预算、先建后卸、确定序；
+     复用 `DigVolumeScheduler` 形态）+ 预制地图（ADR 0026）**按块随机访问**接常驻窗口。
+  2. **S3**：`game/main.cpp` 接入（替换全量加载）+ Ring 0/1/2 分环（CDLOD 顶点 morph 消接缝）+ 雾盖窗口边界。
+  3. **S4**：W7 整项验收（10km 飞越无冻结 / P99 ≤ 2× 帧预算、无 > 50 ms 单帧 / VRAM ≤ 300 MB、CPU ≤ 150 MB / 常驻量只随窗口变化）。
+  4. **本批（W0~W6h + W7-S1）尚未提交**。
+
+---
+
+## 2026-10-06  W7-S2：**地表 tile 常驻调度层**（卸载 API + 分帧调度器）
+
+- 背景：接 W7-S1（常驻策略层）继续；`docs/plans/v0.4.md` §1.12。依据 [ADR 0024](../docs/adr/0024-terrain-streaming-and-lod.md) 决策一
+  （常驻集合 = 玩家窗口 + 预取环；建 / 卸一律分帧，禁止渲染帧内同步做）。
+- 做了什么：
+  1. **`TerrainWorld` 增卸载与枚举**：`UnloadTile`（高度 + 网格一并释放，返回是否**原本常驻**）、
+     `ResidentTiles`（升序）、`ResidentTileCount`（O(1)）—— 此前**没有**任何卸载 API。
+  2. **规划器增"范围版"**：`TerrainTileRange`（世界内存在的 tile 矩形范围）+ 谓词版 `PlanTerrainTileResidency`
+     —— **只遍历窗口矩形（O(窗口)）**，不扫描世界总量（ADR 0024 决策一的不变量）；两个重载共用同一规划核心，
+     结果一致（有单测钉住）；plan 增 `desiredCount`（面板 / 验收用）。
+  3. **新增 `TerrainTileScheduler`**（复用 ADR 0020 `DigVolumeScheduler` 形态）：**幂等 `Update`**（中心 tile 未变则不清空待办）
+     + **分帧 `Step`**（每帧至多 `maxActions` 个动作、**先加载后卸载**、按坐标升序的确定序）+
+     编辑块超上限时淘汰最远者并 **WARN**（不静默）。
+  4. **新增 5 项单测**。
+- 为什么：
+  1. **"卸"必须先存在**：没有 `UnloadTile` 就谈不上流式；且**高度与网格要一起释放**（只放一半 = 内存泄漏）。
+  2. **O(窗口) 而非 O(总量)**：10km 有 ≈25,300 个 tile，若每次窗口变化都扫全表，就把"常驻有界"的收益又还回去了。
+  3. **分帧 + 确定序**：单 tile 的 `GenerateTile + MeshTile` 是毫秒级重活，一次做完会让画面停下等待
+     （SKILL「所有重活都必须离开渲染帧」）；确定序保证"何时可见"可变、**结果不变**（红线 7 / 11）。
+  4. **幂等 `Update`**：分帧推进期间玩家微动不得把待办清空重排（否则永远建不完）。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`cmake --build --preset debug` → 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug -j 6` → **443/443 passed**（438 → 443，新增 5 项 `TerrainTileResidency.*`）。
+  3. **门禁**：`check-banned-identifiers.ps1` → `scanned 162 file(s), 0 violation(s)` / `PASS`。
+  4. **未跑运行冒烟**：本步仍**未接入游戏**（`game/` 未引用调度器）⇒ 冒烟留到 S3 接入时。
+- 计划调整（先报告再改）：**"预制地图按块接入窗口"从 S2 改归 S3** —— 它与"替换全量加载"是**同一处**改动，
+  与游戏层接线一起做才可验证（单独做无法观测）。已在 §1.12 与阶段计划中写明。
+- 下一步 / 遗留：
+  1. **S3（下一步）**：`game/main.cpp` 用 `TerrainTileScheduler` 替换全量加载（由 `PremadeMapReader::TileRadiusX/Z` 推 `TerrainTileRange`；
+     每帧 `Update` + `Step` 预算），再接 Ring 0/1/2 分环（CDLOD 顶点 morph）与**雾盖窗口边界**。
+  2. **S4**：W7 整项验收（10km 飞越无冻结 / P99 / VRAM / CPU / 常驻量只随窗口变化）。
+  3. **登记取舍**：生成 / 网格化目前仍在逻辑线程内**分帧**执行；"下沉 worker"（ADR 0022 形态）排在 S3/S4（本步先把接口与预算留好）。
+  4. **本批（W0~W6h + W7-S1 + W7-S2）尚未提交**。
+
+## 2026-10-06  W7-S3a/S3b：10km 世界流式 + LOD 分环（CDLOD morph）接入
+
+- 做了什么：
+  1. **S3a（10km 世界可流式）**：`world/generation/map_preset.cpp` 的 `kMaxTileRadius` 8 → **78**（≈10×10 km；
+     两项收敛前提已具备：ADR 0025 物理精度、ADR 0024 LOD）；**新增** `assets/maps/world_10km.toml`；
+     `game/main.cpp` 增两个**测试开关**：`--map=<相对仓库根>`（10km 世界与 1km 手工测试场共存）与
+     `--autofly=<秒>`（本环境 `vx_perf_input.ps1` 抢不到前台窗口 ⇒ 飞越证据改为**可脚本化的确定性自动飞行**；
+     缺省 0 = 完全不改变玩法）。
+  2. **S3b-LOD 核心**：`terrain_types.hpp` 增 LOD 步长 / 顶点数 / 索引数；`BuildTerrainMesh(..., lodLevel)`；
+     `MeshVertex` 增 `morph`（= 该顶点在**父级网格**上的采样高度）；主通道顶点输入增 location 3；
+     `mesh.vert` 实现 CDLOD morph（`k = clamp((Chebyshev距离 − start)/(end − start), 0, 1)`，
+     距离取**渲染相对**顶点位置与 `CameraUniform::lodOrigin` 的 Chebyshev 距离 ⇒ 与 CPU 的
+     `TileDistanceFromCenter` **同源**）；`SetMeshLodMorph` 把 `morphStep / start / end` 塞进既有的
+     `meshParams.yzw`（**布局不变**，仍 80 字节）。法线仍按 ±1 相邻列算 ⇒ 跨环**不出现着色接缝**。
+  3. **S3b-分环调度**：`TerrainLodRings`（Ring 0/1/2 = 8/16/32 tile → LOD 0/1/2）+
+     `TerrainLodLevelForTileDistance` + `TerrainLodMorphRangeForLevel`（morph 恰在环边界取 1 ⇒ 相邻环几何逐位相同）+
+     `TerrainTileScheduler` 的分环构造 / `LodLevelForTile` / `PendingRelodCount` / `StepRelod`（relod 只改网格、不碰世界数据）。
+  4. **S3b-接入**：`game/main.cpp` 用分环窗口（半径 32 + 预取 1 = **4489** 个 tile 上限）替换单半径；
+     运行期 relod（每帧 ≤2、有上界）；**碰撞半径收敛**（`kTerrainCollisionRadiusTiles = 9` ⇒ 只有近场建高度场碰撞体）；
+     远裁剪面 1000 → **2100**（盖住 Ring 2 外边界；流式边界由雾遮住：0.003/格 ⇒ 2048 m 处 ≈ 99.8%）；
+     每帧下发 `lodOrigin` = 玩家 tile 中心（渲染相对）。
+- 为什么：
+  - **所有者裁定**：跨环接缝**按 ADR 0024 做 CDLOD 顶点 morph**（不用裙边 / 不用"统一边界分辨率"）；
+    Ring 0 的**体积壳随玩家流式**本次一并做。
+  - morph 的距离口径必须与**环判定的度量同源**（都是 Chebyshev tile 距离）——若混用"视深"，环边界与 morph 端点
+    不对齐，仍会裂缝（这是本次设计里最关键的一处）。
+  - 碰撞必须**收敛半径**：常驻 4489 个 tile 若都给 Jolt 建高度场静态体，宽相位 / 内存 / 建体耗时都不可接受。
+- 验证（真实输出）：
+  1. **构建**：`cmake --build --preset debug` → 退出码 0、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug -j 6` → **455/455 passed**（443 → 450 → 455）。
+  3. **门禁**：`check-banned-identifiers.ps1` → `scanned 163 file(s), 0 violation(s)` / **EXIT=0**。
+  4. **1 km 回归冒烟**（`build/w7s3b_smoke3.log`）：61 行、无 ERROR/WARN；常驻 289/289（世界内全覆盖）；
+     碰撞接管 276 个高度场 + 13 个交出 + **0 个超出半径**（与改动前一致）。
+  5. **10 km 冒烟 + 自动飞越 90 s**（`build/w7s3b_10km.log`）：加载 ≈45 s（debug）；启动常驻 **4489 / 24649**；
+     碰撞体 **348** 个（**4128 个 tile 超出半径 ⇒ 不建**）；自动飞行 90 s 跨越约 13 个 tile 边界；无 ERROR/WARN。
+- 实测问题（**须裁决**，三条都已登记进 `docs/plans/v0.4.md` §3）：
+  1. **CPU 常驻超预算**：10 km 常驻 4489 个 tile ⇒ 进程工作集 **567 MB**（ADR 0008 的 CPU 预算 = 150 MB）。
+     主因是 `TerrainWorld::m_meshes` 为**每个常驻 tile 保留 CPU 侧 MeshData**（Ring 0/1/2 合计 ≈ 160 MB）+ 高度 36 MB。
+  2. **流式吞吐不足**：每跨 1 个 tile 需建/卸 `2×33 = 66`（外加 relod）个 tile，单 tile 生成+网格化在主线程 ≈7 ms ⇒
+     "每帧 1 个动作"（≈60/s）勉强跟得上普通飞行、跟不上冲刺飞行，窗口**长期追不上**（本次 10 km 跑没有出现
+     "常驻集合已随窗口调整完毕"日志）。**ADR 0022/0024 明文要求"建/卸下沉 worker"**（本次只做了分帧）⇒ 这是 S3b 的关键遗留。
+  3. **Draw Call**：首帧按剔除提交 **1383** 个网格（常驻 4489）——分环后仍应按 ADR 0024 决策四**记账并纳入验收**。
+- 下一步 / 遗留：
+  1. **S3b 剩余**：① tile 生成 + 网格化**下沉 worker**（复用 `VolumeBuildPipeline` 的"快照 + 主线程收包上传"形态）；
+     ② **Ring 0 体积壳随玩家流式**（当前仍固定在原点附近 3×3 tile）；③ 预制地图按块随机访问接入。
+  2. **S4**：10 km 烘焙（`voxel_bake`）+ 实测（P99 / VRAM / CPU / 常驻量 / 无缝）。
+  3. **环半径与预算的取舍**：若 4489 tile 的 CPU/VRAM 确实守不住预算，按 ADR 0024「何时需要重新审视」处理
+     （缩环 / 稀疏化 / 释放上传后的 CPU 侧网格），**不得默默降级** —— 需所有者确认后再改。
+  4. `Ring 0 体积壳随玩家流式` 与 `--autofly` 属新增能力 / 测试开关，`engine-capabilities.md` 与 `ui-inventory.md` 待同步。
+
+## 2026-10-06  W7-S3b 续：地表 tile 建/卸下沉 worker + 释放 CPU 侧网格 + 预算重算
+
+- 做了什么：
+  1. **建/卸下沉 worker**（ADR 0022 形态）：新增 `world/streaming/terrain_tile_build_pipeline.{hpp,cpp}`；
+     把「按 (种子, 参数, 编辑, tile 坐标) 生成 `TerrainTile`」抽成自由函数 `GenerateTerrainTileData`（`TerrainWorld::GenerateTile` 改调它 ⇒ 逐位不变）；
+     worker 产出「未过滤索引」的 `MeshData`，**四边形过滤放在主线程**（`ApplyQuadFilterToMesh`）—— 因为过滤器依赖"当前常驻集合"
+     这一可变状态，放 worker 就得做快照、会引入"结果随快照陈旧"的歧义；两条路径共用同一份过滤实现 ⇒ 逐位一致。
+  2. **预取 + 安装**：`TerrainWorld` 增预取缓存；`main` 每帧「`Update` → 收包 → 预取提交（提前 192 个、每帧 ≤64）→ `Step` 安装」；
+     `Step` 只在"本帧将加载的**整批**都已就绪"时才推进 ⇒ **同步回退恒为 0**。`relod` 也下沉（`remeshOnly` 请求）。
+  3. **释放 CPU 侧网格**：上传后清掉该 tile 的 CPU `MeshData`；接管判据改用**新的 `meshEmpty` 标记**（不再用 `indices.empty()`，
+     释放后它恒为空）；relod / 笔刷 / 爆破仍从**高度**重建网格。
+  4. **预算重算**：ADR 0024 §四 的 `VRAM ≤300MB / CPU ≤150MB` 本是 ADR 0008 的「V0.1 小场景」口径（该节原文即写"1~9 个地表 tile"），
+     ADR 0024 起草时沿用未重算 ⇒ 按实测改为 **CPU（进程工作集）≤512MB / VRAM ≤640MB / Draw Call ≤6000 次/帧**（详见该 ADR 的修订小节）。
+- 为什么：所有者 2026-10-06 裁定「保 ADR 视距」，并授权"预算若过低可适当增加"。
+- 验证（真实输出）：
+  1. **构建** `cmake --build --preset debug` ⇒ 退出码 0、零警告。
+  2. **测试** `ctest --preset debug -j 6` ⇒ **463/463 passed**（455 → 463）。
+  3. **门禁** ⇒ `scanned 166 file(s), 0 violation(s)` / EXIT=0。
+  4. **1km 回归**（`build/w7s3b_worker_smoke.log`）：stdout 0 ERROR / 0 WARN；常驻 289/289、碰撞接管 276 + 交出 13 + 超出半径 0（与改动前一致）。
+  5. **10km + `--autofly=90`**（`build/w7s3b_worker_10km.log`）：**36 条**"常驻集合已随窗口调整完毕（…同步回退 **0** 次）"
+     ⇒ 窗口**追得上飞行**（对比修复前：一条都没有）；worker 已构建 13775 个 tile、单 tile 峰值 52 ms；
+     **工作集 567 → 388 MB**（1km 基线实测 293 MB ⇒ 4200 个额外 tile ≈ +95 MB ≈ 23 KB/tile）。
+- 下一步 / 遗留：
+  1. **本批新暴露的瓶颈（属 W7-S4）**：帧尖峰来自**渲染提交 20~33 ms/帧**（draw call ≈5.3k = 约 1300 个提交网格 × 4 遍：
+     主通道 + 3 级级联阴影）与**视锥剔除 5~28 ms**。收敛手段：**按级联正交盒剔除投射体**（阴影只画 180 格内的）、
+     合并远景网格、或等待收敛项 6 的遮挡剔除。
+  2. **VRAM 记账不完整**：`MeshRenderer::Stats().textureBytes` **只统计纹理**，网格缓冲未入账 ⇒ 上表 VRAM 是估算，须补"网格字节记账"。
+  3. **S3b 剩余**：Ring 0 体积壳随玩家流式；预制地图按块随机访问接入。
+  4. **S4**：10km 烘焙 + 实测（P99 / 帧尖峰 / 常驻量 / 跨环无缝目视）。
+
 

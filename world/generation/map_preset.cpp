@@ -17,10 +17,13 @@
 namespace vx {
 namespace {
 
-/// tile 半径上限：8 个 tile ⇒ 每边 512 列、**世界跨度 1024 列 = 1×1 km**
-/// （V0.2「世界成立」的目标尺度，见 `docs/plans/v0.2.md` T58；17×17 = 289 个 tile）。
-/// 世界要更大时须先收敛待收敛项 7（物理世界坐标精度）与 LOD（待收敛项 4）。
-constexpr int kMaxTileRadius = 8;
+/// tile 半径上限：**78** 个 tile ⇒ 每边 4992 列、世界跨度 9984 列 ≈ **10×10 km**
+/// （阶段 W 的目标尺度，见 [ADR 0024](../../docs/adr/0024-terrain-streaming-and-lod.md)；157×157 = 24649 个 tile）。
+///
+/// 口径演进：V0.2 时此处为 8（=1 km），理由是"世界要更大须先收敛待收敛项 7 与 LOD"。
+/// 两项均已收敛 —— 物理坐标精度 → [ADR 0025](../../docs/adr/0025-large-world-coordinate-precision.md)（原点重定基）、
+/// LOD → [ADR 0024](../../docs/adr/0024-terrain-streaming-and-lod.md)（窗口流式 + 分环）⇒ 上限随之放开。
+constexpr int kMaxTileRadius = 78;
 
 /// 出生点与编辑矩形允许的世界列范围由地图范围决定；这里给出统一的越界描述。
 [[nodiscard]] std::string Describe(const std::filesystem::path& path, const char* field) {

@@ -9,6 +9,13 @@
 
 namespace vx {
 
+/// 把世界位置量化成**水平原点挡位**（纯函数）：`x` / `z` 各自向下取整到 `quantum` 的整数倍，`y` 恒为 `0`。
+///
+/// 用途（[ADR 0025](../../docs/adr/0025-large-world-coordinate-precision.md)）：由玩家位置决定
+/// `PhysicsWorld` 的世界原点，避免原点每次微动都触发一次全体平移（挡位化 ⇒ 只有跨越挡位才 `SetWorldOrigin`）。
+/// 前置条件：`quantum > 0`；否则返回 `(0, 0, 0)`。
+[[nodiscard]] glm::dvec3 QuantizeHorizontalWorldOrigin(const glm::dvec3& position, double quantum) noexcept;
+
 /// 物理世界：Jolt 生命周期的薄封装（作业系统 / 临时分配器 / 固定步 `Update`）。
 ///
 /// 分层（SKILL §2 / 方案 §9.1）：本类位于 **engine 层**，只提供**通用**碰撞体与角色控制接口，
@@ -157,6 +164,26 @@ public:
     /// **不得每帧调用**（文档原文："Don't call this every frame"）—— 那是把本已摊平的工作重新集中。
     /// 也**不需要**在批量增删静态体之后反复调用：Jolt 的批量接口本身就会建出高效的包围体层次。
     void OptimizeBroadPhase();
+
+    // ---- 大世界坐标精度（[ADR 0025](../../docs/adr/0025-large-world-coordinate-precision.md)）----
+
+    /// 当前**水平世界原点**（`x` / `z` 有效；`y` 恒为 `0`）。
+    ///
+    /// 语义：**进出 Jolt 的水平位置 = 世界坐标 − 原点**；读取时再加回。对调用方**完全透明**
+    /// （所有接口仍以世界坐标 `double` 收发）。默认 `(0, 0, 0)` ⇒ 与引入本项之前**逐位等价**。
+    ///
+    /// **为什么只重定基水平方向**：世界垂直范围仅 `0 ~ 512` 格，`float32` 精度绰绰有余；
+    /// 且高度场采样本身就是**绝对高度**，对其做 Y 偏移会改变地形形状（故 Y 一律保持世界值）。
+    [[nodiscard]] glm::dvec3 WorldOrigin() const noexcept;
+
+    /// 设置水平世界原点，并把**全部刚体与角色**按 `旧原点 − 新原点` 平移（世界位置不变）。
+    ///
+    /// 用途：玩家远离当前原点时，把原点跳一档（建议用 `QuantizeHorizontalWorldOrigin`，512 格对齐），
+    /// 使送进 Jolt 的坐标始终落在原点附近的小数值区间，避免单精度在大坐标下退化。
+    ///
+    /// 语义要点：① `y` 分量被忽略；② 新旧一致 ⇒ 无操作；③ **只改位置、不改速度与姿态**
+    /// （动态刚体速度保持、不做额外激活）；④ 默认原点 ⇒ 与引入前逐位等价。
+    void SetWorldOrigin(const glm::dvec3& origin) noexcept;
 
     // ---- 通用碰撞体 ----
 

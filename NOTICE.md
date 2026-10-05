@@ -18,7 +18,7 @@
 | Taskflow \* | 任务调度（备选） | MIT | V0.3（备选） |
 | EnTT | ECS | MIT | V0.4 |
 | Jolt Physics（`joltphysics`） | 刚体物理 / 角色碰撞与地形碰撞 | MIT | V0.1 |
-| zstd | 存档压缩 | BSD-3-Clause（另有 GPLv2 双许可） | V0.3 |
+| zstd | 预制地图块压缩（并计划用于存档压缩） | BSD-3-Clause（另有 GPLv2 双许可） | **阶段 W（W2）已引入**：`vcpkg.json` 依赖 `zstd`（实测 **1.5.7**）；唯一引用点 = `world/premade/premade_map.cpp`（`zstd.h` 只在该 `.cpp` 内出现，公共头不含）；消费者 = 预制地图容器（[ADR 0026](docs/adr/0026-premade-map-format-and-bake-tool.md)） |
 | Assimp | 3D 模型加载 | BSD-3-Clause | **V0.3（ⓒ T68）** —— 所有者 2026-09-29 指示由 V0.5 **前移**；**T68 已引入**：`vcpkg.json` 依赖 `assimp`；唯一引用点 = `engine/render/model_loader.cpp`（Assimp 头只在该 `.cpp` 内出现，公共头不含） |
 | Tracy | 性能分析 | BSD-3-Clause | V0.2 |
 | RenderDoc | 图形调试（外部工具，不随产物分发） | MIT | V0.1 |

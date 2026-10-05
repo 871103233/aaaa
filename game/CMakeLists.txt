@@ -13,6 +13,7 @@
 #   tonemap.*  —— HDR 色调映射通道（T20 / ADR 0010 P0）用（其 .vert 亦为全屏三角，T67 起被天空与烘焙共用）。
 #   sky.frag / ibl_irradiance.frag / ibl_prefilter.frag / ibl_brdf_lut.frag
 #              —— 环境贴图与 IBL（T67 / ADR 0021）：天空通道 + 三条加载期烘焙 pass，顶点阶段复用 tonemap.vert。
+#   water.frag —— 水面（W6 / ADR 0027）：flow 滚动波 + 半透明；顶点阶段复用 mesh.vert。
 #   （T27 的光球自发光走 `mesh.frag` 的片元 uniform 槽 3，不新增着色器文件。）
 
 # ImGui：vcpkg 端口已把 SDL3 / SDLGPU3 后端的 .cpp 编进 imgui 库本体，
@@ -50,6 +51,7 @@ add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/shadow.frag)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/tonemap.vert)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/tonemap.frag)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/sky.frag)
+add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/water.frag)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/ibl_irradiance.frag)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/ibl_prefilter.frag)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/ibl_brdf_lut.frag)

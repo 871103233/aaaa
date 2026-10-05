@@ -26,6 +26,9 @@ layout(location = 3) in vec4 inWeights;
 
 layout(set = 0, binding = 0, std430) readonly buffer CameraBuffer {
     mat4 viewProjection;
+    // W7-S3b：仅为与 mesh.vert 的 CameraBuffer **布局一致**而声明（偏移 64；蒙皮网格不参与地表 LOD morph，
+    // 故本着色器**不读**它，行为不变）。
+    vec4 lodOrigin;
 } camera;
 
 layout(set = 0, binding = 1, std430) readonly buffer BoneBuffer {
@@ -34,12 +37,15 @@ layout(set = 0, binding = 1, std430) readonly buffer BoneBuffer {
 
 layout(set = 1, binding = 0, std140) uniform MeshTransformBlock {
     mat4 modelToRender;  // 局部坐标 → 渲染原点相对坐标（std140：mat4 = 4 个 vec4）
+    vec4 meshParams;     // W6e：x = 逐网格不透明度（1 = 不透明；< 1 = 片元 Bayer 抖动淡出），yzw 预留
 } meshTransform;
 
 layout(location = 0) out vec3 v_relativePosition;
 layout(location = 1) out vec3 v_normal;
 // `flat`：与 mesh.frag 的 `flat in float v_material` 对应（整面离散属性，不插值）。
 layout(location = 2) flat out float v_material;
+// W6e：逐网格不透明度（与 mesh.vert 同源；片元按 Bayer 抖动 discard 做 dither 淡出）。
+layout(location = 3) out float v_fade;
 
 void main() {
     // 线性混合蒙皮：权重已在 CPU 侧归一化，直接加权求和。
@@ -58,4 +64,6 @@ void main() {
     // （`kNoMaterialOverride` = -1 ⇒ 片元按世界高度 / 坡度逐像素算权重）。
     // 见 docs/plans/v0.3.md §1.3「明确不做」与 §3 的登记。
     v_material         = -1.0;
+    // W6e：逐网格不透明度（CPU 侧恒显式写入：不透明网格为 1.0，淡出中的主角 < 1.0）。
+    v_fade             = meshTransform.meshParams.x;
 }

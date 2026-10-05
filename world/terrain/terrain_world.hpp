@@ -15,6 +15,20 @@
 
 namespace vx {
 
+/// 按 `(种子隐含在 noise, 生成参数隐含在 noise, 预设编辑, tile 坐标)` 生成一个完整 `TerrainTile` 的**纯自由函数**。
+///
+/// 顺序固定为「噪声先行、编辑覆盖其上」（与既有 `TerrainWorld::GenerateTile` 逐字相同）：
+///   ① `GenerateTerrainTile`（噪声）→ ② `ApplyMapEditsToTile`（预设编辑，按文件顺序）→ ③ 刷新 `maxSurfaceBlocks` 缓存。
+///
+/// 抽出来的目的（W7-S3b / [ADR 0022](../../docs/adr/0022-volume-build-worker-pipeline.md) 形态）：
+/// 让**worker 侧**能在**完全不触碰 `TerrainWorld` 可变状态**的前提下独立生成一个 tile
+/// （worker 各自持有一份由 `(seed, params)` 构造的 `TerrainNoiseGenerator`；该生成器接口全为
+/// `const noexcept`、无共享可变状态 ⇒ 可安全并发只读）。
+///
+/// 前置条件：`noise` 的生命周期覆盖本调用。纯函数（红线 7）：同输入 ⇒ 逐位同输出。
+[[nodiscard]] TerrainTile GenerateTerrainTileData(const TerrainNoiseGenerator& noise,
+                                                  const std::vector<MapEdit>& edits, int tileX, int tileZ);
+
 /// 地表世界：持有已加载 tile 的高度数据与网格，并实现引擎的 `ITerrainQuery` 契约。
 ///
 /// 职责边界（ADR 0004 层 ①）：
@@ -27,8 +41,10 @@ namespace vx {
 class TerrainWorld final : public ITerrainQuery {
 public:
     /// 前置条件：`worldSeed` 即全局世界种子；`materials` 已成功加载
-    /// （见 `TerrainMaterialTable::LoadFromFile`）。
-    TerrainWorld(std::uint64_t worldSeed, TerrainMaterialTable materials);
+    /// （见 `TerrainMaterialTable::LoadFromFile`）；`params` 为地表生成参数（W3 起含地貌分区），
+    /// **默认 = 引入 W3 之前的三层噪声数值**（⇒ 既有调用方与既有世界逐位不变）。
+    TerrainWorld(std::uint64_t worldSeed, TerrainMaterialTable materials,
+                 TerrainGenerationParams params = TerrainGenerationParams::Default());
 
     TerrainWorld(const TerrainWorld&) = delete;
     TerrainWorld& operator=(const TerrainWorld&) = delete;
@@ -54,14 +70,70 @@ public:
 
     /// 为已生成的 tile 构建网格并缓存，覆盖该 tile 之前的网格。
     /// 前置条件：该 tile 已 `GenerateTile`；未生成时为无操作。
-    void MeshTile(int tileX, int tileZ);
+    /// `lodLevel` 透传给 `BuildTerrainMesh`（W7-S3b）；默认 0 ⇒ 与从前逐位一致。
+    void MeshTile(int tileX, int tileZ, int lodLevel = 0);
 
-    /// `GenerateTile` + `MeshTile`。
-    void LoadTile(int tileX, int tileZ);
+    /// `GenerateTile` + `MeshTile`。`lodLevel` 透传给 `MeshTile`（默认 0 = 全细节）。
+    void LoadTile(int tileX, int tileZ, int lodLevel = 0);
+
+    /// **卸载**一个 tile（高度数据 + 网格一并释放）。返回是否**原本常驻**（`false` = 本就不在）。
+    ///
+    /// 用途：流式常驻集合的"卸"（W7 / [ADR 0024](../../docs/adr/0024-terrain-streaming-and-lod.md)）。
+    /// **已编辑的 tile 由调用方负责不卸**（ADR 0020 决策五口径的"脏块留驻"）——
+    /// 本类不记录"是否被玩家改过"，故不做该判断。
+    bool UnloadTile(int tileX, int tileZ);
 
     [[nodiscard]] bool HasTile(int tileX, int tileZ) const noexcept;
     [[nodiscard]] const TerrainTile* FindTile(int tileX, int tileZ) const noexcept;
     [[nodiscard]] const TerrainTileMesh* FindMesh(int tileX, int tileZ) const noexcept;
+
+    /// 当前常驻 tile 数（**O(1)**；调试面板与"常驻量只随窗口变化"的核对用）。
+    [[nodiscard]] std::size_t ResidentTileCount() const noexcept { return m_tiles.size(); }
+
+    /// 当前常驻 tile 坐标，**升序**（流式调度算集合差用）。
+    [[nodiscard]] std::vector<TileCoord> ResidentTiles() const;
+
+    // ---- W7-S3b：worker 预取缓存 + 安装（ADR 0022/0024）----
+
+    /// worker 产出的**已生成、未过滤**的 tile（高度 + 网格）暂存条目。
+    ///
+    /// 网格的层间交接过滤**不在 worker 做**（过滤器依赖**当前常驻集合**这一可变状态，
+    /// 放进 worker 必须快照 ⇒ 结果随快照陈旧而有歧义），改由 `LoadTile` **安装时在主线程**按
+    /// 当前 `m_quadFilter` 应用（`ApplyQuadFilterToMesh`）⇒ 与同步路径**逐位一致**。
+    struct StagedTerrainTile {
+        TerrainTile     tile {};
+        TerrainTileMesh mesh {};
+    };
+
+    /// 把 worker 产出（`{tile, mesh}`）塞进**预取缓存**（覆盖同坐标旧条目）。
+    /// 之后 `LoadTile` 命中缓存 ⇒ **只做安装**（廉价），否则回退同步生成。
+    void StageTile(TerrainTile tile, TerrainTileMesh mesh);
+
+    /// 预取缓存中是否存在 **LOD 匹配**的条目（`lodLevel` 必须一致，否则安装时会 LOD 不符）。
+    [[nodiscard]] bool HasStagedTile(int tileX, int tileZ, int lodLevel) const noexcept;
+
+    /// 预取缓存中的条目数（观测：预取提前量 / 内存有界）。
+    [[nodiscard]] std::size_t StagedTileCount() const noexcept { return m_staged.size(); }
+
+    /// 清空预取缓存（窗口中心变化 ⇒ LOD / 集合口径随之变化，旧条目作废）。
+    void ClearStagedTiles() noexcept { m_staged.clear(); }
+
+    /// `LoadTile` **回退到同步生成**的累计次数（命中缓存 = 0；线程池不可用时回退属预期）。
+    /// 观测用：10km 实测要求该值稳定为 0（有 worker 时不得在渲染帧内同步生成）。
+    [[nodiscard]] std::size_t SyncFallbackCount() const noexcept { return m_syncFallbackCount; }
+
+    /// 安装一份**只重网格**（relod）的结果：高度不变，只换该 tile 的网格。
+    /// 要求 `coord` 仍常驻且 `mesh.lodLevel == lodLevel`；否则返回 `false`（已卸载 / LOD 不符 ⇒ 丢弃，不静默使用陈旧数据）。
+    bool InstallRemeshedMesh(const TileCoord& coord, int lodLevel, TerrainTileMesh mesh);
+
+    /// **释放该 tile 的 CPU 侧网格缓冲**（`clear()` + `shrink_to_fit()`），但**保留**：
+    /// ① 高度数据（重网格要用）；② `meshEmpty`（接管判据）；③ `lodLevel` / `verticesPerSide` / `coord`。
+    ///
+    /// 用途（W7-S3b）：10km 常驻 4489 个 tile 时 `m_meshes` 的 CPU 侧 `MeshData` 约 160 MB（超 ADR 0008 的
+    /// CPU 预算）；GPU 上传完成后这些缓冲**不再被渲染使用**，可释放（目标是把地形相关的 CPU 常驻从 ≈160 MB
+    /// 压到 ≈40 MB = 只剩高度 + 标记）。
+    /// 释放后仍可重网格：`MeshTile` 从**高度**重建 ⇒ relod / 笔刷 / 爆破路径天然可用。
+    void ReleaseTileMeshCpu(int tileX, int tileZ);
 
     // ---- 列访问（笔刷 / 存档用）----
 
@@ -126,6 +198,12 @@ private:
 
     std::map<TileCoord, TerrainTile>     m_tiles;
     std::map<TileCoord, TerrainTileMesh> m_meshes;
+
+    /// **worker 预取缓存**（W7-S3b）：已生成、未过滤、尚未安装的 tile（`LoadTile` 命中即安装）。
+    std::map<TileCoord, StagedTerrainTile> m_staged;
+
+    /// `LoadTile` 回退到同步生成的累计次数（观测；有 worker 时必须稳定为 0）。
+    std::size_t m_syncFallbackCount = 0;
 };
 
 }  // namespace vx

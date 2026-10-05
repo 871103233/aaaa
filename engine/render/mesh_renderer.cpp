@@ -282,6 +282,12 @@ MeshRenderer::MeshRenderer(SDL_GPUDevice* device, SDL_Window* window, std::files
         create_shader_from_file(m_device, shader_dir / ("sky.frag" + extension), SDL_GPU_SHADERSTAGE_FRAGMENT,
                                 artifact.format, ShaderResourceCounts { /*samplers=*/1, 0, 0, /*uniformBuffers=*/1 });
 
+    // W6：**水面**片元阶段（`water.frag`）—— 1 个 uniform 块（槽 0 = 水面参数：时间 / 渲染原点），无采样器。
+    // 顶点阶段**复用** `m_meshVertexShader`（同一顶点布局与逐网格变换）。常驻到析构（同 `m_meshVertexShader` 理由）。
+    m_waterFragmentShader =
+        create_shader_from_file(m_device, shader_dir / ("water.frag" + extension), SDL_GPU_SHADERSTAGE_FRAGMENT,
+                                artifact.format, ShaderResourceCounts { /*samplers=*/0, 0, 0, /*uniformBuffers=*/1 });
+
     // 主通道管线：先按单采样创建（`SetMsaaSampleCount` 通常在构造之后调用；档位变化时
     // `EnsureMainPipeline` 用同一批 Shader 重建），保证构造期即验证"设备 + 管线 + Shader"链路。
     // T67 起它**同时**创建天空管线（两者必须在同一个渲染通道里共存 ⇒ 采样数必须一致）。
@@ -579,6 +585,11 @@ void MeshRenderer::CreateMainPipeline(std::uint32_t sampleCount) {
         { 1, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, static_cast<Uint32>(offsetof(MeshVertex, normal)) },
         // location 2：材质槽位覆盖（ADR 0014）。地表网格填 kNoMaterialOverride（由片元按高度/坡度算权重）。
         { 2, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT, static_cast<Uint32>(offsetof(MeshVertex, material)) },
+        // location 3：morph 目标高度（W7-S3b，CDLOD 顶点过渡消接缝，ADR 0024）。**水面管线复用同一份
+        // attributes**（其顶点着色器同为 `m_meshVertexShader`）⇒ 自动生效。**阴影通道不追加**本项：
+        // `shadow.vert` 只声明 location 0，且阴影投射体都在 Ring 0 内、morph 因子恒为 0（morph 只在 Ring 1/2
+        // 逐步推进），故不追加不丢任何信息。
+        { 3, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT, static_cast<Uint32>(offsetof(MeshVertex, morph)) },
     };
 
     SDL_GPUVertexInputState vertexInput {};
@@ -675,6 +686,38 @@ void MeshRenderer::CreateMainPipeline(std::uint32_t sampleCount) {
     if (m_skinnedPipeline == nullptr) {
         m_pipelineSampleCount = 0;
         throw std::runtime_error(std::string("创建蒙皮主通道管线失败：") + SDL_GetError());
+    }
+
+    // W6：**水面管线**（顶点 = `m_meshVertexShader`、片元 = `water.frag`）—— 与主通道同生共死（随 MSAA 档位重建）。
+    // 与主通道的差异（都是"水面"语义所必需）：① **alpha 混合**（半透明）；② **关闭背面剔除**
+    // （水面 ribbon 从上下看都要可见）；③ **关闭深度写入**（水面不得遮挡其后的地形）。深度测试仍开启。
+    if (m_waterPipeline != nullptr) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_waterPipeline);
+        m_waterPipeline = nullptr;
+    }
+    {
+        SDL_GPUGraphicsPipelineCreateInfo waterInfo = info;
+        waterInfo.fragment_shader             = m_waterFragmentShader;
+        waterInfo.vertex_input_state          = vertexInput;  // 与 MeshVertex 一致（复用 mesh.vert）
+        waterInfo.rasterizer_state.enable_depth_bias = false;  // 不要继承上一步的"带深度偏移"变体
+        waterInfo.rasterizer_state.cull_mode         = SDL_GPU_CULLMODE_NONE;
+        waterInfo.depth_stencil_state.enable_depth_write = false;
+
+        SDL_GPUColorTargetDescription waterColor = colorTargetDescription;
+        waterColor.blend_state.enable_blend             = true;
+        waterColor.blend_state.src_color_blendfactor    = SDL_GPU_BLENDFACTOR_SRC_ALPHA;
+        waterColor.blend_state.dst_color_blendfactor    = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+        waterColor.blend_state.color_blend_op           = SDL_GPU_BLENDOP_ADD;
+        waterColor.blend_state.src_alpha_blendfactor    = SDL_GPU_BLENDFACTOR_ONE;
+        waterColor.blend_state.dst_alpha_blendfactor    = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+        waterColor.blend_state.alpha_blend_op           = SDL_GPU_BLENDOP_ADD;
+        waterInfo.target_info.color_target_descriptions = &waterColor;
+
+        m_waterPipeline = SDL_CreateGPUGraphicsPipeline(m_device, &waterInfo);
+        if (m_waterPipeline == nullptr) {
+            m_pipelineSampleCount = 0;
+            throw std::runtime_error(std::string("创建水面管线失败：") + SDL_GetError());
+        }
     }
 
     // T67：天空管线与主通道**共用同一个渲染通道**（天空先画、网格覆盖其上）⇒ 采样数必须与目标一致，
@@ -865,11 +908,17 @@ MeshRenderer::~MeshRenderer() {
         SDL_ReleaseGPUGraphicsPipeline(m_device, m_brdfLutPipeline);
     }
     // 主通道 Shader 常驻到析构（T23）：必须在**使用它们的管线**销毁之后再释放。
+    if (m_waterPipeline != nullptr) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_waterPipeline);
+    }
     if (m_meshVertexShader != nullptr) {
         SDL_ReleaseGPUShader(m_device, m_meshVertexShader);
     }
     if (m_meshFragmentShader != nullptr) {
         SDL_ReleaseGPUShader(m_device, m_meshFragmentShader);
+    }
+    if (m_waterFragmentShader != nullptr) {
+        SDL_ReleaseGPUShader(m_device, m_waterFragmentShader);
     }
     // T69：蒙皮顶点着色器（主通道 + 阴影通道各一条）同样常驻到析构。
     if (m_skinnedVertexShader != nullptr) {
@@ -893,7 +942,7 @@ MeshRenderer::~MeshRenderer() {
 
 MeshHandle MeshRenderer::UploadMesh(const MeshData& mesh, const glm::dvec3& origin, bool emissive,
                                    std::uint32_t reserveVertexCount, std::uint32_t reserveIndexCount,
-                                   bool depthBiased) {
+                                   bool depthBiased, bool water) {
     if (mesh.vertices.empty() || mesh.indices.empty()) {
         return MeshHandle {};
     }
@@ -914,6 +963,7 @@ MeshHandle MeshRenderer::UploadMesh(const MeshData& mesh, const glm::dvec3& orig
     resources.usedIndexCount = 0;
     resources.emissive       = emissive;
     resources.depthBiased    = depthBiased;  // T78：主通道是否走带深度偏移的管线变体（阴影通道不理会）
+    resources.water          = water;        // W6：水面网格走独立管线、在主通道最后绘制、不投影阴影
     // 世界原点只作"这块网格在世界哪里"的登记（T41）；绘制时与渲染原点相减得平移量。
     // 存 `double`（红线 6）：偏移在 double 下相减后才落回 float，大坐标也不会丢精度。
     resources.origin[0] = origin.x;
@@ -1283,6 +1333,32 @@ void MeshRenderer::SetMeshTransform(MeshHandle handle, const glm::dvec3& origin,
     resources.rotation  = rotation;
 }
 
+void MeshRenderer::SetMeshOpacity(MeshHandle handle, float opacity) noexcept {
+    if (!handle.IsValid() || handle.id > m_meshes.size()) {
+        return;
+    }
+    MeshResources& resources = m_meshes[handle.id - 1];
+    if (resources.vertexBuffer == nullptr) {
+        return;
+    }
+    resources.opacity = std::clamp(opacity, 0.0F, 1.0F);
+}
+
+void MeshRenderer::SetMeshLodMorph(MeshHandle handle, float morphStep, float startDistance,
+                                   float endDistance) noexcept {
+    if (!handle.IsValid() || handle.id > m_meshes.size()) {
+        return;
+    }
+    MeshResources& resources = m_meshes[handle.id - 1];
+    if (resources.vertexBuffer == nullptr) {
+        return;
+    }
+    // morphStep 钳到 ≥ 0（0 = 关闭 morph）；起 / 止距离**保持调用方给的顺序**（不交换）。
+    resources.morphStep          = std::max(morphStep, 0.0F);
+    resources.morphStartDistance = startDistance;
+    resources.morphEndDistance   = endDistance;
+}
+
 void MeshRenderer::ReleaseMesh(MeshHandle handle) noexcept {
     if (!handle.IsValid() || handle.id > m_meshes.size()) {
         return;
@@ -1469,6 +1545,8 @@ void MeshRenderer::SetShadowCascades(const ShadowUniform& uniform, std::uint32_t
 
 void MeshRenderer::SetCamera(const CameraView& camera) noexcept {
     m_cameraUniform.viewProjection = camera.viewProjection;
+    // W7-S3b：LOD 原点（渲染相对坐标，xyz；w 预留）——顶点着色器 morph 距离的基准。缺省 (0,0,0)。
+    m_cameraUniform.lodOrigin = glm::vec4(camera.lodOrigin, 0.0F);
 }
 
 void MeshRenderer::ReleaseEnvironmentTextures() noexcept {
@@ -1856,15 +1934,20 @@ void MeshRenderer::DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURender
                               std::size_t meshCount, bool pushEmissive, SDL_GPUGraphicsPipeline* basePipeline,
                               SDL_GPUGraphicsPipeline* depthBiasedPipeline, SDL_GPUGraphicsPipeline* skinnedPipeline,
                               SDL_GPUBuffer* primaryStorageBuffer, EmissivePushState& emissiveState,
-                              MeshTransformPushState& transformState) {
+                              MeshTransformPushState& transformState, SDL_GPUGraphicsPipeline* waterPipeline,
+                              bool waterPass) {
     if (meshes == nullptr) {
         return;
+    }
+    if (waterPass && waterPipeline == nullptr) {
+        return;  // 水面管线不可用 ⇒ 不画（而不是绑空管线）
     }
 
     // 管线与 storage buffer 的**当前绑定状态**（只在选择结果变化时才重新绑定 ⇒ 绑定次数 = 分组数）：
     //   管线 0 = `basePipeline`（调用方进入时已绑好：主通道 `m_pipeline` / 阴影通道 `m_shadowPipeline`）
     //   管线 1 = `depthBiasedPipeline`（T78：仅地表 tile 这类共面重叠网格；阴影通道传 nullptr ⇒ 永不选中）
     //   管线 2 = `skinnedPipeline`（T69：蒙皮网格，顶点着色器做线性混合蒙皮）
+    //   管线 3 = `waterPipeline`（W6：水面，`water.frag` 的 flow 着色 + alpha 混合；阴影通道传 nullptr）
     // storage buffer 数：非蒙皮 = 1（binding 0 = 相机 / 光空间矩阵）；蒙皮 = 2（+ binding 1 = 骨骼矩阵）。
     int boundPipeline       = 0;
     int boundStorageBuffers = 1;
@@ -1875,6 +1958,11 @@ void MeshRenderer::DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURender
             continue;
         }
         const MeshResources& resources = m_meshes[handle.id - 1];
+        // W6：水面网格**只在**水面通道绘制（且**不投影阴影**：阴影通道 `waterPass == false` ⇒ 这里被跳过）；
+        // 非水面网格**不在**水面通道绘制。两个通道因此互不重复、互不遗漏。
+        if (resources.water != waterPass) {
+            continue;
+        }
         if (resources.vertexBuffer == nullptr || resources.indexBuffer == nullptr) {
             continue;
         }
@@ -1884,14 +1972,19 @@ void MeshRenderer::DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURender
             continue;
         }
 
-        // 管线选择（只在**选择结果变化**时绑定）：2 = 蒙皮、1 = 带深度偏移变体、0 = 基础管线。
-        const int wanted = resources.skinned ? 2 : (((depthBiasedPipeline != nullptr) && resources.depthBiased) ? 1 : 0);
+        // 管线选择（只在**选择结果变化**时绑定）：3 = 水面、2 = 蒙皮、1 = 带深度偏移变体、0 = 基础管线。
+        const int wanted = waterPass ? 3
+                                     : (resources.skinned
+                                            ? 2
+                                            : (((depthBiasedPipeline != nullptr) && resources.depthBiased) ? 1 : 0));
         if (wanted == 2 && skinnedPipeline == nullptr) {
             continue;  // 蒙皮管线不可用（不应发生）⇒ 跳过而不是绑空管线
         }
         if (wanted != boundPipeline) {
-            SDL_BindGPUGraphicsPipeline(pass, wanted == 2 ? skinnedPipeline
-                                                          : (wanted == 1 ? depthBiasedPipeline : basePipeline));
+            SDL_BindGPUGraphicsPipeline(pass, wanted == 3 ? waterPipeline
+                                                          : (wanted == 2 ? skinnedPipeline
+                                                                         : (wanted == 1 ? depthBiasedPipeline
+                                                                                        : basePipeline)));
             boundPipeline = wanted;
         }
         // 顶点 storage buffer：蒙皮网格多一块骨骼矩阵（binding 1）。绑定数变化时才重绑。
@@ -1902,25 +1995,40 @@ void MeshRenderer::DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURender
             boundStorageBuffers = wantedStorageBuffers;
         }
 
-        // 逐网格模型变换（T41 起；T33 由 `vec4` 偏移泛化为 `mat4`）：把**网格局部坐标**变成渲染相对坐标。
-        // 每帧对每个网格只是一次 64 字节的 `SDL_PushGPUVertexUniformData`（**不是**上传，
+        // 逐网格模型变换（T41 起；T33 由 `vec4` 偏移泛化为 `mat4`；W6e 增不透明度）：把**网格局部坐标**
+        // 变成渲染相对坐标。每帧对每个网格只是一次 80 字节的 `SDL_PushGPUVertexUniformData`（**不是**上传，
         // 不创建 / 不拷贝 GPU 缓冲），且 uniform 对**后续**绘制持续生效 ⇒ 与自发光同一套去重。
         // 为什么用矩阵而不是"偏移 + 旋转分开传"：倒塌中的刚体**位置与姿态都在变**，
-        // 而局部顶点完全不变 ⇒ 一次 64 B 推送即可，CPU 无需重烘焙上万顶点（T33）。
+        // 而局部顶点完全不变 ⇒ 一次推送即可，CPU 无需重烘焙上万顶点（T33）。
         {
             MeshTransformUniform transform;
             transform.modelToRender    = glm::mat4_cast(resources.rotation);
             transform.modelToRender[3] = glm::vec4(static_cast<float>(resources.origin[0] - m_renderOrigin.x),
                                                    static_cast<float>(resources.origin[1] - m_renderOrigin.y),
                                                    static_cast<float>(resources.origin[2] - m_renderOrigin.z), 1.0F);
+            // W6e：逐网格不透明度（片元按 Bayer 抖动 discard 做 dither 淡出）。必须进**去重键**，
+            // 否则"只改不透明度"的网格会被误判为未变而不推送。
+            transform.meshParams[0] = resources.opacity;
+            // W7-S3b：LOD morph 参数（CDLOD 顶点过渡消接缝）。`y` = morphStep（> 0 启用）、
+            // `z`/`w` = morph 起 / 止距离（格）。三者也必须进去重键（否则"只改 LOD 参数"会被误判为未变）。
+            transform.meshParams[1] = resources.morphStep;
+            transform.meshParams[2] = resources.morphStartDistance;
+            transform.meshParams[3] = resources.morphEndDistance;
             const float* matrix  = &transform.modelToRender[0][0];
-            bool         changed = !transformState.pushed;
+            bool         changed = !transformState.pushed || transformState.opacity != transform.meshParams[0] ||
+                                   transformState.morphStep != transform.meshParams[1] ||
+                                   transformState.morphStartDistance != transform.meshParams[2] ||
+                                   transformState.morphEndDistance != transform.meshParams[3];
             for (int element = 0; element < 16 && !changed; ++element) {
                 changed = transformState.matrix[element] != matrix[element];
             }
             if (changed) {
                 SDL_PushGPUVertexUniformData(commandBuffer, 0, &transform, static_cast<Uint32>(sizeof(transform)));
-                transformState.pushed = true;
+                transformState.pushed             = true;
+                transformState.opacity            = transform.meshParams[0];
+                transformState.morphStep          = transform.meshParams[1];
+                transformState.morphStartDistance = transform.meshParams[2];
+                transformState.morphEndDistance   = transform.meshParams[3];
                 for (int element = 0; element < 16; ++element) {
                     transformState.matrix[element] = matrix[element];
                 }
@@ -2080,7 +2188,7 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
                        /*basePipeline=*/m_shadowPipeline, /*depthBiasedPipeline=*/nullptr,
                        /*skinnedPipeline=*/m_shadowSkinnedPipeline,
                        /*primaryStorageBuffer=*/m_shadowMatrixBuffers[cascade], shadowEmissiveState,
-                       shadowTransformState);
+                       shadowTransformState, /*waterPipeline=*/nullptr, /*waterPass=*/false);
             SDL_EndGPURenderPass(shadowPass);
         }
     }
@@ -2208,7 +2316,33 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
     // T69：蒙皮网格（主角）走 `m_skinnedPipeline`，其骨骼矩阵经顶点 storage buffer 的 binding 1 绑定。
     DrawMeshes(commandBuffer, pass, meshes, meshCount, /*pushEmissive=*/true, /*basePipeline=*/m_pipeline,
                /*depthBiasedPipeline=*/m_pipelineDepthBiased, /*skinnedPipeline=*/m_skinnedPipeline,
-               /*primaryStorageBuffer=*/m_cameraUniformBuffer, emissiveState, transformState);
+               /*primaryStorageBuffer=*/m_cameraUniformBuffer, emissiveState, transformState,
+               /*waterPipeline=*/nullptr, /*waterPass=*/false);
+
+    // ---- W6：水面通道（ADR 0027）—— 主通道内**最后**绘制，半透明叠加在地形之上 ----
+    // 为什么单独一遍：`water.frag` 的唯一 uniform 块在**片元槽 0**，而该槽平时被"材质"占用
+    // （见上面的 `m_materialUniform` 推送）⇒ 必须在水面绘制之前把它换成水面参数；水面画完即结束本通道，
+    // 故不会影响任何其它绘制。水面**不投影阴影**（阴影通道传 waterPass=false ⇒ 自动跳过）。
+    if (m_waterPipeline != nullptr) {
+        struct WaterUniform {
+            float params[4];  ///< x = 时间（秒）、y = 流速倍率、z/w = 预留
+            float origin[4];  ///< 渲染原点（float 近似；与 `SetRenderOrigin` 一致）
+        };
+        WaterUniform water {};
+        water.params[0] = m_waterTime;
+        water.params[1] = 1.0F;
+        water.origin[0] = static_cast<float>(m_renderOrigin.x);
+        water.origin[1] = static_cast<float>(m_renderOrigin.y);
+        water.origin[2] = static_cast<float>(m_renderOrigin.z);
+        SDL_PushGPUFragmentUniformData(commandBuffer, 0, &water, static_cast<Uint32>(sizeof(water)));
+
+        EmissivePushState      waterEmissiveState;
+        MeshTransformPushState waterTransformState;
+        DrawMeshes(commandBuffer, pass, meshes, meshCount, /*pushEmissive=*/false,
+                   /*basePipeline=*/m_waterPipeline, /*depthBiasedPipeline=*/nullptr, /*skinnedPipeline=*/nullptr,
+                   /*primaryStorageBuffer=*/m_cameraUniformBuffer, waterEmissiveState, waterTransformState,
+                   /*waterPipeline=*/m_waterPipeline, /*waterPass=*/true);
+    }
 
     SDL_EndGPURenderPass(pass);
 

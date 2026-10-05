@@ -143,8 +143,16 @@ private:
     /// 分位（`percentile` ∈ [0, 1]）；样本不足时返回最近一次帧时间。
     [[nodiscard]] double Percentile(double percentile) const noexcept;
 
+    /// 构建**常驻坐标 HUD**（屏幕左上角，只读、不接管输入）。前置条件：已调用 `BeginFrame`。
+    void BuildHud(const DebugStats& stats);
+
     ImGuiContext* m_context = nullptr;
     bool          m_visible = true;
+
+    /// 常驻坐标 HUD 是否显示（默认显示；与 F1 面板相互独立）。
+    bool m_hudVisible = true;
+    /// 上一帧 HUD 的实际像素高度（供 F1 面板排到其下方，避免左上角重叠）。
+    float m_hudHeight = 0.0F;
 
     /// 构造期解析到的字体语言（T16）：是否加载到 CJK 字体，决定标签中 / 英。
     bool m_cjkFontLoaded = false;

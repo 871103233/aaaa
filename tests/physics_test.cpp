@@ -539,3 +539,86 @@ TEST(PhysicsBody, ActivateBodyToleratesInvalidHandlesAndKeepsRestingHullStable) 
     EXPECT_NEAR(after.position.y, resting.position.y, 0.1) << "唤醒静止体不应使它弹跳 / 漂移";
     EXPECT_LT(std::fabs(after.linearVelocity.y), 1.0F);
 }
+
+// ---- T(W1) / [ADR 0025]：大世界坐标精度 —— 物理世界原点与重定基 ----
+//
+// 判据（ADR 0025）：① 默认原点 `(0,0,0)` ⇒ 与引入前逐位等价；② 挡位量化是纯函数且向下取整；
+// ③ `SetWorldOrigin` 只平移、**世界位置不变**（刚体与角色都算），且之后模拟仍稳定。
+
+// 水平原点量化：`x` / `z` 向下取整到 `quantum` 的整数倍、`y` 恒为 0；`quantum ≤ 0` ⇒ 原点 `(0,0,0)`。
+TEST(PhysicsBody, QuantizeHorizontalWorldOriginSnapsDownToGrid) {
+    const glm::dvec3 q = vx::QuantizeHorizontalWorldOrigin(glm::dvec3(10000.0, 123.0, 10000.0), 512.0);
+    EXPECT_DOUBLE_EQ(q.x, 9728.0);  // floor(10000 / 512) = 19 ⇒ 19 × 512
+    EXPECT_DOUBLE_EQ(q.y, 0.0);
+    EXPECT_DOUBLE_EQ(q.z, 9728.0);
+
+    const glm::dvec3 negative = vx::QuantizeHorizontalWorldOrigin(glm::dvec3(-100.0, 0.0, 50.0), 512.0);
+    EXPECT_DOUBLE_EQ(negative.x, -512.0);  // 负坐标也向下取整（-0.195 ⇒ -1）
+    EXPECT_DOUBLE_EQ(negative.z, 0.0);
+
+    EXPECT_EQ(vx::QuantizeHorizontalWorldOrigin(glm::dvec3(1.0, 2.0, 3.0), 0.0), glm::dvec3(0.0));
+}
+
+// 重定基：把全部刚体与角色按"旧原点 − 新原点"平移后，**世界位置逐值不变**；之后角色仍能正常落地。
+TEST(PhysicsBody, SetWorldOriginKeepsWorldPositionsAndSimulationStable) {
+    PhysicsWorld physics;
+    physics.SetGravity(glm::vec3(0.0F, -kGravity, 0.0F));
+    EXPECT_EQ(physics.WorldOrigin(), glm::dvec3(0.0)) << "默认原点必须是 (0,0,0)，保证与引入前等价";
+
+    // 放在距原点 10 km 处：平坦地形（世界原点 10000）+ 角色 + 一个空中动态刚体。
+    const std::vector<float>      samples = MakeFlatSamples(5.0F);
+    PhysicsWorld::HeightFieldDesc heightField = MakeDesc(samples);
+    heightField.originX = 10000.0;
+    heightField.originZ = 10000.0;
+    ASSERT_NE(physics.AddHeightField(heightField), 0u);
+
+    PhysicsWorld::CapsuleDesc capsule;
+    capsule.position = glm::dvec3(10032.0, 20.0, 10032.0);
+    const PhysicsWorld::CharacterHandle character = physics.CreateCharacter(capsule);
+    ASSERT_NE(character, 0u);
+
+    const std::vector<float>     points = MakeBoxHullPoints(1.0F, 1.0F, 1.0F);
+    PhysicsWorld::ConvexHullDesc hull;
+    hull.positions  = points.data();
+    hull.pointCount = points.size() / 3;
+    hull.originX    = 10000.0;
+    hull.originY    = 60.0;
+    hull.originZ    = 10000.0;
+    hull.mass       = 30.0F;
+    const PhysicsWorld::BodyHandle body = physics.AddDynamicConvexHull(hull);
+    ASSERT_NE(body, 0u);
+
+    const glm::dvec3 characterBefore = physics.GetCharacterState(character).position;
+    const glm::dvec3 hullBefore      = physics.GetRigidBodyState(body).position;
+    ASSERT_NEAR(characterBefore.x, 10032.0, 1e-6);
+    ASSERT_NEAR(hullBefore.x, 10000.0, 1e-6);
+
+    // 把原点跳到角色所在的 512 格挡位。
+    const glm::dvec3 newOrigin = vx::QuantizeHorizontalWorldOrigin(characterBefore, 512.0);
+    physics.SetWorldOrigin(newOrigin);
+    EXPECT_EQ(physics.WorldOrigin(), newOrigin);
+
+    const glm::dvec3 characterAfter = physics.GetCharacterState(character).position;
+    const glm::dvec3 hullAfter      = physics.GetRigidBodyState(body).position;
+    EXPECT_NEAR(characterAfter.x, characterBefore.x, 1e-3) << "重定基不得改变角色的世界位置";
+    EXPECT_NEAR(characterAfter.y, characterBefore.y, 1e-3);
+    EXPECT_NEAR(characterAfter.z, characterBefore.z, 1e-3);
+    EXPECT_NEAR(hullAfter.x, hullBefore.x, 1e-3) << "重定基不得改变刚体的世界位置";
+    EXPECT_NEAR(hullAfter.y, hullBefore.y, 1e-3);
+    EXPECT_NEAR(hullAfter.z, hullBefore.z, 1e-3);
+
+    // 幂等：设成同一个原点 ⇒ 无操作、位置仍不变。
+    physics.SetWorldOrigin(newOrigin);
+    EXPECT_NEAR(physics.GetCharacterState(character).position.x, characterBefore.x, 1e-3);
+
+    // 重定基后继续模拟：角色照常落到地表（世界 y ≈ 5），水平不漂移。
+    const glm::vec3 gravity(0.0F, -kGravity, 0.0F);
+    for (int i = 0; i < 240; ++i) {
+        physics.MoveCharacter(character, kFixedDt, gravity);
+    }
+    const PhysicsWorld::CharacterState landed = physics.GetCharacterState(character);
+    EXPECT_TRUE(landed.onGround);
+    EXPECT_NEAR(landed.position.y, 5.0, kRestTolerance) << "重定基后仍必须站在地表";
+    EXPECT_NEAR(landed.position.x, characterBefore.x, 1.0);
+    EXPECT_NEAR(landed.position.z, characterBefore.z, 1.0);
+}

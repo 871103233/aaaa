@@ -12,6 +12,7 @@ using vx::CameraView;
 using vx::ITerrainQuery;
 using vx::kCameraMinDistance;
 using vx::kCameraPitchLimit;
+using vx::ShouldHideFollowTarget;
 using vx::ThirdPersonCamera;
 
 /// 实心球地形桩：球内为地形，球外为空。
@@ -76,7 +77,8 @@ private:
     float     m_radius = 0.0F;
 };
 
-/// 无限水平地面（高度恒为 0），且永不报告线段遮挡——只用来验证"离地间隙"安全网。
+/// 无限水平地面（高度恒为 0，`y <= 0` 即实心），且**永不报告线段遮挡**——
+/// 只用来验证"相机在实心体内时**沿悬臂收缩**"的安全网（遮挡由线段查询兜住，这里刻意让线段查询闭嘴）。
 class FlatGround : public ITerrainQuery {
 public:
     [[nodiscard]] bool QueryHeight(float /*worldX*/, float /*worldZ*/, float& outHeight) const override {
@@ -136,6 +138,131 @@ public:
         const bool insideCave = point.y >= -6.0F && std::abs(point.x) <= 8.0F && std::abs(point.z) <= 8.0F;
         return !insideCave;
     }
+};
+
+/// 带**洞顶**的洞穴桩（W6b）：空腔 = `|x| ≤ 6、|z| ≤ 6、-2 ≤ y ≤ 2`，其余为实心。
+///
+/// `QueryObstruction` **总是报告不遮挡**（模拟"单射线在狭小空间里没查到"的情形）⇒ 只能靠安全网
+/// 把相机收回洞内。修复前安全网只会**向上顶**，会把相机穿过洞顶抬到地表之上（"看到地图外"）。
+class CaveWithCeilingTerrain : public ITerrainQuery {
+public:
+    [[nodiscard]] bool QueryHeight(float /*worldX*/, float /*worldZ*/, float& outHeight) const override {
+        outHeight = 2.0F;
+        return true;
+    }
+
+    [[nodiscard]] bool QueryObstruction(const glm::vec3& /*from*/, const glm::vec3& /*to*/,
+                                        float& outSafeT) const override {
+        outSafeT = 1.0F;
+        return false;
+    }
+
+    [[nodiscard]] bool IsSolid(const glm::vec3& point) const override {
+        const bool insideAir = std::abs(point.x) <= 6.0F && std::abs(point.z) <= 6.0F && point.y >= -2.0F &&
+                               point.y <= 2.0F;
+        return !insideAir;
+    }
+};
+
+/// **窄隧道**桩（W6b）：`y ≤ 2` 是空气、其余实心；线段查询**恒报"起点即被挡"**（`safeT = 0`）
+/// ⇒ 避障把悬臂压到最小距离（相机贴近主角）。
+class NarrowTunnelTerrain : public ITerrainQuery {
+public:
+    [[nodiscard]] bool QueryHeight(float /*worldX*/, float /*worldZ*/, float& outHeight) const override {
+        outHeight = 2.0F;
+        return true;
+    }
+
+    [[nodiscard]] bool QueryObstruction(const glm::vec3& /*from*/, const glm::vec3& /*to*/,
+                                        float& outSafeT) const override {
+        outSafeT = 0.0F;
+        return true;
+    }
+
+    [[nodiscard]] bool IsSolid(const glm::vec3& point) const override { return point.y > 2.0F; }
+};
+
+/// **紧身气室**桩（W6c）：只有以原点为中心、半径 0.35 格的球形空间是空气，其余全为实心。
+///
+/// 代表"角色被窄缝 / 水道裹住"的极端情形：**整根悬臂（含最小距离处）都在实心里**，且线段遮挡查询
+/// 没查到（`QueryObstruction` 恒报不遮挡）⇒ 只能靠 `IsSolid` 安全网。
+/// 缺陷 W6c 的机制：最小距离托底（旧值 0.5）处仍是实心 ⇒ 收缩循环卡死 ⇒ 落到"向上顶"兜底
+/// ⇒ 相机被抬到注视点**正上方** ⇒ 视线变为垂直向下（俯视），且每帧重复 ⇒ "锁定俯视"。
+class TightPocketTerrain : public ITerrainQuery {
+public:
+    [[nodiscard]] bool QueryHeight(float /*worldX*/, float /*worldZ*/, float& outHeight) const override {
+        outHeight = 0.0F;
+        return false;  // 气室被实心裹住，没有可用的地表高度
+    }
+
+    [[nodiscard]] bool QueryObstruction(const glm::vec3& /*from*/, const glm::vec3& /*to*/,
+                                        float& outSafeT) const override {
+        outSafeT = 1.0F;
+        return false;  // 单射线在窄缝里漏检
+    }
+
+    [[nodiscard]] bool IsSolid(const glm::vec3& point) const override {
+        return glm::length(point) > kAirRadius;
+    }
+
+private:
+    static constexpr float kAirRadius = 0.35F;
+};
+
+/// **球探针契约**桩（W6f）：无半径的 `QueryObstruction` 恒报畅通；`QueryObstructionWithRadius` 在
+/// `radius > 0` 时报告"在 t = 0.5 处被挡"。用于验证相机确实走了**带半径**的查询，
+/// 且 `cameraProbeRadius = 0` 时退回**线段**（不被拉近）。
+class RadiusOnlyObstruction : public ITerrainQuery {
+public:
+    [[nodiscard]] bool QueryHeight(float /*worldX*/, float /*worldZ*/, float& outHeight) const override {
+        outHeight = 0.0F;
+        return true;
+    }
+
+    [[nodiscard]] bool QueryObstruction(const glm::vec3& /*from*/, const glm::vec3& /*to*/,
+                                        float& outSafeT) const override {
+        outSafeT = 1.0F;
+        return false;  // 无半径：畅通
+    }
+
+    [[nodiscard]] bool QueryObstructionWithRadius(const glm::vec3& /*from*/, const glm::vec3& /*to*/, float radius,
+                                                  float& outSafeT) const override {
+        if (radius > 0.0F) {
+            outSafeT = 0.5F;
+            return true;
+        }
+        outSafeT = 1.0F;
+        return false;
+    }
+
+    [[nodiscard]] bool IsSolid(const glm::vec3& /*point*/) const override { return false; }
+};
+
+/// **可切换遮挡**桩（W6h）：`blocked` 为真时报告"在安全比例 `safeT` 处被挡"，否则畅通。
+/// 用于模拟"玩家在临界点（遮挡刚出现 / 消失）反复横跳"。
+class SwitchableObstruction : public ITerrainQuery {
+public:
+    [[nodiscard]] bool QueryHeight(float /*worldX*/, float /*worldZ*/, float& outHeight) const override {
+        outHeight = 0.0F;
+        return true;
+    }
+
+    [[nodiscard]] bool QueryObstruction(const glm::vec3& /*from*/, const glm::vec3& /*to*/,
+                                        float& outSafeT) const override {
+        outSafeT = blocked ? safeT : 1.0F;
+        return blocked;
+    }
+
+    [[nodiscard]] bool QueryObstructionWithRadius(const glm::vec3& /*from*/, const glm::vec3& /*to*/,
+                                                  float /*radius*/, float& outSafeT) const override {
+        outSafeT = blocked ? safeT : 1.0F;
+        return blocked;
+    }
+
+    [[nodiscard]] bool IsSolid(const glm::vec3& /*point*/) const override { return false; }
+
+    bool  blocked = false;
+    float safeT   = 0.5F;
 };
 
 /// 视图矩阵是否逐元素有限（出现 NaN / Inf 即为"整帧几何失效"）。
@@ -263,24 +390,31 @@ TEST(ThirdPersonCamera, IsPulledCloserAndStaysOutsideTerrainWhenObstructed) {
     EXPECT_GT(view.eye.z, 3.0F);
 }
 
-// 即便线段查询没报告遮挡，相机也不得停留在**实心体**内（地表 0 以下即实心）。
-TEST(ThirdPersonCamera, NeverDropsBelowGroundClearance) {
+// W6c（判据③"仰视扎地"）：向上看时相机被压到注视点下方、扎进地面，必须**沿悬臂朝注视点拉近**
+// 回到地面之上 —— 而不是被"向上顶"（旧行为，已删除）。
+TEST(ThirdPersonCamera, PullsTheCameraOntoTheGroundAlongTheBoomWhenLookingUp) {
     CameraSettings settings;
-    settings.followDistance  = 5.0F;
-    settings.pivotHeight     = 0.0F;
-    settings.groundClearance = 0.5F;
+    settings.followDistance = 5.0F;
+    settings.pivotHeight    = 1.6F;
 
     ThirdPersonCamera camera(settings);
     camera.SnapTo(glm::vec3(0.0F, 0.0F, 0.0F));
     camera.SetYaw(0.0F);
-    camera.SetPitch(glm::radians(30.0F));  // 向上看 → 相机被压到注视点下方
+    const float pitch = glm::radians(30.0F);  // 向上看 → 相机被压到注视点下方，扎进地面
+    camera.SetPitch(pitch);
 
     const FlatGround terrain;
     const CameraView view = camera.Evaluate(0.0, &terrain);
 
-    // 相机被顶出实心体（地表 0）之后再额外留出 groundClearance 的间隙。
-    EXPECT_FALSE(terrain.IsSolid(view.eye));
-    EXPECT_GT(view.eye.y, 0.0F);
+    // 沿悬臂拉近的必然结果：相机回到地面之上，且仍在悬臂线上。
+    EXPECT_FALSE(terrain.IsSolid(view.eye)) << "相机不得停留在地面之下（实心体）";
+    EXPECT_GT(view.eye.y, 0.0F) << "仰视扎地时必须沿悬臂拉近到地面之上";
+    EXPECT_LT(view.distance, settings.followDistance) << "悬臂应被收缩";
+
+    const glm::vec3 backward(0.0F, -std::sin(pitch), -std::cos(pitch));  // yaw = 0
+    const glm::vec3 boom = glm::normalize(view.eye - view.target);
+    EXPECT_NEAR(glm::length(glm::cross(boom, backward)), 0.0F, 1.0e-4F) << "相机必须始终停在悬臂线上";
+    EXPECT_TRUE(IsFinite(view.viewProjection));
 }
 
 // 人工实测第 7 轮回归：角色站在**体积挖出的洞**里时，相机不得被"旧地表"顶到洞顶之上。
@@ -362,7 +496,6 @@ TEST(ThirdPersonCamera, DegenerateViewIsAvoidedWhenFollowDistanceCollapses) {
     CameraSettings settings;
     settings.followDistance  = 14.0F;  // 与 game/main.cpp 一致
     settings.pivotHeight     = 1.6F;
-    settings.groundClearance = 0.2F;
 
     ThirdPersonCamera camera(settings);
     camera.SnapTo(glm::vec3(0.0F, 0.0F, 0.0F));
@@ -397,5 +530,246 @@ TEST(ThirdPersonCamera, MinDistanceGuardKeepsRequestedDistanceWhenUnobstructed) 
 
     EXPECT_NEAR(view.distance, settings.followDistance, 1e-4F);
     EXPECT_TRUE(IsFinite(view.viewProjection));
+}
+
+// W6b 回归（"看到地图外"）：相机被**洞顶**挤住时，必须**沿视线收缩悬臂**停在洞内，
+// 而不是被"向上顶"穿过洞顶抬到地表之上（旧行为会把 `eye.y` 抬到远超洞顶 = 玩家从地图外看世界）。
+TEST(ThirdPersonCamera, PullsCameraAlongTheBoomInsteadOfLiftingItThroughACeiling) {
+    CameraSettings settings;
+    settings.followDistance = 5.0F;
+    settings.pivotHeight    = 0.0F;
+
+    ThirdPersonCamera camera(settings);
+    camera.SnapTo(glm::vec3(0.0F, 0.0F, 0.0F));
+    camera.SetYaw(0.0F);
+    camera.SetPitch(glm::radians(-45.0F));  // 俯视 ⇒ 相机被抬到注视点**上方**，撞上洞顶（y = 2）
+
+    const CaveWithCeilingTerrain terrain;
+    const CameraView             view = camera.Evaluate(0.0, &terrain);
+
+    EXPECT_FALSE(terrain.IsSolid(view.eye)) << "相机不得停留在实心体内";
+    EXPECT_LT(view.eye.y, 2.0F + 1.0e-3F) << "相机必须留在洞内，不得被顶到洞顶之上（旧行为会穿过洞顶）";
+    EXPECT_LT(view.distance, settings.followDistance) << "悬臂应被收缩";
+    EXPECT_GE(view.distance, kCameraMinDistance - 1.0e-5F);
+    EXPECT_TRUE(IsFinite(view.viewProjection));
+}
+
+// W6b（"看到人物内部"）：相机被避障挤到很近时，`ShouldHideFollowTarget` 必须判定**隐藏主角**；
+// 开阔处则必须保持可见（否则正常视角下主角会莫名消失）。
+TEST(ThirdPersonCamera, HidesFollowTargetWhenTheCameraIsJammedClose) {
+    CameraSettings settings;
+    settings.followDistance     = 6.0F;
+    settings.pivotHeight        = 1.6F;
+    settings.targetHideDistance = 1.5F;
+
+    ThirdPersonCamera camera(settings);
+    camera.SnapTo(glm::vec3(0.0F, 0.0F, 0.0F));
+    camera.SetYaw(0.0F);
+    camera.SetPitch(0.0F);
+
+    // 开阔地：距离保持 ⇒ 主角**必须可见**。
+    const FlatGround open;
+    const CameraView openView = camera.Evaluate(0.0, &open);
+    EXPECT_NEAR(openView.distance, settings.followDistance, 1.0e-4F);
+    EXPECT_FALSE(ShouldHideFollowTarget(openView, settings));
+
+    // 窄隧道：避障把悬臂压到最小距离（相机贴近主角）⇒ 主角**必须隐藏**，且相机仍在空气里。
+    const NarrowTunnelTerrain tunnel;
+    const CameraView          tunnelView = camera.Evaluate(0.0, &tunnel);
+    EXPECT_LE(tunnelView.distance, settings.targetHideDistance);
+    EXPECT_TRUE(ShouldHideFollowTarget(tunnelView, settings));
+    EXPECT_FALSE(tunnel.IsSolid(tunnelView.eye)) << "相机仍不得落在实心体内";
+    EXPECT_LE(tunnelView.eye.y, 2.0F) << "相机不得被顶到隧道顶之上";
+}
+
+// W6c 回归（"窄处锁定俯视"）：窄缝里相机的**朝向不得被改变** —— `normalize(eye − target)` 必须恒等于
+// 悬臂方向 `backward`（由玩家 yaw / pitch 决定）。
+//
+// 缺陷前：最小距离托底（旧值 0.5）处仍为实心 ⇒ 收缩循环卡死 ⇒ "向上顶"兜底把相机抬到注视点**正上方**
+// ⇒ 视线变为垂直向下（俯视），且每帧重复 ⇒ 玩家看到"镜头锁定俯视"。
+TEST(ThirdPersonCamera, KeepsTheCameraOnTheBoomLineInATightPocket) {
+    CameraSettings settings;
+    settings.followDistance = 5.0F;
+    settings.pivotHeight    = 0.0F;
+
+    ThirdPersonCamera camera(settings);
+    camera.SnapTo(glm::vec3(0.0F, 0.0F, 0.0F));
+    camera.SetYaw(0.0F);
+    const float pitch = glm::radians(-30.0F);
+    camera.SetPitch(pitch);
+
+    const TightPocketTerrain terrain;
+    const CameraView         view = camera.Evaluate(0.0, &terrain);
+
+    // 悬臂方向（yaw = 0）：backward = (0, −sin(pitch), −cos(pitch))。
+    const glm::vec3 backward(0.0F, -std::sin(pitch), -std::cos(pitch));
+    const glm::vec3 boom = glm::normalize(view.eye - view.target);
+
+    EXPECT_NEAR(glm::length(glm::cross(boom, backward)), 0.0F, 1.0e-4F)
+        << "相机必须始终停在悬臂线上（朝向由玩家决定，不因避障改变）";
+    EXPECT_GT(glm::dot(boom, backward), 0.0F) << "收缩方向必须指向注视点，不得反向";
+    EXPECT_LT(boom.y, 0.99F) << "相机不得被抬到注视点正上方（旧'向上顶'兜底 ⇒ 垂直俯视）";
+
+    EXPECT_FALSE(terrain.IsSolid(view.eye)) << "相机不得停在实心体内";
+    EXPECT_GE(view.distance, kCameraMinDistance - 1.0e-5F);
+    EXPECT_LT(view.distance, settings.followDistance) << "悬臂应被收缩到最小距离附近";
+    EXPECT_TRUE(IsFinite(view.viewProjection));
+}
+
+// W6g 回归（肩位偏移）：注视点沿**相机右方**平移 `shoulderOffset`，且**不改变朝向**
+// （`normalize(eye − target)` 仍 = 悬臂方向）——否则"偏移"会退化为"改朝向"。
+TEST(ThirdPersonCamera, ShoulderOffsetShiftsThePivotWithoutChangingFacing) {
+    CameraSettings settings;
+    settings.followDistance = 6.0F;
+    settings.pivotHeight    = 0.0F;
+    settings.shoulderOffset = 0.6F;
+
+    ThirdPersonCamera camera(settings);
+    camera.SnapTo(glm::vec3(0.0F, 0.0F, 0.0F));
+    camera.SetYaw(0.0F);
+    const float pitch = glm::radians(-20.0F);
+    camera.SetPitch(pitch);
+
+    const CameraView view = camera.Evaluate(0.0, nullptr);
+
+    // yaw = 0 ⇒ 右方 = (cos 0, 0, −sin 0) = (+1, 0, 0)：注视点应沿 +X 偏移 `shoulderOffset`。
+    EXPECT_NEAR(view.target.x, settings.shoulderOffset, 1.0e-4F) << "注视点应沿相机右方偏移";
+    EXPECT_NEAR(view.target.z, 0.0F, 1.0e-4F);
+
+    // 朝向不变：eye 仍在注视点的悬臂方向上（yaw = 0 ⇒ backward = (0, −sin pitch, −cos pitch)）。
+    const glm::vec3 backward(0.0F, -std::sin(pitch), -std::cos(pitch));
+    const glm::vec3 boom = glm::normalize(view.eye - view.target);
+    EXPECT_NEAR(glm::length(glm::cross(boom, backward)), 0.0F, 1.0e-4F) << "肩位偏移不得改变朝向";
+    EXPECT_GT(glm::dot(boom, backward), 0.0F);
+    EXPECT_NEAR(view.distance, settings.followDistance, 1.0e-4F);
+}
+
+// W6f 回归（球投射探针）：相机必须走**带半径**的遮挡查询 —— 半径 > 0 时按桩报告被拉近；
+// 半径 = 0 时退回**线段**查询（桩报畅通）⇒ 距离保持。这是"薄墙不再从相机旁擦过漏检"的接线判据。
+TEST(ThirdPersonCamera, UsesRadiusAwareObstructionWhenProbeRadiusIsSet) {
+    CameraSettings settings;
+    settings.followDistance  = 6.0F;
+    settings.pivotHeight     = 0.0F;
+    settings.collisionMargin = 0.2F;
+
+    const RadiusOnlyObstruction terrain;
+
+    settings.cameraProbeRadius = 0.25F;
+    ThirdPersonCamera withProbe(settings);
+    withProbe.SnapTo(glm::vec3(0.0F, 0.0F, 0.0F));
+    withProbe.SetYaw(0.0F);
+    withProbe.SetPitch(0.0F);
+    const CameraView probeView = withProbe.Evaluate(0.0, &terrain);
+    EXPECT_LT(probeView.distance, settings.followDistance) << "带半径的查询报告遮挡 ⇒ 相机应被拉近";
+    EXPECT_NEAR(probeView.distance, settings.followDistance * 0.5F - settings.collisionMargin, 1.0e-4F);
+
+    settings.cameraProbeRadius = 0.0F;
+    ThirdPersonCamera withoutProbe(settings);
+    withoutProbe.SnapTo(glm::vec3(0.0F, 0.0F, 0.0F));
+    withoutProbe.SetYaw(0.0F);
+    withoutProbe.SetPitch(0.0F);
+    const CameraView plainView = withoutProbe.Evaluate(0.0, &terrain);
+    EXPECT_NEAR(plainView.distance, settings.followDistance, 1.0e-4F) << "半径 = 0 应退回线段查询（无遮挡）";
+}
+
+// W6e（淡出主角）：`FollowTargetFadeOpacity` 随相机—注视点距离**单调下降**；开阔处 = 1、极近处 = 0。
+TEST(ThirdPersonCamera, FadeOpacityDropsMonotonicallyWithCameraDistance) {
+    CameraSettings settings;
+    settings.targetFadeStartDistance = 1.5F;
+    settings.targetFadeEndDistance   = 0.4F;
+
+    CameraView view;
+
+    view.distance = 3.0F;
+    EXPECT_FLOAT_EQ(vx::FollowTargetFadeOpacity(view, settings), 1.0F) << "开阔处：完全不透明";
+    view.distance = 1.5F;  // 恰在起点
+    EXPECT_FLOAT_EQ(vx::FollowTargetFadeOpacity(view, settings), 1.0F);
+    view.distance = 0.95F;  // (0.95 − 0.4) / (1.5 − 0.4) = 0.5
+    EXPECT_NEAR(vx::FollowTargetFadeOpacity(view, settings), 0.5F, 1.0e-5F);
+    view.distance = 0.4F;  // 恰在终点
+    EXPECT_FLOAT_EQ(vx::FollowTargetFadeOpacity(view, settings), 0.0F);
+    view.distance = 0.2F;  // 比终点更近（= kCameraMinDistance）
+    EXPECT_FLOAT_EQ(vx::FollowTargetFadeOpacity(view, settings), 0.0F);
+
+    // 单调不减（距离越小越透明）。
+    float previous = 1.0F;
+    for (float d = 1.5F; d >= 0.39F; d -= 0.1F) {
+        view.distance       = d;
+        const float opacity = vx::FollowTargetFadeOpacity(view, settings);
+        EXPECT_LE(opacity, previous + 1.0e-6F) << "不透明度必须随距离下降而单调不增";
+        previous = opacity;
+    }
+
+    // 区间退化（起点 <= 终点）：不得产生 NaN / 反号。
+    settings.targetFadeStartDistance = 0.4F;
+    settings.targetFadeEndDistance   = 1.5F;
+    view.distance                    = 1.0F;
+    const float degenerate = vx::FollowTargetFadeOpacity(view, settings);
+    EXPECT_TRUE(std::isfinite(degenerate));
+    EXPECT_GE(degenerate, 0.0F);
+    EXPECT_LE(degenerate, 1.0F);
+}
+
+// W6h 回归（迟滞 + 推远阻尼）：遮挡消失后 `avoidanceClearHold` 窗口内**不得回推**；
+// 越过迟滞后**平滑**推远（单帧增量 < 全部差额），最终收敛。这是"临界点反复横跳 ⇒ 画面闪烁"的根因对策。
+TEST(ThirdPersonCamera, AvoidanceHoldsThenExtendsSmoothlyAfterOcclusionClears) {
+    CameraSettings settings;
+    settings.followDistance          = 10.0F;
+    settings.pivotHeight             = 0.0F;
+    settings.collisionMargin         = 0.0F;
+    settings.cameraProbeRadius       = 0.0F;
+    settings.avoidanceClearHold      = 0.2F;
+    settings.avoidanceExtendDamping  = 0.25F;
+    settings.avoidanceExtendMaxSpeed = 0.0F;  // 不限速，便于断言"平滑"
+
+    SwitchableObstruction terrain;  // safeT = 0.5 ⇒ 目标距离 = 5
+    ThirdPersonCamera     camera(settings);
+    camera.SnapTo(glm::vec3(0.0F, 0.0F, 0.0F));
+    camera.SetYaw(0.0F);
+    camera.SetPitch(0.0F);
+
+    // ① 遮挡出现：首帧直接吸附到 10 × 0.5 = 5（无历史 ⇒ 无平滑）。
+    terrain.blocked = true;
+    camera.UpdateAvoidance(0.016F, 0.0, &terrain);
+    EXPECT_NEAR(camera.Evaluate(0.0, &terrain).distance, 5.0F, 1.0e-4F);
+
+    // ② 遮挡消失：迟滞窗口内**保持不动**（临界点横跳不闪的关键）。
+    terrain.blocked = false;
+    camera.UpdateAvoidance(0.10F, 0.0, &terrain);  // 累计 0.10 < 0.20
+    EXPECT_NEAR(camera.Evaluate(0.0, &terrain).distance, 5.0F, 1.0e-4F) << "迟滞窗口内不得回推";
+
+    // ③ 越过迟滞：开始**平滑**推远（绝不瞬间回到跟随距离）。
+    camera.UpdateAvoidance(0.15F, 0.0, &terrain);  // 累计 0.25 >= 0.20
+    const float afterFirstExtend = camera.Evaluate(0.0, &terrain).distance;
+    EXPECT_GT(afterFirstExtend, 5.0F) << "越过迟滞后应开始推远";
+    EXPECT_LT(afterFirstExtend, settings.followDistance) << "推远必须平滑，不得瞬间回到跟随距离";
+
+    // ④ 持续清晰 ⇒ 收敛到跟随距离。
+    for (int i = 0; i < 200; ++i) {
+        camera.UpdateAvoidance(0.016F, 0.0, &terrain);
+    }
+    EXPECT_NEAR(camera.Evaluate(0.0, &terrain).distance, settings.followDistance, 1.0e-2F);
+}
+
+// W6h 回归（拉近立即）：遮挡**出现**的那一帧距离必须**立即**收紧 —— 相机绝不允许留在墙里（安全优先）。
+TEST(ThirdPersonCamera, AvoidancePullsInImmediatelyWhenOcclusionAppears) {
+    CameraSettings settings;
+    settings.followDistance    = 10.0F;
+    settings.pivotHeight       = 0.0F;
+    settings.collisionMargin   = 0.0F;
+    settings.cameraProbeRadius = 0.0F;
+
+    SwitchableObstruction terrain;  // 先畅通
+    ThirdPersonCamera     camera(settings);
+    camera.SnapTo(glm::vec3(0.0F, 0.0F, 0.0F));
+    camera.SetYaw(0.0F);
+    camera.SetPitch(0.0F);
+
+    camera.UpdateAvoidance(0.016F, 0.0, &terrain);
+    EXPECT_NEAR(camera.Evaluate(0.0, &terrain).distance, 10.0F, 1.0e-4F);
+
+    terrain.blocked = true;  // 遮挡出现（安全比例 0.5 ⇒ 目标 5）
+    camera.UpdateAvoidance(0.001F, 0.0, &terrain);  // 极小帧时间：仍须**立即**收紧
+    EXPECT_NEAR(camera.Evaluate(0.0, &terrain).distance, 5.0F, 1.0e-4F) << "拉近必须立即，不得有阻尼";
 }
 

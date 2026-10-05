@@ -51,23 +51,30 @@ void RefreshTileMaxSurfaceBlocks(TerrainTile& tile) noexcept {
 
 }  // namespace
 
-TerrainWorld::TerrainWorld(std::uint64_t worldSeed, TerrainMaterialTable materials)
-    : m_seed(worldSeed), m_materials(std::move(materials)), m_noise(worldSeed) {}
+TerrainTile GenerateTerrainTileData(const TerrainNoiseGenerator& noise, const std::vector<MapEdit>& edits,
+                                    int tileX, int tileZ) {
+    TerrainTile tile;
+    tile.coord = TileCoord { tileX, tileZ };
+    GenerateTerrainTile(tile, noise);
+    // 预设地图：噪声先行，编辑按文件顺序覆盖其上（T11；纯函数，边界列逐位一致）。
+    ApplyMapEditsToTile(edits, tile);
+    RefreshTileMaxSurfaceBlocks(tile);
+    return tile;
+}
+
+TerrainWorld::TerrainWorld(std::uint64_t worldSeed, TerrainMaterialTable materials, TerrainGenerationParams params)
+    : m_seed(worldSeed), m_materials(std::move(materials)), m_noise(worldSeed, std::move(params)) {}
 
 void TerrainWorld::SetMapPreset(const MapPreset& preset) {
     m_mapEdits = preset.edits;
 }
 
 void TerrainWorld::GenerateTile(int tileX, int tileZ) {
-    TerrainTile& tile = m_tiles[TileCoord { tileX, tileZ }];
-    tile.coord        = TileCoord { tileX, tileZ };
-    GenerateTerrainTile(tile, m_noise);
-    // 预设地图：噪声先行，编辑按文件顺序覆盖其上（T11；纯函数，边界列逐位一致）。
-    ApplyMapEditsToTile(m_mapEdits, tile);
-    RefreshTileMaxSurfaceBlocks(tile);
+    // W7-S3b：生成逻辑抽为自由函数 `GenerateTerrainTileData`（worker 与主线程**共用同一份实现** ⇒ 逐位一致）。
+    m_tiles[TileCoord { tileX, tileZ }] = GenerateTerrainTileData(m_noise, m_mapEdits, tileX, tileZ);
 }
 
-void TerrainWorld::MeshTile(int tileX, int tileZ) {
+void TerrainWorld::MeshTile(int tileX, int tileZ, int lodLevel) {
     const auto found = m_tiles.find(TileCoord { tileX, tileZ });
     if (found == m_tiles.end()) {
         return;
@@ -75,12 +82,90 @@ void TerrainWorld::MeshTile(int tileX, int tileZ) {
     TerrainTile& tile = found->second;
     // 高度缓存在这里刷新：`MeshTile` 是"生成后"与"笔刷改动后"（经 `RemeshDirtyTiles`）的**唯一汇合点**。
     RefreshTileMaxSurfaceBlocks(tile);
-    m_meshes[TileCoord { tileX, tileZ }] = BuildTerrainMesh(tile, m_quadFilter);
+    m_meshes[TileCoord { tileX, tileZ }] = BuildTerrainMesh(tile, m_quadFilter, lodLevel);
 }
 
-void TerrainWorld::LoadTile(int tileX, int tileZ) {
+void TerrainWorld::LoadTile(int tileX, int tileZ, int lodLevel) {
+    const TileCoord coord { tileX, tileZ };
+    const auto      staged = m_staged.find(coord);
+    if (staged != m_staged.end() && staged->second.mesh.lodLevel == lodLevel) {
+        // **命中预取缓存 ⇒ 只做安装**（廉价）：装高度 + 按**当前**过滤器过滤网格（主线程）。
+        // 过滤在安装时（而非 worker 里）做，语义与"同步生成时过滤"**逐位一致**（红线 7 / ADR 0011）。
+        TerrainTile& tile = m_tiles[coord];
+        tile              = std::move(staged->second.tile);
+        ApplyQuadFilterToMesh(tile, m_quadFilter, lodLevel, staged->second.mesh.mesh);
+        staged->second.mesh.meshEmpty = staged->second.mesh.mesh.indices.empty();
+        m_meshes[coord]               = std::move(staged->second.mesh);
+        m_staged.erase(staged);
+        return;
+    }
+    if (staged != m_staged.end()) {
+        m_staged.erase(staged);  // LOD 不符 ⇒ 丢弃陈旧条目（不静默使用），走同步路径重建
+    }
+    // 缓存未命中 ⇒ 回退到同步生成（记一条计数便于观测；线程池不可用时这是预期路径）。
+    ++m_syncFallbackCount;
     GenerateTile(tileX, tileZ);
-    MeshTile(tileX, tileZ);
+    MeshTile(tileX, tileZ, lodLevel);
+}
+
+void TerrainWorld::StageTile(TerrainTile tile, TerrainTileMesh mesh) {
+    const TileCoord coord = tile.coord;
+    StagedTerrainTile staged;
+    staged.tile = std::move(tile);
+    staged.mesh = std::move(mesh);
+    m_staged[coord] = std::move(staged);
+}
+
+bool TerrainWorld::HasStagedTile(int tileX, int tileZ, int lodLevel) const noexcept {
+    const auto found = m_staged.find(TileCoord { tileX, tileZ });
+    return found != m_staged.end() && found->second.mesh.lodLevel == lodLevel;
+}
+
+bool TerrainWorld::InstallRemeshedMesh(const TileCoord& coord, int lodLevel, TerrainTileMesh mesh) {
+    const auto found = m_tiles.find(coord);
+    if (found == m_tiles.end()) {
+        return false;  // 已卸载 ⇒ 丢弃（不静默使用陈旧数据）
+    }
+    if (mesh.lodLevel != lodLevel) {
+        return false;  // LOD 不符 ⇒ 丢弃
+    }
+    ApplyQuadFilterToMesh(found->second, m_quadFilter, lodLevel, mesh.mesh);
+    mesh.meshEmpty      = mesh.mesh.indices.empty();
+    m_meshes[coord]     = std::move(mesh);
+    return true;
+}
+
+void TerrainWorld::ReleaseTileMeshCpu(int tileX, int tileZ) {
+    const auto found = m_meshes.find(TileCoord { tileX, tileZ });
+    if (found == m_meshes.end()) {
+        return;
+    }
+    // 只放掉顶点 / 索引缓冲；`coord` / `lodLevel` / `verticesPerSide` / `meshEmpty` 全部保留。
+    MeshData& mesh = found->second.mesh;
+    if (!mesh.vertices.empty()) {
+        mesh.vertices.clear();
+        mesh.vertices.shrink_to_fit();
+    }
+    if (!mesh.indices.empty()) {
+        mesh.indices.clear();
+        mesh.indices.shrink_to_fit();
+    }
+}
+
+bool TerrainWorld::UnloadTile(int tileX, int tileZ) {
+    const TileCoord coord { tileX, tileZ };
+    m_staged.erase(coord);  // 预取缓存里若有同坐标条目也一并丢弃（避免陈旧）
+    m_meshes.erase(coord);  // 网格先于高度释放（两者都按坐标键；顺序不影响结果，保持与"建"相反）
+    return m_tiles.erase(coord) > 0U;
+}
+
+std::vector<TileCoord> TerrainWorld::ResidentTiles() const {
+    std::vector<TileCoord> coords;
+    coords.reserve(m_tiles.size());
+    for (const auto& entry : m_tiles) {
+        coords.push_back(entry.first);  // `std::map` 按 `TileCoord::operator<` 升序 ⇒ 结果天然升序
+    }
+    return coords;
 }
 
 bool TerrainWorld::HasTile(int tileX, int tileZ) const noexcept {

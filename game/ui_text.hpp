@@ -108,6 +108,11 @@ enum class UiLabel : int {
     LoadingStageMeshUpload,   ///< 阶段：网格上传
     LoadingStageFinalize,     ///< 阶段：收尾
 
+    // ---- 常驻 HUD（屏幕左上角坐标显示）----
+    HudCoordinates,           ///< HUD 标题：坐标
+    HudCoordinatesFormat,     ///< HUD 坐标数值格式（`X %.1f  Y %.1f  Z %.1f`）
+    HudCellFormat,            ///< HUD 所在格格式（`cell (%d, %d, %d)`）
+
     kCount  ///< 标签总数（必须保持在最后）
 };
 
@@ -201,6 +206,9 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsEnglish = {
     "Collision bodies",
     "Mesh upload",
     "Finalizing",
+    "Coordinates",
+    "X %.1f  Y %.1f  Z %.1f",
+    "cell (%d, %d, %d)",
 };
 
 /// 中文标签表：仅当**成功加载 CJK 字体**时启用（此时不可能缺字）。
@@ -290,6 +298,9 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsChinese = {
     "碰撞体",
     "网格上传",
     "收尾",
+    "坐标",
+    "X %.1f  Y %.1f  Z %.1f",
+    "格 (%d, %d, %d)",
 };
 
 /// 纯函数：判断字符串是否**只含 ASCII 字节**（`cjkFontAvailable = false` 时的硬约束）。

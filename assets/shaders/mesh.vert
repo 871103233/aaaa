@@ -23,9 +23,15 @@
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
 layout(location = 2) in float inMaterial;
+// W7-S3b：morph 目标高度（该顶点在**父级 LOD 网格**对应列上的采样高度，单位 = 格）。仅当地表网格的
+// meshParams.y（morphStep）> 0 时被下方 morph 段消费；非地表网格缺省 0（不参与 morph）。
+layout(location = 3) in float inMorph;
 
 layout(set = 0, binding = 0, std430) readonly buffer CameraBuffer {
     mat4 viewProjection;
+    // W7-S3b：LOD 原点（渲染相对坐标，xyz；w 预留；std430 偏移 = 64，紧跟 mat4）。morph 因子按顶点到
+    // 该原点的 Chebyshev 距离计算；缺省 (0,0,0) ⇒ 与从前逐位一致。
+    vec4 lodOrigin;
 } camera;
 
 // 逐网格**模型变换**（T41 起；T33 由 `vec4` 偏移泛化为 `mat4`）：
@@ -36,19 +42,47 @@ layout(set = 0, binding = 0, std430) readonly buffer CameraBuffer {
 // ② 倒塌中的刚体（位置与姿态都在变）也只需改这一块，CPU **不必**重烘焙上万顶点（T33）。
 layout(set = 1, binding = 0, std140) uniform MeshTransformBlock {
     mat4 modelToRender;  // 局部坐标 → 渲染原点相对坐标（std140：mat4 = 4 个 vec4）
+    // W6e/W7-S3b：x = 逐网格不透明度（1 = 不透明；< 1 = 片元 Bayer 抖动淡出）；
+    // y = morphStep（> 0 启用 CDLOD 顶点过渡；= 父级网格步长）；z / w = morph 起 / 止距离（格）。
+    vec4 meshParams;
 } meshTransform;
 
 layout(location = 0) out vec3 v_relativePosition;
 layout(location = 1) out vec3 v_normal;
 // `flat`：材质槽位是**整面离散属性**，不做插值（插值会让三角形内出现"槽位 1.7"这种无意义的中间值）。
 layout(location = 2) flat out float v_material;
+// W6e：逐网格不透明度（插值无害；同一网格所有顶点同值）。
+layout(location = 3) out float v_fade;
 
 void main() {
     // 网格局部坐标 → 渲染原点相对坐标（片元据此 + 渲染原点还原世界坐标）。
-    const vec3 relativePosition = (meshTransform.modelToRender * vec4(inPosition, 1.0)).xyz;
-    gl_Position        = camera.viewProjection * vec4(relativePosition, 1.0);
+    vec3 relativePosition = (meshTransform.modelToRender * vec4(inPosition, 1.0)).xyz;
+    gl_Position           = camera.viewProjection * vec4(relativePosition, 1.0);
+
+    // W7-S3b：CDLOD 顶点过渡（ADR 0024 接缝策略）——把本环顶点向**父级（更粗一级）网格**的对应列靠拢，
+    // 使相邻环在环边界处几何逐位一致，消除裂缝。`meshParams.y`（morphStep）= 父级网格步长，0 = 关闭（跳过）。
+    const float morphStep = meshTransform.meshParams.y;
+    if (morphStep > 0.0 && meshTransform.meshParams.w > meshTransform.meshParams.z) {
+        // 顶点到 LOD 原点的 **Chebyshev 距离**（与 CPU 侧 tile 距离口径同源，ADR 0024「tile 对齐」）。
+        const float lodDistance = max(abs(relativePosition.x - camera.lodOrigin.x),
+                                      abs(relativePosition.z - camera.lodOrigin.z));
+        // morph 因子：起点前 0（保留本环细节）、终点后 1（完全贴合父级网格）——
+        // 目标是让 k 恰在环边界取 1（ADR 0024「边界处相邻环几何逐位相同」）。
+        const float k = clamp((lodDistance - meshTransform.meshParams.z) /
+                                  (meshTransform.meshParams.w - meshTransform.meshParams.z), 0.0, 1.0);
+        // 父级网格的对应列（局部坐标向下对齐到 morphStep 的整数倍），高度取顶点自带的 morph 目标高度。
+        const vec3 targetLocal = vec3(floor(inPosition.x / morphStep) * morphStep, inMorph,
+                                      floor(inPosition.z / morphStep) * morphStep);
+        const vec3 morphedLocal = mix(inPosition, targetLocal, k);
+        relativePosition = (meshTransform.modelToRender * vec4(morphedLocal, 1.0)).xyz;
+        gl_Position      = camera.viewProjection * vec4(relativePosition, 1.0);
+    }
+
+    // 注意：`v_relativePosition` 必须在 morph **之后**赋值（片元用它还原世界坐标算材质权重）。
     v_relativePosition = relativePosition;
     // 法线必须跟着**同一个旋转**走（T33：倒塌中的刚体会翻滚）——矩阵无缩放，故 mat3 仍是纯旋转、法线保持单位长。
     v_normal           = mat3(meshTransform.modelToRender) * inNormal;
     v_material         = inMaterial;
+    // W6e：逐网格不透明度（CPU 侧恒显式写入：不透明网格为 1.0，淡出中的主角 < 1.0）。
+    v_fade             = meshTransform.meshParams.x;
 }

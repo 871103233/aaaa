@@ -32,6 +32,7 @@
 #include <Jolt/Physics/PhysicsSystem.h>
 #include <Jolt/RegisterTypes.h>
 
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <vector>
@@ -271,6 +272,23 @@ struct PhysicsWorld::Impl {
     std::vector<std::uint32_t>  freeBodySlots;
     std::vector<CharacterEntry> characters;
 
+    /// **水平世界原点**（[ADR 0025](../../docs/adr/0025-large-world-coordinate-precision.md)）：进出 Jolt 的
+    /// 水平位置 = 世界坐标 − 原点；垂直方向不重定基（垂直范围 ≤ 512 格，且高度场采样是绝对高度）。
+    /// 默认 `(0, 0)` ⇒ 与引入本项之前逐位等价。
+    double originX = 0.0;
+    double originZ = 0.0;
+
+    /// 世界坐标 → Jolt 位置（水平减原点，垂直保持世界值）。
+    [[nodiscard]] JPH::RVec3 ToLocalPosition(double x, double y, double z) const {
+        return JPH::RVec3(static_cast<JPH::Real>(x - originX), static_cast<JPH::Real>(y),
+                          static_cast<JPH::Real>(z - originZ));
+    }
+
+    /// Jolt 位置 → 世界坐标（水平加原点，垂直保持）。
+    [[nodiscard]] glm::dvec3 ToWorldPosition(double x, double y, double z) const {
+        return glm::dvec3(x + originX, y, z + originZ);
+    }
+
     /// 把一个成功创建的刚体登记进槽位表，返回句柄（`slot + 1`）。
     [[nodiscard]] PhysicsWorld::BodyHandle RegisterBody(const JPH::BodyID& bodyID,
                                                        const JPH::Vec3& comLocal = JPH::Vec3::sZero()) {
@@ -338,15 +356,65 @@ void PhysicsWorld::OptimizeBroadPhase() {
     m_impl->system->OptimizeBroadPhase();
 }
 
+glm::dvec3 QuantizeHorizontalWorldOrigin(const glm::dvec3& position, double quantum) noexcept {
+    if (!(quantum > 0.0)) {
+        return glm::dvec3(0.0);
+    }
+    return glm::dvec3(std::floor(position.x / quantum) * quantum, 0.0,
+                      std::floor(position.z / quantum) * quantum);
+}
+
+glm::dvec3 PhysicsWorld::WorldOrigin() const noexcept {
+    return glm::dvec3(m_impl->originX, 0.0, m_impl->originZ);
+}
+
+void PhysicsWorld::SetWorldOrigin(const glm::dvec3& origin) noexcept {
+    const double newX = origin.x;
+    const double newZ = origin.z;
+    const double deltaX = m_impl->originX - newX;  // 旧 − 新：把已有 Jolt 位置加上它即保持世界位置不变
+    const double deltaZ = m_impl->originZ - newZ;
+    if (deltaX == 0.0 && deltaZ == 0.0) {
+        return;
+    }
+
+    JPH::BodyInterface& bodyInterface = m_impl->system->GetBodyInterface();
+    const JPH::Real     shiftX        = static_cast<JPH::Real>(deltaX);
+    const JPH::Real     shiftZ        = static_cast<JPH::Real>(deltaZ);
+
+    // 静态与动态一体平移（`SetPosition` 对静态体同样有效：改位置并通知宽相，见 Jolt `BodyInterface::SetPosition`）。
+    // `DontActivate`：不因搬迁唤醒休眠体（只改位置，不改速度与姿态）。
+    for (const JPH::BodyID bodyID : m_impl->bodies) {
+        if (bodyID.IsInvalid()) {
+            continue;
+        }
+        JPH::RVec3 position;
+        JPH::Quat  rotation;
+        bodyInterface.GetPositionAndRotation(bodyID, position, rotation);
+        bodyInterface.SetPosition(bodyID,
+                                  JPH::RVec3(position.GetX() + shiftX, position.GetY(), position.GetZ() + shiftZ),
+                                  JPH::EActivation::DontActivate);
+    }
+    for (Impl::CharacterEntry& entry : m_impl->characters) {
+        if (entry.character == nullptr) {
+            continue;
+        }
+        const JPH::RVec3 position = entry.character->GetPosition();
+        entry.character->SetPosition(
+            JPH::RVec3(position.GetX() + shiftX, position.GetY(), position.GetZ() + shiftZ));
+    }
+
+    m_impl->originX = newX;
+    m_impl->originZ = newZ;
+}
+
 PhysicsWorld::BodyHandle PhysicsWorld::AddHeightField(const HeightFieldDesc& desc) {
     const JPH::ShapeRefC shape = build_height_field_shape(desc);
     if (shape == nullptr) {
         return 0;
     }
 
-    JPH::BodyCreationSettings bodySettings(shape,
-                                           JPH::RVec3(static_cast<JPH::Real>(desc.originX), JPH::Real(0.0),
-                                                      static_cast<JPH::Real>(desc.originZ)),
+    // 高度场采样是**绝对世界高度** ⇒ 只对水平做原点偏移，垂直位置保持 0（见 Impl 的精度说明）。
+    JPH::BodyCreationSettings bodySettings(shape, m_impl->ToLocalPosition(desc.originX, 0.0, desc.originZ),
                                            JPH::Quat::sIdentity(), JPH::EMotionType::Static, kObjectLayerStatic);
     const JPH::BodyID bodyID =
         m_impl->system->GetBodyInterface().CreateAndAddBody(bodySettings, JPH::EActivation::DontActivate);
@@ -367,10 +435,7 @@ PhysicsWorld::BodyHandle PhysicsWorld::AddStaticBox(const BoxDesc& desc) {
     const JPH::ShapeRefC shape =
         new JPH::BoxShape(JPH::Vec3(static_cast<float>(desc.halfExtents.x), static_cast<float>(desc.halfExtents.y),
                                     static_cast<float>(desc.halfExtents.z)));
-    JPH::BodyCreationSettings bodySettings(shape,
-                                           JPH::RVec3(static_cast<JPH::Real>(desc.center.x),
-                                                      static_cast<JPH::Real>(desc.center.y),
-                                                      static_cast<JPH::Real>(desc.center.z)),
+    JPH::BodyCreationSettings bodySettings(shape, m_impl->ToLocalPosition(desc.center.x, desc.center.y, desc.center.z),
                                            JPH::Quat::sIdentity(), JPH::EMotionType::Static, kObjectLayerStatic);
     const JPH::BodyID bodyID =
         m_impl->system->GetBodyInterface().CreateAndAddBody(bodySettings, JPH::EActivation::DontActivate);
@@ -407,9 +472,8 @@ PhysicsWorld::BodyHandle PhysicsWorld::AddMesh(const MeshDesc& desc) {
     }
 
     JPH::BodyCreationSettings bodySettings(
-        shape, JPH::RVec3(static_cast<JPH::Real>(desc.originX), static_cast<JPH::Real>(desc.originY),
-                          static_cast<JPH::Real>(desc.originZ)),
-        JPH::Quat::sIdentity(), JPH::EMotionType::Static, kObjectLayerStatic);
+        shape, m_impl->ToLocalPosition(desc.originX, desc.originY, desc.originZ), JPH::Quat::sIdentity(),
+        JPH::EMotionType::Static, kObjectLayerStatic);
     const JPH::BodyID bodyID =
         m_impl->system->GetBodyInterface().CreateAndAddBody(bodySettings, JPH::EActivation::DontActivate);
     if (bodyID.IsInvalid()) {
@@ -457,9 +521,9 @@ PhysicsWorld::BodyHandle PhysicsWorld::AddDynamicConvexHull(const ConvexHullDesc
 
     JPH::BodyCreationSettings bodySettings(
         shape,
-        JPH::RVec3(static_cast<JPH::Real>(desc.originX) + comWorld.GetX(),
-                   static_cast<JPH::Real>(desc.originY) + comWorld.GetY(),
-                   static_cast<JPH::Real>(desc.originZ) + comWorld.GetZ()),
+        m_impl->ToLocalPosition(desc.originX + static_cast<double>(comWorld.GetX()),
+                                desc.originY + static_cast<double>(comWorld.GetY()),
+                                desc.originZ + static_cast<double>(comWorld.GetZ())),
         rotation, JPH::EMotionType::Dynamic, kObjectLayerStatic);
     bodySettings.mAllowSleeping              = true;  // 落定后由 Jolt 休眠（省 CPU）
     bodySettings.mFriction                   = desc.friction;
@@ -497,11 +561,12 @@ PhysicsWorld::RigidBodyState PhysicsWorld::GetRigidBodyState(BodyHandle handle) 
     const JPH::Vec3 linear  = bodyInterface.GetLinearVelocity(bodyID);
     const JPH::Vec3 angular = bodyInterface.GetAngularVelocity(bodyID);
 
-    // 质心 → 局部原点（与 `Body::GetWorldTransform()` 同式：减去"旋转后的质心局部偏移"）。
+    // 质心 → 局部原点（与 `Body::GetWorldTransform()` 同式：减去"旋转后的质心局部偏移"）；
+    // 再叠加世界原点 ⇒ 对外始终是世界坐标（ADR 0025）。
     const JPH::Vec3 localOffset = rotation * m_impl->bodyComLocals[handle - 1];
-    state.position = glm::dvec3(centerOfMass.GetX() - localOffset.GetX(),
-                               centerOfMass.GetY() - localOffset.GetY(),
-                               centerOfMass.GetZ() - localOffset.GetZ());
+    state.position = m_impl->ToWorldPosition(static_cast<double>(centerOfMass.GetX() - localOffset.GetX()),
+                                             static_cast<double>(centerOfMass.GetY() - localOffset.GetY()),
+                                             static_cast<double>(centerOfMass.GetZ() - localOffset.GetZ()));
     state.rotation = glm::quat(rotation.GetW(), rotation.GetX(), rotation.GetY(), rotation.GetZ());
     state.linearVelocity  = glm::vec3(linear.GetX(), linear.GetY(), linear.GetZ());
     state.angularVelocity = glm::vec3(angular.GetX(), angular.GetY(), angular.GetZ());
@@ -521,8 +586,8 @@ PhysicsWorld::RayCastHit PhysicsWorld::RayCastDynamic(const glm::dvec3& from, co
     }
 
     // Jolt 的 `RRayCast` 约定：`inDirection` 是"起点 → 终点"的**非单位**向量 ⇒ `mFraction ∈ [0, 1]`。
-    const JPH::RRayCast ray { JPH::RVec3(static_cast<JPH::Real>(from.x), static_cast<JPH::Real>(from.y),
-                                         static_cast<JPH::Real>(from.z)),
+    // 起点转局部（减世界原点）；方向是差值 ⇒ 与原点无关，保持不变。
+    const JPH::RRayCast ray { m_impl->ToLocalPosition(from.x, from.y, from.z),
                               JPH::Vec3(static_cast<JPH::Real>(dx), static_cast<JPH::Real>(dy),
                                         static_cast<JPH::Real>(dz)) };
     JPH::RayCastResult       hit;
@@ -532,8 +597,8 @@ PhysicsWorld::RayCastHit PhysicsWorld::RayCastDynamic(const glm::dvec3& from, co
     }
     const JPH::RVec3 point = ray.GetPointOnRay(hit.mFraction);
     result.hit             = true;
-    result.point = glm::dvec3(static_cast<double>(point.GetX()), static_cast<double>(point.GetY()),
-                              static_cast<double>(point.GetZ()));
+    result.point = m_impl->ToWorldPosition(static_cast<double>(point.GetX()), static_cast<double>(point.GetY()),
+                                           static_cast<double>(point.GetZ()));
     // BodyID → 句柄（槽位表很小，线性扫描即可；与 `RegisterBody` 的 `slot + 1` 约定一致）。
     for (std::size_t slot = 0; slot < m_impl->bodies.size(); ++slot) {
         if (m_impl->bodies[slot] == hit.mBodyID) {
@@ -593,9 +658,7 @@ PhysicsWorld::CharacterHandle PhysicsWorld::CreateCharacter(const CapsuleDesc& d
     settings.mShape = shapeResult.Get();
 
     auto character = std::make_unique<JPH::CharacterVirtual>(
-        &settings,
-        JPH::RVec3(static_cast<JPH::Real>(desc.position.x), static_cast<JPH::Real>(desc.position.y),
-                   static_cast<JPH::Real>(desc.position.z)),
+        &settings, m_impl->ToLocalPosition(desc.position.x, desc.position.y, desc.position.z),
         JPH::Quat::sIdentity(), m_impl->system.get());
 
     Impl::CharacterEntry entry;
@@ -632,8 +695,7 @@ void PhysicsWorld::SetCharacterPosition(CharacterHandle handle, const glm::dvec3
     if (character == nullptr) {
         return;
     }
-    character->SetPosition(JPH::RVec3(static_cast<JPH::Real>(position.x), static_cast<JPH::Real>(position.y),
-                                      static_cast<JPH::Real>(position.z)));
+    character->SetPosition(m_impl->ToLocalPosition(position.x, position.y, position.z));
     character->SetLinearVelocity(JPH::Vec3::sZero());
 }
 
@@ -691,7 +753,8 @@ PhysicsWorld::CharacterState PhysicsWorld::GetCharacterState(CharacterHandle han
 
     const JPH::RVec3 position = character->GetPosition();
     const JPH::Vec3  velocity = character->GetLinearVelocity();
-    state.position = glm::dvec3(position.GetX(), position.GetY(), position.GetZ());
+    state.position = m_impl->ToWorldPosition(static_cast<double>(position.GetX()), static_cast<double>(position.GetY()),
+                                             static_cast<double>(position.GetZ()));
     state.velocity = glm::vec3(velocity.GetX(), velocity.GetY(), velocity.GetZ());
 
     // T54：把 Jolt 的**三态**如实映射出来 —— 不能把 `OnSteepGround` 与 `OnGround` 合成一个布尔。

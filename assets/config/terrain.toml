@@ -1,0 +1,103 @@
+# 地表生成参数（含**地貌分区**：山川 / 平原 / 丘陵）
+#
+# 依据：docs/adr/0005-config-parsing.md（TOML + toml++，启动期一次性加载、**非法即抛**）、
+#       docs/tech-plan-v2.0.md §3.1（生成参数全部来自 TOML）、§3.2（分块确定性：种子 + 整数坐标的纯函数）、
+#       docs/plans/v0.4.md §1.2（W3 施工细则：范围 / 顺序 / 落点 / 验收）。
+#
+# 权威解释在代码：字段语义与两个纯函数见 world/generation/terrain_params.hpp 与 terrain_noise.cpp。
+# 本文件只提供数值。
+#
+# 语义（三层噪声 + 地貌掩罩）：
+#   高度(格) = height_offset_blocks
+#              + 地貌基线平移(掩罩)
+#              + ( base·base_amplitude + detail·detail_amplitude + rough·rough_amplitude ) × 地貌幅度倍数(掩罩)
+#   掩罩 m ∈ [0,1] 由一层**低频**噪声归一化得到（频率远低于地形本身 ⇒ 成片的大区域）：
+#     m <  hills_start                        ⇒ 平原（低而平）
+#     hills_start ≤ m < mountains_start       ⇒ 丘陵（中等起伏）
+#     m ≥  mountains_start                    ⇒ 山川（高而崎岖）
+#   三段之间用宽度 blend 的 smoothstep 过渡（连续、单调）。
+#
+# 缺省口径（重要）：**代码内默认 `landform.enabled = false`**（⇒ 与引入地貌层之前逐位一致，既有测试不受影响）；
+#   本文件是**显式启用**它的地方 —— 游戏与离线烘焙都加载本文件，故**游戏世界与预制地图同源**。
+#
+# 约束（加载时校验，违反即中止启动）：
+#   - 所有频率 / 幅度 > 0（幅度可 = 0）；height_offset_blocks ∈ [0, 512]；
+#   - 0 ≤ hills_start ≤ mountains_start ≤ 1；blend ≥ 0 且 hills_start + blend ≤ mountains_start；
+#   - seed_channel 为正整数，且**不得与其它层通道（1~4）重复**。
+
+schema_version = 1
+
+# ---- 三层噪声（数值 = 引入地貌层之前的常量，未改动）----
+base_frequency      = 0.0035   # 低频：大的丘陵走势
+detail_frequency    = 0.015    # 中频：表面细节
+rough_frequency     = 0.06     # 高频：粗糙颗粒
+base_amplitude      = 96.0
+detail_amplitude    = 22.0
+rough_amplitude     = 4.0
+height_offset_blocks = 128.0   # 基线地面落在世界垂直范围（0~512）中段
+variation_frequency = 0.05     # 材质过渡带抖动（与地形起伏无关的独立通道）
+
+# ---- 地貌分区（W3）----
+[landform]
+enabled = true
+
+frequency       = 0.0012   # 掩罩波长 ≈ 833 格 ⇒ 1km 世界内可见成片地貌；10km 上层次丰富
+hills_start     = 0.42
+mountains_start = 0.66
+blend           = 0.08     # 过渡带宽（掩罩值域的比例）
+
+# 幅度倍数（相对三层噪声叠加起伏；越大越崎岖）
+plains_amplitude_scale    = 0.30
+hills_amplitude_scale     = 0.85
+mountains_amplitude_scale = 1.45
+
+# 基线高度平移（格；正 = 抬高）
+plains_offset_blocks    = -8.0
+hills_offset_blocks     = 0.0
+mountains_offset_blocks = 24.0
+
+seed_channel = 5   # 与 base/detail/rough/variation 的通道 1~4 不重复
+
+# ---- 悬垂（W4 地表体积壳使用的 **3D** 噪声）----
+#
+# 语义：体积壳把 `overhang(x,y,z) × amplitude_blocks` 叠加到"距地表的有符号距离"上；
+#   当 `amplitude_blocks × 2π × frequency > 1` 时等值面**折叠** ⇒ 出现**悬垂 / 洞穴**（本表默认 ≈ 2.2 > 1）。
+# 注意：不启用体积壳时本段不参与任何现有路径（高度场生成完全不受影响）。
+[overhang]
+frequency        = 0.05   # 波长 ≈ 20 格
+amplitude_blocks = 7.0    # 位移幅度（格）
+seed_channel     = 6      # 与通道 1~5 不重复
+
+# ---- 洞穴网络（W5 地表体积壳使用的 **3D** 隧道噪声）----
+#
+# 语义（业界口径 = Minecraft 的 spaghetti carver）：两条**互不相关**的 3D 噪声 a、b，
+#   在 sqrt(a² + b²) < tunnel_radius 处雕刻岩体 —— 两片零等值面的交线即隧道轴线，加粗成管 ⇒ 连通隧道网。
+# carve_strength_blocks = 隧道最大雕刻量（格）：只有它超过"该点到地表的深度"时才真正挖空
+#   ⇒ 越深越难成洞、隧道自然收敛，不会把壳挖穿。
+# depth_fade_blocks = 壳底附近的淡出带宽（格）⇒ 隧道不穿出壳的可视边界（边界淡出与悬垂同源）。
+# 注意：tunnel_radius 是**噪声值域口径**（必须落在 (0, 1]）；世界半径 ≈ radius / (2π × frequency)。
+[caves]
+enabled               = true
+frequency             = 0.02   # 波长 ≈ 50 格（隧道间距）
+tunnel_radius         = 0.32   # 世界半径 ≈ 2.5 格（直径 ≈ 5 格，可供角色通行）
+carve_strength_blocks = 22.0   # 最大雕刻量（格）
+depth_fade_blocks     = 8.0    # 壳底 8 格内淡出到 0
+seed_channel          = 7      # 与通道 1~6 不重复
+
+# ---- 河流 + 水体（W6 / ADR 0027）----
+#
+# 语义：河道自区域内**最高**列起，沿**最陡下降**方向行进（方向叠加确定性抖动 = 域扭曲）；
+#   河床按"到河道折线的距离"**下切**进地表壳；水面按**静态水位**生成（水位 = 河床底 + 水深），
+#   并沿程强制**单调不升**（水往低处流）。**不做**流体模拟 / 游泳 / 动态水位。
+# 约束（加载时校验）：water_depth_blocks ≤ channel_depth_blocks（水必须在河床之内）。
+[river]
+enabled                  = true
+step_blocks              = 8.0    # 路径采样步长（格）
+max_nodes                = 512    # 路径节点上限
+channel_depth_blocks     = 4.0    # 河道中心下切深度（格）
+channel_half_width_blocks = 6.0   # 下切满值区半宽（格）
+bank_half_width_blocks   = 4.0    # 河岸过渡半宽（格；下切线性衰减到 0）
+water_depth_blocks       = 2.0    # 水面距河床底的高度（格）
+jitter_radians           = 0.35   # 下坡方向的最大抖动偏角（弧度）
+jitter_frequency         = 0.01   # 抖动噪声频率（波长 ≈ 100 格）
+seed_channel             = 8      # 与通道 1~7 不重复

@@ -39,14 +39,21 @@ inline constexpr float kNoMaterialOverride = -1.0F;
 ///                                  禁止用面法线近似）
 ///   - location 2 `float material` —— **材质槽位覆盖**（ADR 0014）：`kNoMaterialOverride` = 由片元
 ///                                  按高度 / 坡度算（地表）；否则直接取该槽位（可挖体积的内表面）
+///   - location 3 `float morph`    —— **morph 目标高度**（格，单位 = 格）：该顶点在**父级 LOD 网格**
+///                                  对应列上的采样高度。仅当该网格的 `meshParams.y`（morphStep）> 0 时被顶点
+///                                  着色器消费，用于 CDLOD 顶点过渡消接缝（ADR 0024）；非地表网格保持缺省 0
+///                                  （不参与 morph）。
 ///
 /// **不承载材质权重**（ADR 0009）：权重由片元着色器按世界高度与坡度**逐像素**重算，
 /// 过渡带宽因此由几何曲率决定、不受顶点间距限制。片元用 uniform 的**渲染原点**把这里的顶点
 /// 还原为世界坐标（见 `SetMaterialUniform`）。
+///
+/// **注意**：`morph` 使 `sizeof(MeshVertex)` 由 28 变 32（对齐补齐）—— 这是**有意的**（顶点为 `float4` 对齐）。
 struct MeshVertex {
     float position[3] = { 0.0F, 0.0F, 0.0F };
     float normal[3]   = { 0.0F, 1.0F, 0.0F };
     float material    = kNoMaterialOverride;
+    float morph       = 0.0F;
 };
 
 /// 一份待上传的网格数据（顶点 + 32 位索引）。
@@ -84,20 +91,33 @@ struct SkinnedMeshData {
 /// （每帧每网格一次上传，与网格数 —— 而不是与关节数或世界总量 —— 成正比）。
 inline constexpr std::uint32_t kMaxSkinJoints = 64;
 
-/// 每帧相机常量：与 Shader 中的相机 storage buffer 布局一一对应。
-/// `mat4` 在 std140 下为 4 个 `vec4`，无隐式填充，可直接整块上传。
+/// 每帧相机常量：与 Shader 中的相机 storage buffer（`mesh.vert` / `mesh_skinned.vert` 的 `CameraBuffer`）布局一一对应。
+/// `mat4` 在 std430 下为 4 个 `vec4`，无隐式填充，可直接整块上传。
 struct CameraUniform {
     glm::mat4 viewProjection { 1.0F };
+    /// **LOD 原点**在**渲染相对**坐标下的位置（xyz；w 预留）。
+    ///
+    /// W7-S3b（[ADR 0024](../../docs/adr/0024-terrain-streaming-and-lod.md)）：地表 LOD 的 CDLOD 顶点过渡
+    /// 按顶点到该原点的 **Chebyshev 距离**算 morph 因子（`mesh.vert`）；它是"**玩家所在 tile 的中心**"
+    /// （tile 对齐 ⇒ CPU 与着色器判定同源）。缺省 `(0,0,0)` ⇒ 与从前逐位一致（无 morph）。
+    glm::vec4 lodOrigin { 0.0F, 0.0F, 0.0F, 0.0F };
 };
 
-/// 逐网格顶点 uniform：与 Shader 中 `set = 1, binding = 0` 的 std140 块一一对应（T41 起；T33 泛化）。
+/// 逐网格顶点 uniform：与 Shader 中 `set = 1, binding = 0` 的 std140 块一一对应（T41 起；T33 泛化；W6e 增 `meshParams`）。
 ///
 /// `modelToRender` = **平移(网格世界原点 − 渲染原点) × 旋转** —— 把**网格局部坐标**变成渲染相对坐标。
 /// 顶点只承载网格局部坐标 ⇒ ① 渲染原点重定基只需改这一个 uniform（不再重传整世界顶点）；
 /// ② 倒塌中的刚体只需每帧改这一块（**不必**在 CPU 侧重烘焙上万顶点）。
-/// std140 下 `mat4` 即 4 个 `vec4`（64 字节），无隐式填充。
+///
+/// `meshParams`（W6e；W7-S3b 扩展语义，**布局不变**）：逐网格参数。
+///   - `x` = **不透明度** ∈ [0,1]（1 = 不透明；< 1 时片元按 Bayer 抖动 discard 做 dither 淡出，见 `assets/shaders/mesh.frag`）；
+///   - `y` = **morphStep**（> 0 启用 CDLOD 顶点过渡；= **父级网格步长**，即 `2 × 当前步长`；0 = 不启用）；
+///   - `z` = **morph 起距离**（格）、`w` = **morph 止距离**（格）——均按顶点到 LOD 原点的 Chebyshev 距离计。
+///
+/// std140 下 `mat4` = 4 个 `vec4`（64 字节）+ `vec4`（16 字节）= 80 字节，无隐式填充（扩展语义不改布局）。
 struct MeshTransformUniform {
     glm::mat4 modelToRender { 1.0F };
+    glm::vec4 meshParams { 1.0F, 0.0F, 0.0F, 0.0F };
 };
 
 /// 网格资源的 GPU 句柄。`id == 0` 表示无效句柄。
@@ -264,7 +284,8 @@ public:
     /// （后续 `UpdateMeshGeometry` 只要网格长一点点就会被拒）。`T82` 的 tile 兜底与 `T76` 的体积块均按 `× 2` 传。
     [[nodiscard]] MeshHandle UploadMesh(const MeshData& mesh, const glm::dvec3& origin, bool emissive = false,
                                        std::uint32_t reserveVertexCount = 0,
-                                       std::uint32_t reserveIndexCount = 0, bool depthBiased = false);
+                                       std::uint32_t reserveIndexCount = 0, bool depthBiased = false,
+                                       bool water = false);
 
     /// 创建并按容量上传一个**蒙皮**网格（T69）。
     ///
@@ -320,6 +341,22 @@ public:
     /// 无效句柄为无操作。下一次 `RenderFrame` 生效。
     void SetMeshTransform(MeshHandle handle, const glm::dvec3& origin, const glm::quat& rotation) noexcept;
 
+    /// 设置一个网格的**不透明度** ∈ [0,1]（W6e）：1 = 不透明（默认），< 1 = 片元按 **Bayer 抖动 discard** 淡出。
+    ///
+    /// 用途：相机贴到主角身上时**平滑淡出主角**（dither fade，业界对"贴脸穿模"的标准解），
+    /// 而非硬隐藏（有 pop 感）。**保持不透明管线**（不引入 alpha 混合 ⇒ 不破坏深度排序）。
+    /// 无效句柄为无操作；值被钳到 [0,1]。下一次 `RenderFrame` 生效。
+    void SetMeshOpacity(MeshHandle handle, float opacity) noexcept;
+
+    /// 设置一个网格的 **LOD morph 参数**（W7-S3b / [ADR 0024](../../docs/adr/0024-terrain-streaming-and-lod.md)）：
+    /// CDLOD 顶点过渡，让相邻 LOD 环在边界处几何逐位一致、消除接缝。
+    ///
+    /// `morphStep` = **父级网格步长**（> 0 启用；= 0 关闭 ⇒ 顶点着色器整段跳过，与从前逐位一致）；
+    /// `startDistance` / `endDistance` = morph 起 / 止距离（格，按顶点到 LOD 原点的 Chebyshev 距离）。
+    /// 无效句柄为无操作；`morphStep` 被钳到 ≥ 0；起止距离**保持调用方给的顺序**（不交换）。
+    /// 下一次 `RenderFrame` 生效。
+    void SetMeshLodMorph(MeshHandle handle, float morphStep, float startDistance, float endDistance) noexcept;
+
     /// 释放一个网格的 GPU 资源；无效句柄为无操作。
     void ReleaseMesh(MeshHandle handle) noexcept;
 
@@ -370,6 +407,10 @@ public:
         m_emissiveColor[1] = green;
         m_emissiveColor[2] = blue;
     }
+
+    /// 设置**水面**的流动时间（秒；W6 / [ADR 0027](../../docs/adr/0027-water-representation.md)）。
+    /// 只影响以 `water = true` 上传的网格（`water.frag` 的滚动波），下一次 `RenderFrame` 生效。
+    void SetWaterTime(float seconds) noexcept { m_waterTime = seconds; }
 
     /// 烘焙并上传**环境贴图**（T67 / [ADR 0021](../../docs/adr/0021-environment-ibl.md)）：
     /// 天空 HDRI + 漫反射 irradiance（32×16）+ 预过滤高光（6 级 mip，128×64 起）+ BRDF LUT（256²）。
@@ -453,6 +494,22 @@ private:
         double origin[3] = { 0.0, 0.0, 0.0 };
         /// 该网格的**旋转**（T33：倒塌中的刚体；其余网格恒为单位四元数）。
         glm::quat rotation { 1.0F, 0.0F, 0.0F, 0.0F };
+
+        /// 该网格的**不透明度** ∈ [0,1]（W6e；默认 1 = 不透明）。`SetMeshOpacity` 写入，
+        /// `DrawMeshes` 经 `MeshTransformUniform::meshParams.x` 传给顶点着色器 → 片元做 Bayer 抖动淡出。
+        float opacity = 1.0F;
+
+        /// 该网格的 **LOD morph 参数**（W7-S3b；默认全 0 = 不启用 ⇒ 与从前逐位一致）。
+        /// `morphStep` = 父级网格步长（0 = 关闭）；`morphStartDistance` / `morphEndDistance` = morph 起 / 止距离（格）。
+        /// `SetMeshLodMorph` 写入，`DrawMeshes` 经 `MeshTransformUniform::meshParams.yzw` 传给顶点着色器。
+        float morphStep = 0.0F;
+        float morphStartDistance = 0.0F;
+        float morphEndDistance = 0.0F;
+
+        /// 是否为**水面**网格（W6 / [ADR 0027](../../docs/adr/0027-water-representation.md)）：
+        /// 走独立的水面管线（`water.frag` 的 flow 着色 + alpha 混合 + 不剔除），在主通道**最后**绘制，
+        /// 且**不投影阴影**。见 `UploadMesh` 的 `water` 参数与 `DrawMeshes` 的 `waterPass`。
+        bool water = false;
 
         // ---- 蒙皮网格（T69）----
         /// 是否为**蒙皮**网格：走独立的蒙皮管线（顶点着色器做线性混合蒙皮），并持有骨骼矩阵缓冲。
@@ -546,19 +603,25 @@ private:
     };
 
     /// T41/T33：逐网格顶点变换的**推送去重**状态（与 `EmissivePushState` 同构、同源理由）。
-    /// 变换由 `SDL_PushGPUVertexUniformData(cmd, 0, ...)` 推送（64 字节 / 次，**不是**上传），
+    /// 变换由 `SDL_PushGPUVertexUniformData(cmd, 0, ...)` 推送（80 字节 / 次，**不是**上传），
     /// 对后续绘制持续生效 ⇒ 值没变就不推。主通道与阴影通道**各持一份**（两个通道的着色器各读自己的）。
+    /// W6e 起去重键**含不透明度** `opacity`；W7-S3b 起再**含 LOD morph 三参数**
+    /// （`morphStep` / `morphStartDistance` / `morphEndDistance`）——否则"只改 LOD 参数"的网格会被误判为未变而不推送。
     struct MeshTransformPushState {
         bool  pushed = false;
         float matrix[16] = { 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F,
                              0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F };
+        float opacity = 1.0F;
+        float morphStep = 0.0F;
+        float morphStartDistance = 0.0F;
+        float morphEndDistance = 0.0F;
     };
 
     void DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURenderPass* pass, const MeshHandle* meshes,
                     std::size_t meshCount, bool pushEmissive, SDL_GPUGraphicsPipeline* basePipeline,
                     SDL_GPUGraphicsPipeline* depthBiasedPipeline, SDL_GPUGraphicsPipeline* skinnedPipeline,
                     SDL_GPUBuffer* primaryStorageBuffer, EmissivePushState& emissiveState,
-                    MeshTransformPushState& transformState);
+                    MeshTransformPushState& transformState, SDL_GPUGraphicsPipeline* waterPipeline, bool waterPass);
 
     /// 上传本帧所有**脏**蒙皮网格的骨骼矩阵：一次 map + 一次 copy pass，**不创建任何 GPU 资源**
     /// （缓冲容量在上传网格时已定死）。
@@ -604,6 +667,18 @@ private:
 
     /// 蒙皮阴影顶点着色器（常驻）。
     SDL_GPUShader* m_shadowSkinnedVertexShader = nullptr;
+
+    // ---- 水面（W6 / ADR 0027）----
+
+    /// 水面的片元阶段（`water.frag`）：**常驻**（水面管线随 MSAA 档位在 `CreateMainPipeline` 里重建）。
+    SDL_GPUShader* m_waterFragmentShader = nullptr;
+
+    /// 水面管线：顶点阶段**复用** `m_meshVertexShader`、片元 = `water.frag`；**开启 alpha 混合**、
+    /// **关闭背面剔除**、**关闭深度写入**（半透明水面不得遮挡其后的地形）。与主通道同生共死。
+    SDL_GPUGraphicsPipeline* m_waterPipeline = nullptr;
+
+    /// 水面流动时间（秒；`SetWaterTime` 写入，水面通道前推送到片元槽 0）。
+    float m_waterTime = 0.0F;
 
     /// 骨骼矩阵上传的**常驻**暂存缓冲：所有蒙皮网格共用，一次 map + 逐块 copy。
     SDL_GPUTransferBuffer* m_boneStagingBuffer   = nullptr;

@@ -34,6 +34,22 @@
   这两个窗口是**业界默认项**（不做就是可感知的"按了没跳 / 落地没跳"），不属于可选增强。
 - 位置一律整数与 `double`；上传 GPU 的顶点只承载**网格局部**坐标，位置由逐网格顶点 uniform 的"网格原点 − 渲染原点"补上（红线 6；T41）——**禁止**在重定基时重传整世界顶点。
 - **第三人称相机**：跟随角色，**必须**具备避障（不穿地形）；相机避障只在渲染侧做，**不得**影响角色逻辑状态。
+  - **狭小空间（洞 / 水道 / 峡谷）七条硬规则（W6b / W6c / W6d / W6e / W6f / W6g / W6h，2026-10-06）**：
+    ① 相机落在实心体内时**沿视线收缩悬臂**（朝注视点收，相机始终留在角色所在的空间），**不得**用"沿 +Y 向上顶"——向上顶会穿过洞顶把相机抬到地表之上 ⇒ 玩家从"地图外"看世界；
+    ② 相机被挤到极近（`view.distance` < `CameraSettings::targetHideDistance`）时**能力上**应隐藏主角（判据走纯函数 `ShouldHideFollowTarget`）；
+    但所有者 2026-10-06 裁定（W6d）：游戏层取 `targetHideDistance = 0` ⇒ 关闭该行为（能力代码保留，改回 1.5 即启用），改由 ④ 的**淡出**承担；
+    ③ 相机**只许停在悬臂线上**、朝向恒由玩家 yaw / pitch 决定——**不得**有任何"改变朝向"的兜底（既不许上顶，也不许把相机抬到注视点正上方 ⇒ 俯视）；收缩极限 = `kCameraMinDistance = 0.2`（对齐 Cinemachine `MinimumDistanceFromTarget`）；
+    ④ **过近时淡出主角**（W6e）：不透明度 = `FollowTargetFadeOpacity`（`targetFadeStartDistance` → `targetFadeEndDistance`），
+    由 `MeshRenderer::SetMeshOpacity` 逐网格下发，片元按 **4×4 Bayer 抖动 `discard`** 实现 —— **不得**改用 alpha 混合（会引入深度排序问题）；
+    这是"贴脸穿模（近裁剪面切开角色）"的正解，取代"硬隐藏"；
+    ⑤ **遮挡查询必须带半径**（W6f 球投射探针）：走 `ITerrainQuery::QueryObstructionWithRadius`（`CameraSettings::cameraProbeRadius`），
+    **不得**只依赖单线段 —— 薄墙会从相机旁"擦过"而漏检 ⇒ 穿墙；
+    ⑥ **肩位偏移**（W6g）：`CameraSettings::shoulderOffset` 只**平移注视点**（沿相机右方），**不得**借此改变朝向。
+    ⑦ **避障不得瞬间跳变**（W6h）：跟随距离的**推远**必须经 `ThirdPersonCamera::UpdateAvoidance` 的**迟滞（`avoidanceClearHold`）
+    + 指数平滑（`avoidanceExtendDamping` / `avoidanceExtendMaxSpeed`）**；**拉近恒立即**（安全优先）；`Evaluate` 只**读**平滑结果
+    （保持 `const` / 幂等）。否则临界点（遮挡刚出现 / 消失）反复横跳会让距离**逐帧跳变** ⇒ 相机瞬移 + 淡出不透明度抖动 ⇒ **画面闪烁**。
+    （业界口径：UE5 `USpringArmComponent` 的 boom/probe 扫描 + 挤近时隐藏 pawn；Unity Cinemachine `CinemachineDeoccluder` 的
+    `CameraRadius` 球投射 + `PullCameraForward` + `Damping` / `MinimumOcclusionTime` + 角色淡出；TPS 肩位偏移。）
 - 地形碰撞由**地表 tile 的 `HeightFieldShape`** 与**体积块的 `MeshShape`** 共同承担（方案 §5.1）。
 
 ## 4. 笔刷式挖掘与堆建（地表高度场）
@@ -93,5 +109,6 @@
 - **标记边界**：标记区域之外的三维挖掘被拒绝；地表笔刷在区域外仍生效且不创建体积块。
 - **层间过渡**：体积与地表相接处无裂缝、无穿模。
 - **物件不写地形**：放置与拆除物件后，地表高度场与体积密度场逐值不变。
-- **相机避障**：第三人称相机不穿地形。
+- **相机避障**：第三人称相机不穿地形。**狭小空间复验（W6b）**：走进洞穴 / 水道后 —— ① 相机**不得**跑到地表之上
+  （"看到地图外"）；② 相机过近时主角**被隐藏**（"看到人物内部"）。
 - **坐标精度**：相机移至 `x = 10,000,000` 后地表网格无抖动。

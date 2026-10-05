@@ -21,6 +21,7 @@
 #include "destruction_queue.hpp"
 #include "gameplay_input.hpp"
 #include "generation/map_preset.hpp"
+#include "generation/terrain_params.hpp"
 #include "input/input_map.hpp"
 #include "mouse_capture.hpp"
 #include "orb.hpp"
@@ -44,6 +45,8 @@
 #include "terrain/terrain_types.hpp"
 #include "terrain/terrain_world.hpp"
 #include "terrain/world_bounds.hpp"
+#include "shell/surface_shell.hpp"
+#include "water/river.hpp"
 #include "test_mode.hpp"
 #include "ui_text.hpp"
 #include "dig/collapse_table.hpp"
@@ -55,6 +58,8 @@
 #include "dig/volume_collapse.hpp"
 #include "dig/volume_collision.hpp"
 #include "streaming/dig_volume_residency.hpp"
+#include "streaming/terrain_tile_build_pipeline.hpp"
+#include "streaming/terrain_tile_residency.hpp"
 #include "streaming/volume_build_pipeline.hpp"
 
 #include <SDL3/SDL.h>
@@ -73,6 +78,7 @@
 #include <exception>
 #include <filesystem>
 #include <limits>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -235,6 +241,16 @@ struct WorldAabb {
     return bounds;
 }
 
+/// W7-S3b：地表 **LOD 分环**（[ADR 0024](../../docs/adr/0024-terrain-streaming-and-lod.md) 决策二）。
+///
+/// Ring 0 = `0..8` tile（≈ 512 m，**步长 1**，全分辨率）→ Ring 1 = `9..16`（512–1024 m，步长 2）
+/// → Ring 2 = `17..32`（1024–2048 m，步长 4）。距离口径 = **Chebyshev tile 距离**（与
+/// `TerrainTileWindow::TileDistanceFromCenter` 同源 ⇒ CPU 判定与着色器 morph 判定同源）。
+/// 常驻半径 = 最外环 32 + `kTerrainResidencyPrefetchTiles`（= 33 tile ≈ 2112 m）⇒ **视距 2048 m < 常驻半径**
+/// （雾盖住流式边界，ADR 0024 硬要求）。
+/// **不变量**：常驻量 = 窗口级（`(2·33+1)²` = 4489 上限），**与世界总大小无关**（10km 与 1km 同级）。
+constexpr vx::TerrainLodRings kGameTerrainLodRings { { 8, 16, 32 }, { 0, 1, 2 } };
+
 /// 上传（或重传）一个已网格化 tile 的 GPU 网格。
 ///
 /// T41：**不再依赖渲染原点** —— 顶点就是 tile **局部**坐标（0..64 格，由地表网格化器产出），
@@ -259,10 +275,15 @@ void UploadTileMesh(vx::MeshRenderer& renderer, vx::MeshHandle& handle, const vx
     if (boundsOut != nullptr) {
         *boundsOut = BoundsOfVertices(tileMesh->mesh.vertices, tileOrigin);
     }
+    // W7-S3b：CDLOD morph 参数按 **LOD 档**取（与 `world/streaming/terrain_tile_residency.hpp` 的
+    // `TerrainLodMorphRangeForLevel` 同源）：最外环 morphStep = 0（没有更粗的环可 morph）⇒ 不启用。
+    const vx::TerrainLodMorphRange morph =
+        vx::TerrainLodMorphRangeForLevel(kGameTerrainLodRings, tileMesh->lodLevel);
     if (handle.IsValid()) {
         // **T75 快路径**：地表 tile 的网格拓扑固定（65×65 高度场）或"被体积接管后**变小**" ⇒ 容量通常够用，
         // 于是复用同一对缓冲"提交即走"（旧路径 = `ReleaseMesh` + `UploadMesh` = **等 2 次 fence**）。
         if (renderer.UpdateMeshGeometry(handle, tileMesh->mesh, tileOrigin)) {
+            renderer.SetMeshLodMorph(handle, morph.morphStep, morph.startDistance, morph.endDistance);
             return;
         }
         // 容量不够（该 tile 曾被体积接管、网格变小，现在恢复成整张地表）⇒ 重建；**不静默**。
@@ -272,18 +293,127 @@ void UploadTileMesh(vx::MeshRenderer& renderer, vx::MeshHandle& handle, const vx
         renderer.ReleaseMesh(handle);
         handle = vx::MeshHandle {};
     }
-    // **按满地表上界预留（T82）**：只有**索引数**会随层间接管（ADR 0011）升降，上界 = `kTerrainTileIndexCount`；
-    // 只要本次网格是"部分地表"（被接管），就按这个上界建缓冲 ⇒ 该 tile 之后无论接管如何翻转都走快路径、**永不重建**。
-    // 为什么不在**所有** tile 上预留：tile 全量常驻，289 × 上界 ≈ 28 MB 未记账几何显存（ADR 0008 的 300 MB 预算
-    // 当前已用 262.42 MB）。而"部分地表"的 tile 只可能落在可挖区（区域 = 中心 4×4 tile）内 ⇒ **至多 16 个**
-    // （≈ 16 × 98 KB ≈ 1.6 MB），代价有上界。满地表时 `reserve = 0` 等价（capacity 恰好等于上界）。
+    // **按该 LOD 的满地表上界预留（T82 / W7-S3b）**：只有**索引数**会随层间接管（ADR 0011）升降，
+    // 上界 = `TerrainLodIndexCount(本 tile 的 LOD 档)`；只要本次网格是"部分地表"（被接管），
+    // 就按这个上界建缓冲 ⇒ 该 tile 之后无论接管如何翻转都走快路径、**永不重建**。
+    // 为什么不在**所有** tile 上预留：常驻集合是窗口级（10km 下至多 4489 个 tile），按 LOD 上界预留
+    // 会把显存推到不可接受（LOD0 上界 ≈ 98 KB/索引 + 135 KB/顶点）——而"部分地表"的 tile 只可能落在
+    // 可挖区（中心 4×4 tile）内 ⇒ **至多 16 个**，代价有上界。
+    // W7-S3b 修正：上界**随 LOD 档变化**（否则 LOD2 的 tile 也会被预留成 LOD0 的 24576 个索引）。
     // 口径提醒：`reserve*Count` 是**总容量**（实现取 `max(本次数量, reserve)`），不是"额外预留"。
+    const std::uint32_t lodIndexBound = static_cast<std::uint32_t>(vx::TerrainLodIndexCount(tileMesh->lodLevel));
     const std::uint32_t reserveIndices =
-        (tileMesh->mesh.indices.size() < static_cast<std::size_t>(vx::kTerrainTileIndexCount))
-            ? static_cast<std::uint32_t>(vx::kTerrainTileIndexCount)
-            : 0U;
+        (tileMesh->mesh.indices.size() < static_cast<std::size_t>(lodIndexBound)) ? lodIndexBound : 0U;
     handle = renderer.UploadMesh(tileMesh->mesh, tileOrigin, /*emissive=*/false,
                                  /*reserveVertexCount=*/0, reserveIndices, /*depthBiased=*/true);
+    renderer.SetMeshLodMorph(handle, morph.morphStep, morph.startDistance, morph.endDistance);
+}
+
+// ---------------------------------------------------------------------------
+// W7-S3a：地表 tile 的**常驻集合**（[ADR 0024](../../docs/adr/0024-terrain-streaming-and-lod.md) 决策一）
+//
+// 三个并行数组（同下标 = 同一个 tile）：`coords` / `handles` / `bounds`。由 `TerrainTileScheduler` 决定
+// 谁该常驻；本层的四个小函数负责"把世界数据变成可渲染 / 可碰撞的资源"与"卸载时回收"。
+// 为什么用并行数组而不是 map：渲染循环要按视锥剔除**逐 tile** 遍历，数组连续、确定序、稳态零分配；
+// 卸载用**交换删除**（下标会变，但所有引用都在同一帧内即时解析，不留悬空下标）。
+// ---------------------------------------------------------------------------
+
+/// 常驻集合的资源绑定（避免六七个参数一路传下去）。
+struct TileResidencyResources {
+    vx::TerrainWorld&           world;
+    vx::TerrainCollision&       collision;
+    vx::MeshRenderer&           renderer;
+    std::vector<vx::TileCoord>& coords;   ///< 常驻 tile 坐标（与后三者**同下标**）
+    std::vector<vx::MeshHandle>& handles;  ///< GPU 网格句柄
+    std::vector<WorldAabb>&     bounds;    ///< T39：世界 AABB（剔除用）
+    /// W7-S3b：该 tile **当前是否装有高度场碰撞体**（0/1）。用于把"碰撞体随窗口建 / 撤"限制成**状态跃迁**，
+    /// 而不是每帧重扫都重做一遍（Jolt 的高度场体构建是毫秒级 ⇒ 必须是跃迁 + 分帧）。
+    std::vector<std::uint8_t>&  collisionActive;
+};
+
+/// 把一个 tile 追加进常驻集合（**只登记**；世界数据由 `TerrainTileScheduler::Step` 负责生成 / 卸载）。
+/// 返回新下标。
+[[nodiscard]] std::size_t AppendResidentTile(TileResidencyResources& res, const vx::TileCoord& coord) {
+    res.coords.push_back(coord);
+    res.handles.push_back(vx::MeshHandle {});
+    res.bounds.push_back(WorldAabb {});
+    res.collisionActive.push_back(0U);
+    return res.coords.size() - 1U;
+}
+
+/// 上传下标 `index` 的 tile 网格（并刷新其世界 AABB）。空网格 = 不可见 ⇒ 句柄保持无效。
+///
+/// W7-S3b：上传完成后**释放该 tile 的 CPU 侧网格**（`TerrainWorld::ReleaseTileMeshCpu`）——
+/// 释放后只留高度 + `meshEmpty` 标记（重网格从高度重建，接管判据读标记）⇒ 地形 CPU 常驻从 ≈160 MB 压回预算内。
+void UploadResidentTile(TileResidencyResources& res, std::size_t index) {
+    UploadTileMesh(res.renderer, res.handles[index], res.world, res.coords[index], &res.bounds[index]);
+    res.world.ReleaseTileMeshCpu(res.coords[index].x, res.coords[index].z);
+}
+
+/// 同步下标 `index` 的 tile 的**高度场碰撞体**（ADR 0012 接管）：可见面全归体积 / 地表壳 ⇒ 交出；
+/// 否则建高度场。判据与 ADR 0011 的四边形跳过**同源**（同一次 `BuildTerrainMesh`）。
+///
+/// W7-S3b：`wantCollision == false`（该 tile 超出 `kTerrainCollisionRadiusTiles`）⇒ 直接**移除**碰撞体并返回
+/// `false`（碰撞只在玩家附近有意义；否则 4489 个高度场静态体会压垮 Jolt 的宽相位与内存）。
+/// 返回是否**保留高度场碰撞体**（`false` = 未保留：已交出，或超出碰撞半径）。
+[[nodiscard]] bool SyncResidentTileCollision(TileResidencyResources& res, std::size_t index,
+                                             bool wantCollision) {
+    const vx::TileCoord& coord = res.coords[index];
+    if (!wantCollision) {
+        res.collision.RemoveTile(coord.x, coord.z);
+        res.collisionActive[index] = 0U;
+        return false;
+    }
+    const vx::TerrainTileMesh* tileMesh = res.world.FindMesh(coord.x, coord.z);
+    // W7-S3b：读 `meshEmpty` 标记（**不是** `indices.empty()`）—— 上传后 CPU 侧网格已释放，`indices` 恒为空。
+    const bool                 empty    = (tileMesh != nullptr) && tileMesh->meshEmpty;
+    if (empty) {
+        res.collision.RemoveTile(coord.x, coord.z);
+        res.collisionActive[index] = 0U;
+        return false;
+    }
+    (void)res.collision.SyncTile(res.world, coord.x, coord.z);
+    res.collisionActive[index] = 1U;
+    return true;
+}
+
+/// 常驻集合里 `coord` 的下标；不存在返回 `false`。O(常驻数)（常驻集合是窗口级，量小）。
+[[nodiscard]] bool FindResidentTileIndex(const TileResidencyResources& res, const vx::TileCoord& coord,
+                                         std::size_t& outIndex) {
+    for (std::size_t i = 0; i < res.coords.size(); ++i) {
+        if (res.coords[i] == coord) {
+            outIndex = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// 把 `coord` 移出常驻集合：释放 GPU 网格与碰撞体、卸载世界数据（高度 + 网格），再做**交换删除**。
+/// 返回是否原本常驻（`false` = 不在集合里，无操作）。
+bool RemoveResidentTile(TileResidencyResources& res, const vx::TileCoord& coord) {
+    std::size_t index = 0;
+    if (!FindResidentTileIndex(res, coord, index)) {
+        return false;
+    }
+    if (res.handles[index].IsValid()) {
+        res.renderer.ReleaseMesh(res.handles[index]);
+    }
+    res.collision.RemoveTile(coord.x, coord.z);
+    (void)res.world.UnloadTile(coord.x, coord.z);
+
+    const std::size_t last = res.coords.size() - 1U;
+    if (index != last) {
+        res.coords[index]          = res.coords[last];
+        res.handles[index]         = res.handles[last];
+        res.bounds[index]          = res.bounds[last];
+        res.collisionActive[index] = res.collisionActive[last];
+    }
+    res.coords.pop_back();
+    res.handles.pop_back();
+    res.bounds.pop_back();
+    res.collisionActive.pop_back();
+    return true;
 }
 
 /// 把绝对世界空间相机求值结果平移到渲染原点附近：`eye` / `target` / `view` 全部减去渲染原点。
@@ -534,6 +664,49 @@ public:
         return false;
     }
 
+    /// W6f：**球投射探针** —— 把相机近似为半径 `radius` 的球，而非一个点。
+    ///
+    /// 做法：沿线段**固定步长**前进，每步检查**中心 + 垂直于轴的 4 个环点**（两个正交方向 × 正负），
+    /// 任一实心即视为遮挡，返回**最后一个安全比例**。
+    /// 为什么用"步进 + 环点"而不是解析胶囊求交：只依赖既有的 `IsSolid` 点查询（世界层不必再暴露新接口），
+    /// 且固定步长 / 固定环方向 ⇒ 结果确定（红线 7）。`radius <= 0` 时逐字退回 `QueryObstruction`。
+    [[nodiscard]] bool QueryObstructionWithRadius(const glm::vec3& from, const glm::vec3& to, float radius,
+                                                  float& outSafeT) const override {
+        if (!(radius > 0.0F)) {
+            return QueryObstruction(from, to, outSafeT);
+        }
+        outSafeT = 1.0F;
+        const glm::vec3 delta  = to - from;
+        const float     length = glm::length(delta);
+        if (!(length > 0.0F)) {
+            return false;
+        }
+        // 与轴正交的两个单位方向：任取一个不平行于轴的参考轴做叉乘（轴的 |y| 接近 1 时换参考轴）。
+        const glm::vec3 axis = delta / length;
+        const glm::vec3 reference =
+            (std::abs(axis.y) < 0.9F) ? glm::vec3(0.0F, 1.0F, 0.0F) : glm::vec3(1.0F, 0.0F, 0.0F);
+        const glm::vec3 tangent   = glm::normalize(glm::cross(reference, axis));
+        const glm::vec3 bitangent = glm::cross(axis, tangent);
+        const glm::vec3 ring[4]   = { tangent * radius, -tangent * radius, bitangent * radius, -bitangent * radius };
+
+        const int steps    = std::max(1, static_cast<int>(std::ceil(length / kCameraQueryStepBlocks)));
+        float     lastSafe = 0.0F;
+        for (int i = 1; i <= steps; ++i) {
+            const float     t      = static_cast<float>(i) / static_cast<float>(steps);
+            const glm::vec3 center = glm::mix(from, to, t);
+            bool            blocked = IsSolid(center);
+            for (int r = 0; r < 4 && !blocked; ++r) {
+                blocked = IsSolid(center + ring[r]);
+            }
+            if (blocked) {
+                outSafeT = lastSafe;
+                return true;
+            }
+            lastSafe = t;
+        }
+        return false;
+    }
+
 private:
     const vx::TerrainWorld&   m_terrain;
     const vx::DigVolumeWorld& m_volumes;
@@ -734,6 +907,70 @@ public:
 private:
     const VolumeSlotTable& m_slots;
 };
+
+/// W4：**地表壳区域的四边形过滤器** —— 四边形**四角全部**落在壳区域内时跳过（改由壳网格绘制）。
+///
+/// 判据与 `ResidentQuadFilter` / ADR 0011 **同形**；因为壳区域是**按 tile 对齐**的有界区域，
+/// "被跳过的四边形"恰好整块落在若干 tile 内 ⇒ 这些 tile 的网格变空 ⇒ 既有的
+/// `CollisionBodies` 阶段会**自动**把它们的高度场碰撞体交出去（见该阶段注释），无需另写一条接管路径。
+class ShellQuadFilter final : public vx::ITerrainQuadFilter {
+public:
+    explicit ShellQuadFilter(const vx::SurfaceShellRegion& region) noexcept : m_region(region) {}
+
+    [[nodiscard]] bool SkipQuad(const vx::TerrainQuad& quad) const override {
+        for (int corner = 0; corner < 4; ++corner) {
+            if (!m_region.ContainsColumn(quad.columnX[corner], quad.columnZ[corner])) {
+                return false;  // 有一角在区域外 ⇒ 地表照旧画
+            }
+        }
+        return true;
+    }
+
+private:
+    const vx::SurfaceShellRegion& m_region;
+};
+
+/// 级联过滤器：任一子过滤器要求跳过即跳过（可挖体积接管 ∪ 地表壳接管）。
+class CompositeQuadFilter final : public vx::ITerrainQuadFilter {
+public:
+    CompositeQuadFilter(const vx::ITerrainQuadFilter& first, const vx::ITerrainQuadFilter& second) noexcept
+        : m_first(first), m_second(second) {}
+
+    [[nodiscard]] bool SkipQuad(const vx::TerrainQuad& quad) const override {
+        return m_first.SkipQuad(quad) || m_second.SkipQuad(quad);
+    }
+
+private:
+    const vx::ITerrainQuadFilter& m_first;
+    const vx::ITerrainQuadFilter& m_second;
+};
+
+/// W4：把一个**地表壳块**的网格登记为静态三角网碰撞体（[ADR 0012](../../docs/adr/0012-collision-takeover-by-volumes.md) 同构）。
+///
+/// 与渲染**共用同一份 `MeshData`** ⇒ "谁画谁挡"同源、不可能漂移。块内顶点是局部坐标，世界定位由
+/// `origin*` 以 `double` 承担（红线 6）。空网格 = 无操作（该块没有可见表面）。
+void AddShellBlockCollider(vx::PhysicsWorld& physics, const vx::MeshData& mesh, const vx::BlockCoord& block) {
+    if (mesh.vertices.empty() || mesh.indices.empty()) {
+        return;
+    }
+    // `MeshDesc` 需要"3 个 float / 顶点"的紧凑位置缓冲；`MeshVertex` 是交错布局 ⇒ 这里摊平一次。
+    std::vector<float> positions;
+    positions.reserve(mesh.vertices.size() * 3U);
+    for (const vx::MeshVertex& vertex : mesh.vertices) {
+        positions.push_back(vertex.position[0]);
+        positions.push_back(vertex.position[1]);
+        positions.push_back(vertex.position[2]);
+    }
+    vx::PhysicsWorld::MeshDesc desc;
+    desc.positions     = positions.data();
+    desc.vertexCount   = mesh.vertices.size();
+    desc.indices       = mesh.indices.data();
+    desc.triangleCount = mesh.indices.size() / 3U;
+    desc.originX       = static_cast<double>(vx::BlockOriginBlocks(block.x));
+    desc.originY       = static_cast<double>(vx::BlockOriginBlocks(block.y));
+    desc.originZ       = static_cast<double>(vx::BlockOriginBlocks(block.z));
+    (void)physics.AddMesh(desc);
+}
 
 /// T27：爆炸写回世界所需的全部句柄与缓冲（避免十几个参数一路传下去）。
 struct WorldEditContext {
@@ -969,6 +1206,8 @@ private:
                 if (index < context.tileHandles.size()) {
                     UploadTileMesh(context.renderer, context.tileHandles[index], context.world, unit.tile,
                                    &context.tileBounds[index]);
+                    // W7-S3b：上传后释放 CPU 侧网格（与常驻路径同口径）。
+                    context.world.ReleaseTileMeshCpu(unit.tile.x, unit.tile.z);
                 }
                 break;
             }
@@ -986,7 +1225,7 @@ private:
                 if (tileMesh == nullptr) {
                     break;
                 }
-                if (!tileMesh->mesh.indices.empty()) {
+                if (!tileMesh->meshEmpty) {
                     (void)context.collision.SyncTile(context.world, unit.tile.x, unit.tile.z);
                 } else {
                     // T61：常驻集合随玩家移动 ⇒ **接管状态会翻转**（走远卸载 ⇒ 地表重新由高度场绘制）。
@@ -1086,6 +1325,14 @@ constexpr std::size_t kVolumeInitStepsPerSlice = 1;
 /// 窗口之外只能炸地表坑、**挖不出三维洞**（ADR 0020 后果 1，切换条件已登记）。
 constexpr int kDigVolumeWindowRadiusTiles = 2;
 
+/// W4 / [ADR 0023](../../docs/adr/0023-world-representation-v2-hybrid-shell.md)：**地表壳的近场区域**
+/// （tile 坐标，闭区间）。选在**与可挖区域不重叠**的位置（可挖区 = 中心 3×3 tile ≈ 列 `[-64, 160)`；
+/// 本区 = 列 `[192, 384)`）⇒ 避免"可挖体积接管"与"地表壳接管"两套机制在同一处打架。
+/// 列范围 = `[kShellTileMin * 64, (kShellTileMax + 1) * 64)`。
+/// **全图铺开属 W7 流式**（ADR 0024），W4 只在近场落地。
+constexpr int kShellTileMin = 3;
+constexpr int kShellTileMax = 5;
+
 /// T61：**每帧最多做几个"建块 / 卸块"动作**（与 `kVolumeInitStepsPerSlice` 同口径，一个动作 ≈ 1~5 ms）。
 /// 新建块的**碰撞体**与因此受影响的 **tile 重网格**不在这里同步做 —— 它们入 `PendingDestruction` 队列，
 /// 由既有的每帧预算（`kDestructionBudgetMs`）摊平（ADR 0020 决策四）。
@@ -1100,6 +1347,44 @@ constexpr std::size_t kVolumeBuildsInstalledPerFrame = 4;
 
 /// 网格上传的**每批个数**：单个网格的上传是一次阻塞拷贝，取 4 使其 ≲ 5 ms。
 constexpr std::size_t kMeshUploadsPerSlice = 4;
+
+/// W7-S3b：需要**高度场碰撞体**的最大 Chebyshev tile 距离（= Ring 0 外边界 + 预取环）。
+///
+/// 为什么收敛（而不是给每个常驻 tile 都建）：Jolt 的静态体随常驻量线性增长，4489 个高度场体
+/// 在宽相位与内存上都不可接受；而**碰撞只在玩家附近有意义**（角色 / 弹道 / 爆炸都发生在近场）。
+constexpr int kTerrainCollisionRadiusTiles = 9;
+
+/// W7-S3b：**加载期**每个分片最多安装几个地表 tile。
+/// 安装 = 预取缓存命中后只做 move + 过滤（生成 / 网格化已下沉 worker）⇒ 单帧成本很低；
+/// 调大以缩短加载时间（仍是**有上界**的固定预算；上传另在 `MeshUpload` 阶段分片）。
+constexpr std::size_t kTerrainTilesPerLoadSlice = 8;
+
+/// W7-S3b：**运行期**每帧最多建 / 卸几个地表 tile（安装 = move + 过滤 + GPU 上传；**有上界**）。
+constexpr std::size_t kTerrainResidencyActionsPerFrame = 4;
+
+/// W7-S3b：**运行期**每帧最多提交几个 **relod** 重网格任务（提交廉价；网格化已下沉 worker）。
+/// 无 worker（同步回退）时该预算会直接变成主线程重建次数 ⇒ 调用方按 `HasWorkers()` 收敛（见主循环）。
+constexpr std::size_t kTerrainRelodPerFrame = 6;
+
+/// W7-S3b：**预取提前量**上界（tile）= "已提交 + 已暂存但尚未安装"的总数上限。
+/// 有界 ⇒ 预取缓存的内存有上界，且 worker 不会无限跑在安装之前（每帧成本只与窗口有关，ADR 0024 决策一）。
+constexpr std::size_t kTerrainPrefetchLookahead = 192;
+
+/// W7-S3b：**每帧最多提交**几个 worker 构建任务（提交本身廉价，但避免一次提交整窗造成单帧尖峰）。
+constexpr std::size_t kTerrainPrefetchSubmitsPerFrame = 64;
+
+/// W7-S3b：**每帧最多上传**几个 relod 重网格结果（上传是一次阻塞拷贝，有上界）。
+constexpr std::size_t kTerrainRelodUploadsPerFrame = 4;
+
+/// W7-S3b：**每帧最多建 / 撤几个地表 tile 的碰撞体**（Jolt 高度场体构建是毫秒级 ⇒ 必须分帧、有上界）。
+constexpr std::size_t kTerrainCollisionActionsPerFrame = 2;
+
+/// W7-S3b：tile 是否需要**高度场碰撞体**（Chebyshev 距离 <= `kTerrainCollisionRadiusTiles`）。
+/// 距离口径与 LOD 分环**同源**（`TerrainTileWindow::TileDistanceFromCenter`）。
+[[nodiscard]] bool NeedsTerrainCollision(const vx::TerrainTileWindow& window,
+                                         const vx::TileCoord&         coord) noexcept {
+    return window.TileDistanceFromCenter(coord) <= kTerrainCollisionRadiusTiles;
+}
 
 /// 阶段 → 加载画面上的文字标签（经 `UiText` 取值，故无 CJK 字体时也不会出现缺字）。
 [[nodiscard]] vx::UiLabel LoadStageLabel(LoadStage stage) noexcept {
@@ -1206,6 +1491,33 @@ int main(int argc, char** argv) {
         }
     }
 
+    // W7-S4：`--map=<相对仓库根路径>` 选择预设地图（缺省 = `kDefaultMapFile`）。
+    // 为什么需要：10km 大世界（S4 的流式 / LOD 实测）与 1km 手工测试场（W4~W6 的目视验收）
+    // 必须能共存，否则改默认地图就会让既有人工验收项失去场景。
+    std::string mapFile = kDefaultMapFile;
+    for (const std::string& argument : arguments) {
+        constexpr const char* kMapPrefix = "--map=";
+        if (argument.rfind(kMapPrefix, 0) == 0) {
+            mapFile = argument.substr(std::char_traits<char>::length(kMapPrefix));
+        }
+    }
+
+    // W7-S4：`--autofly=<秒>` —— **确定性自动化飞行**（仅测试用；缺省 0 = 不启用）。
+    // 为什么需要：W7 的验收判据要求"10km 飞越全图"的实测证据，而本环境无法用
+    // `tools/vx_perf_input.ps1` 向游戏注入按键（注入只到达**前台**窗口，CI / 无头会话抢不到，
+    // 见该脚本的 focus guard 说明）。本开关让"飞越"可脚本化复现，且**不影响任何缺省行为**。
+    double autoFlySeconds = 0.0;
+    for (const std::string& argument : arguments) {
+        constexpr const char* kAutoFlyPrefix = "--autofly=";
+        if (argument.rfind(kAutoFlyPrefix, 0) == 0) {
+            try {
+                autoFlySeconds = std::stod(argument.substr(std::char_traits<char>::length(kAutoFlyPrefix)));
+            } catch (const std::exception&) {
+                autoFlySeconds = 0.0;  // 非法值 = 关闭（测试开关，静默回退不改变玩法）
+            }
+        }
+    }
+
     // T85：把测试模式打进日志（自动测试 ⇒ 勿动键鼠；人工测试 ⇒ 逐条列出验收项）。
     // 即便本机未加载 CJK 字体、面板不渲染非 ASCII 动态文本，日志里仍有完整信息。
     if (testMode.mode == vx::TestMode::Auto) {
@@ -1222,6 +1534,23 @@ int main(int argc, char** argv) {
     try {
         const vx::TerrainMaterialTable materials =
             vx::TerrainMaterialTable::LoadFromFile(SourceAssetPath("assets/config/materials.toml"));
+
+        // W3：地表生成参数（含**地貌分区**：山川 / 平原 / 丘陵）。与材质表**同源解析**；
+        // 加载失败（缺失 / 语法错 / 校验不过 / schema_version 不符）抛异常 → 启动失败（**禁止静默回退**）。
+        // 离线烘焙（tools/baker）加载**同一份**文件 ⇒ 预制地图与游戏世界同源。
+        const vx::TerrainGenerationParams terrainParams =
+            vx::TerrainGenerationParams::LoadFromFile(SourceAssetPath("assets/config/terrain.toml"));
+        VX_LOG_INFO("地表生成参数已加载：地貌分区 %s（掩罩频率 %.4f；平原/丘陵/山川 幅度 ×%.2f / ×%.2f / ×%.2f）",
+                    terrainParams.landform.enabled ? "**启用**" : "关闭",
+                    static_cast<double>(terrainParams.landform.frequency),
+                    static_cast<double>(terrainParams.landform.plainsAmplitudeScale),
+                    static_cast<double>(terrainParams.landform.hillsAmplitudeScale),
+                    static_cast<double>(terrainParams.landform.mountainsAmplitudeScale));
+        VX_LOG_INFO("洞穴网络（W5 地表壳）：%s（频率 %.4f；隧道半径 %.2f；最大雕刻 %.1f 格）",
+                    terrainParams.caves.enabled ? "**启用**" : "关闭",
+                    static_cast<double>(terrainParams.caves.frequency),
+                    static_cast<double>(terrainParams.caves.tunnelRadius),
+                    static_cast<double>(terrainParams.caves.carveStrengthBlocks));
 
         // T21a / T21c：光照与雾配置。与材质表**同源解析**（同一个 SourceAssetPath，同一个 toml++），
         // 加载失败（缺失 / 语法错 / 校验不过 / schema_version 不符）抛异常 → 外层 catch → 启动失败，
@@ -1319,7 +1648,7 @@ int main(int argc, char** argv) {
                     static_cast<double>(destructionSpec.propBrokenTint[2]));
 
         // T11：从预设地图构建世界（种子 / 范围 / 地形编辑全部来自文件，不再硬编码）。
-        const std::filesystem::path mapPath = SourceAssetPath(kDefaultMapFile);
+        const std::filesystem::path mapPath = SourceAssetPath(mapFile);
         const vx::MapPreset         preset  = vx::MapPreset::LoadFromFile(mapPath);
 
         vx::Window window("Voxel Engine - V0.1 terrain", 1280, 720);
@@ -1607,48 +1936,192 @@ int main(int argc, char** argv) {
         std::vector<vx::BlockCoord> volumeCreated;           ///< 本帧新建的块（入延后队列，复用缓冲）
         std::vector<vx::TileCoord>  volumeTouchedTiles;      ///< 本帧接管状态翻转的 tile（入延后队列，复用缓冲）
 
-        vx::TerrainWorld world(preset.seed, materials);
+        vx::TerrainWorld world(preset.seed, materials, terrainParams);
         world.SetMapPreset(preset);  // 噪声先行、编辑覆盖其上（必须在 LoadTile 之前）
         // T8 层间交接（ADR 0011）＋ T61：判据 = **当前常驻集合**（ADR 0020 决策三），故必须在 LoadTile 之前设置。
-        world.SetQuadFilter(&residentQuadFilter);
+        // W4：**地表壳**的近场区域 + 级联四边形过滤器（可挖体积接管 ∪ 地表壳接管）。
+        // 区域按 tile 对齐 ⇒ 被跳过的四边形整块落在若干 tile 内 ⇒ 那些 tile 的网格变空 ⇒
+        // `CollisionBodies` 阶段会自动交出它们的高度场碰撞体（与 ADR 0012 同一条路径）。
+        vx::SurfaceShellRegion shellRegion;
+        shellRegion.minColumnX = kShellTileMin * vx::kTerrainTileSize;
+        shellRegion.maxColumnX = (kShellTileMax + 1) * vx::kTerrainTileSize;
+        shellRegion.minColumnZ = kShellTileMin * vx::kTerrainTileSize;
+        shellRegion.maxColumnZ = (kShellTileMax + 1) * vx::kTerrainTileSize;
+        vx::SurfaceShellParams shellParams;
+        ShellQuadFilter        shellQuadFilter(shellRegion);
+        CompositeQuadFilter    compositeQuadFilter(residentQuadFilter, shellQuadFilter);
+        world.SetQuadFilter(&compositeQuadFilter);
 
-        // 地图范围由预设的 tile 半径决定：tile ∈ [-r, r] → 世界列 ∈ [-r*64, r*64]。
-        std::vector<vx::TileCoord>  tileCoords;
-        std::vector<vx::MeshHandle> tileHandles;
-        const std::size_t           tilesX = static_cast<std::size_t>(2 * preset.tileRadiusX + 1);
-        const std::size_t           tilesZ = static_cast<std::size_t>(2 * preset.tileRadiusZ + 1);
-        tileCoords.reserve(tilesX * tilesZ);
-        tileHandles.reserve(tilesX * tilesZ);
+        // ---- W7-S3a：地表 tile 的**常驻集合**（ADR 0024 决策一）----
+        // 地图范围（世界内**存在**的 tile）由预设 tile 半径决定；**常驻集合**只取"玩家窗口 + 预取环"⇒
+        // 与世界总大小无关（10km 与 1km 的常驻量同级）。三个并行数组（同下标 = 同一 tile）作为常驻集合。
+        std::vector<vx::TileCoord>   tileCoords;
+        std::vector<vx::MeshHandle>  tileHandles;
+        std::vector<WorldAabb>       tileBounds;
+        std::vector<std::uint8_t>    tileCollisionActive;  ///< W7-S3b：与上面三个数组**同下标**（0/1 = 是否装有碰撞体）
+        const std::size_t            worldTilesX = static_cast<std::size_t>(2 * preset.tileRadiusX + 1);
+        const std::size_t           worldTilesZ = static_cast<std::size_t>(2 * preset.tileRadiusZ + 1);
+        const std::size_t           residencyCap = static_cast<std::size_t>(
+            2 * (kGameTerrainLodRings.radii[2] + vx::kTerrainResidencyPrefetchTiles) + 1);
+        tileCoords.reserve(residencyCap * residencyCap);
+        tileHandles.reserve(residencyCap * residencyCap);
+        tileBounds.reserve(residencyCap * residencyCap);
+
+        // W7-S3b：分环调度器（活动半径 = 最外环 32 tile；LOD 按 Chebyshev 环距离分配）。
+        vx::TerrainTileScheduler tileScheduler(
+            vx::MakeTerrainTileRange(-preset.tileRadiusX, -preset.tileRadiusZ, 2 * preset.tileRadiusX + 1,
+                                     2 * preset.tileRadiusZ + 1),
+            kGameTerrainLodRings, vx::kTerrainResidencyPrefetchTiles);
+        std::vector<vx::TileCoord> terrainResidencyChanged;  ///< 每帧调度产生的"建 / 卸"tile（复用缓冲）
+        std::vector<vx::TileCoord> terrainRelodChanged;      ///< 每帧调度产生的"LOD 切换"tile（复用缓冲）
+
+        // ---- W7-S3b：地表 tile 构建**下沉 worker**（[ADR 0022](../../docs/adr/0022-volume-build-worker-pipeline.md) 形态）----
+        // 形态与可挖体积（T81）同源：worker 只跑纯函数（生成 + 网格化），主线程只做"收包 + 过滤 + 安装 + GPU 上传"。
+        // 逐个 worker 各自持有由 `(seed, params)` 构造的 `TerrainNoiseGenerator`（不共用 `TerrainWorld` 的）。
+        // 线程池不可用时自动回落同步路径（结果不变、只是尖峰回到从前；`TaskScheduler` 会 WARN 一次，不静默）。
+        vx::TerrainTileBuildPipeline terrainBuildPipeline(preset.seed, terrainParams, preset.edits);
+        const bool                   terrainHasWorkers = terrainBuildPipeline.HasWorkers();
+        VX_LOG_INFO(
+            "地表 tile 构建（W7-S3b / ADR 0022 形态）：%s（worker 线程 %u 个；主线程只做「收包 + 过滤 + 安装 + GPU 上传」）",
+            terrainHasWorkers ? "**下沉 worker**（生成 + 网格化不再占用渲染帧）"
+                              : "**不可用 ⇒ 回退同步构建**（见上方 WARN）",
+            terrainBuildPipeline.WorkerThreadCount());
+
+        std::set<vx::TileCoord>    terrainBuildInFlight;        ///< 已提交、尚未收包的**加载**任务坐标（主线程独占）
+        std::set<vx::TileCoord>    terrainRelodInFlight;        ///< 已提交、尚未收包的 **relod** 任务坐标
+        std::vector<vx::TileCoord> terrainPendingLoadScratch;   ///< `CollectPendingLoadTiles` 复用缓冲
+        std::vector<vx::TileCoord> terrainRelodUploads;         ///< 已安装、待重传 GPU 的 relod tile（可能有上帧残留）
+        int terrainPrefetchCenterX = std::numeric_limits<int>::max();
+        int terrainPrefetchCenterZ = std::numeric_limits<int>::max();
+
+        // 收包：加载结果 → 预取缓存（`Step` 命中即**廉价安装**）；relod 结果 → 直接换网格 + 记入待重传清单。
+        // 每帧把完成队列**全部**取回（队列长度 ≤ 预取提前量 `kTerrainPrefetchLookahead`，**有上界**；
+        // 每次只是一个 move）。**只暂存仍在当前常驻窗口内的结果**（窗口已移走的陈旧结果直接丢弃，
+        // 否则会占用预取提前量、挤掉新窗口的预取）。
+        const auto drainTerrainTileBuilds = [&]() {
+            vx::TerrainTileBuildResult built;
+            while (terrainBuildPipeline.TakeCompleted(built)) {
+                if (built.remeshOnly) {
+                    terrainRelodInFlight.erase(built.coord);
+                    if (world.InstallRemeshedMesh(built.coord, built.lodLevel, std::move(built.mesh))) {
+                        terrainRelodUploads.push_back(built.coord);
+                    }
+                } else {
+                    terrainBuildInFlight.erase(built.coord);
+                    if (tileScheduler.ResidencyWindow().Contains(built.coord)) {
+                        world.StageTile(std::move(built.tile), std::move(built.mesh));
+                    }
+                }
+            }
+        };
+
+        // 预取：为"待加载、未暂存、未在飞"的坐标**提前**提交 worker（早于 `Step`；ADR 0024 决策一）。
+        const auto prefetchTerrainTiles = [&]() {
+            terrainPendingLoadScratch.clear();
+            if (!terrainHasWorkers) {
+                return;  // 无 worker：`Step` 走同步回退（结果不变，只是尖峰回到从前）
+            }
+            tileScheduler.CollectPendingLoadTiles(terrainPendingLoadScratch);
+            std::size_t submits = 0;
+            for (const vx::TileCoord& coord : terrainPendingLoadScratch) {
+                if (submits >= kTerrainPrefetchSubmitsPerFrame) {
+                    break;
+                }
+                if (world.StagedTileCount() + terrainBuildInFlight.size() >= kTerrainPrefetchLookahead) {
+                    break;  // 提前量封顶 ⇒ 预取缓存 / 在飞任务的内存有上界
+                }
+                const int lod = tileScheduler.LodLevelForTile(coord);
+                if (world.HasStagedTile(coord.x, coord.z, lod) ||
+                    terrainBuildInFlight.find(coord) != terrainBuildInFlight.end()) {
+                    continue;
+                }
+                vx::TerrainTileBuildRequest request;
+                request.coord    = coord;
+                request.lodLevel = lod;
+                terrainBuildPipeline.Submit(std::move(request));
+                terrainBuildInFlight.insert(coord);
+                ++submits;
+            }
+        };
+
+        // 门控：`Step` 本帧会加载的**前 `batch` 个** tile 必须**全部已就绪**，否则本帧不推进 `Step`
+        //（等 worker；**绝不**在渲染帧内同步生成）。`terrainPendingLoadScratch` 已由 `prefetchTerrainTiles` 填好。
+        const auto terrainStepReady = [&](std::size_t batch) {
+            if (!terrainHasWorkers) {
+                return true;  // 无 worker：`Step` 走同步回退（预期路径）
+            }
+            const std::size_t count = std::min(batch, terrainPendingLoadScratch.size());
+            for (std::size_t i = 0; i < count; ++i) {
+                const vx::TileCoord& coord = terrainPendingLoadScratch[i];
+                if (!world.HasStagedTile(coord.x, coord.z, tileScheduler.LodLevelForTile(coord))) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        // W7-S3b：**碰撞体随窗口重扫**的游标（只在窗口中心变化时开启一轮；每帧只做 `kTerrainCollisionActionsPerFrame`
+        // 个跃迁 ⇒ 单帧成本有上界）。`centerX/Z` 记录上一轮中心，用来判定"是否要开启新一轮"。
+        bool  terrainCollisionSweepActive = false;
+        int   terrainCollisionSweepCursor = 0;
+        int   terrainCollisionCenterX     = 0;
+        int   terrainCollisionCenterZ     = 0;
         {
-            // ---- 阶段 2：地形 tile 生成 + 网格化（逐 tile 分片）----
-            const std::size_t tileCount = tilesX * tilesZ;
-            std::size_t       loaded    = 0;
+            // ---- 阶段 2：地形 tile（生成 + 网格化**下沉 worker**；主线程按常驻窗口**分帧安装**，不冻结画面）----
+            const auto terrainLoadProgress = [&]() {
+                const std::size_t desired = tileScheduler.DesiredCount();
+                return (desired == 0U) ? 1.0
+                                       : static_cast<double>(tileCoords.size()) / static_cast<double>(desired);
+            };
+            (void)tileScheduler.Update(world, preset.spawnX, preset.spawnZ);
+            terrainPrefetchCenterX = tileScheduler.Window().centerTileX;
+            terrainPrefetchCenterZ = tileScheduler.Window().centerTileZ;
             if (!loading.Run(LoadStage::TerrainTiles, [&]() {
-                    if (loaded >= tileCount) {
+                    if (!tileScheduler.HasPendingWork()) {
                         return 1.0;
                     }
-                    const int tileZ = -preset.tileRadiusZ + static_cast<int>(loaded / tilesX);
-                    const int tileX = -preset.tileRadiusX + static_cast<int>(loaded % tilesX);
-                    world.LoadTile(tileX, tileZ);  // 生成 + 网格化
-                    tileCoords.push_back(vx::TileCoord { tileX, tileZ });
-                    tileHandles.push_back(vx::MeshHandle {});
-                    ++loaded;
-                    return static_cast<double>(loaded) / static_cast<double>(tileCount);
+                    terrainResidencyChanged.clear();
+                    drainTerrainTileBuilds();
+                    prefetchTerrainTiles();
+                    // 门控：本帧 `Step` 会加载的**整批** tile 都已就绪才推进（等 worker；**绝不**在渲染帧内同步生成）。
+                    if (!terrainStepReady(kTerrainTilesPerLoadSlice)) {
+                        return terrainLoadProgress();
+                    }
+                    (void)tileScheduler.Step(world, kTerrainTilesPerLoadSlice, terrainResidencyChanged);
+                    for (const vx::TileCoord& coord : terrainResidencyChanged) {
+                        // 世界数据已由 `Step`（从预取缓存）安装 ⇒ 这里只登记常驻集合（GPU / 碰撞在后续阶段）。
+                        // ⚠️ 四个并行数组**必须同步增长**（同下标 = 同一 tile）；漏掉任一个都会让后续
+                        // `SyncResidentTileCollision` 的按下标写入越界（曾经真的踩到）。
+                        tileCoords.push_back(coord);
+                        tileHandles.push_back(vx::MeshHandle {});
+                        tileBounds.push_back(WorldAabb {});
+                        tileCollisionActive.push_back(0U);
+                    }
+                    return terrainLoadProgress();
                 })) {
                 VX_LOG_INFO("加载期收到退出请求（地形 tile 阶段），退出");
                 return EXIT_SUCCESS;
             }
         }
-        VX_LOG_INFO("预设地图已加载：%s（文件 %s）—— 种子 %llu，tile 半径 [%d, %d]（%zu 个 tile），"
+        VX_LOG_INFO("预设地图已加载：%s（文件 %s）—— 种子 %llu，tile 半径 [%d, %d]（世界内共 %zu 个 tile），"
                     "地形编辑 %zu 条，出生点 (%.1f, %.1f)",
                     preset.name.c_str(), mapPath.string().c_str(), static_cast<unsigned long long>(preset.seed),
-                    preset.tileRadiusX, preset.tileRadiusZ, tileCoords.size(), preset.edits.size(), preset.spawnX,
-                    preset.spawnZ);
+                    preset.tileRadiusX, preset.tileRadiusZ, worldTilesX * worldTilesZ, preset.edits.size(),
+                    preset.spawnX, preset.spawnZ);
+        VX_LOG_INFO("地表 tile 常驻集合（W7-S3b / ADR 0024）：活动半径 %d tile（LOD 分环 %d/%d/%d tile，"
+                    "最外环 ≈ %d m）+ 预取环 %d ⇒ 启动常驻 **%zu** 个（世界内 %zu 个；窗口目标 %zu 个）",
+                    kGameTerrainLodRings.radii[2], kGameTerrainLodRings.radii[0], kGameTerrainLodRings.radii[1],
+                    kGameTerrainLodRings.radii[2], kGameTerrainLodRings.radii[2] * vx::kTerrainTileSize,
+                    vx::kTerrainResidencyPrefetchTiles, tileCoords.size(), worldTilesX * worldTilesZ,
+                    tileScheduler.DesiredCount());
 
         // 物理世界 + 碰撞体。T28 / ADR 0012：**地表高度场只在"可见地表不归体积画"的 tile 上建**，
         // 其余 tile 的碰撞改由可挖体积的三角网提供（否则隐形高度场会把角色挡在自己挖的洞口外）。
         vx::PhysicsWorld     physics;
         vx::TerrainCollision terrainCollision(physics);
+        // W7-S3a：常驻集合的资源绑定（GPU 网格 / 碰撞 / AABB 与 `tileCoords` 同下标）。
+        TileResidencyResources tileResidency { world, terrainCollision, renderer, tileCoords, tileHandles,
+                                               tileBounds, tileCollisionActive };
 
         // T33：Jolt 的重力必须与玩法层**同一口径**（Jolt 默认 -9.81，而角色 / 弹道用 `kGravity`）——
         // 否则倒塌的塔与角色会各按一套重力下落，世界不自洽。
@@ -1705,6 +2178,53 @@ int main(int argc, char** argv) {
                         static_cast<double>(digVolumes.MaterialBytes()) / (1024.0 * 1024.0), surfaceBlocks);
         }
 
+        // ---- W4：**地表壳**近场块清单（网格化放进下面**有预算**的阶段里，不在这里同步做）----
+        // 另建一个噪声源，但用**同一份** `(种子, 参数)` ⇒ 与 `TerrainWorld` 的世界同源（纯函数 ⇒ 逐位一致）。
+        const vx::TerrainNoiseGenerator shellNoise(preset.seed, terrainParams);
+
+        // ---- W6：河流（ADR 0027）—— 河道自高处沿下坡生成，河床**刻蚀进地表壳**；水面按静态水位生成 ----
+        // 与壳**同一份**下切场 ⇒ 河床碰撞随壳的三角网自动承担（"谁画谁挡"零分叉）。
+        vx::RiverPath       riverPath;
+        vx::RiverCarveField riverCarve;
+        {
+            riverPath = vx::GenerateRiverPath(shellNoise, terrainParams.river, shellRegion.minColumnX,
+                                              shellRegion.minColumnZ, shellRegion.maxColumnX,
+                                              shellRegion.maxColumnZ);
+            riverCarve = vx::RiverCarveField(riverPath, terrainParams.river, shellRegion.minColumnX,
+                                             shellRegion.minColumnZ, shellRegion.maxColumnX - shellRegion.minColumnX,
+                                             shellRegion.maxColumnZ - shellRegion.minColumnZ);
+            VX_LOG_INFO("河流（W6 / ADR 0027）：%s；河道 %zu 个节点（下切场 %d×%d 格；中心下切 %.1f 格、水深 %.1f 格）",
+                        terrainParams.river.enabled ? "**启用**" : "关闭", riverPath.nodes.size(),
+                        shellRegion.maxColumnX - shellRegion.minColumnX,
+                        shellRegion.maxColumnZ - shellRegion.minColumnZ,
+                        static_cast<double>(terrainParams.river.channelDepthBlocks),
+                        static_cast<double>(terrainParams.river.waterDepthBlocks));
+        }
+
+        std::vector<vx::BlockCoord>     shellBlockCoords;
+        std::vector<vx::MeshData>       shellBlockMeshes;
+        std::vector<vx::MeshHandle>     shellHandles;
+        std::vector<WorldAabb>          shellBounds;
+        {
+            const int blockMinX = shellRegion.minColumnX / vx::kVolumeBlockSize;
+            const int blockMaxX = (shellRegion.maxColumnX - 1) / vx::kVolumeBlockSize;
+            const int blockMinZ = shellRegion.minColumnZ / vx::kVolumeBlockSize;
+            const int blockMaxZ = (shellRegion.maxColumnZ - 1) / vx::kVolumeBlockSize;
+            for (int bz = blockMinZ; bz <= blockMaxZ; ++bz) {
+                for (int bx = blockMinX; bx <= blockMaxX; ++bx) {
+                    const vx::ShellBlockSpan span = vx::ComputeShellBlockSpanY(shellNoise, shellParams, bx, bz);
+                    for (int by = span.minBlockY; by <= span.maxBlockY; ++by) {
+                        shellBlockCoords.push_back(vx::BlockCoord { bx, by, bz });
+                    }
+                }
+            }
+        }
+        shellBlockMeshes.resize(shellBlockCoords.size());
+        shellHandles.resize(shellBlockCoords.size());
+        shellBounds.resize(shellBlockCoords.size());
+        VX_LOG_INFO("地表壳（W4 / ADR 0023）：区域列 [%d, %d)²，待建 %zu 个块（近场；全图铺开属 W7 流式）",
+                    shellRegion.minColumnX, shellRegion.maxColumnX, shellBlockCoords.size());
+
         // ---- T28 碰撞接管（ADR 0012）----
         // 判据直接取"该 tile 的地表网格是否已经没有任何面"：它与 ADR 0011 的四边形跳过判据**同源**
         // （同一次 `BuildTerrainMesh`），因此不可能出现"渲染交给体积、碰撞却留在高度场"的漂移。
@@ -1714,26 +2234,44 @@ int main(int argc, char** argv) {
         vx::VolumeCollision volumeCollision(physics);
         std::size_t         collisionTiles = 0;
         std::size_t         takenOverTiles = 0;
+        std::size_t         noCollisionTiles = 0;  ///< W7-S3b：超出碰撞半径、**不建**高度场碰撞体的 tile
+        std::size_t         shellSurfaceBlocks = 0;
         {
             const std::size_t tileCount   = tileCoords.size();
             const std::size_t volumeCount = initialVolumeCoords.size();
-            const std::size_t totalUnits  = tileCount + volumeCount;
+            const std::size_t shellCount  = shellBlockCoords.size();
+            const std::size_t totalUnits  = tileCount + volumeCount + shellCount;
             std::size_t       unit        = 0;
             if (!loading.Run(LoadStage::CollisionBodies, [&]() {
                     if (unit >= totalUnits) {
                         return 1.0;
                     }
                     if (unit < tileCount) {
-                        const vx::TileCoord&       coord    = tileCoords[unit];
-                        const vx::TerrainTileMesh* tileMesh = world.FindMesh(coord.x, coord.z);
-                        const bool empty = (tileMesh != nullptr) && tileMesh->mesh.indices.empty();
-                        if (empty) {
-                            ++takenOverTiles;  // 可见面全归体积 ⇒ 高度场碰撞体交出去
-                        } else if (terrainCollision.SyncTile(world, coord.x, coord.z)) {
-                            ++collisionTiles;
+                        // 可见面全归体积 / 地表壳 ⇒ 高度场碰撞体交出（判据与 ADR 0011 同源，见该助手）。
+                        // W7-S3b：超出碰撞半径的 tile **不建**碰撞体（记入 `noCollisionTiles`）。
+                        if (NeedsTerrainCollision(tileScheduler.Window(), tileResidency.coords[unit])) {
+                            if (SyncResidentTileCollision(tileResidency, unit, /*wantCollision=*/true)) {
+                                ++collisionTiles;
+                            } else {
+                                ++takenOverTiles;
+                            }
+                        } else {
+                            (void)SyncResidentTileCollision(tileResidency, unit, /*wantCollision=*/false);
+                            ++noCollisionTiles;
                         }
-                    } else {
+                    } else if (unit < tileCount + volumeCount) {
                         (void)volumeCollision.SyncBlock(digVolumes, initialVolumeCoords[unit - tileCount]);
+                    } else {
+                        // W4：地表壳块 —— **网格化一次**，同时用于碰撞（下面）与渲染（`MeshUpload` 阶段）。
+                        const std::size_t    index = unit - tileCount - volumeCount;
+                        const vx::BlockCoord& block = shellBlockCoords[index];
+                        shellBlockMeshes[index] =
+                            vx::BuildShellBlockMesh(shellNoise, terrainParams, shellParams, shellRegion, block,
+                                                    &riverCarve);
+                        if (!shellBlockMeshes[index].indices.empty()) {
+                            AddShellBlockCollider(physics, shellBlockMeshes[index], block);
+                            ++shellSurfaceBlocks;
+                        }
                     }
                     ++unit;
                     return static_cast<double>(unit) / static_cast<double>(totalUnits);
@@ -1744,8 +2282,15 @@ int main(int argc, char** argv) {
         }
         const std::size_t volumeBodies = volumeCollision.BlockBodyCount();
         VX_LOG_INFO("碰撞接管（ADR 0012）：地表高度场碰撞体 %zu 个；%zu/%zu 个 tile 的可见面已全由体积绘制"
-                    "（其高度场碰撞体已交出）；可挖体积三角网碰撞体 %zu 个",
-                    collisionTiles, takenOverTiles, tileCoords.size(), volumeBodies);
+                    "（其高度场碰撞体已交出）；**%zu 个 tile 超出碰撞半径 %d（不建碰撞体）**；"
+                    "可挖体积三角网碰撞体 %zu 个",
+                    collisionTiles, takenOverTiles, tileCoords.size(), noCollisionTiles,
+                    kTerrainCollisionRadiusTiles, volumeBodies);
+        VX_LOG_INFO("地表壳（W4 / ADR 0023）：%zu/%zu 个块有等值面；网格已作为**三角网静态碰撞体**登记"
+                    "（与渲染同源）；区域世界列中心 ≈ (%d, %d)",
+                    shellSurfaceBlocks, shellBlockCoords.size(),
+                    (shellRegion.minColumnX + shellRegion.maxColumnX) / 2,
+                    (shellRegion.minColumnZ + shellRegion.maxColumnZ) / 2);
 
         // T18 / T84：世界边界由**地图范围自动推导**（tile_radius → 世界列范围），不硬编码：换地图或将来
         // 改由程序化决定大小时自动跟随。**六面封闭**（T84，所有者 2026-10-05 裁定）：四周建**不可见**静态墙
@@ -1841,6 +2386,25 @@ int main(int argc, char** argv) {
                                       ? static_cast<float>(clientSize.width) / static_cast<float>(clientSize.height)
                                       : (16.0F / 9.0F);
         settings.followDistance = kCameraFollowDistance;
+        // W6g：**肩位偏移**（over-the-shoulder）—— 注视点沿相机右方平移，主角偏出画面中心，
+        // 半封闭空间里不必把悬臂塌到角色身上（业界 TPS 通行做法）。只平移注视点，**不改变朝向**。
+        settings.shoulderOffset = 0.6F;
+        // W6f：**球投射探针半径** —— 遮挡查询把相机近似为半径 0.25 格的球（对齐 Cinemachine `CameraRadius`），
+        // 薄墙不再从相机旁边"擦过"而漏检 ⇒ 减少穿墙。
+        settings.cameraProbeRadius = 0.25F;
+        // W6e：**淡出主角** —— 相机与注视点近于 1.5 格起平滑淡出、到 0.4 格完全淡出（片元 Bayer 抖动 discard），
+        // 取代"过近突然消失"（W6d 关闭的隐藏）与"近裁剪面切开模型看不到人物内部"。
+        settings.targetFadeStartDistance = 1.5F;
+        settings.targetFadeEndDistance   = 0.4F;
+        // W6d：**取消**"相机过近时隐藏主角"（所有者 2026-10-06 裁定：镜头拉近时不再隐藏角色）。
+        // 取 0 = 关闭该判据（`view.distance < 0` 恒 false）⇒ 主角恒提交；**能力代码保留**
+        // （`CameraSettings::targetHideDistance` 与纯函数 `ShouldHideFollowTarget` 均未删除），改回 1.5 即可重新启用。
+        // 当前的"贴脸穿模"由 W6e 的**淡出**负责（不再是隐藏）。
+        settings.targetHideDistance = 0.0F;
+        // W7-S3b：**远裁剪面**必须盖住 Ring 2 的外边界（2048 m），否则最外环会被裁掉 ⇒ 流式窗口边界露出"硬切"。
+        // 取 2100（= Ring 2 外边界 2048 + 余量）。流式边界本身（常驻半径 33 tile ≈ 2112 m）由**雾**遮住：
+        // 雾密度 0.003/格 ⇒ 2048 m 处遮挡 ≈ 99.8%（`assets/config/lighting.toml`；ADR 0024 的"视距 < 常驻半径"）。
+        settings.farPlane = 2100.0F;
 
         vx::ThirdPersonCamera camera(settings);
         camera.SnapTo(glm::vec3(spawnX, static_cast<float>(capsule.position.y), spawnZ));
@@ -1882,9 +2446,6 @@ int main(int argc, char** argv) {
             return EXIT_SUCCESS;
         }
 
-        // T39：每个网格的**世界空间** AABB（上传时算一次，之后每帧只做视锥剔除判定）。
-        std::vector<WorldAabb> tileBounds(tileCoords.size());
-
         // T37：延后破坏队列与其执行器（爆炸只入队；重网格 / 上传 / 碰撞体重建按每帧预算推进）。
         vx::PendingDestruction pendingDestruction;
         DestructionProcessor   destructionProcessor;
@@ -1893,10 +2454,12 @@ int main(int argc, char** argv) {
         // T36：每个网格的上传都是一次**阻塞到 GPU 完成**的拷贝；`UploadMesh` 会创建 GPU 资源并等待，
         // 而 SDL_gpu 的命令缓冲是单线程的 ⇒ 上传必须留在主线程，只能靠"每帧只传几个"来摊平。
         std::size_t volumeMeshCount = 0;
+        std::size_t shellMeshCount  = 0;
         {
             const std::size_t tileCount   = tileCoords.size();
             const std::size_t volumeCount = initialVolumeCoords.size();
-            const std::size_t totalUnits  = tileCount + volumeCount;
+            const std::size_t shellCount  = shellBlockCoords.size();
+            const std::size_t totalUnits  = tileCount + volumeCount + shellCount;
             std::size_t       unit        = 0;
             if (!loading.Run(LoadStage::MeshUpload, [&]() {
                     if (unit >= totalUnits) {
@@ -1905,13 +2468,29 @@ int main(int argc, char** argv) {
                     const std::size_t batchEnd = std::min(unit + kMeshUploadsPerSlice, totalUnits);
                     for (; unit < batchEnd; ++unit) {
                         if (unit < tileCount) {
-                            UploadTileMesh(renderer, tileHandles[unit], world, tileCoords[unit], &tileBounds[unit]);
-                        } else {
+                            UploadResidentTile(tileResidency, unit);
+                        } else if (unit < tileCount + volumeCount) {
                             const std::size_t index = unit - tileCount;
                             UploadVolumeMeshAt(volumeSlots, renderer, digVolumes, initialVolumeCoords[index]);
                             const auto uploaded = volumeSlots.Find(initialVolumeCoords[index]);
                             if (uploaded != volumeSlots.end() && uploaded->second.handle.IsValid()) {
                                 ++volumeMeshCount;
+                            }
+                        } else {
+                            // W4：地表壳块 —— 上传**碰撞用的同一份**网格（谁画谁挡同源）；无表面则跳过。
+                            const std::size_t     index = unit - tileCount - volumeCount;
+                            const vx::MeshData&   mesh  = shellBlockMeshes[index];
+                            if (!mesh.indices.empty()) {
+                                const vx::BlockCoord& block = shellBlockCoords[index];
+                                const glm::dvec3 origin(static_cast<double>(vx::BlockOriginBlocks(block.x)),
+                                                        static_cast<double>(vx::BlockOriginBlocks(block.y)),
+                                                        static_cast<double>(vx::BlockOriginBlocks(block.z)));
+                                shellHandles[index] =
+                                    renderer.UploadMesh(mesh, origin, /*emissive=*/false,
+                                                        /*reserveVertexCount=*/0, /*reserveIndexCount=*/0,
+                                                        /*depthBiased=*/false);
+                                shellBounds[index] = BoundsOfVertices(mesh.vertices, origin);
+                                ++shellMeshCount;
                             }
                         }
                     }
@@ -1921,8 +2500,29 @@ int main(int argc, char** argv) {
                 return EXIT_SUCCESS;
             }
         }
+
+        // ---- W6：水面网格（近场；与河道同源）—— 独立管线（flow 着色 + 半透明），在主通道最后绘制 ----
+        vx::MeshHandle waterHandle;
+        std::size_t    waterTriangles = 0;
+        if (!riverPath.Empty()) {
+            const vx::MeshData waterMesh =
+                vx::BuildRiverWaterMesh(riverPath, shellRegion.minColumnX, shellRegion.minColumnZ);
+            if (!waterMesh.indices.empty()) {
+                const glm::dvec3 waterOrigin(static_cast<double>(shellRegion.minColumnX), 0.0,
+                                             static_cast<double>(shellRegion.minColumnZ));
+                waterHandle = renderer.UploadMesh(waterMesh, waterOrigin, /*emissive=*/false,
+                                                  /*reserveVertexCount=*/0, /*reserveIndexCount=*/0,
+                                                  /*depthBiased=*/false, /*water=*/true);
+                waterTriangles = waterMesh.indices.size() / 3U;
+            }
+        }
+        VX_LOG_INFO("水面网格（W6 / ADR 0027）：%zu 个三角形（flow 滚动波 + 半透明；河床碰撞随地表壳承担）",
+                    waterTriangles);
+
         VX_LOG_INFO("可挖体积网格已上传：%zu/%zu 个块有可见表面（其余块全实心或全空，无等值面）", volumeMeshCount,
                     volumeSlots.Size());
+        VX_LOG_INFO("地表壳网格已上传：%zu/%zu 个块（Surface Nets；与碰撞体同一份数据）", shellMeshCount,
+                    shellBlockCoords.size());
 
         // T13 / T69：主角**可视**体（装饰用，不参与任何物理，尺寸与碰撞胶囊一致）。
         // T69：优先用 CC0 **占位模型**（Quaternius《Casual Female》，蒙皮 + 骨骼动画，见 plans/v0.3.md §1.3）；
@@ -2080,6 +2680,10 @@ int main(int argc, char** argv) {
         // 飞行模式开关状态（T12）；切换时清零速度，避免残留速度把角色弹飞。
         bool flying = false;
 
+        // W7-S4：`--autofly=<秒>` 的剩余秒数与"已启动"标记（缺省 0 ⇒ 全程不生效）。
+        double autoFlyRemainingSeconds = autoFlySeconds;
+        bool   autoFlyStarted          = false;
+
         // T27：重新捕获鼠标的那一次点击**不落到发射上**（直到松开按键）。左键改为按住连发后，
         // 若只在按下帧抑制，按住不放会在下一帧立刻发射，等于把"捕获点击"变成了开火；
         // 故用锁存：捕获点击被消费时置位，左键松开时清零。
@@ -2139,6 +2743,9 @@ int main(int argc, char** argv) {
             const float     length = glm::length(direction);
             return (length > 0.0F) ? (direction / length) : glm::vec3(0.0F, 1.0F, 0.0F);
         }();
+
+        // W6：水面流动时间（秒）—— 累加**固定步**时间（与物理同步 ⇒ 确定性，不受帧率影响）。
+        double waterTimeSeconds = 0.0;
 
         while (true) {
             // T79②（T74 打点拆分，**先量后改**）：帧周期的采样点必须在**帧首**。
@@ -2279,6 +2886,28 @@ int main(int argc, char** argv) {
                 command.vertical = (input.Held(vx::ActionId::Jump) ? 1.0F : 0.0F) -
                                    (input.Held(vx::ActionId::FlyDown) ? 1.0F : 0.0F);
                 command.flySpeed = input.Held(vx::ActionId::Sprint) ? (kFlySpeed * 2.0F) : kFlySpeed;
+            }
+
+            // W7-S4：自动化飞行（`--autofly=<秒>`；缺省 0 ⇒ 本段整体不生效，玩法与从前逐值一致）。
+            // 语义：强制飞行 + **持续前进 + 持续上升**（沿世界顶盖下方横穿全图，不受地形起伏阻挡），
+            // 到时自动交还控制。用于给"10km 飞越 / 常驻量只随窗口变化 / P99"提供可脚本化证据。
+            if (autoFlyRemainingSeconds > 0.0) {
+                if (!autoFlyStarted) {
+                    autoFlyStarted = true;
+                    flying         = true;
+                    physics.SetCharacterVelocity(character, glm::vec3(0.0F));
+                    VX_LOG_INFO("自动飞行测试（--autofly）：强制飞行 + 前进 + 上升，持续 %.1f 秒（W7-S4 实测用）",
+                                autoFlySeconds);
+                }
+                command.forward  = 1.0F;
+                command.vertical = 1.0F;
+                command.speed    = kFlySpeed;
+                command.flySpeed = kFlySpeed;
+                autoFlyRemainingSeconds -= frameDeltaSeconds;
+                if (autoFlyRemainingSeconds <= 0.0) {
+                    VX_LOG_INFO("自动飞行测试（--autofly）：**结束**（已飞行 %.1f 秒；此后交还玩家控制）",
+                                autoFlySeconds);
+                }
             }
 
             // T24：逻辑步相位（固定步循环：物理 + 相机 + 光球 + 出界检查）。
@@ -2493,6 +3122,153 @@ int main(int argc, char** argv) {
                                 volumeScheduler.KeptDirtyCount(), buildStats.completed, buildStats.computeMsMax,
                                 volumeBuildPipeline.WorkerThreadCount());
                 }
+
+                // ---- W7-S3b：地表 tile 常驻集合随窗口调整（ADR 0024 决策一）----
+                // 生成 + 网格化**下沉 worker**（ADR 0022 形态）：主线程只做"收包 + 过滤 + 安装 + GPU 上传"，
+                // 每帧成本**有上界**（见 `kTerrain*PerFrame`）；`Update` 只重算计划（幂等）。
+                terrainResidencyChanged.clear();
+                terrainRelodChanged.clear();
+                const bool tileWasBusy = tileScheduler.HasPendingWork();
+                (void)tileScheduler.Update(world, playerState.position.x, playerState.position.z);
+                // 窗口中心变化 ⇒ 预取缓存（按旧中心的集合 / LOD 口径）作废，重新预取。
+                if (tileScheduler.Window().centerTileX != terrainPrefetchCenterX ||
+                    tileScheduler.Window().centerTileZ != terrainPrefetchCenterZ) {
+                    terrainPrefetchCenterX = tileScheduler.Window().centerTileX;
+                    terrainPrefetchCenterZ = tileScheduler.Window().centerTileZ;
+                    world.ClearStagedTiles();
+                    terrainBuildInFlight.clear();
+                }
+                // 先收包（安装已算好的结果），再**提前**预取，最后**门控**推进 `Step` 做廉价安装。
+                drainTerrainTileBuilds();
+                prefetchTerrainTiles();
+                // 门控：本帧 `Step` 会加载的**整批** tile 都已就绪才推进（等 worker；**绝不**在渲染帧内同步生成）。
+                const bool canStep = terrainStepReady(kTerrainResidencyActionsPerFrame);
+                if (canStep && tileScheduler.HasPendingWork()) {
+                    (void)tileScheduler.Step(world, kTerrainResidencyActionsPerFrame, terrainResidencyChanged);
+                }
+                for (const vx::TileCoord& coord : terrainResidencyChanged) {
+                    // `Step` 已经改过世界：**世界里有 ⇒ 这是新建**（登记 + 上传 + 碰撞）；否则是卸载。
+                    if (world.HasTile(coord.x, coord.z)) {
+                        const std::size_t index = AppendResidentTile(tileResidency, coord);
+                        UploadResidentTile(tileResidency, index);
+                        // 新 tile 只可能出现在窗口边缘（Chebyshev 33）⇒ 通常不在碰撞半径内；这里按判据如实处理。
+                        (void)SyncResidentTileCollision(tileResidency, index,
+                                                        NeedsTerrainCollision(tileScheduler.Window(), coord));
+                    } else {
+                        (void)RemoveResidentTile(tileResidency, coord);
+                    }
+                }
+
+                // **LOD 切换（relod）**：只改**网格**，不改世界数据。
+                // 有 worker ⇒ 提交**重网格任务**（高度快照进 worker，网格化离开渲染帧）；结果在 `drain` 里安装、
+                // 随后按预算重传。无 worker ⇒ 回退主线程重建（有界由 `kTerrainRelodPerFrame` 保证）。
+                (void)tileScheduler.StepRelod(kTerrainRelodPerFrame, terrainRelodChanged);
+                for (const vx::TileCoord& coord : terrainRelodChanged) {
+                    std::size_t index = 0;
+                    if (!world.HasTile(coord.x, coord.z) ||
+                        !FindResidentTileIndex(tileResidency, coord, index)) {
+                        continue;  // 同一帧里已被卸掉（relod 清单可能含"随后卸载"的 tile）⇒ 跳过
+                    }
+                    const int lod = tileScheduler.LodLevelForTile(coord);
+                    if (terrainHasWorkers) {
+                        if (terrainRelodInFlight.find(coord) != terrainRelodInFlight.end()) {
+                            continue;  // 已在飞 ⇒ 不重复提交
+                        }
+                        const vx::TerrainTile* tile = world.FindTile(coord.x, coord.z);
+                        if (tile == nullptr) {
+                            continue;
+                        }
+                        vx::TerrainTileBuildRequest request;
+                        request.coord      = coord;
+                        request.lodLevel   = lod;
+                        request.remeshOnly = true;
+                        request.tile       = *tile;  // 高度快照（8 KB）⇒ worker 只读、不碰世界
+                        terrainBuildPipeline.Submit(std::move(request));
+                        terrainRelodInFlight.insert(coord);
+                        continue;
+                    }
+                    world.MeshTile(coord.x, coord.z, lod);
+                    if (tileResidency.handles[index].IsValid()) {
+                        tileResidency.renderer.ReleaseMesh(tileResidency.handles[index]);
+                        tileResidency.handles[index] = vx::MeshHandle {};
+                    }
+                    UploadResidentTile(tileResidency, index);
+                    (void)SyncResidentTileCollision(tileResidency, index,
+                                                    NeedsTerrainCollision(tileScheduler.Window(), coord));
+                }
+                // 重传本帧（含上帧残留）已安装的 relod 网格（有上界）。
+                {
+                    std::size_t relodUploads = 0;
+                    while (relodUploads < kTerrainRelodUploadsPerFrame && !terrainRelodUploads.empty()) {
+                        const vx::TileCoord coord = terrainRelodUploads.front();
+                        terrainRelodUploads.erase(terrainRelodUploads.begin());
+                        ++relodUploads;
+                        std::size_t index = 0;
+                        if (!world.HasTile(coord.x, coord.z) ||
+                            !FindResidentTileIndex(tileResidency, coord, index)) {
+                            continue;  // 已被卸掉 ⇒ 丢弃
+                        }
+                        if (tileResidency.handles[index].IsValid()) {
+                            tileResidency.renderer.ReleaseMesh(tileResidency.handles[index]);
+                            tileResidency.handles[index] = vx::MeshHandle {};
+                        }
+                        UploadResidentTile(tileResidency, index);
+                        (void)SyncResidentTileCollision(tileResidency, index,
+                                                        NeedsTerrainCollision(tileScheduler.Window(), coord));
+                    }
+                }
+
+                // **碰撞体随窗口重扫**（W7-S3b）：只在窗口中心变化时**开启一轮**，每帧只做固定个**状态跃迁**。
+                // 为什么必须收敛半径：碰撞只在近场有意义（角色 / 弹道 / 爆炸都在玩家附近），而常驻集合要到 33 tile；
+                // 若给每个常驻 tile 都建高度场，Jolt 的静态体会达数千个（宽相位 / 内存 / 建体耗时都不可接受）。
+                if (terrainCollisionCenterX != tileScheduler.Window().centerTileX ||
+                    terrainCollisionCenterZ != tileScheduler.Window().centerTileZ) {
+                    terrainCollisionCenterX     = tileScheduler.Window().centerTileX;
+                    terrainCollisionCenterZ     = tileScheduler.Window().centerTileZ;
+                    terrainCollisionSweepActive = true;
+                    terrainCollisionSweepCursor = 0;
+                }
+                if (terrainCollisionSweepActive) {
+                    const int   half = kTerrainCollisionRadiusTiles + 1;  // 多扫一圈：让"刚离开的"也走到撤销
+                    const int   side = 2 * half + 1;
+                    std::size_t used = 0;
+                    while (terrainCollisionSweepCursor < side * side &&
+                           used < kTerrainCollisionActionsPerFrame) {
+                        const int dx = (terrainCollisionSweepCursor % side) - half;
+                        const int dz = (terrainCollisionSweepCursor / side) - half;
+                        ++terrainCollisionSweepCursor;
+                        const vx::TileCoord coord { terrainCollisionCenterX + dx, terrainCollisionCenterZ + dz };
+                        std::size_t         index = 0;
+                        if (!FindResidentTileIndex(tileResidency, coord, index)) {
+                            continue;  // 不在常驻集合里（世界边界外 / 尚未加载）⇒ 无碰撞体可谈
+                        }
+                        const bool want = NeedsTerrainCollision(tileScheduler.Window(), coord);
+                        if (want == (tileResidency.collisionActive[index] != 0U)) {
+                            continue;  // 状态一致 ⇒ 不付重活（游标继续扫，不占预算）
+                        }
+                        (void)SyncResidentTileCollision(tileResidency, index, want);
+                        ++used;
+                    }
+                    if (terrainCollisionSweepCursor >= side * side) {
+                        terrainCollisionSweepActive = false;
+                    }
+                }
+                // "窗口调整完毕" = 调度器无待办 **且** worker 在飞 / 待重传都已排空（**真正追上飞行**的可观测判据）。
+                const bool terrainCaughtUp = !tileScheduler.HasPendingWork() && terrainBuildInFlight.empty() &&
+                                             terrainRelodInFlight.empty() && terrainRelodUploads.empty();
+                if (tileWasBusy && terrainCaughtUp) {
+                    // 一次"窗口调整"收尾后记一条（跨越 tile 边界一条，不逐帧刷屏）——走动验收的可观测证据。
+                    const vx::TerrainTileBuildPipeline::Stats buildStats = terrainBuildPipeline.SnapshotStats();
+                    VX_LOG_INFO("地表 tile 常驻集合已随窗口调整完毕（W7-S3b / ADR 0024）：玩家 tile (%d, %d) ⇒ "
+                                "常驻 **%zu** 个（世界内 %zu 个、窗口目标 %zu 个；LOD 分环 %d/%d/%d tile、"
+                                "碰撞半径 %d tile）；**worker 已构建 %zu 个 tile、单 tile 计算峰值 %.2f ms**、"
+                                "**同步回退 %zu 次**",
+                                tileScheduler.Window().centerTileX, tileScheduler.Window().centerTileZ,
+                                tileCoords.size(), worldTilesX * worldTilesZ, tileScheduler.DesiredCount(),
+                                kGameTerrainLodRings.radii[0], kGameTerrainLodRings.radii[1],
+                                kGameTerrainLodRings.radii[2], kTerrainCollisionRadiusTiles, buildStats.completed,
+                                buildStats.computeMsMax, world.SyncFallbackCount());
+                }
             }
 
             const std::size_t destructionUnits = destructionProcessor.Process(editContext, kDestructionBudgetMs);
@@ -2584,11 +3360,26 @@ int main(int argc, char** argv) {
             }
             const double dynamicUploadMs = dynamicUploadTimer.EndMs();
 
+            // W6h：推进**避障平滑**（每渲染帧一次）—— 阻尼 + 迟滞，消除"临界点（遮挡刚出现 / 消失）反复横跳
+            // ⇒ 跟随距离瞬间跳变 ⇒ 画面闪烁"。`Evaluate` 随后只**读**该结果（保持 const / 幂等，红线 11）。
+            camera.UpdateAvoidance(static_cast<float>(frameDeltaSeconds), plan.alpha, &cameraQuery);
             // 渲染：alpha 只用于在上一 / 当前逻辑状态之间插值，绝不回写模拟状态（红线 11）。
             const vx::CameraView view = camera.Evaluate(plan.alpha, &cameraQuery);
             // 渲染原点相对视图：顶点上传时已减去渲染原点，故**相机与剔除必须用同一坐标系**（红线 6）。
             // 提前到这里是因为下面的绘制列表要用它的 `viewProjection` 做视锥剔除（T39）。
-            const vx::CameraView relativeView = RelativeCameraView(view, renderOrigin);
+            vx::CameraView relativeView = RelativeCameraView(view, renderOrigin);
+            // W7-S3b：**LOD 原点** = 玩家所在 tile 的**中心**（tile 对齐）在**渲染相对**坐标下的位置。
+            // 顶点着色器按"顶点到它的 Chebyshev 距离"推进 CDLOD morph —— 与 CPU 侧
+            // `TerrainTileWindow::TileDistanceFromCenter` 同源 ⇒ morph 因子恰在环边界取 1，
+            // 相邻环在边界处几何**逐位相同**（无接缝）。
+            relativeView.lodOrigin = glm::vec3(
+                static_cast<float>(static_cast<double>(tileScheduler.Window().centerTileX * vx::kTerrainTileSize +
+                                                       vx::kTerrainTileSize / 2) -
+                                   renderOrigin.x),
+                0.0F,
+                static_cast<float>(static_cast<double>(tileScheduler.Window().centerTileZ * vx::kTerrainTileSize +
+                                                       vx::kTerrainTileSize / 2) -
+                                   renderOrigin.z));
             // T79②：**剔除与绘制列表构建**独立计时（原先落在"未计时"里）。
             cullTimer.Begin();
 
@@ -2601,6 +3392,7 @@ int main(int argc, char** argv) {
             frameHandles.clear();
             std::size_t visibleTiles   = 0;
             std::size_t visibleVolumes = 0;
+            std::size_t visibleShells  = 0;
             for (std::size_t i = 0; i < tileHandles.size(); ++i) {
                 if (tileHandles[i].IsValid() && VisibleToCamera(frustum, tileBounds[i], renderOrigin, sunDirection)) {
                     frameHandles.push_back(tileHandles[i]);
@@ -2614,7 +3406,24 @@ int main(int argc, char** argv) {
                     ++visibleVolumes;
                 }
             }
-            if (characterMesh.IsValid()) {
+            // W4：地表壳的近场块（静网格，与 tile / 体积同走 T39 视锥剔除）。
+            for (std::size_t i = 0; i < shellHandles.size(); ++i) {
+                if (shellHandles[i].IsValid() &&
+                    VisibleToCamera(frustum, shellBounds[i], renderOrigin, sunDirection)) {
+                    frameHandles.push_back(shellHandles[i]);
+                    ++visibleShells;
+                }
+            }
+            // W6：水面（半透明；在主通道**最后**绘制 ⇒ 追加在列表末尾）。
+            if (waterHandle.IsValid()) {
+                frameHandles.push_back(waterHandle);
+            }
+            // W6e：主角**淡出** —— 相机贴太近时不再被近裁剪面切开（⇒ 不再看到"人物内部"；业界对"贴脸穿模"的标准解）。
+            // 不透明度由纯函数给出（开阔处 = 1 = 不透明）；实际淡出在片元侧按 **Bayer 抖动 discard** 实现
+            // （保持不透明管线 ⇒ 无深度排序问题）。
+            // W6d 的"过近隐藏"能力仍保留、仍关闭（`targetHideDistance = 0` ⇒ 判据恒 false ⇒ 主角恒提交）。
+            if (characterMesh.IsValid() && !vx::ShouldHideFollowTarget(view, camera.Settings())) {
+                renderer.SetMeshOpacity(characterMesh, vx::FollowTargetFadeOpacity(view, camera.Settings()));
                 frameHandles.push_back(characterMesh);
             }
             for (std::size_t i = 0; i < orbHandles.size(); ++i) {
@@ -2638,10 +3447,10 @@ int main(int argc, char** argv) {
             // 决定"）：只打一条，用于确认剔除真的在起作用（而不是把整个世界都提交了）。
             if (!cullingLogged) {
                 cullingLogged = true;
-                VX_LOG_INFO("首帧视锥剔除（T39）：地表 tile %zu/%zu、可挖体积块 %zu/%zu 通过（含阴影扫掠余量）；"
-                            "本帧提交网格 %zu 个",
-                            visibleTiles, tileHandles.size(), visibleVolumes, volumeSlots.Size(),
-                            submittedThisFrame);
+                VX_LOG_INFO("首帧视锥剔除（T39）：地表 tile %zu/%zu、可挖体积块 %zu/%zu、地表壳块 %zu/%zu 通过"
+                            "（含阴影扫掠余量）；本帧提交网格 %zu 个",
+                            visibleTiles, tileHandles.size(), visibleVolumes, volumeSlots.Size(), visibleShells,
+                            shellHandles.size(), submittedThisFrame);
             }
 
             // 调试面板：统计经独立接口采集，只在渲染线程构建，不进世界层热路径。
@@ -2757,6 +3566,9 @@ int main(int argc, char** argv) {
             // 这是"渲染原点重定基"的全部代价（一次常量写入，零重传）。`renderOrigin` 是整数（取整），
             // 传入 `double` 与上传时登记的网格原点相减不会引入误差。
             renderer.SetRenderOrigin(renderOrigin);
+            // W6：推进水面流动时间并下发（`water.frag` 的滚动波据此流动）。
+            waterTimeSeconds += static_cast<double>(plan.steps) * vx::kFixedDt;
+            renderer.SetWaterTime(static_cast<float>(waterTimeSeconds));
             // T21b：级联分割与各级光空间矩阵由 game 每帧按相机参数算出（engine 不认识相机设置），
             // 经 BuildShadowUniform 单入口投影成片元 uniform 槽 2 的参数块；级数 / 分辨率来自配置。
             // 缺陷 1：投射体扩展需要"最高投射体相对渲染原点的高度"——由已加载地形推导：

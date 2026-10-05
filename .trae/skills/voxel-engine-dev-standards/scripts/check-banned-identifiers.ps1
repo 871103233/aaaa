@@ -29,7 +29,7 @@
     looking for .git / CMakePresets.json / CMakeLists.txt / vcpkg.json.
 
 .PARAMETER IncludeDir
-    Directories to scan, relative to the repository root. Default: engine voxel game editor tests.
+    Directories to scan, relative to the repository root. Default: engine world game tools editor tests.
 
 .PARAMETER SelfTest
     Run the built-in fixture cases only (validates the rule regexes) and do not scan.
@@ -46,7 +46,7 @@
 [CmdletBinding()]
 param(
     [string]   $RepoRoot,
-    [string[]] $IncludeDir = @('engine', 'world', 'game', 'editor', 'tests'),
+    [string[]] $IncludeDir = @('engine', 'world', 'game', 'tools', 'editor', 'tests'),
     [string[]] $IncludeExt = @('.h', '.hpp', '.hh', '.cpp', '.cxx', '.cc'),
     [string[]] $ExcludeDir = @('third_party', 'build', 'out', '.git', '.trae', 'external', 'vendor', 'cmake-build-debug', 'cmake-build-release'),
     [switch]   $SelfTest

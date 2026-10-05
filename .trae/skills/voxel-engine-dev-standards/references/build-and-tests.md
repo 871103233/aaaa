@@ -88,6 +88,9 @@
   ```
 
 - **接入 CI**：在构建步骤**之前**执行，非 0 即终止。
+- **扫描范围**：默认 `IncludeDir = engine world game tools editor tests`、`IncludeExt = .h/.hpp/.hh/.cpp/.cxx/.cc`
+  （`.ps1` 等不在扩展名内）。**新增"进入构建的目录"必须纳入扫描**，否则门禁会出现盲区
+  —— 阶段 W2-S2b 因 `tools/` 首次出现 C++（`tools/baker/`）而把 `tools` 补进默认扫描目录。
 - **扩展方式**：新增结构性规则时，只修改脚本 `$rules` 并补一条 `-SelfTest` 用例；不要在正文里堆叠禁令。
 
 ### 6.1 门禁的覆盖边界（重要）

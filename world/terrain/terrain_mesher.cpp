@@ -38,60 +38,56 @@ glm::dvec3 TerrainTileMesh::WorldPosition(std::size_t vertexIndex) const noexcep
                       static_cast<double>(TileOriginColumn(coord.z)) + static_cast<double>(vertex.position[2]));
 }
 
-TerrainTileMesh BuildTerrainMesh(const TerrainTile& tile, const ITerrainQuadFilter* quadFilter) {
+TerrainTileMesh BuildTerrainMesh(const TerrainTile& tile, const ITerrainQuadFilter* quadFilter, int lodLevel) {
     TerrainTileMesh result;
-    result.coord = tile.coord;
+    result.coord           = tile.coord;
+    result.lodLevel        = lodLevel;
+    result.verticesPerSide = TerrainLodVertexSide(lodLevel);
 
-    const std::size_t vertexCount =
-        static_cast<std::size_t>(kTerrainTileVertexCount) * static_cast<std::size_t>(kTerrainTileVertexCount);
+    const int step     = TerrainLodStep(lodLevel);
+    const int snapStep = TerrainLodSnapStep(lodLevel);
+    const int side     = result.verticesPerSide;
+
+    // 父级网格对应列：把局部列向下对齐到父级网格间距（CDLOD，见 terrain_types.hpp 的 TerrainLodSnapStep）。
+    const auto snapColumn = [snapStep](int column) noexcept {
+        return std::min((column / snapStep) * snapStep, kTerrainTileSize);
+    };
+
+    const std::size_t vertexCount = static_cast<std::size_t>(side) * static_cast<std::size_t>(side);
     result.mesh.vertices.resize(vertexCount);
 
-    for (int j = 0; j < kTerrainTileVertexCount; ++j) {
-        for (int i = 0; i < kTerrainTileVertexCount; ++i) {
-            const float     heightBlocks = HeightToBlocks(tile.At(i, j));
-            const glm::vec3 normal       = ComputeNormal(tile, i, j);
+    for (int j = 0; j < side; ++j) {
+        for (int i = 0; i < side; ++i) {
+            const int gi = i * step;
+            const int gj = j * step;
+            // 法线**仍用 ±1 相邻列**算梯度（不是 ±step）：不同 LOD 在相同世界列上得到相同法线 ⇒ 跨环不着色接缝。
+            const glm::vec3 normal = ComputeNormal(tile, gi, gj);
 
-            MeshVertex& vertex = result.mesh.vertices[TerrainTileMesh::VertexIndex(i, j)];
-            vertex.position[0] = static_cast<float>(i);
-            vertex.position[1] = heightBlocks;
-            vertex.position[2] = static_cast<float>(j);
+            MeshVertex& vertex = result.mesh.vertices[TerrainTileMesh::VertexIndex(i, j, side)];
+            vertex.position[0] = static_cast<float>(gi);
+            vertex.position[1] = HeightToBlocks(tile.At(gi, gj));
+            vertex.position[2] = static_cast<float>(gj);
             vertex.normal[0]   = normal.x;
             vertex.normal[1]   = normal.y;
             vertex.normal[2]   = normal.z;
+            // W7-S3b：morph 目标高度 = 该顶点在**父级网格**对应列上的采样高度（格）。LOD0 时 = 每 2 列。
+            vertex.morph = HeightToBlocks(tile.At(snapColumn(gi), snapColumn(gj)));
         }
     }
 
     // 索引：每格两个三角形，绕序保证正面朝上。
-    // T8 层间交接：`quadFilter` 命中（四角全部落在可挖区域内）的四边形**不发射**，改由体积网格绘制。
-    const std::size_t quadCount = static_cast<std::size_t>(kTerrainTileSize) * static_cast<std::size_t>(kTerrainTileSize);
+    //
+    // W7-S3b：**先建"未过滤"的全量索引**（`(j, i)` 升序、每格 `a, c, b, b, c, d`），
+    // 再交给 `ApplyQuadFilterToMesh` 按 `quadFilter` 过滤 —— 复用同一个纯函数，
+    // 保证"worker 产出 + 主线程过滤"与"主线程同步构建"两条路径**逐位一致**（红线 7）。
+    const std::size_t quadCount = static_cast<std::size_t>(side - 1) * static_cast<std::size_t>(side - 1);
     result.mesh.indices.reserve(quadCount * 6);
-    const int originColumnX = TileOriginColumn(tile.coord.x);
-    const int originColumnZ = TileOriginColumn(tile.coord.z);
-    for (int j = 0; j < kTerrainTileSize; ++j) {
-        for (int i = 0; i < kTerrainTileSize; ++i) {
-            if (quadFilter != nullptr) {
-                TerrainQuad quad;
-                quad.columnX[0] = originColumnX + i;      // A = (i, j)
-                quad.columnZ[0] = originColumnZ + j;
-                quad.columnX[1] = originColumnX + i + 1;  // B = (i + 1, j)
-                quad.columnZ[1] = originColumnZ + j;
-                quad.columnX[2] = originColumnX + i;      // C = (i, j + 1)
-                quad.columnZ[2] = originColumnZ + j + 1;
-                quad.columnX[3] = originColumnX + i + 1;  // D = (i + 1, j + 1)
-                quad.columnZ[3] = originColumnZ + j + 1;
-                quad.height[0]  = HeightAtBlocks(tile, i, j);
-                quad.height[1]  = HeightAtBlocks(tile, i + 1, j);
-                quad.height[2]  = HeightAtBlocks(tile, i, j + 1);
-                quad.height[3]  = HeightAtBlocks(tile, i + 1, j + 1);
-                if (quadFilter->SkipQuad(quad)) {
-                    continue;
-                }
-            }
-
-            const std::uint32_t a = static_cast<std::uint32_t>(TerrainTileMesh::VertexIndex(i, j));
-            const std::uint32_t b = static_cast<std::uint32_t>(TerrainTileMesh::VertexIndex(i + 1, j));
-            const std::uint32_t c = static_cast<std::uint32_t>(TerrainTileMesh::VertexIndex(i, j + 1));
-            const std::uint32_t d = static_cast<std::uint32_t>(TerrainTileMesh::VertexIndex(i + 1, j + 1));
+    for (int j = 0; j < side - 1; ++j) {
+        for (int i = 0; i < side - 1; ++i) {
+            const std::uint32_t a = static_cast<std::uint32_t>(TerrainTileMesh::VertexIndex(i, j, side));
+            const std::uint32_t b = static_cast<std::uint32_t>(TerrainTileMesh::VertexIndex(i + 1, j, side));
+            const std::uint32_t c = static_cast<std::uint32_t>(TerrainTileMesh::VertexIndex(i, j + 1, side));
+            const std::uint32_t d = static_cast<std::uint32_t>(TerrainTileMesh::VertexIndex(i + 1, j + 1, side));
 
             result.mesh.indices.push_back(a);
             result.mesh.indices.push_back(c);
@@ -101,8 +97,63 @@ TerrainTileMesh BuildTerrainMesh(const TerrainTile& tile, const ITerrainQuadFilt
             result.mesh.indices.push_back(d);
         }
     }
+    ApplyQuadFilterToMesh(tile, quadFilter, lodLevel, result.mesh);
 
+    // 接管判据（W7-S3b）：以过滤**之后**的空否为准 —— 上传后 CPU 侧网格会被释放，
+    // 届时 `indices` 恒为空，故必须在网格化时把"本 tile 是否有可见面"固化到本标记。
+    result.meshEmpty = result.mesh.indices.empty();
     return result;
+}
+
+void ApplyQuadFilterToMesh(const TerrainTile& tile, const ITerrainQuadFilter* quadFilter, int lodLevel,
+                           MeshData& meshInOut) {
+    if (quadFilter == nullptr) {
+        return;  // 无过滤器 ⇒ 未过滤索引列表即结果（与旧行为逐位一致）
+    }
+
+    const int step            = TerrainLodStep(lodLevel);
+    const int side            = TerrainLodVertexSide(lodLevel);
+    const int originColumnX   = TileOriginColumn(tile.coord.x);
+    const int originColumnZ   = TileOriginColumn(tile.coord.z);
+
+    const std::size_t quadsPerSide = static_cast<std::size_t>(side - 1);
+    const std::size_t quadCount    = quadsPerSide * quadsPerSide;
+
+    std::vector<std::uint32_t> filtered;
+    filtered.reserve(meshInOut.indices.size());
+
+    // 顺序必须与 `BuildTerrainMesh` 建未过滤索引时**完全一致**（`(j, i)` 升序 ⇒ 行主序的格序号）。
+    for (std::size_t quadIndex = 0; quadIndex < quadCount; ++quadIndex) {
+        const int i  = static_cast<int>(quadIndex % quadsPerSide);
+        const int j  = static_cast<int>(quadIndex / quadsPerSide);
+        const int gi = i * step;
+        const int gj = j * step;
+
+        // 四角世界列 / 高度：与 `BuildTerrainMesh` 内的构造**逐字一致**（角序 00, 10, 01, 11）。
+        TerrainQuad quad;
+        quad.columnX[0] = originColumnX + gi;
+        quad.columnZ[0] = originColumnZ + gj;
+        quad.columnX[1] = originColumnX + gi + step;
+        quad.columnZ[1] = originColumnZ + gj;
+        quad.columnX[2] = originColumnX + gi;
+        quad.columnZ[2] = originColumnZ + gj + step;
+        quad.columnX[3] = originColumnX + gi + step;
+        quad.columnZ[3] = originColumnZ + gj + step;
+        quad.height[0]  = HeightAtBlocks(tile, gi, gj);
+        quad.height[1]  = HeightAtBlocks(tile, gi + step, gj);
+        quad.height[2]  = HeightAtBlocks(tile, gi, gj + step);
+        quad.height[3]  = HeightAtBlocks(tile, gi + step, gj + step);
+        if (quadFilter->SkipQuad(quad)) {
+            continue;  // 命中 ⇒ 该格的 6 个索引整段丢弃
+        }
+
+        const std::size_t base = quadIndex * 6U;
+        for (std::size_t k = 0; k < 6U; ++k) {
+            filtered.push_back(meshInOut.indices[base + k]);
+        }
+    }
+
+    meshInOut.indices = std::move(filtered);
 }
 
 }  // namespace vx

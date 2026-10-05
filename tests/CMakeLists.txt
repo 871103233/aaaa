@@ -14,6 +14,7 @@
 find_package(GTest CONFIG REQUIRED)
 
 add_executable(voxel_tests
+    cave_test.cpp
     character_animation_test.cpp
     character_facing_test.cpp
     character_jump_test.cpp
@@ -28,22 +29,29 @@ add_executable(voxel_tests
     frustum_test.cpp
     gameplay_input_test.cpp
     input_map_test.cpp
+    landform_test.cpp
     lighting_table_test.cpp
     map_preset_test.cpp
     model_loader_test.cpp
     mouse_capture_test.cpp
     orb_test.cpp
+    premade_map_test.cpp
     system_settings_test.cpp
     test_mode_test.cpp
     physics_test.cpp
     render_camera_test.cpp
     render_stats_test.cpp
+    river_test.cpp
     shadow_cascade_test.cpp
+    surface_shell_test.cpp
     terrain_brush_hold_test.cpp
     terrain_brush_test.cpp
+    terrain_lod_test.cpp
     terrain_material_test.cpp
     terrain_material_texture_test.cpp
+    terrain_tile_build_pipeline_test.cpp
     terrain_tile_test.cpp
+    terrain_tile_residency_test.cpp
     texture_loader_test.cpp
     ui_font_test.cpp
     ui_text_test.cpp

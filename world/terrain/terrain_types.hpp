@@ -25,6 +25,39 @@ inline constexpr int kTerrainTileVertexCount = kTerrainTileSize + 1;
 /// 使该 tile 之后无论接管如何翻转都不再触发重建）。
 inline constexpr int kTerrainTileIndexCount = kTerrainTileSize * kTerrainTileSize * 6;
 
+// ---------------------------------------------------------------
+// 地表 LOD 分环（[ADR 0024](../../docs/adr/0024-terrain-streaming-and-lod.md)「二、LOD 分环」）
+// ---------------------------------------------------------------
+
+/// 地表 LOD 环数：Ring 0 = 步长 1（全细节）/ Ring 1 = 步长 2（高模）/ Ring 2 = 步长 4（低模）。
+inline constexpr int kTerrainLodLevelCount = 3;
+
+/// LOD 环 `lod` 的**列步长**：相邻网格顶点在世界列上相隔多少列（`1, 2, 4`）。
+[[nodiscard]] constexpr int TerrainLodStep(int lod) noexcept { return 1 << lod; }
+
+/// LOD 环 `lod` 的**父级网格间距**（`2 × 步长`，即 `2, 4, 8`）。
+///
+/// CDLOD 的顶点过渡把细网格顶点向**父级（更粗一级）网格**的对应列靠拢（ADR 0024「接缝策略：顶点过渡 morph」）；
+/// 父级网格间距恰为本级步长的两倍，故 morph 目标列 = `floor(列 / 父级间距) × 父级间距`（见 `terrain_mesher.cpp`）。
+[[nodiscard]] constexpr int TerrainLodSnapStep(int lod) noexcept { return 2 * TerrainLodStep(lod); }
+
+/// LOD 环 `lod` 的**顶点每边数量**：`kTerrainTileSize / 步长 + 1`（`65 / 33 / 17`）。
+/// 多出的一行 / 一列仍是**共享边界采样**（与 LOD0 同口径），故相邻环在边界列上高度一致。
+[[nodiscard]] constexpr int TerrainLodVertexSide(int lod) noexcept {
+    return kTerrainTileSize / TerrainLodStep(lod) + 1;
+}
+
+/// LOD 环 `lod` 的**顶点总数**（`side²`；`4225 / 1089 / 289`）。
+[[nodiscard]] constexpr int TerrainLodVertexCount(int lod) noexcept {
+    return TerrainLodVertexSide(lod) * TerrainLodVertexSide(lod);
+}
+
+/// LOD 环 `lod` 的**索引数**：每格两个三角形 = `(kTerrainTileSize / 步长)² × 6`（`24576 / 6144 / 1536`）。
+[[nodiscard]] constexpr int TerrainLodIndexCount(int lod) noexcept {
+    const int quadsPerSide = kTerrainTileSize / TerrainLodStep(lod);
+    return quadsPerSide * quadsPerSide * 6;
+}
+
 /// 高度定点精度：`int16`，1/16 格（ADR 0008）。
 /// 定点而非 `float`，是为了让高度存储与比较跨调用完全确定。
 inline constexpr int kHeightUnitsPerBlock = 16;

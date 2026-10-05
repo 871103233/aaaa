@@ -82,6 +82,8 @@ layout(location = 1) in vec3 v_normal;
 //   < 0 = 未指定（地表网格：按世界高度与坡度逐像素算权重）
 //   >= 0 = 直接用该槽位（可挖体积的内表面：洞里看到的应是"被切开的那种材质"）
 layout(location = 2) flat in float v_material;
+// W6e：逐网格不透明度 ∈ [0,1]（1 = 不透明）。< 1 时按 Bayer 抖动 discard 做 dither 淡出（见文件末）。
+layout(location = 3) in float v_fade;
 
 layout(location = 0) out vec4 o_color;
 
@@ -375,6 +377,24 @@ float sampleShadow(vec3 relativePosition, vec3 geometricNormal, float viewDepth)
     return sampleCascadeShadow(cascade, shadowPosition);
 }
 
+/// 2×2 Bayer 矩阵 `[[0, 2], [3, 1]]`（行主序）的单元素。
+int bayer2(int x, int y) {
+    if (y == 0) {
+        return (x == 0) ? 0 : 2;
+    }
+    return (x == 0) ? 3 : 1;
+}
+
+/// 4×4 Bayer 有序抖动阈值 ∈ (0, 1)（屏幕像素坐标 → 16 级阈值）。
+/// 递归构造：`B4(y,x) = 4·B2(y/2, x/2) + B2(y%2, x%2)`。
+/// 用途：W6e 逐网格不透明度的 **dither 淡出** —— 阈值 ≥ 不透明度即 `discard`。
+float bayer4x4(vec2 pixelCoord) {
+    const int x = int(mod(pixelCoord.x, 4.0));
+    const int y = int(mod(pixelCoord.y, 4.0));
+    const int value = 4 * bayer2((x / 2) % 2, (y / 2) % 2) + bayer2(x % 2, y % 2);
+    return (float(value) + 0.5) / 16.0;
+}
+
 void main() {
     const vec3  worldPosition   = v_relativePosition + material.renderOrigin.xyz;
     const vec3  geometricNormal = normalize(v_normal);
@@ -619,6 +639,16 @@ void main() {
     // 放在雾之后是刻意的：光球是光源，不该被大气雾按距离洗掉（否则远距离射击时看不见弹丸）。
     // 强度 0（普通地表 / 角色网格）时这一项严格加 0，不影响任何既有观感。
     finalColor += emissiveParams.emissive.rgb * emissiveParams.emissive.a;
+
+    // ---- W6e：逐网格淡出（Bayer 抖动 discard）----
+    // 为什么用 dither 而不是 alpha 混合：混合会引入**深度排序**问题（角色在透明队列里与地形互相穿插）；
+    // 抖动 discard 保持在**不透明管线**内（照常写深度、无排序），是业界"贴脸淡出主角"的通行做法。
+    // 不透明度 ≥ 1 时不进入该分支（普通网格零开销）。
+    if (v_fade < 0.999) {
+        if (bayer4x4(gl_FragCoord.xy) >= v_fade) {
+            discard;
+        }
+    }
 
     o_color = vec4(finalColor, 1.0);
 }

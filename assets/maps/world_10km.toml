@@ -1,0 +1,41 @@
+# 阶段 W 世界预设：world_10km —— **10×10 km 大世界**（[ADR 0024](../../docs/adr/0024-terrain-streaming-and-lod.md)）
+#
+# 用途：给"流式加载 + LOD 分环"提供**真正够大**的世界，使"常驻量只随窗口变化"可被观测
+#   （1 km 的 test_range 会被常驻窗口完全覆盖 ⇒ 看不出增删；10 km 才会有持续的建 / 卸）。
+#
+# 坐标口径：min / max / spawn 都是**世界列坐标（格）**，闭区间；tile 坐标范围为 [-78, 78]
+# （157×157 = 24649 个 tile），即世界列 [-4992, 4992] ≈ **9984 格 ≈ 10×10 km**
+# （1 格 ≈ 1 米，1 个地表 tile = 64 格 ≈ 64 米）。
+#
+# 除下面几处手工编辑外，**其余全部是程序化生成的噪声地形**（W3 地貌分区：山川 / 平原 / 丘陵）。
+# 权威解释在代码：字段语义与校验见 world/generation/map_preset.hpp。
+
+schema_version = 1
+name           = "阶段 W 世界：10×10 km（流式加载 + LOD 分环）"
+seed           = 1592594996  # 与 test_range 同种子，便于与 1 km 世界对照
+tile_radius    = [78, 78]
+spawn          = [0.0, 0.0]
+
+# ---- 出生平台：把中心 128×128 格压平，保证出生点干净可预期 ----
+[[edit]]
+name   = "spawn_plateau"
+mode   = "flatten"
+min    = [-64, -64]
+max    = [64, 64]
+height = 120.0
+
+# ---- 地标塔：出生点东北方的醒目方柱，供大世界里定位方向 ----
+[[edit]]
+name   = "landmark_pillar"
+mode   = "flatten"
+min    = [180, 180]
+max    = [184, 184]
+height = 240.0
+
+# ---- 远处高台：东南方约 1.5 km 处的一处平顶高地（跨环飞越时可见）----
+[[edit]]
+name   = "far_plateau"
+mode   = "flatten"
+min    = [1400, 1400]
+max    = [1536, 1536]
+height = 200.0

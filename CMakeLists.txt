@@ -95,6 +95,7 @@ include(Shaders)
 add_subdirectory(engine)
 add_subdirectory(world)
 add_subdirectory(game)
+add_subdirectory(tools/baker)  # 离线烘焙 CLI（阶段 W / W2-S2b）：不进游戏产物，仅离线生成预制地图
 
 # ============================================================
 # 测试
