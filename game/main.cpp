@@ -20,16 +20,22 @@
 #include "debug_overlay.hpp"
 #include "destruction_queue.hpp"
 #include "gameplay_input.hpp"
+#include "generation/level_manifest.hpp"
 #include "generation/map_preset.hpp"
 #include "generation/terrain_params.hpp"
 #include "input/input_map.hpp"
 #include "mouse_capture.hpp"
+#include "object/object_layer.hpp"
+#include "object/object_mesh.hpp"
+#include "object/object_scatter.hpp"  // V8：程序化散布（纯函数）
+#include "object/object_support.hpp"
 #include "orb.hpp"
 #include "out_of_bounds.hpp"
 #include "physics/physics_world.hpp"
 #include "platform/command_line.hpp"
 #include "platform/settings.hpp"
 #include "platform/window.hpp"
+#include "portal_interaction.hpp"
 #include "render/camera.hpp"
 #include "render/environment.hpp"
 #include "render/frustum.hpp"
@@ -49,6 +55,7 @@
 #include "water/river.hpp"
 #include "test_mode.hpp"
 #include "ui_text.hpp"
+#include "world_manager.hpp"
 #include "dig/collapse_table.hpp"
 #include "dig/destruction_table.hpp"
 #include "dig/dig_region.hpp"
@@ -210,6 +217,21 @@ struct CpuFrameCost {
 /// 同上；`relative` 为 `std::filesystem::path`（T66：材质表 `[textures].root` 就是该类型）。
 [[nodiscard]] std::filesystem::path SourceAssetPath(const std::filesystem::path& relative) {
     return SourceAssetPath(relative.string().c_str());
+}
+
+/// V1/V2a：把 `--world=<裸 id 或 清单路径>` 判定为"像路径"（含分隔符或 `.toml` 结尾）。
+[[nodiscard]] bool WorldArgumentLooksLikePath(const std::string& argument) {
+    return argument.find('/') != std::string::npos || argument.find('\\') != std::string::npos ||
+           (argument.size() > 5U && argument.compare(argument.size() - 5U, 5U, ".toml") == 0);
+}
+
+/// V1：把 `--world=<裸 id 或 清单路径>` 解析成清单文件路径。
+/// `world_a` ⇒ `assets/maps/world_a.toml`；含路径分隔符或以 `.toml` 结尾 ⇒ 按仓库相对路径。
+[[nodiscard]] std::filesystem::path ResolveWorldManifestPath(const std::string& argument) {
+    if (WorldArgumentLooksLikePath(argument)) {
+        return SourceAssetPath(argument);
+    }
+    return SourceAssetPath(std::string("assets/maps/") + argument + ".toml");
 }
 
 /// 一个网格的**世界空间** AABB（世界范围 ≤ 512 格，`float` 足以精确表示整数坐标）。
@@ -766,6 +788,190 @@ struct VolumeSlot {
     vx::MeshHandle handle {};  ///< 该块的 GPU 网格（无表面时保持无效）
     WorldAabb      bounds {};  ///< T39：世界空间 AABB（视锥剔除用；上传时更新）
 };
+
+/// V0b/V0c：一个已接线的**物件实例**在游戏层的槽位（ADR 0004 层③）。
+///
+/// 生命周期（`plans/v0.5.md` §1.5）：**静态**（默认：静态三角网碰撞体）→ 失去支撑 / 被爆炸命中 ⇒
+/// **转动态刚体**（掉落 / 被炸飞）→ 若可破坏则**被摧毁**（网格 + 碰撞体 + 实体一并释放）。
+/// 渲染网格是**未旋转**的局部几何（位姿由 `SetMeshTransform` 施加）；静态碰撞体把朝向**烘进顶点**
+/// （静态体没有旋转接口），动态刚体则用 `ConvexHullDesc::rotation`。
+struct ObjectSlot {
+    std::uint32_t                id = 0;           ///< `ObjectLayer` 的稳定 id（0 = 已移除）
+    const vx::ObjectType*        type = nullptr;   ///< 类型（生命周期 = 所属 `ObjectTable`）
+    vx::MeshHandle               handle {};        ///< GPU 网格（上传失败 / 已摧毁时无效）
+    WorldAabb                    bounds {};        ///< 世界空间 AABB（视锥剔除）
+    vx::MeshData                 localMesh {};     ///< 局部网格（转动态凸包用；底面中心为原点）
+    vx::PhysicsWorld::BodyHandle body {};          ///< 当前碰撞体（静态三角网 / 动态凸包；0 = 无）
+    glm::dvec3                   position { 0.0 }; ///< 当前**底面中心**世界坐标
+    float                        yawDegrees = 0.0F;
+    bool                         dynamic = false;  ///< 是否已转动态刚体（转后不再转回，由 Jolt 休眠）
+    bool                         removed = false;  ///< 是否已被摧毁（句柄已释放）
+};
+
+/// 支撑探测的**下探深度**（格）：探测点取"底面中心 − 该深度"。小于它 ⇒ 视为脚下已是空的。
+constexpr double kObjectSupportProbeDepth = 0.25;
+
+/// 支撑检查的**固定步间隔**（成本与物件数成正比，故不每步做；见 V0c 的已知限制）。
+constexpr int kObjectSupportCheckIntervalSteps = 10;
+
+/// 被爆炸"炸飞"的初速度（格/秒；仅用于**不可破坏**物件被炸开）。
+constexpr float kObjectBlastSpeedBlocksPerSecond = 7.0F;
+
+/// 物件质量（**占位口径**，只影响掉落 / 被炸飞的手感；正式数据随 kit 资产引入）。
+[[nodiscard]] constexpr float ObjectPlaceholderMass(vx::ObjectAssetKind kind) noexcept {
+    switch (kind) {
+        case vx::ObjectAssetKind::DirtPile:
+            return 120.0F;
+        case vx::ObjectAssetKind::Stone:
+            return 400.0F;
+        case vx::ObjectAssetKind::Crate:
+            return 60.0F;
+    }
+    return 120.0F;
+}
+
+/// 把网格顶点摊平成 `ConvexHullDesc` / `MeshDesc` 需要的"3 float / 顶点"紧凑缓冲。
+[[nodiscard]] std::vector<float> FlattenObjectPositions(const vx::MeshData& mesh) {
+    std::vector<float> positions;
+    positions.reserve(mesh.vertices.size() * 3U);
+    for (const vx::MeshVertex& vertex : mesh.vertices) {
+        positions.push_back(vertex.position[0]);
+        positions.push_back(vertex.position[1]);
+        positions.push_back(vertex.position[2]);
+    }
+    return positions;
+}
+
+/// **静态 ⇒ 动态**：把物件的静态三角网碰撞体换成**动态凸包刚体**
+/// （失支撑掉落与被爆炸炸飞的**共同入口**；与 ADR 0015/0017 的"失支撑 ⇒ 动态刚体"同一口径）。
+/// `initialVelocity` = 初速度（格/秒；零 = 单纯掉落）。凸包构建失败 ⇒ 保持静态并 WARN（不静默）。
+[[nodiscard]] bool ConvertObjectToDynamic(ObjectSlot& slot, vx::PhysicsWorld& physics,
+                                          const glm::vec3& initialVelocity) {
+    if (slot.removed || slot.dynamic || slot.type == nullptr) {
+        return false;
+    }
+    const std::vector<float> positions = FlattenObjectPositions(slot.localMesh);
+    if (positions.size() < 12U) {  // 凸包至少需要 4 个点
+        VX_LOG_WARN("物件 [%s] 顶点不足，无法转动态刚体", slot.type->id.c_str());
+        return false;
+    }
+
+    vx::PhysicsWorld::ConvexHullDesc hull;
+    hull.positions      = positions.data();
+    hull.pointCount     = slot.localMesh.vertices.size();
+    hull.originX        = slot.position.x;
+    hull.originY        = slot.position.y;
+    hull.originZ        = slot.position.z;
+    hull.mass           = ObjectPlaceholderMass(slot.type->kind);
+    hull.friction       = 0.6F;
+    hull.restitution    = 0.0F;
+    hull.linearVelocity = initialVelocity;
+    hull.rotation       = glm::angleAxis(glm::radians(slot.yawDegrees), glm::vec3(0.0F, 1.0F, 0.0F));
+
+    const vx::PhysicsWorld::BodyHandle body = physics.AddDynamicConvexHull(hull);
+    if (body == 0) {
+        VX_LOG_WARN("物件 [%s] 转动态刚体失败（凸包构建失败）⇒ 保持静态", slot.type->id.c_str());
+        return false;
+    }
+    if (slot.body != 0) {
+        physics.RemoveBody(slot.body);
+    }
+    slot.body    = body;
+    slot.dynamic = true;
+    return true;
+}
+
+/// **摧毁**一个物件：释放 GPU 网格与碰撞体、从 `ObjectLayer` 移除实体。
+/// 前置条件：调用方已确认"总开关打开 且 `type.destructible`"（见 `BlastObjects`）。
+void DestroyObjectSlot(ObjectSlot& slot, vx::ObjectLayer& layer, vx::PhysicsWorld& physics,
+                       vx::MeshRenderer& renderer) {
+    if (slot.removed) {
+        return;
+    }
+    if (slot.handle.IsValid()) {
+        renderer.ReleaseMesh(slot.handle);
+    }
+    if (slot.body != 0) {
+        physics.RemoveBody(slot.body);
+    }
+    if (slot.id != 0) {
+        (void)layer.Remove(slot.id);
+    }
+    slot.handle  = vx::MeshHandle {};
+    slot.body    = 0;
+    slot.removed = true;
+}
+
+/// 一次爆炸对物件的**按类型分流**（`plans/v0.5.md` §1.5）：
+///   - `destructible_enabled && type.destructible` ⇒ **摧毁消失**；
+///   - 否则 ⇒ **只被炸飞**（静态 ⇒ 转动态刚体并给向外初速；已是动态 ⇒ 仅唤醒）。
+void BlastObjects(std::vector<ObjectSlot>& slots, const vx::ObjectTable& table, vx::ObjectLayer& layer,
+                  vx::PhysicsWorld& physics, vx::MeshRenderer& renderer, const glm::dvec3& center,
+                  float radiusBlocks) {
+    for (ObjectSlot& slot : slots) {
+        if (slot.removed || slot.type == nullptr) {
+            continue;
+        }
+        // 以物件**中心**（底面中心 + 半高）到爆心的距离判定，再用**包围球半径**放宽（保守，宁可多算）。
+        const glm::dvec3 objectCenter(
+            slot.position.x, slot.position.y + static_cast<double>(slot.type->halfExtentY), slot.position.z);
+        const float halfDiagonal = std::sqrt(slot.type->halfExtentX * slot.type->halfExtentX +
+                                             slot.type->halfExtentY * slot.type->halfExtentY +
+                                             slot.type->halfExtentZ * slot.type->halfExtentZ);
+        const glm::dvec3 delta    = objectCenter - center;
+        const double     distance = std::sqrt(glm::dot(delta, delta));
+        if (distance > static_cast<double>(radiusBlocks) + static_cast<double>(halfDiagonal)) {
+            continue;  // 不在本次爆炸影响范围内
+        }
+
+        if (table.destructibleEnabled && slot.type->destructible) {
+            const std::string typeId = slot.type->id;  // `slot.type` 在摧毁后仍有效，但先留一份便于日志
+            DestroyObjectSlot(slot, layer, physics, renderer);
+            VX_LOG_INFO("物件 [%s] 被爆炸**摧毁**（网格 + 碰撞体 + 实体一并释放）", typeId.c_str());
+            continue;
+        }
+
+        // 不可破坏（或总开关关闭）：只被炸飞 —— 向外 + 略微向上。
+        glm::vec3 direction(0.0F, 1.0F, 0.0F);
+        if (distance > 1.0e-3) {
+            direction = glm::normalize(glm::vec3(static_cast<float>(delta.x),
+                                                 static_cast<float>(delta.y + static_cast<double>(halfDiagonal)),
+                                                 static_cast<float>(delta.z)));
+        }
+        const glm::vec3 velocity = direction * kObjectBlastSpeedBlocksPerSecond;
+        if (slot.dynamic) {
+            // 已是动态：唤醒即可（本阶段 `PhysicsWorld` 没有"设置线速度"接口 ⇒ 不再补冲量，登记为已知限制）。
+            physics.ActivateBody(slot.body);
+        } else if (ConvertObjectToDynamic(slot, physics, velocity)) {
+            VX_LOG_INFO("物件 [%s] 不可破坏 ⇒ 被爆炸**炸飞**（转动态刚体，初速 %.1f 格/秒）",
+                        slot.type->id.c_str(), static_cast<double>(kObjectBlastSpeedBlocksPerSecond));
+        }
+    }
+}
+
+/// **支撑检查**（每 `kObjectSupportCheckIntervalSteps` 个固定步一次）：底面探测点全为空 ⇒ 失去支撑
+/// ⇒ 静态物件转动态刚体（**掉落**）。判据用与弹道相同的"高度场 + 可挖体积"点查询（"谁画谁挡同源"）。
+void CheckObjectSupports(std::vector<ObjectSlot>& slots, const GameOrbWorldQuery& solidQuery,
+                         vx::PhysicsWorld& physics) {
+    for (ObjectSlot& slot : slots) {
+        if (slot.removed || slot.dynamic || slot.type == nullptr) {
+            continue;  // 已是动态 ⇒ 由 Jolt 负责重力
+        }
+        const auto probes =
+            vx::ObjectSupportProbes(slot.type->halfExtentX, slot.type->halfExtentZ, slot.yawDegrees);
+        bool solidFlags[vx::kObjectSupportProbeCount] = {};
+        for (std::size_t i = 0; i < probes.size(); ++i) {
+            solidFlags[i] = solidQuery.IsSolid(slot.position.x + static_cast<double>(probes[i].x),
+                                               slot.position.y - kObjectSupportProbeDepth,
+                                               slot.position.z + static_cast<double>(probes[i].z));
+        }
+        if (!vx::ObjectHasSupport(solidFlags, probes.size()) &&
+            ConvertObjectToDynamic(slot, physics, glm::vec3(0.0F))) {
+            VX_LOG_INFO("物件 [%s] 失去支撑（脚下地表 / 体积已被移除）⇒ 转动态刚体**掉落**",
+                        slot.type->id.c_str());
+        }
+    }
+}
 
 /// `BlockCoord` 的坐标哈希（T79⑤）：三个整数分量各按大素数混合后再异或。
 ///
@@ -1502,6 +1708,17 @@ int main(int argc, char** argv) {
         }
     }
 
+    // V1（ADR 0028 §一）：`--world=<裸 id 或 清单路径>` —— 从**世界清单**驱动启动。
+    // 裸 id（如 `world_a`）⇒ `assets/maps/world_a.toml`；含路径分隔符或以 `.toml` 结尾 ⇒ 按仓库相对路径。
+    // 未给出时仍走 `--map=`（回退，保持既有验收场景不变）。
+    std::string worldManifestFile;
+    for (const std::string& argument : arguments) {
+        constexpr const char* kWorldPrefix = "--world=";
+        if (argument.rfind(kWorldPrefix, 0) == 0) {
+            worldManifestFile = argument.substr(std::char_traits<char>::length(kWorldPrefix));
+        }
+    }
+
     // W7-S4：`--autofly=<秒>` —— **确定性自动化飞行**（仅测试用；缺省 0 = 不启用）。
     // 为什么需要：W7 的验收判据要求"10km 飞越全图"的实测证据，而本环境无法用
     // `tools/vx_perf_input.ps1` 向游戏注入按键（注入只到达**前台**窗口，CI / 无头会话抢不到，
@@ -1517,6 +1734,36 @@ int main(int argc, char** argv) {
             }
         }
     }
+
+    // V2b：`--switch-test=<世界 id>@<秒>`（**可重复给出**，按秒数先后触发）—— **确定性自动化世界切换**（仅测试用）。
+    // 为什么需要：正式触发是 V3 的"走近交互点按 F"，但本环境无法向前台窗口注入按键（同 `--autofly` 的理由）
+    // ⇒ 用"到点即请求切换"的测试开关，让"切换不冻结 / 有进度 / **卸载不留残** / 可复现"可被脚本化验证。
+    // 秒数按**会话时钟**（跨世界累计的墙钟）计：`--switch-test=a@20 --switch-test=b@40` 即可连续切换两个世界。
+    std::vector<std::pair<double, std::string>> switchTests;
+    for (const std::string& argument : arguments) {
+        constexpr const char* kSwitchPrefix = "--switch-test=";
+        if (argument.rfind(kSwitchPrefix, 0) != 0) {
+            continue;
+        }
+        const std::string value = argument.substr(std::char_traits<char>::length(kSwitchPrefix));
+        const std::size_t at    = value.find('@');
+        if (at == std::string::npos || at == 0U || at + 1U >= value.size()) {
+            VX_LOG_WARN("`--switch-test` 取值非法（应为 <世界 id>@<秒>）：%s ⇒ 忽略", value.c_str());
+            continue;
+        }
+        double seconds = 0.0;
+        try {
+            seconds = std::stod(value.substr(at + 1U));
+        } catch (const std::exception&) {
+            VX_LOG_WARN("`--switch-test` 的秒数非法：%s ⇒ 忽略", value.c_str());
+            continue;
+        }
+        switchTests.emplace_back(seconds, value.substr(0U, at));
+    }
+    std::sort(switchTests.begin(), switchTests.end(),
+              [](const std::pair<double, std::string>& left, const std::pair<double, std::string>& right) {
+                  return left.first < right.first;
+              });
 
     // T85：把测试模式打进日志（自动测试 ⇒ 勿动键鼠；人工测试 ⇒ 逐条列出验收项）。
     // 即便本机未加载 CJK 字体、面板不渲染非 ASCII 动态文本，日志里仍有完整信息。
@@ -1648,8 +1895,47 @@ int main(int argc, char** argv) {
                     static_cast<double>(destructionSpec.propBrokenTint[2]));
 
         // T11：从预设地图构建世界（种子 / 范围 / 地形编辑全部来自文件，不再硬编码）。
+        // V1：`--world=` 时地形由**世界清单**（LevelManifest）引用的地形预设给出 ——
+        //     清单只声明族 / 来源 / 策略，地形字段的**单一事实来源**仍是那份 `MapPreset`。
+        // V2a：清单先进 `WorldManager`（**注册表 + 当前世界 + 切换请求状态机**，见 plans/v0.5.md §1.7）；
+        //     `--world=<裸 id>` 走注册表（未知 id 直接报错并列出已注册的世界），`--world=<路径>` 注册该文件。
         const std::filesystem::path mapPath = SourceAssetPath(mapFile);
-        const vx::MapPreset         preset  = vx::MapPreset::LoadFromFile(mapPath);
+        vx::MapPreset               preset;
+        std::string                 presetSourceLabel = mapPath.string();  // 日志用：地形实际来自哪里
+        vx::WorldManager            worldManager;
+        if (!worldManifestFile.empty()) {
+            if (WorldArgumentLooksLikePath(worldManifestFile)) {
+                // 路径形式：注册这一份并激活（`Register` 返回其 id）。
+                worldManager.SetActive(worldManager.Register(SourceAssetPath(worldManifestFile)));
+            } else {
+                worldManager.RegisterAll({ SourceAssetPath("assets/maps/world_a.toml"),
+                                           SourceAssetPath("assets/maps/world_b.toml"),
+                                           SourceAssetPath("assets/maps/world_c.toml") });
+                worldManager.SetActive(worldManifestFile);  // 未知 id ⇒ 抛（阶段计划 §1.7 的验收判据）
+            }
+
+            const vx::LevelManifest& manifest = worldManager.Active();
+            preset                            = manifest.terrain;
+            presetSourceLabel                 = "清单 " + ResolveWorldManifestPath(worldManifestFile).string();
+            if (manifest.source == vx::WorldSource::Premade) {
+                // 不静默：V1 只做"清单 + 加载"，**预制容器（ADR 0026）的读取在 V4 接入** ——
+                // 因此本次仍按 `terrain_preset` **程序化生成**，`premade_file` 尚未被读取。
+                VX_LOG_WARN("世界 [%s] 声明 source = premade（预制文件 %s），但**预制读取将在 V4 接入** ⇒ "
+                            "本次仍按引用的地形预设程序化生成",
+                            manifest.id.c_str(), manifest.premadeFile.c_str());
+            }
+            VX_LOG_INFO("世界清单（V1/V2a）：id=%s 名称=\"%s\" 族=%s 来源=%s；破坏=%s 持久化=%s 换种子=%s；"
+                        "清单=%s 地形预设=%s（半径 %d×%d、种子 %llu、出生 (%.1f, %.1f)）；注册表 %zu 个世界",
+                        manifest.id.c_str(), manifest.name.c_str(), vx::ToString(manifest.family),
+                        vx::ToString(manifest.source), manifest.destructionEnabled ? "开" : "关",
+                        manifest.persistent ? "是" : "否", manifest.randomizeSeedOnEntry ? "是" : "否",
+                        ResolveWorldManifestPath(worldManifestFile).string().c_str(),
+                        manifest.terrainPresetPath.c_str(), preset.tileRadiusX, preset.tileRadiusZ,
+                        static_cast<unsigned long long>(preset.seed), preset.spawnX, preset.spawnZ,
+                        worldManager.Count());
+        } else {
+            preset = vx::MapPreset::LoadFromFile(mapPath);
+        }
 
         vx::Window window("Voxel Engine - V0.1 terrain", 1280, 720);
 
@@ -1728,6 +2014,7 @@ int main(int argc, char** argv) {
         input.BindKey(vx::ActionId::ToggleFly, SDL_SCANCODE_F);         // T12：飞行模式开关
         input.BindKey(vx::ActionId::FlyDown, SDL_SCANCODE_LCTRL);       // T12：飞行时下降
         input.BindKey(vx::ActionId::ToggleSystemPanel, SDL_SCANCODE_ESCAPE);  // T15：Esc 开关系统面板（语义已统一）
+        input.BindKey(vx::ActionId::Interact, SDL_SCANCODE_E);                // V3：走近传送门按 E 触发切换
         input.BindMouseButton(vx::ActionId::Attack, SDL_BUTTON_LEFT);   // T27：左键 = 发射光球
         input.BindMouseAxis(vx::ActionId::LookX, vx::MouseAxis::X);
         input.BindMouseAxis(vx::ActionId::LookY, vx::MouseAxis::Y);
@@ -1904,6 +2191,54 @@ int main(int argc, char** argv) {
         } else {
             VX_LOG_INFO("光照表未启用 `[environment]`（或 enabled = false）⇒ 环境光使用**半球天空光**"
                         "（ADR 0010 P1；打开 assets/config/lighting.toml 的 [environment] 段即可对比）");
+        }
+
+        // ================================================================================
+        // V2b：**世界装载循环**（[ADR 0028](../docs/adr/0028-world-families-and-static-asset-first.md) 决策四"进程内真切世界"）——
+        //   每轮 = 装配一个世界（**世界级状态全部是本轮局部变量**）并跑到"退出或切换"为止；
+        //   **纹理 / 环境 IBL / 渲染器 / 窗口 / 面板留在循环之外复用**（重建它们既慢又违背 ADR 0028）。
+        //   本轮末尾由 V2a 的 `WorldManager` 决定**退出**还是**切到下一个世界**（见本轮尾部的卸载 / 切换段）。
+        //   ⚠️ 循环体**沿用原有缩进**（未再缩进一级）—— 以免产生万行级的纯空白 diff；语义与缩进无关。
+        // ================================================================================
+        bool        quitRequested  = false;  ///< 主循环要求退出（窗口关闭 / 面板"退出游戏"）
+        std::size_t switchTestNext = 0;      ///< `--switch-test` 的下一个待触发项（**跨世界保持**）
+
+        // 系统面板（T15，Esc）：面板就地编辑一份设置副本，主循环据此调用平台层与落盘。
+        // V2b：**世界装载循环之外** —— 面板与用户设置是**跨世界共享**的状态（切换世界不重置它）。
+        vx::SystemPanelContext panelContext;
+        panelContext.settings           = systemSettings;
+        panelContext.displayRefreshRate = displayRefreshRate;  // T17：帧率上限滑块的上界
+
+        // 分辨率档位：取自 SDL 支持的显示模式（按尺寸去重、升序）。当前尺寸若不在列表里则补入，
+        // 否则下拉框无法显示 / 回选当前值（例如窗口被手动缩放过）。
+        std::vector<vx::DisplaySize> supportedResolutions = window.SupportedResolutions();
+        const auto hasResolution = [&supportedResolutions](int width, int height) {
+            return std::any_of(supportedResolutions.begin(), supportedResolutions.end(),
+                               [width, height](const vx::DisplaySize& size) {
+                                   return size.width == width && size.height == height;
+                               });
+        };
+        if (!hasResolution(systemSettings.windowWidth, systemSettings.windowHeight)) {
+            supportedResolutions.push_back(vx::DisplaySize { systemSettings.windowWidth, systemSettings.windowHeight });
+            std::sort(supportedResolutions.begin(), supportedResolutions.end(),
+                      [](const vx::DisplaySize& left, const vx::DisplaySize& right) {
+                          if (left.width != right.width) {
+                              return left.width < right.width;
+                          }
+                          return left.height < right.height;
+                      });
+        }
+        panelContext.resolutions = &supportedResolutions;
+
+        // V2b：**跨世界**的会话计时（只用于退出日志）——循环内的 `clock` 是每轮重建的帧计时器。
+        vx::Clock sessionClock;
+
+        for (;;) {
+        // V2b：本轮要装配的世界 = `worldManager.Active()`（首轮由 `--world=` 决定；切换后由请求更新）。
+        // 走 `--map=` 时注册表为空 ⇒ 保持外面那份 `MapPreset` 不变（行为与从前**逐位一致**）。
+        if (worldManager.Count() > 0U) {
+            preset            = worldManager.Active().terrain;
+            presetSourceLabel = "清单 " + worldManager.ActiveId();
         }
 
         // ---- T61 / ADR 0020 决策二：**常驻集合 = 玩家窗口 ∩ 可挖区域** ----
@@ -2105,7 +2440,7 @@ int main(int argc, char** argv) {
         }
         VX_LOG_INFO("预设地图已加载：%s（文件 %s）—— 种子 %llu，tile 半径 [%d, %d]（世界内共 %zu 个 tile），"
                     "地形编辑 %zu 条，出生点 (%.1f, %.1f)",
-                    preset.name.c_str(), mapPath.string().c_str(), static_cast<unsigned long long>(preset.seed),
+                    preset.name.c_str(), presetSourceLabel.c_str(), static_cast<unsigned long long>(preset.seed),
                     preset.tileRadiusX, preset.tileRadiusZ, worldTilesX * worldTilesZ, preset.edits.size(),
                     preset.spawnX, preset.spawnZ);
         VX_LOG_INFO("地表 tile 常驻集合（W7-S3b / ADR 0024）：活动半径 %d tile（LOD 分环 %d/%d/%d tile，"
@@ -2362,6 +2697,137 @@ int main(int argc, char** argv) {
                     static_cast<double>(spawnX), static_cast<double>(spawnZ), static_cast<double>(spawnSurface),
                     static_cast<double>(spawnSurface + kSpawnClearance), static_cast<double>(kSpawnClearance));
 
+        // ---- V0b：物件层（ADR 0004 层③「物件 / 建造」）接线 ----
+        // 读类型表 + 放置清单 → 逐条放置（底面 Y 按**地表高度**求解）→ 上传网格 + 建**静态三角网**碰撞体。
+        // 硬约束（ADR 0004 / ADR 0028）：物件是**独立实体**，几何**绝不写进地形场**；
+        // 渲染与碰撞**共用同一份 `MeshData`**（"谁画谁挡"同源，尺寸不可能漂移）。
+        // 静态碰撞体**没有旋转接口** ⇒ 朝向烘进顶点（`RotateMeshAboutY`），与渲染的四元数同向。
+        // V3：物件清单**由世界清单指定**（`objects_file`；ADR 0028 §一"差异全部落在清单"）——
+        //     走 `--world=` 时取该世界清单的路径（绝对路径直接用，缺省为仓库相对字面量再拼 `SourceAssetPath`）；
+        //     走 `--map=`（注册表为空）时回退到全局默认 `assets/config/objects.toml`。
+        const std::filesystem::path objectsPath = [&]() -> std::filesystem::path {
+            if (worldManager.Count() > 0U) {
+                const std::filesystem::path& declared = worldManager.Active().objectsFile;
+                return declared.is_absolute() ? declared : SourceAssetPath(declared);
+            }
+            return SourceAssetPath("assets/config/objects.toml");
+        }();
+        vx::ObjectTable objects = vx::ObjectTable::LoadFromFile(objectsPath);
+        vx::ObjectLayer objectLayer;
+        std::vector<ObjectSlot> objectSlots;
+
+        // V8：模型文件**按路径缓存**（同一 `model_file` 只载入一次；多个类型 / 多次散布共用同一模型）。
+        // 局部网格按形态分流：程序化形态走 `BuildObjectMesh`，`Model` 走 `BuildObjectMeshFromModel`
+        //（等比装进 `2*half_extent` 的盒、底面贴地）—— 两者产物都是同一 `vx::MeshData` ⇒ 下游（渲染 + 碰撞 + 剔除）零分叉。
+        std::unordered_map<std::string, vx::Model> modelCache;
+        const auto buildLocalMesh = [&](const vx::ObjectType& type) -> vx::MeshData {
+            if (type.kind != vx::ObjectAssetKind::Model) {
+                return vx::BuildObjectMesh(type);
+            }
+            auto found = modelCache.find(type.modelFile);
+            if (found == modelCache.end()) {
+                found = modelCache.emplace(type.modelFile, vx::LoadModel(SourceAssetPath(type.modelFile))).first;
+                VX_LOG_INFO("物件模型已载入（V8）：%s（网格 %zu 个）", type.modelFile.c_str(),
+                            found->second.meshes.size());
+            }
+            // `material_slot` 未指定（-1）时取形态默认（对 `Model` 即草槽，见 `ObjectMaterialSlot` 的说明）。
+            const float materialSlot = (type.materialSlot >= 0) ? static_cast<float>(type.materialSlot)
+                                                               : vx::ObjectMaterialSlot(type.kind);
+            return vx::BuildObjectMeshFromModel(found->second, type.halfExtentX, type.halfExtentY, type.halfExtentZ,
+                                                materialSlot);
+        };
+
+        // V8：落点清单 = **显式 `[[placement]]`（按文件顺序）+ 程序化 `[[scatter]]` 展开**（按文件顺序）。
+        // 顺序固定 ⇒ "遍历顺序 = 放置顺序"（确定性，红线 7）仍然成立。
+        std::vector<vx::ObjectPlacement> objectPlan = objects.placements;
+        std::size_t                      scatterPointCount = 0;
+        for (const vx::ObjectScatter& scatter : objects.scatters) {
+            const std::vector<vx::ScatterPoint> points = vx::PlanObjectScatter(scatter);
+            if (points.size() < static_cast<std::size_t>(scatter.count)) {
+                VX_LOG_WARN("散布 [%s] 只生成 %zu / %d 个点（半径太小？已抬高格点密度重试）",
+                            scatter.typeId.c_str(), points.size(), scatter.count);
+            }
+            for (const vx::ScatterPoint& point : points) {
+                vx::ObjectPlacement placed;
+                placed.typeId     = scatter.typeId;
+                placed.x          = point.x;
+                placed.z          = point.z;
+                placed.yawDegrees = point.yawDegrees;  // 散布给出朝向；显式放置仍用 `yaw_deg`
+                objectPlan.push_back(std::move(placed));
+            }
+            scatterPointCount += points.size();
+        }
+
+        objectSlots.reserve(objectPlan.size());
+        std::vector<vx::PortalEntry> portals;  // V3：供"最近门"查询（交互用）
+        portals.reserve(2U);
+        std::size_t objectSkipped = 0;
+        for (const vx::ObjectPlacement& declared : objectPlan) {
+            vx::ObjectPlacement placed = declared;
+            float                surface = 0.0F;
+            if (!world.QueryHeight(placed.x, placed.z, surface)) {
+                // 不静默：落点没有地表数据时**跳过并告警**，绝不猜一个高度把物件放到错的地方。
+                VX_LOG_WARN("物件 [%s] 的落点 (%.1f, %.1f) 无地表数据 ⇒ 跳过该条放置",
+                            placed.typeId.c_str(), static_cast<double>(placed.x), static_cast<double>(placed.z));
+                ++objectSkipped;
+                continue;
+            }
+            placed.y = surface;  // 底面贴地表（`objects.toml` 的 y 分量当前不生效）
+
+            const std::uint32_t id = objectLayer.Place(objects, placed);
+            vx::ObjectInstance  instance;
+            (void)objectLayer.Get(id, instance);
+
+            const vx::MeshData localMesh    = buildLocalMesh(*instance.type);
+            const vx::MeshData colliderMesh = vx::RotateMeshAboutY(localMesh, instance.yawDegrees);
+            const glm::dvec3   origin(static_cast<double>(instance.x), static_cast<double>(instance.y),
+                                      static_cast<double>(instance.z));
+            // V3：传送门登记到交互表（`target_world` 来自放置条目 —— `ObjectInstance` 不带目标世界）。
+            if (instance.type->kind == vx::ObjectAssetKind::Portal) {
+                portals.push_back(vx::PortalEntry { origin, placed.targetWorldId });
+            }
+            const glm::quat rotation =
+                glm::angleAxis(glm::radians(instance.yawDegrees), glm::vec3(0.0F, 1.0F, 0.0F));
+
+            ObjectSlot slot;
+            slot.id         = id;
+            slot.type       = instance.type;
+            slot.localMesh  = localMesh;
+            slot.position   = origin;
+            slot.yawDegrees = instance.yawDegrees;
+            // 剔除包围盒取**旋转后**的几何（它才是世界里的真实形状；渲染侧施加同一旋转）。
+            slot.bounds = BoundsOfVertices(colliderMesh.vertices, origin);
+            slot.handle = renderer.UploadMesh(localMesh, origin);
+            if (!slot.handle.IsValid()) {
+                VX_LOG_WARN("物件 [%s] 的网格上传失败（网格为空）", instance.type->id.c_str());
+            } else {
+                renderer.SetMeshTransform(slot.handle, origin, rotation);
+            }
+
+            // 静态碰撞体：与渲染**共用同一份几何**（朝向烘进顶点 ⇒ "谁画谁挡"同源）。
+            const std::vector<float>   positions = FlattenObjectPositions(colliderMesh);
+            vx::PhysicsWorld::MeshDesc collider;
+            collider.positions     = positions.data();
+            collider.vertexCount   = colliderMesh.vertices.size();
+            collider.indices       = colliderMesh.indices.data();
+            collider.triangleCount = colliderMesh.indices.size() / 3U;
+            collider.originX       = origin.x;
+            collider.originY       = origin.y;
+            collider.originZ       = origin.z;
+            slot.body              = physics.AddMesh(collider);
+            if (slot.body == 0) {
+                VX_LOG_WARN("物件 [%s] 的静态碰撞体创建失败（渲染仍在 ⇒ 只会「看得见走得穿」）",
+                            instance.type->id.c_str());
+            }
+
+            objectSlots.push_back(std::move(slot));
+        }
+        VX_LOG_INFO("物件层就绪（V0b/V0c/V3/V8）：清单 %s；放置 %zu / %zu 个物件（渲染 + 静态碰撞：其中传送门 %zu、"
+                    "散布点 %zu、模型文件 %zu 个），类型表 %zu 项；可破坏总开关 = %s%s",
+                    objectsPath.string().c_str(), objectSlots.size(), objectPlan.size(), portals.size(), scatterPointCount,
+                    modelCache.size(), objects.types.size(), objects.destructibleEnabled ? "开" : "关",
+                    (objectSkipped == 0U) ? "" : "（有落点被跳过，见上方 WARN）");
+
         vx::PhysicsWorld::CapsuleDesc capsule;
         capsule.radius             = kCharacterRadius;
         capsule.cylinderHalfHeight = kCharacterCylinderHalfHeight;
@@ -2412,30 +2878,7 @@ int main(int argc, char** argv) {
         camera.SetPitch(-0.42F);  // 略微俯视地表
 
         // 系统面板（T15，Esc）：面板就地编辑一份设置副本，主循环据此调用平台层与落盘。
-        vx::SystemPanelContext panelContext;
-        panelContext.settings           = systemSettings;
-        panelContext.displayRefreshRate = displayRefreshRate;  // T17：帧率上限滑块的上界
-
-        // 分辨率档位：取自 SDL 支持的显示模式（按尺寸去重、升序）。当前尺寸若不在列表里则补入，
-        // 否则下拉框无法显示 / 回选当前值（例如窗口被手动缩放过）。
-        std::vector<vx::DisplaySize> supportedResolutions = window.SupportedResolutions();
-        const auto hasResolution = [&supportedResolutions](int width, int height) {
-            return std::any_of(supportedResolutions.begin(), supportedResolutions.end(),
-                               [width, height](const vx::DisplaySize& size) {
-                                   return size.width == width && size.height == height;
-                               });
-        };
-        if (!hasResolution(systemSettings.windowWidth, systemSettings.windowHeight)) {
-            supportedResolutions.push_back(vx::DisplaySize { systemSettings.windowWidth, systemSettings.windowHeight });
-            std::sort(supportedResolutions.begin(), supportedResolutions.end(),
-                      [](const vx::DisplaySize& left, const vx::DisplaySize& right) {
-                          if (left.width != right.width) {
-                              return left.width < right.width;
-                          }
-                          return left.height < right.height;
-                      });
-        }
-        panelContext.resolutions = &supportedResolutions;
+        // V2b：**已上移到世界装载循环之外**（面板与用户设置是**跨世界共享**的状态，不随世界重建）。
 
         // 渲染原点：整数世界定位，上传的 float 顶点都以它为基准（红线 6）。
         glm::dvec3 renderOrigin(std::floor(static_cast<double>(spawnX)), std::floor(static_cast<double>(spawnSurface)),
@@ -2628,7 +3071,7 @@ int main(int argc, char** argv) {
         // 每帧的绘制列表（tile + 体积 + 主角 + 活动光球 + **倒塌整体**）：容量固定，稳态零分配。
         std::vector<vx::MeshHandle> frameHandles;
         frameHandles.reserve(tileHandles.size() + volumeSlots.Size() + 1 + orbHandles.size() +
-                             static_cast<std::size_t>(collapseSpec.maxActiveUnits));
+                             objectSlots.size() + static_cast<std::size_t>(collapseSpec.maxActiveUnits));
 
         /// T33：本帧**落定**（倒了、停住了）的倒塌整体 —— 帧末统一体素化回写（缓冲复用，稳态零分配）。
         std::vector<vx::ActiveCollapseUnit> settledCollapseUnits;
@@ -2726,6 +3169,7 @@ int main(int argc, char** argv) {
                     "**光球命中物体表面即爆炸**：射入可挖区域（测试地图西南的山体）⇒ **在山体上挖出洞**；"
                     "射在区域外的地面 ⇒ 炸出坑（半径 %.1f 格 / 深 %.1f / 外环 %.1f）；"
                     "（原鼠标挖 / 堆 / 爆破笔刷已解绑：地形破坏只由光球触发）；"
+                    "**E = 走近传送门时传送**（HUD 出提示后按 E 切换到门的目标世界；**不自动切换**）；"
                     "Esc = 开关系统面板（打开时释放鼠标、关闭时恢复）；"
                     "点击窗口 = 重新捕获（**该次点击不会发射**）；F1 = 调试面板；关闭窗口 = 退出",
                     orbSpec.id.c_str(), static_cast<double>(orbSpec.fireIntervalSeconds),
@@ -2759,6 +3203,7 @@ int main(int argc, char** argv) {
 
             inputTimer.Begin();
             if (!window.pump_events(input)) {
+                quitRequested = true;  // V2b：本轮结束后退出外层"世界装载循环"
                 break;  // 窗口关闭 / 收到退出事件（与旧 `while (window.pump_events(...))` 等价）
             }
             input.BeginFrame();  // 每帧采样一次，且只在固定步循环之外
@@ -2917,6 +3362,8 @@ int main(int argc, char** argv) {
             const vx::StepPlan plan = accumulator.Advance(frameDeltaSeconds);
             bool                 terrainExplosionSeen  = false;
             settledCollapseUnits.clear();
+            // V0c：物件支撑检查的固定步节拍（成本与物件数成正比 ⇒ 不每步做）。
+            int objectSupportStepCounter = 0;
             for (int step = 0; step < plan.steps; ++step) {
                 StepCharacter(physics, character, camera, command, flying, jumpAssist);
 
@@ -3013,12 +3460,62 @@ int main(int argc, char** argv) {
                         }
                         const DetonationOutcome outcome = Detonate(editContext, hit.point, orbSpec);
                         terrainExplosionSeen = terrainExplosionSeen || outcome.terrainChanged;
+                        // V0c：同一次爆炸也作用于**物件层**（ADR 0004 层③）—— 按类型分流：
+                        // 可破坏者被摧毁消失，不可破坏者只被炸飞（见 `BlastObjects`）。
+                        BlastObjects(objectSlots, objects, objectLayer, physics, renderer, hit.point,
+                                     orbSpec.explosionRadiusBlocks);
                     }
+                }
+
+                // V0c：**支撑检查**（节拍推进）—— 脚下地表 / 体积被移除的物件必须**落下**（不得悬空）。
+                // 放在本步**末尾**：这样本步的爆炸 / 挖除结果能在同一步被看见。
+                if (++objectSupportStepCounter >= kObjectSupportCheckIntervalSteps) {
+                    objectSupportStepCounter = 0;
+                    CheckObjectSupports(objectSlots, orbQuery, physics);
                 }
             }
             // 至少跑过一个逻辑步后，锁存的跳跃请求已被判定过（含"不满足着地条件而放弃"），消费掉。
             if (plan.steps > 0) {
                 jumpRequested = false;
+            }
+
+            // V2b（测试设施）：`--switch-test` 到点请求**一次**世界切换（按会话时钟；可连续给出多个）。
+            // 请求只是记账（V2a 的 `WorldManager`）；真正的卸载 / 重载在主循环退出后由外层循环尾部执行。
+            if (switchTestNext < switchTests.size() && !worldManager.HasPendingSwitch() &&
+                sessionClock.ElapsedSeconds() >= switchTests[switchTestNext].first) {
+                const std::string& target = switchTests[switchTestNext].second;
+                std::string        switchReason;
+                if (worldManager.RequestSwitch(target, switchReason)) {
+                    VX_LOG_INFO("世界切换（--switch-test）：已于会话 %.2f s 请求切到 [%s]（本帧末执行卸载 / 重载）",
+                                sessionClock.ElapsedSeconds(), target.c_str());
+                } else {
+                    VX_LOG_WARN("世界切换（--switch-test）被拒绝：%s", switchReason.c_str());
+                }
+                ++switchTestNext;
+            }
+
+            // V3：传送门交互 —— **走近（≤ 提示半径）出提示；按 E 触发切到该门的目标世界**；
+            //     **不自动切换**（正式玩家路径只有"门 + E"；`--switch-test` 保留为测试设施）。
+            // 位置取本帧固定步之后的角色状态；`ConsumePressed` 只在门附近消费（pressed 边沿本就不跨帧残留）。
+            // `nearbyPortalTargetId` 在帧末填入 `DebugStats` 交给 HUD（空串 = 不显示提示）。
+            std::string nearbyPortalTargetId;
+            if (!portals.empty()) {
+                const vx::PortalEntry* portal =
+                    vx::FindNearestPortal(portals, physics.GetCharacterState(character).position,
+                                          vx::kPortalPromptRadius);
+                if (portal != nullptr) {
+                    nearbyPortalTargetId = portal->targetWorldId;
+                    if (mouseCaptured && !suppression.keyboardGameplay &&
+                        input.ConsumePressed(vx::ActionId::Interact)) {
+                        std::string switchReason;
+                        if (worldManager.RequestSwitch(portal->targetWorldId, switchReason)) {
+                            VX_LOG_INFO("世界切换（传送门）：走近门后按 E ⇒ 请求切到 [%s]（本帧末执行卸载 / 重载）",
+                                        portal->targetWorldId.c_str());
+                        } else {
+                            VX_LOG_WARN("世界切换（传送门）被拒绝：%s", switchReason.c_str());
+                        }
+                    }
+                }
             }
             // T33：把本帧**落定**的倒塌整体体素化回写为地形（残骸可站、可继续挖），
             // 其重网格 / 碰撞体重建 / GPU 上传交给 T37 的延后队列按每帧预算推进。
@@ -3380,6 +3877,28 @@ int main(int argc, char** argv) {
                 static_cast<float>(static_cast<double>(tileScheduler.Window().centerTileZ * vx::kTerrainTileSize +
                                                        vx::kTerrainTileSize / 2) -
                                    renderOrigin.z));
+            // V0c：把**动态物件**（掉落中 / 被炸飞）的位姿推给渲染器与剔除包围盒。
+            // 与倒塌整体同口径：只推 64 B 的逐网格变换（`SetMeshTransform`），**不重烘焙顶点**。
+            // 动态物件用**包围球**做剔除包围盒（任意姿态下都保守，不会漏画）。
+            for (ObjectSlot& slot : objectSlots) {
+                if (slot.removed || !slot.dynamic || slot.body == 0 || slot.type == nullptr) {
+                    continue;
+                }
+                const vx::PhysicsWorld::RigidBodyState state = physics.GetRigidBodyState(slot.body);
+                slot.position = state.position;
+                if (slot.handle.IsValid()) {
+                    renderer.SetMeshTransform(slot.handle, state.position, state.rotation);
+                }
+                const float radius = std::sqrt(slot.type->halfExtentX * slot.type->halfExtentX +
+                                               slot.type->halfExtentY * slot.type->halfExtentY +
+                                               slot.type->halfExtentZ * slot.type->halfExtentZ);
+                const glm::vec3 center(static_cast<float>(state.position.x), static_cast<float>(state.position.y),
+                                       static_cast<float>(state.position.z));
+                slot.bounds.min   = center - glm::vec3(radius, radius, radius);
+                slot.bounds.max   = center + glm::vec3(radius, radius, radius);
+                slot.bounds.valid = true;
+            }
+
             // T79②：**剔除与绘制列表构建**独立计时（原先落在"未计时"里）。
             cullTimer.Begin();
 
@@ -3393,6 +3912,7 @@ int main(int argc, char** argv) {
             std::size_t visibleTiles   = 0;
             std::size_t visibleVolumes = 0;
             std::size_t visibleShells  = 0;
+            std::size_t visibleObjects = 0;
             for (std::size_t i = 0; i < tileHandles.size(); ++i) {
                 if (tileHandles[i].IsValid() && VisibleToCamera(frustum, tileBounds[i], renderOrigin, sunDirection)) {
                     frameHandles.push_back(tileHandles[i]);
@@ -3412,6 +3932,14 @@ int main(int argc, char** argv) {
                     VisibleToCamera(frustum, shellBounds[i], renderOrigin, sunDirection)) {
                     frameHandles.push_back(shellHandles[i]);
                     ++visibleShells;
+                }
+            }
+            // V0b：物件层（ADR 0004 层③）—— **静网格**，与 tile / 体积 / 地表壳同走 T39 视锥剔除。
+            // 提交量由剔除结果决定（SKILL 第四节硬规则 3）；物件不移动 ⇒ 位姿在上传时一次登记。
+            for (const ObjectSlot& slot : objectSlots) {
+                if (slot.handle.IsValid() && VisibleToCamera(frustum, slot.bounds, renderOrigin, sunDirection)) {
+                    frameHandles.push_back(slot.handle);
+                    ++visibleObjects;
                 }
             }
             // W6：水面（半透明；在主通道**最后**绘制 ⇒ 追加在列表末尾）。
@@ -3447,10 +3975,10 @@ int main(int argc, char** argv) {
             // 决定"）：只打一条，用于确认剔除真的在起作用（而不是把整个世界都提交了）。
             if (!cullingLogged) {
                 cullingLogged = true;
-                VX_LOG_INFO("首帧视锥剔除（T39）：地表 tile %zu/%zu、可挖体积块 %zu/%zu、地表壳块 %zu/%zu 通过"
-                            "（含阴影扫掠余量）；本帧提交网格 %zu 个",
+                VX_LOG_INFO("首帧视锥剔除（T39）：地表 tile %zu/%zu、可挖体积块 %zu/%zu、地表壳块 %zu/%zu、"
+                            "物件 %zu/%zu 通过（含阴影扫掠余量）；本帧提交网格 %zu 个",
                             visibleTiles, tileHandles.size(), visibleVolumes, volumeSlots.Size(), visibleShells,
-                            shellHandles.size(), submittedThisFrame);
+                            shellHandles.size(), visibleObjects, objectSlots.size(), submittedThisFrame);
             }
 
             // 调试面板：统计经独立接口采集，只在渲染线程构建，不进世界层热路径。
@@ -3477,6 +4005,7 @@ int main(int argc, char** argv) {
             stats.loadedTileCount   = tileCoords.size();
             stats.lastDirtyTileCount = destructionUnits;
             stats.tileBodyCount     = terrainCollision.TileBodyCount();
+            stats.nearbyPortalTargetId = nearbyPortalTargetId;  // V3：走近传送门的提示（空串 = 不显示）
             stats.physicsReady      = true;
 
             // T24：渲染开销取自引擎的通用统计；绘制数为**最近一次** RenderFrame（面板早于本帧渲染）。
@@ -3537,6 +4066,7 @@ int main(int argc, char** argv) {
             }
             if (panelContext.requestQuit) {
                 VX_LOG_INFO("系统面板：点击退出游戏 → 离开主循环");
+                quitRequested = true;  // V2b：本轮结束后退出外层"世界装载循环"
                 break;
             }
 
@@ -3623,7 +4153,67 @@ int main(int argc, char** argv) {
                                 ? "等交换链（GPU / 呈现）"
                                 : "CPU 侧（逻辑 / UI / 提交）");
             }
+
+            // V2b：会话墙钟推进 —— `Clock::ElapsedSeconds()` **只在 `Tick()` 时累计**，
+            // 而 `--switch-test` 的秒数以它为准 ⇒ 必须每帧 `Tick` 一次（否则它恒为 0，到点判断永不成立）。
+            (void)sessionClock.Tick();
+
+            // V2b：本帧末尾若已有**待处理的世界切换请求**（`--switch-test` 或 V3 的交互点）⇒ 结束本轮世界：
+            // 跳出主循环，由外层"世界装载循环"的尾部执行**卸载**并在下一轮**装配新世界**。
+            // 放在帧末（而非请求处立即跳）：保证退出前的那一帧是**完整的一帧**（不半途而废）。
+            if (worldManager.HasPendingSwitch()) {
+                break;
+            }
         }
+
+        // ================================================================================
+        // V2b：本轮世界结束 —— **卸载**（交还该世界创建的 GPU 网格）并决定**退出**或**切到下一个世界**。
+        // 为什么必须显式交还：这些句柄是**本轮的局部变量**，析构只销毁句柄值、**不会**把槽位还给渲染器；
+        // 不交还的话每切一次世界，`MeshRenderer` 的网格槽位就永久多一批（V2b 验收判据 = "卸载不留残"）。
+        // Jolt 物体不需逐个移除：`PhysicsWorld` 等世界级对象都是**本轮局部变量**，随作用域析构。
+        // ================================================================================
+        for (vx::MeshHandle& handle : tileHandles) {
+            if (handle.IsValid()) { renderer.ReleaseMesh(handle); }
+        }
+        for (auto& entry : volumeSlots) {
+            if (entry.second.handle.IsValid()) { renderer.ReleaseMesh(entry.second.handle); }
+        }
+        for (vx::MeshHandle& handle : shellHandles) {
+            if (handle.IsValid()) { renderer.ReleaseMesh(handle); }
+        }
+        for (ObjectSlot& slot : objectSlots) {
+            if (slot.handle.IsValid()) { renderer.ReleaseMesh(slot.handle); }
+        }
+        for (vx::MeshHandle& handle : orbHandles) {
+            if (handle.IsValid()) { renderer.ReleaseMesh(handle); }
+        }
+        if (waterHandle.IsValid()) { renderer.ReleaseMesh(waterHandle); }
+        if (characterMesh.IsValid()) { renderer.ReleaseMesh(characterMesh); }
+        rigidCollapse.ReleasePool(renderer);
+        VX_LOG_INFO("世界卸载完成（V2b）：交还 GPU 网格 —— tile %zu / 体积块 %zu / 地表壳 %zu / 物件 %zu / 光球 %zu"
+                    "（另含水面 / 主角 / 倒塌网格池）；渲染器网格槽位 %zu（反复切换应**趋于稳定** = 无泄漏）",
+                    tileHandles.size(), volumeSlots.Size(), shellHandles.size(), objectSlots.size(),
+                    orbHandles.size(), renderer.MeshSlotCount());
+
+        if (quitRequested) {
+            break;  // 退出世界装载循环（随后走设置落盘与退出日志）
+        }
+        if (!worldManager.HasPendingSwitch()) {
+            break;  // 既未退出也无切换请求（`while (true)` 只在退出时结束）⇒ 收尾
+        }
+        // 切换：取出请求并**确认新世界**。
+        // 口径：装载失败会抛异常 ⇒ 进程直接退出（**不会**留下"半个新世界"），故这里先确认再于下一轮装配；
+        // 若将来要"装载失败回退到原世界"，把 `CommitActive` 移到本轮世界阶段全部完成之后即可（V2c 可细化）。
+        {
+            const std::optional<std::string> target = worldManager.TakePendingSwitch();
+            if (!target.has_value()) {
+                break;
+            }
+            worldManager.CommitActive(*target);
+            VX_LOG_INFO("世界切换（V2b）：开始装载 [%s]（地形预设 %s）—— 下一轮装配新世界",
+                        target->c_str(), worldManager.Active().terrainPresetPath.c_str());
+        }
+        }  // for (;;)：进入下一轮，装配（新）世界
 
         // 设置落盘：正常退出、窗口关闭、面板退出游戏都走这里（落盘失败只告警，不阻断退出）。
         try {
@@ -3633,7 +4223,7 @@ int main(int argc, char** argv) {
             VX_LOG_WARN("设置保存失败：%s", saveError.what());
         }
 
-        VX_LOG_INFO("收到退出请求，主循环结束（累计 %.1f s）", clock.ElapsedSeconds());
+        VX_LOG_INFO("收到退出请求，主循环结束（累计 %.1f s）", sessionClock.ElapsedSeconds());
     } catch (const std::exception& error) {
         VX_LOG_ERROR("启动或主循环失败：%s", error.what());
         return EXIT_FAILURE;

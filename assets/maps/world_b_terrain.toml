@@ -1,0 +1,18 @@
+# 地形预设：**预制小世界 B 的地形**（≈1×1 km；被 assets/maps/world_b.toml 引用）
+#
+# 坐标口径：tile 半径 [8, 8] ⇒ 世界列 [-512, 512] = 1024 格 ≈ 1×1 km（与 test_range 同尺度）。
+# 字段语义与校验见 world/generation/map_preset.hpp（本文件只提供数值）。
+
+schema_version = 1
+name           = "预制小世界 B 的地形（1×1 km）"
+seed           = 20261006
+tile_radius    = [8, 8]
+spawn          = [0.0, 0.0]
+
+# ---- 出生平台：把中心压平，保证进入 B 时落点干净可预期（"目标落点由目标清单声明"）----
+[[edit]]
+name   = "spawn_plateau"
+mode   = "flatten"
+min    = [-24, -24]
+max    = [24, 24]
+height = 120.0

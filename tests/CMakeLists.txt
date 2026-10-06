@@ -30,12 +30,18 @@ add_executable(voxel_tests
     gameplay_input_test.cpp
     input_map_test.cpp
     landform_test.cpp
+    level_manifest_test.cpp
     lighting_table_test.cpp
     map_preset_test.cpp
     model_loader_test.cpp
     mouse_capture_test.cpp
+    object_layer_test.cpp
+    object_mesh_test.cpp
+    object_scatter_test.cpp
+    object_support_test.cpp
     orb_test.cpp
     premade_map_test.cpp
+    portal_interaction_test.cpp
     system_settings_test.cpp
     test_mode_test.cpp
     physics_test.cpp
@@ -43,6 +49,8 @@ add_executable(voxel_tests
     render_stats_test.cpp
     river_test.cpp
     shadow_cascade_test.cpp
+    shell_block_build_pipeline_test.cpp
+    shell_block_residency_test.cpp
     surface_shell_test.cpp
     terrain_brush_hold_test.cpp
     terrain_brush_test.cpp
@@ -59,6 +67,7 @@ add_executable(voxel_tests
     volume_collision_test.cpp
     volume_mesher_test.cpp
     world_bounds_test.cpp
+    world_manager_test.cpp
 )
 
 # 让测试能定位仓库内已提交的资产（如 assets/config/materials.toml）。

@@ -1,0 +1,22 @@
+# 世界清单 A：**大世界**（10×10 km，[ADR 0028](../../docs/adr/0028-world-families-and-static-asset-first.md) §一）
+#
+# 口径（字段语义与校验见 world/generation/level_manifest.hpp）：
+#   - 本文件只**声明**世界族与策略；地形（种子 / 半径 / 出生点 / 编辑）由 `terrain_preset` **引用**，
+#     其**单一事实来源**仍是那份地形预设（本清单不复制任何地形字段）；
+#   - `terrain_preset` / `premade_file` 都按**本文件所在目录**解析（一个世界自成一个目录）。
+#
+# 现状（V1）：A 走 `procedural`（运行期按种子生成 10 km 高度场 + 窗口流式 + LOD）。
+#   ADR 0028 的**目标形态**是 `premade`（离线烘焙、运行期只读）；切换时机 = 把 10 km 烘焙，见 plans/v0.5.md。
+
+schema_version = 1
+id   = "world_a"
+name = "大世界 A（10×10 km）"
+
+family = "overworld"
+source = "procedural"
+terrain_preset = "world_10km.toml"
+objects_file   = "world_a_objects.toml"   # V3：本世界的物件 / 传送门放置清单（相对本文件目录）
+
+destruction_enabled     = true   # 破坏策略：小部分可破坏（标记区域）
+persistent              = true   # 存档策略：大世界持久化（存档未开始，先登记）
+randomize_seed_on_entry = false

@@ -462,6 +462,12 @@ public:
     /// 其中绘制统计为**最近一次** `RenderFrame` 的实测值；纹理字节为当前总量。
     [[nodiscard]] const RenderStats& Stats() const noexcept { return m_stats; }
 
+    /// 只读：**网格槽位总数**（含空闲槽位）。
+    ///
+    /// 用途（V2b 世界切换的验收判据"卸载不留残"）：槽位是**复用**的（`ReleaseMesh` 归还到空闲表），
+    /// 因此反复切换世界时本值应当**趋于稳定**而不是持续增长 —— 持续增长即说明有句柄未交还。
+    [[nodiscard]] std::size_t MeshSlotCount() const noexcept { return m_meshes.size(); }
+
     /// 渲染一帧：网格渲到离屏 HDR 目标 → 色调映射到交换链 → 可选的叠加层。
     ///
     /// 顺序（ADR 0010 的 P0 / P3）：主通道写 `R16G16B16A16_FLOAT` HDR 颜色目标（+ 深度），

@@ -1,0 +1,62 @@
+# 物件层（ADR 0004 层③「物件 / 建造」）的**类型表**与**放置清单**。
+#
+# 口径（见 plans/v0.5.md §1.3 / §1.4）：
+#   - V0 只支持**程序化代形**（dirt_pile / stone / crate），尚无 glTF 模型资产；
+#   - `position` 为物件的**底面中心**（世界坐标，米）——即"摆在地面上的落点"；
+#     **`position` 的 `y` 分量当前不生效**：放置时底面 Y 由**地表高度**求解（V0b 已实现），
+#     字段保留以便将来支持"手工指定高度的悬浮 / 叠放"；
+#   - V0b 已接线：每个物件上传一份程序化网格（渲染）+ 一个**静态三角网碰撞体**（物理），
+#     两者**共用同一份 `MeshData`**（"谁画谁挡"同源）；`yaw_deg` 对两者同时生效；
+#   - 非法配置（缺字段 / 重复 id / 未知形态 / 非正尺寸 / 引用不存在的类型）⇒ 启动失败（ADR 0005）；
+#   - 这里的示例物件是**临时占位内容**，正式设定待所有者提供（world-setting.md §3）。
+
+schema_version = 1
+
+# 物件可破坏能力**总开关**（V0c；SKILL「已实现能力只允许配置项关闭」）：
+#   true  = 按下面每个类型的 `destructible` 分流 —— 可破坏者被爆炸**摧毁消失**，不可破坏者**只被炸飞**；
+#   false = **任何物件都不被摧毁**（一律只被炸飞 / 失支撑掉落）。
+# 缺省为 true（不写本字段等价于 true）。显式给出时必须是布尔值，否则启动失败（ADR 0005）。
+destructible_enabled = true
+
+[[type]]
+id = "dirt_pile"
+kind = "dirt_pile"
+half_extent = [1.0, 0.75, 1.0]
+destructible = true
+
+[[type]]
+id = "stone_boulder"
+kind = "stone"
+half_extent = [1.2, 0.9, 1.2]
+destructible = false
+
+[[type]]
+id = "wooden_crate"
+kind = "crate"
+half_extent = [0.5, 0.5, 0.5]
+destructible = true
+
+# 放置清单（世界坐标，米）：示例摆在原点附近，供 V0b 接线验证与 V6「土堆」复用。
+[[placement]]
+type = "dirt_pile"
+position = [6.0, 0.0, 6.0]
+yaw_deg = 0.0
+
+[[placement]]
+type = "stone_boulder"
+position = [-8.0, 0.0, 4.0]
+
+[[placement]]
+type = "wooden_crate"
+position = [3.0, 0.0, -5.0]
+yaw_deg = 30.0
+
+# V0c 测试实例（对照，见 plans/v0.5.md §1.5）：一对并排的「可破坏 / 不可破坏」物件，便于人工对比
+# （土堆可被爆炸摧毁消失；石块只被炸飞 / 掉落，不消失）。
+[[placement]]
+type = "dirt_pile"
+position = [-2.0, 0.0, 12.0]
+
+[[placement]]
+type = "stone_boulder"
+position = [2.0, 0.0, 12.0]

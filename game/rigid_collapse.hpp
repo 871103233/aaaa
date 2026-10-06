@@ -137,6 +137,13 @@ public:
     /// 释放全部活跃刚体与网格槽位（退出前善后；无效句柄为无操作）。
     void Clear(PhysicsWorld& physics, MeshRenderer& renderer);
 
+    /// **释放网格池**（V2b：世界卸载时调用）：把池里**所有槽位**的 GPU 网格交还渲染器。
+    ///
+    /// 与 `Clear` 的区别：`Clear` 只把活跃整体**隐藏**（`usedIndexCount = 0`）并**保留池**，供本世界后续倒塌复用；
+    /// 本方法把池**也**交还 —— 世界切换时若只调 `Clear`，`MeshRenderer` 会永久多留 `slotCount` 个网格槽位
+    /// （"卸载不留残"是 V2b 的验收判据）。调用后需重新 `Init` 才能再次使用本运行时。
+    void ReleasePool(MeshRenderer& renderer);
+
 private:
     /// 槽位 → 网格句柄（加载期创建，容量固定；顶点容量 = `m_capacityVerts`，索引容量 = `m_capacityVerts / 4 × 6`）。
     std::vector<MeshHandle>         m_pool;

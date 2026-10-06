@@ -179,6 +179,12 @@ void DebugOverlay::BuildHud(const DebugStats& stats) {
                 static_cast<int>(std::floor(stats.characterPosition.y)),
                 static_cast<int>(std::floor(stats.characterPosition.z)));
 
+    // V3：走近传送门时的交互提示（一行）。目标世界 id 为 ASCII ⇒ 无 CJK 字体时也不会出现缺字。
+    if (!stats.nearbyPortalTargetId.empty()) {
+        ImGui::Separator();
+        ImGui::Text(UiText(UiLabel::PortalPromptFormat, cjk), stats.nearbyPortalTargetId.c_str());
+    }
+
     // 记录实际高度：F1 面板据此把初始位置排在 HUD 下方（避免左上角重叠）。
     m_hudHeight = ImGui::GetWindowSize().y;
     ImGui::End();

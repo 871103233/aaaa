@@ -82,6 +82,7 @@ endif()
 # ============================================================
 find_package(SDL3 CONFIG REQUIRED)
 find_package(glm  CONFIG REQUIRED)
+find_package(EnTT CONFIG REQUIRED)   # 物件层（层③）的 ECS，见 ADR 0003 / 0004
 
 # ============================================================
 # Shader 辅助函数

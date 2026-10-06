@@ -24,6 +24,7 @@ enum class ActionId : std::uint8_t {
     FlyDown,           ///< 飞行时下降（T12；只在 game/ 消费，不参与模拟）
     ReleaseMouseCapture,  ///< 释放鼠标相对模式（T14 遗留；T15 起 `Esc` 改绑 `ToggleSystemPanel`，本动作不再绑定）
     ToggleSystemPanel,    ///< 开关系统面板（T15；`Esc`；只在 game/ 消费，不参与模拟）
+    Interact,             ///< 交互（V3；`E`；走近传送门按 E 触发切换；只在 game/ 消费，不参与模拟）
 
     Count,
 };

@@ -21,13 +21,17 @@ add_library(voxel_world STATIC
     dig/volume_collapse.cpp
     dig/volume_collision.cpp
     dig/volume_mesher.cpp
+    generation/level_manifest.cpp
     generation/map_preset.cpp
     generation/terrain_noise.cpp
     generation/terrain_params.cpp
+    object/object_layer.cpp
     premade/premade_bake.cpp
     premade/premade_map.cpp
     shell/surface_shell.cpp
+    shell/surface_shell_residency.cpp
     streaming/dig_volume_residency.cpp
+    streaming/shell_block_build_pipeline.cpp
     streaming/terrain_tile_build_pipeline.cpp
     streaming/terrain_tile_residency.cpp
     streaming/volume_build_pipeline.cpp
@@ -53,4 +57,5 @@ target_link_libraries(voxel_world
     PUBLIC  voxel_engine              # 公共头暴露 MeshVertex / ITerrainQuery，故为 PUBLIC
     PRIVATE tomlplusplus::tomlplusplus
     PRIVATE zstd::libzstd
+    PRIVATE EnTT::EnTT
 )

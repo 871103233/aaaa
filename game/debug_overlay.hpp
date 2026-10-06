@@ -10,6 +10,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <utility>
 
 struct ImGuiContext;
@@ -51,6 +52,9 @@ struct DebugStats {
     double        cpuUiMs       = 0.0;  ///< 最近一帧 UI 构建耗时（毫秒）
     double        cpuRenderMs   = 0.0;  ///< 最近一帧渲染提交耗时（`RenderFrame` 及其内部上传，毫秒）
     double        swapchainWaitMs = 0.0;  ///< 最近一帧**等待交换链纹理**的毫秒数（T38；取自 `RenderStats`）
+    /// V3：角色附近（提示半径内）传送门的**目标世界 id**；空串 = 附近没有门（HUD 不显示提示）。
+    /// 用目标世界 **id**（而非显示名）是为了在无 CJK 字体时也能纯 ASCII 显示（见 `ui_text.hpp`）。
+    std::string   nearbyPortalTargetId;
 };
 
 /// 极简 ImGui 调试面板（T9）。基于 imgui 的 **SDL3 平台后端 + SDL3_gpu 渲染后端**。

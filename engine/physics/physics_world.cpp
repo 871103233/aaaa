@@ -3,6 +3,10 @@
 #include "physics/physics_world.hpp"
 
 #include "core/log.hpp"
+#include "render/mesh_renderer.hpp"  // MeshData / MeshVertex（PrepareMeshShape 的便捷重载）
+
+#include <memory>
+#include <vector>
 
 #include <Jolt/Jolt.h>
 
@@ -463,6 +467,61 @@ bool PhysicsWorld::UpdateHeightField(BodyHandle handle, const HeightFieldDesc& d
     m_impl->system->GetBodyInterface().SetShape(bodyID, shape, /*inUpdateMassProperties=*/false,
                                                 JPH::EActivation::DontActivate);
     return true;
+}
+
+/// `PreparedMeshShape` 的**定义**（不透明：只在物理层可见 ⇒ 公共头不泄漏 Jolt 类型）。
+class PreparedMeshShape {
+public:
+    JPH::ShapeRefC shape;
+};
+
+std::shared_ptr<PreparedMeshShape> PrepareMeshShape(const float* positions, std::size_t vertexCount,
+                                                    const std::uint32_t* indices, std::size_t triangleCount) {
+    if (positions == nullptr || indices == nullptr || vertexCount == 0U || triangleCount == 0U) {
+        return nullptr;
+    }
+    PhysicsWorld::MeshDesc desc;
+    desc.positions     = positions;
+    desc.vertexCount   = vertexCount;
+    desc.indices       = indices;
+    desc.triangleCount = triangleCount;
+    JPH::ShapeRefC shape = build_mesh_shape(desc);
+    if (!shape) {
+        return nullptr;  // 构建失败（Jolt 报错已在 build_mesh_shape 内记录）
+    }
+    auto prepared   = std::make_shared<PreparedMeshShape>();
+    prepared->shape = std::move(shape);
+    return prepared;
+}
+
+std::shared_ptr<PreparedMeshShape> PrepareMeshShape(const MeshData& mesh) {
+    if (mesh.vertices.empty() || mesh.indices.empty()) {
+        return nullptr;
+    }
+    std::vector<float> positions;
+    positions.reserve(mesh.vertices.size() * 3U);
+    for (const MeshVertex& vertex : mesh.vertices) {
+        positions.push_back(vertex.position[0]);
+        positions.push_back(vertex.position[1]);
+        positions.push_back(vertex.position[2]);
+    }
+    return PrepareMeshShape(positions.data(), mesh.vertices.size(), mesh.indices.data(), mesh.indices.size() / 3U);
+}
+
+PhysicsWorld::BodyHandle PhysicsWorld::AddMesh(const PreparedMeshShape& prepared, double originX, double originY,
+                                               double originZ) {
+    if (!prepared.shape) {
+        return 0;
+    }
+    JPH::BodyCreationSettings bodySettings(prepared.shape, m_impl->ToLocalPosition(originX, originY, originZ),
+                                           JPH::Quat::sIdentity(), JPH::EMotionType::Static, kObjectLayerStatic);
+    const JPH::BodyID bodyID =
+        m_impl->system->GetBodyInterface().CreateAndAddBody(bodySettings, JPH::EActivation::DontActivate);
+    if (bodyID.IsInvalid()) {
+        VX_LOG_ERROR("创建三角网刚体失败（预构建形状）");
+        return 0;
+    }
+    return m_impl->RegisterBody(bodyID);
 }
 
 PhysicsWorld::BodyHandle PhysicsWorld::AddMesh(const MeshDesc& desc) {

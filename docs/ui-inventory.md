@@ -113,9 +113,13 @@
 | --- | --- | --- | --- |
 | 世界坐标 `X / Y / Z` | 角色**脚底**的世界坐标（格，`double`，显示 1 位小数） | **已实现** | 只读；与 F1 面板「角色 · 位置」同源（同一个 `DebugStats::characterPosition`） |
 | 所在格 | 上述坐标向下取整的整数格 `(x, y, z)` | **已实现** | 只读；与 F1 面板「所在格」同源 |
+| **传送门交互提示**（V3） | 角色走近传送门（≤ `kPortalPromptRadius` = 4 格）时出现一行：`靠近传送门「<目标世界 id>」：按 E 传送` | **已实现**（2026-10-06） | 只在**附近有门**时出现（否则整行隐藏，含分隔线）；文案为**通用占位**（门的命名 / 为何能传送待所有者提供，见 [world-setting](world-setting.md) §3）；用**目标世界 id**（纯 ASCII）⇒ 无 CJK 字体时也不缺字 |
 
-> **可读性**：两条动态行均经**标签缝** `ui_text.hpp` 取得格式串（`HudCoordinates` / `HudCoordinatesFormat` / `HudCellFormat`）；
-> 数值本身为纯数字，故**无 CJK 字体时也不会出现缺字 `?`**（有 `ui_text` 单测覆盖）。
+> **可读性**：动态行均经**标签缝** `ui_text.hpp` 取得格式串（`HudCoordinates` / `HudCoordinatesFormat` / `HudCellFormat` /
+> **`PortalPromptFormat`**）；数值与目标世界 id 本身为纯 ASCII，故**无 CJK 字体时也不会出现缺字 `?`**（有 `ui_text` 单测覆盖）。
+>
+> **交互按键（V3）**：走近传送门后按 **`E`**（`ActionId::Interact`）触发世界切换 —— 键位语义见「控制说明」日志；
+> **不按 `E` 绝不切换**（正式玩家路径只有"门 + `E`"）。
 
 ## 3. 设置项与持久化
 

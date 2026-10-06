@@ -1,5 +1,7 @@
 #pragma once
 
+#include "physics/mesh_shape_prepare.hpp"
+
 #include <glm/gtc/quaternion.hpp>
 #include <glm/vec3.hpp>
 
@@ -197,6 +199,14 @@ public:
     /// 创建一个静态三角网碰撞体（例如可挖体积的等值面网格，ADR 0012）。
     /// 返回无效句柄表示创建失败（参数非法等），失败原因写入日志。
     [[nodiscard]] BodyHandle AddMesh(const MeshDesc& desc);
+
+    /// 用**预构建**的网格形状添加一个静态三角网体（W7-S3b① / ADR 0024）。
+    ///
+    /// 形状由 **worker 侧** `PrepareMeshShape` 产出（其 BVH 构建 ≈ 16 ms/块，不得占用渲染帧）；
+    /// 本调用只做"加体"（≪ 1 ms），**主线程**调用。`prepared` 在返回后可析构（形状被刚体持有）。
+    /// 语义与 `AddMesh(MeshDesc)` 一致；形状无效 ⇒ 返回无效句柄。
+    [[nodiscard]] BodyHandle AddMesh(const PreparedMeshShape& prepared, double originX, double originY,
+                                     double originZ);
 
     /// 用新的三角网**重建同一碰撞体**的形状（挖除 / 塌落之后）。
     /// 网格为空（`triangleCount == 0`）返回 false —— 调用方应先 `RemoveBody`。

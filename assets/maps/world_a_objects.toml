@@ -1,0 +1,255 @@
+# 物件放置清单：**大世界 A**（被 assets/maps/world_a.toml 的 `objects_file` 引用）
+#
+# 内容（V8，[ADR 0028](../../docs/adr/0028-world-families-and-static-asset-first.md) §一「差异全部落在清单」）：
+#   - **两个传送门**（V3）：走到附近按 `E` 切到目标世界（B / C）——**不自动切换**；
+#   - **自然物**（V8）：从公共 CC0 素材（Kenney《Nature Kit》，见 NOTICE.md 台账）选抽的 **12 个低模**，
+#     在出生平台附近**程序化散布**（`[[scatter]]`，确定性抖动网格）+ 一个**小营地**（营火 + 木栅，显式摆放）；
+#   - 一个**土堆对照**（可破坏，用于验证"破坏按类型分流"，V6）。
+#
+# 口径：
+#   - `[[placement]]` 的 `position` = **底面中心的世界列坐标**（格），Y 由地表高度求解（本文件的 y 分量不生效）；
+#   - `[[scatter]]` 由**纯函数**生成平面点 + 朝向（同 seed 逐位可复现），Y 同样由地表高度求解；
+#   - `kind = "model"` 的类型必须给出 `model_file`；`half_extent` 是**目标包围盒半尺寸**
+#     （模型**等比**缩放到"装进"该盒 ⇒ 想等比放大，三个分量按模型原始比例给，见下）；
+#   - `material_slot`（仅 model）= 逐顶点**地表材质槽位**（0 草 / 1 土 / 2 岩 / 3 沙）。
+#     **本阶段模型自带贴图不出**（渲染器只有地表 4 槽材质）⇒ 树给草槽、岩石给岩槽、木器给土槽（见 plans/v0.5.md §1.9）。
+# **待补（世界观，SKILL 六.9）**：门的命名与解释待所有者提供（见 docs/world-setting.md §3）；自然物为**通用自然物**，无需设定。
+
+schema_version = 1
+destructible_enabled = true
+
+# ---------------------------------------------------------------------------
+# 类型表
+# ---------------------------------------------------------------------------
+
+[[type]]
+id = "portal_gate"
+kind = "portal"
+half_extent = [1.0, 1.5, 0.2]   # 门洞半宽 0.6 格、半高 1.1 格（环心线 = 半尺寸 − 管半径）
+destructible = false            # 传送装置不可破坏
+
+[[type]]
+id = "dirt_pile"
+kind = "dirt_pile"
+half_extent = [1.0, 0.75, 1.0]
+destructible = true
+
+# ---- 自然植被（V8；half_extent = 模型原始半尺寸 × 目标缩放，三者同倍 ⇒ 等比、不拉伸）----
+# 原始尺寸见各 GLB 的 POSITION 包围盒（例：tree_default 0.76 × 1.71 × 0.65 ⇒ ×3.5 ≈ 6.0 格高）。
+
+[[type]]
+id = "tree_default"
+kind = "model"
+model_file = "assets/models/nature/tree_default.glb"
+half_extent = [1.33, 2.99, 1.14]   # ×3.5 ⇒ 高 ≈ 6.0 格
+material_slot = 0                  # 草
+destructible = false
+
+[[type]]
+id = "tree_pine"
+kind = "model"
+model_file = "assets/models/nature/tree_pineTallB.glb"
+half_extent = [0.68, 3.38, 0.68]   # ×3.5 ⇒ 高 ≈ 6.8 格
+material_slot = 0
+destructible = false
+
+[[type]]
+id = "tree_oak"
+kind = "model"
+model_file = "assets/models/nature/tree_oak.glb"
+half_extent = [1.44, 2.77, 1.67]   # ×4.5 ⇒ 高 ≈ 5.5 格
+material_slot = 0
+destructible = false
+
+[[type]]
+id = "bush"
+kind = "model"
+model_file = "assets/models/nature/plant_bush.glb"
+half_extent = [0.60, 0.36, 0.60]   # ×3.0 ⇒ 高 ≈ 0.72 格
+material_slot = 0
+destructible = false
+
+[[type]]
+id = "grass_tuft"
+kind = "model"
+model_file = "assets/models/nature/grass.glb"
+half_extent = [0.48, 0.31, 0.49]   # ×2.5 ⇒ 高 ≈ 0.63 格
+material_slot = 0
+destructible = false
+
+[[type]]
+id = "flower_red"
+kind = "model"
+model_file = "assets/models/nature/flower_redA.glb"
+half_extent = [0.20, 0.36, 0.23]   # ×2.5 ⇒ 高 ≈ 0.73 格
+material_slot = 0
+destructible = false
+
+[[type]]
+id = "mushroom"
+kind = "model"
+model_file = "assets/models/nature/mushroom_red.glb"
+half_extent = [0.21, 0.25, 0.25]   # ×2.5 ⇒ 高 ≈ 0.50 格
+material_slot = 1                  # 土（占位：无独立菌类材质）
+destructible = false
+
+# 水系点缀：高叶丛（芦苇 / 水草的通用替代；沿水边撒）
+[[type]]
+id = "reed"
+kind = "model"
+model_file = "assets/models/nature/plant_flatTall.glb"
+half_extent = [0.41, 0.42, 0.41]   # ×3.0 ⇒ 高 ≈ 0.84 格
+material_slot = 0
+destructible = false
+
+# ---- 岩石 / 巨石 ----
+[[type]]
+id = "boulder"
+kind = "model"
+model_file = "assets/models/nature/rock_largeA.glb"
+half_extent = [1.37, 0.46, 1.79]   # ×3.5 ⇒ 高 ≈ 0.91 格 / 长 ≈ 3.6 格
+material_slot = 2                  # 岩
+destructible = false
+
+[[type]]
+id = "pebble"
+kind = "model"
+model_file = "assets/models/nature/rock_smallB.glb"
+half_extent = [0.54, 0.27, 0.54]   # ×3.0 ⇒ 高 ≈ 0.54 格
+material_slot = 2
+destructible = false
+
+# ---- 中立小道具（营火 / 木栅；无世界观语义）----
+[[type]]
+id = "campfire"
+kind = "model"
+model_file = "assets/models/nature/campfire_logs.glb"
+half_extent = [0.87, 0.18, 0.87]   # ×6.0 ⇒ 直径 ≈ 1.7 格
+material_slot = 1                  # 土（木料占位）
+destructible = false
+
+[[type]]
+id = "fence"
+kind = "model"
+model_file = "assets/models/nature/fence_simple.glb"
+half_extent = [1.75, 0.61, 0.12]   # ×3.5 ⇒ 长 ≈ 3.5 格 / 高 ≈ 1.2 格
+material_slot = 1                  # 土（木料占位）
+destructible = false
+
+# ---------------------------------------------------------------------------
+# 显式放置（2 个传送门 + 1 个土堆 + 一个小营地）
+# ---------------------------------------------------------------------------
+
+# ---- 两个传送门：出生平台（±64 格压平至 120 格）上，出生点东 / 西两侧 ----
+[[placement]]
+type = "portal_gate"
+position = [12.0, 0.0, 0.0]
+yaw_deg = 90.0                  # 门洞面向东西向的走近方向
+target_world = "world_b"
+
+[[placement]]
+type = "portal_gate"
+position = [-12.0, 0.0, 0.0]
+yaw_deg = 90.0
+target_world = "world_c"
+
+# ---- 土堆对照 ----
+[[placement]]
+type = "dirt_pile"
+position = [0.0, 0.0, 12.0]
+
+# ---- 小营地（出生点东南）：营火居中，三面木栅围出半圈、朝出生点一侧留口（不封死，可走进去）----
+[[placement]]
+type = "campfire"
+position = [6.0, 0.0, -6.0]
+
+[[placement]]
+type = "fence"
+position = [6.0, 0.0, -7.75]
+yaw_deg = 0.0
+
+[[placement]]
+type = "fence"
+position = [6.0, 0.0, -4.25]
+yaw_deg = 0.0
+
+[[placement]]
+type = "fence"
+position = [7.75, 0.0, -6.0]
+yaw_deg = 90.0
+
+# ---------------------------------------------------------------------------
+# 程序化散布（出生平台附近；确定性抖动网格，同 seed 逐位可复现）
+# 半径 80 格：整片都落在启动常驻窗口（半径 32 tile = 2048 格）内 ⇒ 地表高度必然可解。
+# 种子各不相同 ⇒ 各类之间互不"对齐"；同一类再改 seed 即换一套布局。
+# ---------------------------------------------------------------------------
+
+[[scatter]]
+type = "tree_default"
+center = [0.0, 0.0]
+radius = 80.0
+count = 18
+seed = 1001
+
+[[scatter]]
+type = "tree_pine"
+center = [0.0, 0.0]
+radius = 80.0
+count = 12
+seed = 1002
+
+[[scatter]]
+type = "tree_oak"
+center = [0.0, 0.0]
+radius = 80.0
+count = 10
+seed = 1003
+
+[[scatter]]
+type = "bush"
+center = [0.0, 0.0]
+radius = 80.0
+count = 16
+seed = 1004
+
+[[scatter]]
+type = "grass_tuft"
+center = [0.0, 0.0]
+radius = 80.0
+count = 22
+seed = 1005
+
+[[scatter]]
+type = "flower_red"
+center = [0.0, 0.0]
+radius = 80.0
+count = 14
+seed = 1006
+
+[[scatter]]
+type = "mushroom"
+center = [0.0, 0.0]
+radius = 80.0
+count = 10
+seed = 1007
+
+[[scatter]]
+type = "reed"
+center = [0.0, 0.0]
+radius = 80.0
+count = 12
+seed = 1008
+
+[[scatter]]
+type = "boulder"
+center = [0.0, 0.0]
+radius = 80.0
+count = 6
+seed = 1009
+
+[[scatter]]
+type = "pebble"
+center = [0.0, 0.0]
+radius = 80.0
+count = 12
+seed = 1010

@@ -68,6 +68,38 @@ ShellBlockSpan ComputeShellBlockSpanY(const TerrainNoiseGenerator& noise, const 
     return span;
 }
 
+ShellBlockSpan ComputeShellBlockSpanYCoarse(const TerrainNoiseGenerator& noise, const SurfaceShellParams& params,
+                                            int blockX, int blockZ, int sampleStepBlocks,
+                                            int marginHeightBlocks) noexcept {
+    const int originX = BlockOriginBlocks(blockX);
+    const int originZ = BlockOriginBlocks(blockZ);
+    const int step    = (sampleStepBlocks > 0) ? sampleStepBlocks : 1;
+    const float margin = (marginHeightBlocks > 0) ? static_cast<float>(marginHeightBlocks) : 0.0F;
+
+    float minHeight = 1.0e9F;
+    float maxHeight = -1.0e9F;
+    // 采 `0, step, 2*step, ...` 并**始终**包含 `kVolumeBlockSize`（块右 / 上边界列）。
+    for (int dz = 0; dz <= kVolumeBlockSize; dz += step) {
+        for (int dx = 0; dx <= kVolumeBlockSize; dx += step) {
+            const float height = HeightToBlocks(noise.HeightUnits(originX + dx, originZ + dz));
+            minHeight          = std::min(minHeight, height);
+            maxHeight          = std::max(maxHeight, height);
+        }
+    }
+    const float heightRight = HeightToBlocks(noise.HeightUnits(originX + kVolumeBlockSize, originZ));
+    const float heightTop   = HeightToBlocks(noise.HeightUnits(originX, originZ + kVolumeBlockSize));
+    minHeight               = std::min(minHeight, std::min(heightRight, heightTop));
+    maxHeight               = std::max(maxHeight, std::max(heightRight, heightTop));
+
+    const float band = params.bandHalfThicknessBlocks;
+    ShellBlockSpan span;
+    span.minBlockY =
+        static_cast<int>(std::floor((minHeight - band - margin) / static_cast<float>(kVolumeBlockSize)));
+    span.maxBlockY =
+        static_cast<int>(std::floor((maxHeight + band + margin) / static_cast<float>(kVolumeBlockSize)));
+    return span;
+}
+
 SurfaceShellSampler::SurfaceShellSampler(const TerrainNoiseGenerator& noise,
                                          const TerrainGenerationParams& generation, const SurfaceShellParams& params,
                                          const SurfaceShellRegion& region, BlockCoord block,

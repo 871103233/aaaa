@@ -16,7 +16,7 @@
 | GoogleTest | 单元测试 | BSD-3-Clause | V0.1 |
 | enkits（enkiTS）\* | 任务调度 | zlib | **V0.3（T81 起已真正启用）**：`vcpkg.json` 依赖 `enkits`（实测 **1.12**）；唯一引用点 = `engine/core/task_scheduler.*`（头目录 `include/enkiTS/`，只在 `.cpp` 内出现），首个消费者 = `world/streaming/volume_build_pipeline.*`（可挖体积块构建下沉 worker，见 [ADR 0022](docs/adr/0022-volume-build-worker-pipeline.md)） |
 | Taskflow \* | 任务调度（备选） | MIT | V0.3（备选） |
-| EnTT | ECS | MIT | V0.4 |
+| EnTT | ECS | MIT | **V0.4（V0.5 的 V0 起已真正启用）**：`vcpkg.json` 依赖 `entt`（实测 **3.16.0**）；引用点 = `world/object/object_layer.cpp`（entt 头只在 `.cpp` 内出现，公共头不含；PIMPL 隔离），首个消费者 = **物件层**（[ADR 0004](docs/adr/0004-hybrid-layered-world-representation.md) 层③ / [ADR 0003](docs/adr/0003-ecs-and-third-party-libs.md)） |
 | Jolt Physics（`joltphysics`） | 刚体物理 / 角色碰撞与地形碰撞 | MIT | V0.1 |
 | zstd | 预制地图块压缩（并计划用于存档压缩） | BSD-3-Clause（另有 GPLv2 双许可） | **阶段 W（W2）已引入**：`vcpkg.json` 依赖 `zstd`（实测 **1.5.7**）；唯一引用点 = `world/premade/premade_map.cpp`（`zstd.h` 只在该 `.cpp` 内出现，公共头不含）；消费者 = 预制地图容器（[ADR 0026](docs/adr/0026-premade-map-format-and-bake-tool.md)） |
 | Assimp | 3D 模型加载 | BSD-3-Clause | **V0.3（ⓒ T68）** —— 所有者 2026-09-29 指示由 V0.5 **前移**；**T68 已引入**：`vcpkg.json` 依赖 `assimp`；唯一引用点 = `engine/render/model_loader.cpp`（Assimp 头只在该 `.cpp` 内出现，公共头不含） |
@@ -49,6 +49,7 @@
 | ambientCG | Ground 093 C（地表-沙 / 沙漠沙丘） | 同上 | CC0 1.0 Universal | <https://ambientcg.com/view?id=Ground093C> | 2026-09-29 |
 | Poly Haven | Kloofendal 48d Partly Cloudy（环境 HDRI，户外晴天） | Greg Zaal | CC0 1.0 Universal | <https://polyhaven.com/a/kloofendal_48d_partly_cloudy> | 2026-09-29 |
 | Quaternius（经 Cinevva 分发） | Casual Female（**T69 占位主角**；含 `Idle`/`Walk`/`Run`/`Jump`） | Quaternius | CC0 1.0 Universal | <https://quaternius.com/>（分发页 <https://app.cinevva.com/game-assets/free-3d-character-models>） | 2026-10-05 |
+| Kenney | Nature Kit（**自然物整包**；本项目**选抽 12 个低模**：3 树 / 灌木 / 草 / 花 / 蘑菇 / 高草 / 2 岩石 / 营火 / 木栅） | Kenney | CC0 1.0 Universal | <https://kenney.nl/assets/nature-kit> | 2026-10-06 |
 
 ### 表 2：文件与校验和（`SHA-256`，逐文件）
 
@@ -72,6 +73,18 @@
 | `assets/textures/terrain/sand/ao.jpg` | Ground 093 C | `b327c1c436e1cdf40e85c71ea0dacac4beb647c9e54a1962a95887ba044298a6` |
 | `assets/textures/env/kloofendal_48d_partly_cloudy_2k.hdr` | Kloofendal 48d Partly Cloudy | `3fbd33f279f29bd64925c1dd3214fd46c627493d21f1100248b6b1098da4d06e` |
 | `assets/models/character/Casual_Female.glb` | Casual Female（Quaternius；经 Cinevva 分发） | `3b4f39d27dc8a5f3b42d023f88a928679e7b1b0ea49ddb4857a07399bc4d8332` |
+| `assets/models/nature/tree_default.glb` | Nature Kit（Kenney） | `562d29638c902de3c7bee465d3a53bb77117efbc392ae04ed894faf6b5dc691d` |
+| `assets/models/nature/tree_pineTallB.glb` | Nature Kit（Kenney） | `49b54146351e1e009e97ee592f997a90a16b10c5467baf734d352df1cddec5d1` |
+| `assets/models/nature/tree_oak.glb` | Nature Kit（Kenney） | `d7fd8773674928c50c11b66d12c636d49bdcc15a8b1c7fbb98e6f63a3439a3f3` |
+| `assets/models/nature/plant_bush.glb` | Nature Kit（Kenney） | `ae7b1beb39e242b13f5f29e3ec23ef21034b814f82297b8aa00a9bf4e1b09590` |
+| `assets/models/nature/grass.glb` | Nature Kit（Kenney） | `260e41d3e5f2472492ed7b475c5b92a30b13ce2bad408535b5ff50574d4575e7` |
+| `assets/models/nature/flower_redA.glb` | Nature Kit（Kenney） | `171930b7789ddbf735af3745576b5393750beb9133b9ff4a444bb6bb2986c020` |
+| `assets/models/nature/mushroom_red.glb` | Nature Kit（Kenney） | `843e2de43dce78920a5675a67bac4b72f500e6220315e713fe08381642cfc571` |
+| `assets/models/nature/plant_flatTall.glb` | Nature Kit（Kenney） | `b192523736f32754788de4dc7a5dcf30a58322b260ec8969120c91432a10b633` |
+| `assets/models/nature/rock_largeA.glb` | Nature Kit（Kenney） | `6dd15390fd96501dcd1454765a17ba61dbbd8d47705dfe5149c8dd92b353ce25` |
+| `assets/models/nature/rock_smallB.glb` | Nature Kit（Kenney） | `11b26bc0a12e971a3b69df1401e530e24432d528c262df94b99c412e7f372763` |
+| `assets/models/nature/campfire_logs.glb` | Nature Kit（Kenney） | `98d87cdcf9095b94fd348d0946e911dd4ca6c0956bac3318cfd2b0030b86055a` |
+| `assets/models/nature/fence_simple.glb` | Nature Kit（Kenney） | `ecaf6c29532aa9fd305a8ef71df769d60748bd797f2eb1c63bdefc4edb8062a7` |
 
 **取回命令**（资源不入库 ⇒ 干净克隆后需执行一次）：
 
@@ -85,9 +98,13 @@ powershell -ExecutionPolicy Bypass -File tools\fetch_assets.ps1            # 之
 
 **规格**（T69 消费者需要）：角色模型 = **单文件 GLB** —— `Casual_Female.glb`（**23 关节 / 6,624 三角面 / 17 条动画**，含 `Idle` / `Walk` / `Run` / `Jump`；**无外部贴图依赖**）。
 
+**规格**（V8 消费者需要）：**自然物**模型 = **单文件 GLB**（Kenney《Nature Kit》**选抽 12 个**：`tree_default` / `tree_pineTallB` / `tree_oak` / `plant_bush` / `grass` / `flower_redA` / `mushroom_red` / `plant_flatTall` / `rock_largeA` / `rock_smallB` / `campfire_logs` / `fence_simple`），落到 `assets/models/nature/`。
+**注意**：这些 GLB 自带贴图 / UV，但**本项目当前不渲染模型自带贴图**（渲染器只有地表 4 槽材质）⇒ 按**地表材质槽**着色（见 [`docs/plans/v0.5.md`](docs/plans/v0.5.md) §1.9 的已确认降级）；**逐模型贴图**登记为后续能力。
+
 ## 待办
 
 - [ ] 填入 `LICENSE` 中的 `<COPYRIGHT HOLDER>`（当前为占位符）
 - [ ] 逐项核对上表标 \* 的许可与版本
 - [ ] 首次发布前生成完整的许可原文归档（如 `licenses/` 目录）
 - [x] 首套美术资源（地表 PBR 4 套 + 1 张 HDRI，全部 CC0）来源 / 许可 / 作者 / 采集日期 / SHA-256 已登记（2026-09-29）
+- [x] **自然物素材（Kenney Nature Kit 选抽 12 个 GLB，CC0）**来源 / 许可 / 作者 / 采集日期 / SHA-256 已登记（2026-10-06，V8）

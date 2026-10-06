@@ -4066,4 +4066,539 @@
   3. **S3b 剩余**：Ring 0 体积壳随玩家流式；预制地图按块随机访问接入。
   4. **S4**：10km 烘焙 + 实测（P99 / 帧尖峰 / 常驻量 / 跨环无缝目视）。
 
+## 2026-10-06  规范补充：**已实现能力只允许配置项关闭，不得删除代码**（SKILL）
+
+- 做了什么：`SKILL.md` 第五节增「**已实现能力：只允许用配置项关闭，不得删除代码**」硬规则（来源 = 所有者 2026-10-06：
+  "代码已经实现的能力在后续开发中如果需要关闭，则提供配置项，不删除已经实现的能力代码"，例：地图挖洞 / 挖坑效果）；
+  DoD 增一条对应自检项。规则要点：① 已实现的能力代码**一律不得删除**（含单测 / 能力纯函数），"关掉"必须是**可经配置
+  重新启用的活路径**（不得清空 / 注释 / `#if 0`）；② 关闭走**显式配置项**（默认值 + 取值语义 + 所有入口点统一生效）；
+  ③ 关闭需在 `engine-capabilities.md` 标「已引入未使用 / 休眠」并写明重新启用方法与切换条件；④ 默认关闭时既有测试**逐位不变**。
+- 为什么：把 [ADR 0023](../adr/0023-world-representation-v2-hybrid-shell.md) 的"未用到的能力不删除代码、只休眠"由**单点**升级为
+  **全仓库通用硬规则**（破坏子系统即典型例：W8 休眠但代码 / ADR / 单测全部保留）。与 SKILL 既有的「降级必须先问」互补 ——
+  **删代码**不是降级，是超出"关闭"范畴的动作，须先取得所有者确认。
+- 验证：纯文档改动（`SKILL.md`），不涉及构建 / 测试 / 门禁。
+- 下一步 / 遗留：无。
+
+## 2026-10-06  W7-S3b①：**Ring 0 地表壳随玩家流式**（策略层 + worker 构建 S1/S2）
+
+- 做了什么（细则见 [plans/v0.4.md §1.13](plans/v0.4.md)）：
+  1. **S1 策略层**：**新增** `world/shell/surface_shell_residency.{hpp,cpp}` —— `SurfaceShellWindow` +
+     `MakeSurfaceShellRegion`（覆盖 tile `[center ± r]` ⇒ 列边界是 `kTerrainTileSize` 的倍数、**同时 block 对齐**；
+     钳制到世界列范围；空范围 ⇒ 空区域）+ `SurfaceShellRebuildRingThickness`（`ceil(edgeFadeBlocks / kVolumeBlockSize)`）
+     + `PlanSurfaceShellResidency`（目标集 = 区域内列块 × `ComputeShellBlockSpanY`；产出 `toLoad` / `toUnload` /
+     **`toRebuild`**：区域中心一动 ⇒ 最外 `thickness` 圈列块的边界淡出值变 ⇒ 需重建，∩ 常驻）。三清单**升序、只由入参决定**。
+  2. **S2 worker 构建**：**新增** `world/streaming/shell_block_build_pipeline.{hpp,cpp}`（照 [ADR 0022](../adr/0022-volume-build-worker-pipeline.md) 形态）——
+     worker 跑纯函数 `BuildShellBlockMesh`；请求携带 **`SurfaceShellRegion` 快照**（边界淡出依赖区域 ⇒ 必须随请求固化，
+     worker 不读任何可变状态）；河道下切场以 `const RiverCarveField*` 只读传入（`CarveAt` 无状态 ⇒ 并发只读安全）；
+     唯一互斥量只保护完成队列；线程池不可用 ⇒ WARN + 同步回退（结果不变）。
+  3. **新增单测 13 项**：`tests/shell_block_residency_test.cpp`（区域对齐 / 钳制 / 空区域 / 负半径 / 重建厚度 /
+     确定性升序 / 集合差 / 最外圈重建 / 空区域卸载 / 负坐标）+ `tests/shell_block_build_pipeline_test.cpp`
+     （同步回退逐位一致 / 真 worker 逐位一致 / **区域快照确实影响几何**）。
+- 为什么：
+  1. **按 S1~S4 分步交付**（与 W7 自身口径一致，每步独立可验证）：先落**纯策略层**（无行为变化、可单测钉死）与
+     **worker 构建**，再做游戏层接入（动态区域 / 分帧建卸 / 碰撞体增删 / 接管翻转），把风险集中在 S3。
+  2. **为什么带区域快照**：壳密度含 `EdgeFade(到区域边界的距离)` ⇒ 区域一动，边界圈的块内容就变；
+     把区域放进请求 ⇒ worker 结果**可复现**、不会随主线程状态漂移（与地形 tile 的"过滤留主线程"是两处不同的可变性处理）。
+  3. **已知代价已显式登记**：`toRebuild`（区域外圈重建）是"边界淡出随区域移动"的直接后果，写在计划里、不是静默行为。
+- 验证（真实输出）：
+  1. **构建**：`cmake --build --preset debug` ⇒ 退出码 0、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug -j 6` ⇒ **476/476 passed**（463 → 476，+10 `SurfaceShellResidency.*` +3 `ShellBlockWorker.*`）。
+  3. **门禁**：`check-banned-identifiers.ps1` ⇒ `scanned 169 file(s), 0 violation(s)` / EXIT=0。
+  4. 踩坑：首次链接失败 `LNK1168 无法打开 voxel_game.exe`（残留进程锁住 exe）⇒ `taskkill /F /IM voxel_game.exe` 后正常。
+- 下一步 / 遗留：
+  1. **S3b①-S3（游戏层接入）**：动态 `SurfaceShellRegion`（随玩家 tile + `TerrainHysteresisCenterTile` 滞回）+
+     分帧建 / 卸（含 `AddMesh` / `RemoveBody` 的碰撞体增删）+ **接管翻转**（区域变化 ⇒ 对受影响地表 tile 提交 `remeshOnly`
+     ⇒ 既有 `drain` / `InstallRemeshedMesh`（**会重新应用当前过滤器**）自动完成"壳接管 / 交还"）。
+     **规模须实测**：Ring 0 ≈ 2300~3500 个壳块 + 同量级 Jolt 静态体 ⇒ 在 S3 冒烟里量 CPU / VRAM / 帧时间。
+  2. **河道当前是"区域相对"的**（`GenerateRiverPath` 取**区域内**最高列）：壳区域一动，河道就会变 ⇒ 本批**不动河道**，
+     壳的河道下切场仍绑在原点近场（与今天可见行为一致，无回退）；**"河道随世界锚定 + 随区域流式"登记为 W7 后续项**。
+  3. **S3b②**：预制地图按块随机访问接入运行时。
+
+## 2026-10-06  W7-S3b①-S3 尝试：**Ring 0 壳流式的实测阻塞**（游戏层已回滚，待裁决）
+
+- 做了什么：按 §1.13 的 S3 实现了游戏层接入（动态 `SurfaceShellRegion` + 滞回、分帧建 / 卸、
+  `AddMesh` / `RemoveBody` 碰撞体增删、**接管翻转**：受影响的 tile 走既有 `remeshOnly` ⇒ `InstallRemeshedMesh`
+  重新应用**当前**过滤器、`ShellQuadFilter` 改为按**已安装壳块集合**判定（避免空洞 / 掉穿））。
+  实现完成后**实机冒烟暴露严重性能问题**，故**回滚 `game/main.cpp`**（`git checkout -- game/main.cpp`），
+  只保留 S1/S2 模块与其单测（`ctest` **477/477**、门禁 **172 文件 0 违规**、构建零警告）。
+- 为什么回滚（**实测数据，违反 SKILL 第四节"不冻结画面 / hitch-free"，不是主观判断**）：
+  1. **规模**：Ring 0 = 玩家 tile ± 8 ⇒ 区域列 `[-512, 576)²` ⇒ **目标 4085 个壳块**
+     （17×17 tile = 1156 个列块 × 平均 ≈ 3.5 个 Y 块）。
+  2. **首次规划冻结 1.05 s**（日志 `帧尖峰 1078.6 ms：逻辑 1054.99`）：`ComputeShellBlockSpanY` 每个列块要采
+     `34×34` 列高度 ⇒ **≈ 0.9 ms/列块**，整环 1156 列块 ≈ **1.04 s**（主线程）。
+     即便加列块 Y 范围缓存，**每跨一个 tile 新进入的 ~68 个列块仍 ≈ 61 ms**（仍超一帧预算）。
+  3. **运行期持续尖峰 ~176–261 ms**（逻辑 172–257 ms，阈值 33 ms）：**安装一块壳块的实测成本 ≈ 50 ms**
+     （`renderer.UploadMesh` 阻塞拷贝 + Jolt `MeshShape` 三角网 BVH 构建），按 `kShellBuildsInstalledPerFrame = 4`
+     ⇒ ~200 ms/帧；4085 块按 4/帧需 ~1000 帧，**窗口永远追不上**（日志中无任何"调整完毕"）。
+- 结论：**"Ring 0 ± 8 tile 的体积壳 + 逐块 Jolt MeshShape"在本架构下超预算**（与 §1.13 登记的"规模提示"吻合）。
+  这不是可以靠"少装几个 / 加缓存"解决的小问题 —— 两项成本（**逐列块噪声采样** 与 **逐块三角网碰撞体 + 阻塞上传**）
+  都随块数线性增长，而块数由 Ring 0 面积决定。
+- 影响与待裁决（**降级必须先问**，未擅自缩小环半径）：
+  1. **壳半径**：是否把 Ring 0 的**壳**覆盖缩到 ±4 / ±2 tile（**偏离 ADR 0024 的 "Ring 0 = 512 m 体积壳"**，
+     属降级 ⇒ 需所有者确认）；或维持 ±8 但**只保留渲染、不建逐块碰撞**（碰撞仍由高度场承担，
+     代价 = 洞口 / 悬垂处**无碰撞**，须按「世界内一致性」评估）。
+  2. **Y 范围口径**：是否允许由"逐列块 34×34 采样取 min/max"改为**近似（粗采样 + 安全余量）**，
+     并把结果在**加载期**离线算好（消除主线程逐列块采样）。
+  3. **逐块碰撞体的代价**：是否改用"近场更小半径的碰撞子集"（只给玩家周围 N tile 内的壳块建碰撞），
+     或**共享 / 合并**壳块碰撞体（减少 Jolt body 数）。
+- 验证（真实输出）：`build\w7s3b1_smoke.log`（1 km `test_range`）：首个尖峰 `1078.6 ms`（逻辑 1054.99）；
+  随后 `261.5 / 208.3 / 200.9 / 216.9 / … ms`（逻辑 ~172–257）；`目标 4085 块`、`列块缓存 1156`。
+- 下一步 / 遗留：**等所有者对上面 1~3 项给出方向**，再重做 S3（模块与单测已在位，可直接复用）。
+
+## 2026-10-06  W7-S3b①-S3 重做（±4 tile + 粗采样）：**规划冻结已消除，仍受阻于 Jolt 形状构建**
+
+- 背景：所有者裁定**缩到 ±4 tile（256 m）**（对 ADR 0024 "Ring 0 = 512 m 体积壳" 的降级，已确认）。
+- 做了什么（性能修复两件，均已落库并单测）：
+  1. **粗采样 + 高度余量的 Y 范围**：新增 `ComputeShellBlockSpanYCoarse`（每 `4` 列采一次高度 + `16` 格高度余量；
+     余量取"高度"而非"Y 块"⇒ 最多外扩 1 个块）；`SurfaceShellSpanCache::SpanOf` 改用它。
+     新增单测 `CoarseSpanContainsExactSpan`（**保守性**：粗范围必须 ⊇ 逐列范围，169 个列块全过）。
+  2. **±4 tile** + 安装预算 2 块/帧。
+- 实测（`build\w7s3b4_smoke.log`，1 km）：
+  - **规划冻结已消除**：目标 **1457** 块（原 4085），规划日志即时出现（**不再有 1.05 s 冻结**）；
+  - **仍受阻**：帧尖峰 **184 / 291 ms**（逻辑 177 / 285），根因 = **`JPH::MeshShape` 构建 ≈ 16 ms/块**
+    （本工程既有实测值，见 `engine/physics/physics_world.cpp` 的 `FavorBuildSpeed` 注释）× 1457 块 ≈ **23 s**，
+    且每个固定步都装 2 块（多步帧会叠成 5×2=10 块 ≈ 160–285 ms）⇒ **无法塞进任何每帧预算**。
+  - `renderer.UploadMesh` **不是**瓶颈（T75 起"提交即走"、不建 transfer buffer、不等 fence）。
+- 结论与建议修复（**需批准，属引擎层 API 变更**）：
+  - **A（推荐）**：把 `MeshShape`（BVH）构建**下沉 worker** —— 新增"**从预构建形状句柄添加静态网体**"的引擎 API
+    （`PhysicsWorld` 收 worker 产出的不透明形状句柄；公共头不泄漏 Jolt 类型），主线程只做廉价的"加体 / 移体"。
+    这样 1457 块的 23 s 分摊到 11 个 worker ≈ 2 s，主线程每帧只加 1–2 个体（≪ 1 ms），**碰撞可覆盖全部壳块**。
+  - **B**：只为玩家周围更小半径（±1~2 tile）的壳块建碰撞（随移动重建，仍有 ~16 ms 尖峰）。
+  - **C**：壳**不建碰撞**（碰撞仍由高度场承担）—— 代价 = 洞口 / 悬垂处无碰撞（须按「世界内一致性」评估）。
+- 现状：`game/main.cpp` 已**再次回滚**（模块 + 单测保留：`ctest` **478/478**、构建零警告）。
+- 下一步 / 遗留：**等所有者对 A / B / C 给出选择**再落地。
+
+## 2026-10-06  W7-S3b①-S3 落地（方案 A：形状 BVH 下沉 worker）+ 实测收口
+
+- 做了什么（**已落库**，非回滚）：
+  1. **引擎新增"预构建形状"API**：`engine/physics/mesh_shape_prepare.hpp` —— 不透明类型 `PreparedMeshShape` +
+     `PrepareMeshShape(...)`（**worker 侧**构建 `JPH::MeshShape`，返回 `shared_ptr` 以支持前置声明下的销毁）；
+     `PhysicsWorld::AddMesh(const PreparedMeshShape&, ox, oy, oz)`（**主线程**只加体）。公共头**不泄漏 Jolt 类型**。
+  2. `ShellBlockBuildPipeline` 的 worker 在产出网格后**顺带预构建形状**（`result.shape`）；
+     `game/main.cpp` 用 `physics.AddMesh(*built.shape, ...)` 安装（加体）。
+  3. 游戏层接入：动态壳区域（±4 tile + 滞回）、分帧建 / 卸、碰撞体增删、**接管翻转**（受影响 tile 走既有
+     `remeshOnly` ⇒ `InstallRemeshedMesh` 重新应用当前过滤器）、`ShellQuadFilter` 按**已安装壳块集合**判定（无空洞 / 不掉穿）。
+- 实测（`build\w7s3b6_smoke.log` / `w7s3b7`，1 km）：
+  - **功能成立**：目标 **1457** 块（有可见面 765），**全部流式装入并打出"常驻集合已随窗口调整完毕"**；
+    运行期跟随玩家 tile 变化（(-1,0) → (-1,-1)）重新规划（待建 / **待重建** / 待卸），无 ERROR、无空洞 / 掉穿。
+  - **`MeshShape` 下沉 worker 生效**：worker 侧单块峰值 261 ms，但**主线程**不再付 BVH 成本。
+  - **仍有尖峰（未达标）**：`kShellBuildsInstalledPerFrame = 4` 时 ~170–230 ms；降到 **1** 后 ~**35–67 ms**
+    （首帧一次 **202 ms**）。两个来源：**① 单块安装 ≈10 ms**（`UploadMesh` 每次**新建** GPU 顶点 / 索引缓冲，无池）；
+    **② 渲染提交**（壳块使 draw call 升到 ~1600，单帧 50 ms ⇒ 即 §3 已登记的 S4 渲染 / 级联瓶颈）。
+  - 另：预算太小 ⇒ 1457 块按 1/步要 ~60 s 才装满，**跟不上移动**（玩家持续漂移时长期追赶）。
+- 结论：**功能完成、性能未达标**（不满足 P99 ≤ 2×预算 / 无 >50 ms 单帧）。未按"已完成"结案；属 **S4 性能收口**。
+- 下一步 / 遗留（需继续）：
+  1. **GPU 缓冲池**：壳块网格走池化 / `UpdateMeshGeometry` 复用（消掉每次新建缓冲的 ~10 ms）。
+  2. **安装按"每帧"而非"每步"限流**（固定步每帧可跑多次 ⇒ 需帧级预算闸门）。
+  3. **渲染提交**：壳块使 draw call 翻倍 ⇒ 按 §3「实测的新瓶颈」处理（级联正交盒剔除投射体 / 合并远景）。
+  4. 跨环 / 边界**目视**与 10 km 飞越验收（S4）仍待做。
+
+## 2026-10-06  需求重规划：**回滚壳流式 + ADR 0028（世界族 + 静态资产优先）+ 新阶段 v0.5**
+
+- 背景（所有者 2026-10-06）：① 指出"之前游戏是流畅的，现在卡顿"（由本轮 W7-S3b① 壳流式引入）；
+  ② 重新规划需求：**10 km 预制静态大世界**（绝大多数不可破坏、**小部分可破坏**）+ **1 km 预制小世界**（部分可破坏）
+  + **按规范随机生成的临时地图**（**肉鸽**，部分可破坏）；③ 明确 **"地图采用 AAA 方案：建筑 / 地宫 / 洞府 / 房间
+  几乎全是静态资产；地形只管'地面与大尺度形体'"**；④ 性能优先、地图可用**最简单的高度场**。
+- 做了什么：
+  1. **回滚**：`git checkout -- game/main.cpp` ⇒ 恢复改动前的流畅基线（固定近场壳、加载期建好）。
+  2. **规范**：`SKILL.md` 第五节增硬规则「**地图与空间表示：静态资产优先**」（地形只管地面/大尺度；人工可进入空间用
+     静态资产；只有"要挖穿的"才用体素 + 标记区域；运行期不生成几何/不烘碰撞），DoD 增对应自检项。
+  3. **决策**：新增 **[ADR 0028](adr/0028-world-families-and-static-asset-first.md)**（世界族与实例切换 + 静态资产优先），
+     **取代** W7-S3b①，并**取代** [ADR 0024](adr/0024-terrain-streaming-and-lod.md) §二 的"Ring 0 = 512 m 体积壳"口径；
+     `adr/README.md` 增 0028 行 + 阶段计划表更新。
+  4. **计划**：新增 **[`plans/v0.5.md`](plans/v0.5.md)**（阶段 V0.5：三世界 A/B/C + F 传送 + 可破坏土堆，含 V1~V7 分解、
+     验收判据、3A 对照与 V6 待确认项）；`v0.4.md` §3 标注 S3b① **已取代并回滚**（保留其实测数据作为"不做密集体积壳"的证据）。
+  5. **需求登记**：`game-design.md` §5.1（三类世界需求表 + 待确认项）；`world-setting.md` §3（传送/秘境设定 **待所有者提供**）。
+- 为什么：这是**方向性变更**（世界表示 + 破坏作用域 + 地图方案），按 SKILL 必须**先落 ADR 与计划再动手**；
+  且"静态资产优先"直接来自所有者本次要求，需写进规范以免以后再走回"体素表达建筑/地宫"。
+- 验证（真实输出）：构建**零警告**、`ctest` **478/478**、门禁 **173 文件 0 违规**；`game/main.cpp` 已回滚（无 diff）。
+- 下一步 / 遗留：
+  1. **v0.5 的 V1（世界清单）→ V2（世界切换管理器 + 加载界面）→ V3（A 上两个交互点）→ V4/V5（B/C）→ V6（土堆）→ V7（性能验收）**。
+  2. **待所有者确认（阻塞 V6）**：土堆用**高度场隆起**（建议，复用既有笔刷 + 标记区域）还是**物件层实体**（需先补物件层能力）；
+     以及摆放**触发方式**与**土堆尺寸**。
+  3. **待所有者提供设定**：传送点 / 秘境的**世界观解释与命名**（AI 不代拟）。
+
+---
+
+## 2026-10-06  V0 落地：**物件层起步**（类型表 / 放置清单 + EnTT `ObjectLayer`；ADR 0004 层③）
+
+- 背景：所有者"开始做物件层能力"；依据 [ADR 0028](adr/0028-world-families-and-static-asset-first.md) 决策二（人工可进入空间 = **静态资产**）
+  与 [ADR 0004](adr/0004-hybrid-layered-world-representation.md) **层③「物件/建造」**；施工细则见 [`plans/v0.5.md`](plans/v0.5.md) §1.3。
+  V0 是 V6「土堆 = 物件层实体」的**前置能力**。
+- 做了什么：
+  1. **依赖启用**：`vcpkg.json` 增 **`entt`**（此前虽在 ADR 0003 规定用 ECS，但依赖清单里漏了）；根 `CMakeLists.txt` 增
+     `find_package(EnTT CONFIG REQUIRED)`；`world/CMakeLists.txt` 登记源文件 + 链接 `EnTT::EnTT`；`tests/CMakeLists.txt` 登记新测试。
+  2. **新增** `world/object/object_layer.{hpp,cpp}`：
+     - **`ObjectTable`**（数据层）：类型表 `[[type]]`（`id` / `ObjectAssetKind`：`DirtPile` / `Stone` / `Crate` / `half_extent` 三分量 /
+       `destructible`）+ 放置清单 `[[placement]]`（`type` + 底面中心世界坐标 + `yaw_degrees`），`LoadFromFile` 用 toml++ 解析；
+       校验 `schema_version` / 缺字段 / 重复 id / 未知形态 / 非正尺寸 / 引用不存在的类型，**任一失败抛 `std::runtime_error`**（ADR 0005）。
+     - **`ObjectLayer`**（机制层）：`Impl` 持有 **`entt::registry`** + `byId` 映射 + `order` 顺序表；`Place` 建实体（`Transform` + `TypeRef` 组件）
+       并返回**从 1 递增**的稳定 id；`Remove` / `Get` / `ForEach`（**遍历 = 放置顺序，确定性**）/ `Count` / `Clear`。
+       **公共头不含任何 entt 类型**（PIMPL 隔离，与 `terrain_noise` 同口径）。
+  3. **配置** `assets/config/objects.toml`（`schema_version = 1`）：土堆（`dirt_pile`，可破坏）/ 石块（`stone_boulder`，不可破坏）/
+     木箱（`wooden_crate`，可破坏）三个**占位**类型 + 3 条放置。
+  4. **新增** `tests/object_layer_test.cpp` **12 项**：类型表 / 放置清单解析、仓库配置可加载、重复 id / 未知形态 / 非正尺寸 / 缺字段 /
+     引用不存在类型 / 版本不符**皆抛**；`ObjectLayer` 的放置-查询-移除-计数、遍历顺序、未知类型抛、清空后计数与 id 语义。
+- 为什么：
+  1. **按 SKILL「先落计划再动手」**：V0 施工细则（范围 / 顺序 / 落点 / 验收判据 / 3A 基线三问 / 是否降级）已在 `plans/v0.5.md` §1.3 写定。
+  2. **物件 = 实体、几何不写进地形场**：ADR 0004 硬约束 1；物件层是"静态资产"的**机制侧**（谁摆在哪、可不可破坏），
+     与"内容"（具体 glTF 模型）解耦 ⇒ 本期只做**程序化代形**，避免依赖尚未就位的美术 kit 资产。
+  3. **数据驱动 + 非法即抛**：类型表 / 放置清单属外部输入边界，缺失或非法必须中止而非静默回退（ADR 0005，与 `map_preset` / `terrain_material` 同口径）。
+- **降级确认（按 SKILL「降级必须先问」）**：**有**（已在 `plans/v0.5.md` §1.3 登记）——V0 **不含 glTF 模型资产**（只支持程序化代形），
+  **不含与渲染 / 物理的接线**（放下一步 **V0b**）；原因 = 美术 kit 资产尚未就位，先验证物件层**机制**本身。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`cmake --build --preset debug` → 退出码 **0**、**零警告**（`/W4 /WX`）；configure 时自动取回 `entt 3.16.0`。
+  2. **测试**：`ctest --preset debug -j 6` → **490/490 passed**（478 → 490，新增 12 项 `ObjectTable.*` / `ObjectLayer.*`）。
+  3. **门禁**：`check-banned-identifiers.ps1` → `scanned 176 file(s), 0 violation(s)` / `PASS`（173 → 176）。
+- 下一步 / 遗留：
+  1. **V0b**：物件层与**渲染 / 物理接线**（落到 `game/main.cpp`：把 `ObjectLayer` 的实体画出来 + 建简化碰撞体）。
+  2. **V1~V7**：世界清单 → 世界切换（进程内，含加载界面）→ A 两交互点（F）→ B → C → 可破坏土堆 → 性能验收。
+  3. **待所有者提供**：传送点 / 秘境的**世界观设定与命名**（不阻塞技术）；土堆**摆放触发方式与尺寸**（暂定 `G` 键 / 半径 ~2 格、高 ~1.5 格）。
+  4. **本批（W0~W6h + W7 + V0）尚未提交**。
+
+---
+
+## 2026-10-06  V0b 落地：**物件层接线（渲染 + 物理）**（程序化代形 + 静态三角网碰撞体）
+
+- 背景：接 V0（物件层机制）；依据 [`plans/v0.5.md`](plans/v0.5.md) §1.4（V0b 施工细则）与 [ADR 0004](adr/0004-hybrid-layered-world-representation.md)
+  层③「物件 / 建造」/ [ADR 0028](adr/0028-world-families-and-static-asset-first.md) 决策二（人工可进入空间 = 静态资产）。
+- 做了什么：
+  1. **新增** `world/object/object_mesh.hpp`（纯函数，header-only）：
+     - `ObjectMaterialSlot(kind)` —— 逐顶点**材质槽位覆盖**（土堆 = 土 / 石块 = 岩 / 木箱 = 土占位）；
+       不给覆盖时片元会按**地表**规则（高度 + 坡度）着色 ⇒ 平地上的石块会被染成草绿。
+     - `BuildObjectMesh(type)` —— 程序化代形：`Crate` = **盒**、`Stone` = **椭球**（法线取椭球隐函数梯度，
+       非"球面方向近似"）、`DirtPile` = **锥**（侧面解析法线 + 底盘封闭）；三者**底面中心为原点、底面在 `y = 0`**，
+       法线单位且朝外，绕序从外部看为逆时针。
+     - `RotateMeshAboutY(mesh, yawDeg)` —— 位置与法线一起绕 `+Y` 旋转（供静态碰撞体；方向与渲染的四元数同向）。
+  2. **`game/main.cpp` 接线**：加载 `assets/config/objects.toml` → `ObjectLayer::Place` 逐条放置（底面 Y 按
+     `TerrainWorld::QueryHeight` 求解；**无地表数据 ⇒ WARN 并跳过**，不静默猜高度）→ 逐实例 `UploadMesh` +
+     `SetMeshTransform`（旋转四元数）→ 建**静态三角网碰撞体**（`PhysicsWorld::AddMesh`，朝向**烘进顶点** ——
+     静态体没有旋转接口）→ 每帧视锥剔除入绘制列表。首帧剔除日志增列"物件 N/M"。
+  3. **新增** `tests/object_mesh_test.cpp` **7 项**：非空 / 索引合法 / 法线单位且**朝外**（逐三角形绕序校验）/
+     底面在 `y = 0` 且包围盒与半尺寸一致 / 材质槽位 / 构建确定性 / 绕 Y 旋转（含互逆与非方底交换 xz）。
+- 为什么：
+  1. **渲染与碰撞同源**（"谁画谁挡"，本项目既有口径）：两者**共用同一份 `MeshData`** ⇒ 尺寸不可能漂移；
+     碰撞只把朝向烘进顶点（静态体无旋转接口），与渲染施加的四元数同一约定。
+  2. **不静默**：落点无地表数据时**跳过并告警**（ADR 0005 口径）——绝不猜一个高度把物件放到错的位置。
+  3. **提交量由剔除决定**（SKILL 第四节硬规则 3）：物件是静网格，位姿上传时一次登记，每帧只做视锥剔除。
+- **降级确认（按 SKILL「降级必须先问」）**：**有**（已登记 `plans/v0.5.md` §1.4）——① 代形为**程序化几何**
+  （盒 / 椭球 / 锥），**不含 glTF / kit 资产**；② **每实例一份 GPU 网格**（未做实例化 / HLOD）。原因：美术 kit 未就位；
+  实例化 / HLOD 属 ADR 0028 的后续阶段。**切换条件**：kit 资产就位 → 换 glTF；物件数量上量 → 上实例化 / HLOD。
+- **踩坑（已修，值得记录）**：圆锥的环序是**自底向上**（与椭球的"自上向下"相反）⇒ 初版绕序反了、法线朝内；
+  椭球的**两极环会塌缩到一点**，四边形的另一半是**零面积退化三角形** ⇒ 跳过退化三角形。
+  **教训**：程序化网格必须用"逐三角形绕序 vs 逐顶点法线"的**不变量单测**钉死，靠肉眼看不出这些问题。
+- 验证（命令 + 真实结果）：
+  1. **构建**：同一命令内 `Launch-VsDevShell.ps1`（本机 shell 每次独立进程，`INCLUDE` 不跨命令保留）→
+     `cmake --build --preset debug` → 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug -j 6` → **497/497 passed**（490 → 497，新增 7 项 `ObjectMesh.*`）。
+  3. **门禁**：`check-banned-identifiers.ps1` → `scanned 178 file(s), 0 violation(s)` / `PASS`（176 → 178）。
+  4. **运行冒烟**（`build\v0b_smoke.log` / `.err.log`，`--auto-test`）：`物件层就绪（V0b）：放置 3 / 3 个物件
+     （渲染 + 静态碰撞），类型表 3 项`；`首帧视锥剔除（T39）：…物件 3/3 通过…；本帧提交网格 264 个`；
+     **无 ERROR / WARN**、`stderr` 为空（0 行）。
+- 下一步 / 遗留：
+  1. **V1（世界清单）**：`LevelManifest` + A/B/C 三份（10 km / 1 km 预制 / 1 km 随机）→ **V2（世界切换 + 加载界面）**。
+  2. **待人工目视确认**：走近三个物件（土堆 ≈ (6, 6)、石块 ≈ (−8, 4)、木箱 ≈ (3, −5)，yaw 30°）——
+     ① **看得见**且形态 / 材质（土 / 岩）正确；② **挡路**（走向木箱被挡）；③ **可站上去**（跳上土堆）；④ 木箱**朝向**与视觉一致。
+  3. **已知限制（已登记）**：物件为程序化代形（无 glTF / kit 资产）；**每实例一份 GPU 网格**（无实例化 / HLOD）；
+     破坏状态 `Intact` / `Broken` 未消费（V6）。
+  4. **本批（W0~W6h + W7 + V0 + V0b）尚未提交**。
+
+---
+
+## 2026-10-06  V0c 落地：**物件生命周期**（失支撑掉落 + 按类型可破坏 + 配置开关）
+
+- 背景（缺陷 + 所有者裁定）：所有者人工实测报告"在地上挖坑后物件**不掉落、也不被破坏**"。真伪判定：
+  ① **不掉落 = 确认是缺陷** —— 违 SKILL「世界内一致性」的"承重 / 地基被破坏 ⇒ 上部不得**悬空不动**"；
+  ② **不破坏 = 已登记**（V6 未做）。所有者裁定：掉落按 **A（失支撑 ⇒ 转动态刚体）**，破坏按 **C（按类型分流）**，
+  并**做成配置项**、**分别创建实例**供人工测试。施工细则见 [`plans/v0.5.md`](plans/v0.5.md) §1.5。
+- 做了什么：
+  1. **配置项**：`ObjectTable` 增 `destructibleEnabled`（`objects.toml` 的 `destructible_enabled`，**缺省 true**；
+     非布尔 ⇒ 非法即抛）。按 SKILL「已实现能力只允许配置项关闭」：能力可被**一个配置项关掉**，代码与单测一律保留。
+  2. **对照测试实例**：`objects.toml` 放置清单 3 → **5** 条，新增并排的"土堆（可破坏）/ 石块（不可破坏）"一对。
+  3. **新增** `world/object/object_support.hpp`（纯函数）：`ObjectSupportProbes`（底面中心 + 四角，绕 Y 旋转，
+     与 `RotateMeshAboutY` **同一约定**）+ `ObjectHasSupport`（**任一实心即有支撑** ⇒ 只有全部落空才算失去支撑）。
+  4. **`game/main.cpp` 接线**：`ObjectSlot` 扩为完整生命周期（`id`/`type`/`localMesh`/`body`/`position`/`yaw`/`dynamic`/`removed`）；
+     新增 `ConvertObjectToDynamic`（静态三角网 ⇒ **动态凸包刚体**，可带初速；与 ADR 0015/0017 的"失支撑 ⇒ 动态刚体"**同一口径**）、
+     `DestroyObjectSlot`、`BlastObjects`（**按类型分流**）、`CheckObjectSupports`（**每 10 固定步**，放本步末尾 ⇒ 当步的爆炸结果当步可见）；
+     每帧对动态物件取 `GetRigidBodyState` 同步位姿（只推 64 B 变换 + 用**包围球**做剔除包围盒，任意姿态都保守）。
+  5. **新增** `tests/object_support_test.cpp`（4 项：中心 + 四角 / 绕 Y 与渲染同向 / 方底旋转不变 / 任一实心即有支撑）；
+     `tests/object_layer_test.cpp` 增 3 项（开关解析 / 缺省 true / 非布尔即抛）。
+- 为什么：
+  1. **同一口径优先**：掉回复用**既有的 Jolt 动态凸包路径**（不引第二套物理）；判据用与弹道相同的
+     "高度场 + 可挖体积"点查询 ⇒ "谁画谁挡同源"（不会出现"看着还在地上、其实已被挖空"）。
+  2. **不静默**：所有失败路径都 WARN（凸包构建失败保持静态、落点无地表跳过、碰撞体创建失败）。 
+  3. **成本有界**（SKILL 第四节）：支撑检查**按固定步节拍**（每 10 步）而非每帧每步；动态同步只推逐网格常量，不重烘焙顶点。
+- **降级确认（按 SKILL「降级必须先问」，所有者已确认）**：① **无破坏持久化**（存档未开始）；② **无凹形多凸包**；
+  ③ **无多段血条**（`prop_damage_threshold = 0` ⇒ 单发命中即摧毁）；④ 支撑检查为**固定探测点 + 固定节拍**（非连续接触求解）；
+  ⑤ **已是动态的物件**被二次爆炸时**只唤醒**（`PhysicsWorld` 本阶段无"设置线速度"接口）⇒ 不再补冲量。
+  **切换条件**：存档启动 ⇒ 持久化；出现凹形物件 ⇒ 多凸包；需要"打几下才破" ⇒ 接 `destruction.toml` 的伤害预算。
+- 验证（命令 + 真实结果）：
+  1. **构建**：同一命令内 `Launch-VsDevShell.ps1` → `cmake --build --preset debug` → 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug -j 6` → **504/504 passed**（497 → 504，新增 7 项）。
+  3. **门禁**：`check-banned-identifiers.ps1` → `scanned 180 file(s), 0 violation(s)` / `PASS`（178 → 180）。
+  4. **运行冒烟**（`build\v0c_smoke.log` / `.err.log`，`--auto-test`）：`物件层就绪（V0b/V0c）：放置 5 / 5 个物件…可破坏总开关 = 开`；
+     `首帧视锥剔除（T39）：…物件 5/5 通过…；本帧提交网格 266 个`；**无假阳"失去支撑"**（⇒ 探测点不会把出生静态物件误判为悬空）；
+     **无 ERROR / WARN**、`stderr` 为空。
+- 下一步 / 遗留：
+  1. **待人工目视确认（本次重点）**：① 在物件**脚下**炸出坑 ⇒ 物件**掉下去**并停在新地面；② 轰土堆 / 木箱 ⇒ **消失**；
+     ③ 轰石块 ⇒ **不消失**（只被炸飞）；④ 把 `destructible_enabled` 改成 `false` 后重进 ⇒ **任何物件都不消失**。
+  2. **V1（世界清单）**：`LevelManifest` + A/B/C 三份 → **V2（世界切换 + 加载界面）**。
+  3. **V6 仍待做**：运行时**任意位置摆放**可破坏土堆（当前是配置里的固定实例）。
+  4. **本批（W0~W6h + W7 + V0 + V0b + V0c）尚未提交**。
+
+---
+
+## 2026-10-06  V1 落地：**世界清单 `LevelManifest` + A/B/C 三份**
+
+- 背景：接 V0c 继续推进阶段 v0.5；依据 [ADR 0028](adr/0028-world-families-and-static-asset-first.md) §一
+  （"三型世界的差异**全部落在 `LevelManifest`**：数据来源 / 常驻策略 / 破坏策略 / 存档策略 / 生成参数"）与
+  [`plans/v0.5.md`](plans/v0.5.md) §1.6（V1 施工细则）。
+- 做了什么：
+  1. **新增** `world/generation/level_manifest.{hpp,cpp}`：`LevelManifest` = `id` / `name` / **`family`**
+     （`overworld` / `instance_premade` / `instance_roguelike`）/ **`source`**（`procedural` / `premade` + `premade_file`）/
+     **`terrain_preset`**（**引用**一份 `MapPreset`，并把加载结果作为 `terrain` 持有）/ 策略位
+     （`destruction_enabled` / `persistent` / `randomize_seed_on_entry`，**均必填**）+ `ToString` 两个枚举名。
+     **校验即抛**（ADR 0005）：`schema_version`、必填字段、枚举串、`premade` 缺 `premade_file`、
+     `procedural` 带 `premade_file`、`randomize_seed_on_entry` 非 roguelike、roguelike 却 `persistent`、
+     **引用的地形预设非法**（异常被包上"哪个清单引用它"的上下文）。引用路径按**清单所在目录**解析。
+  2. **新增 3 份清单 + 2 份 1 km 地形预设**：`assets/maps/world_a.toml`（10 km，`overworld`，引用既有
+     `world_10km.toml`）、`world_b.toml`（`instance_premade`，`premade_file = "world_b.vxmap"`，引用 `world_b_terrain.toml`）、
+     `world_c.toml`（`instance_roguelike`，`randomize_seed_on_entry = true`，`persistent = false`，引用 `world_c_terrain.toml`）。
+  3. **`game/main.cpp` 增 `--world=<裸 id 或清单路径>`**：裸 id ⇒ `assets/maps/<id>.toml`；给出时地形取**清单引用的地形预设**，
+     日志打印清单全字段；`source = premade` 时打 **WARN**（预制读取在 V4 接入，本次仍程序化生成 —— **不静默**）。
+     **`--map=` 与缺省路径完全不变**（既有验收场景不受影响）。
+  4. **新增** `tests/level_manifest_test.cpp` **14 项**：发布清单三份可加载且字段正确（A/B/C 的族 / 来源 / 半径 / 策略）、
+     地形预设按清单目录解析并真被加载、以及 10 类非法情形（缺 id / 枚举串 / `premade` 缺文件 / `procedural` 带文件 /
+     `randomize` 非 roguelike / roguelike 却 `persistent` / 缺策略位 / 版本不符 / 缺 `terrain_preset` /
+     引用不存在的地形预设 / 引用的地形预设本身非法）。
+- 为什么：
+  1. **单一职责 + 单一事实来源**：`MapPreset` = **地形预设**（种子 / 半径 / 出生点 / 编辑），`LevelManifest` = **世界清单**
+     （族 / 来源 / 策略）—— 清单**引用**地形预设而**不复制**其字段 ⇒ 不会出现"同一结论两处写"（SKILL 技术栈节的口径统一）。
+     **对计划 §1.1 落点的修正**（原写"`map_preset.*` 清单扩展"）已写入 §1.6 并在本条目记录。
+  2. **一条代码路径**（ADR 0028 §一）：引擎与游戏层**不认识"哪个世界"**，只认识清单字段 ⇒ V2 的切换管理器与 V3~V5
+     的世界内容都复用同一条路径。
+  3. **不静默**：所有"声明了但本步不消费"的字段（`premade_file` / `randomize_seed_on_entry` / `persistent`）
+     要么打 WARN（premade），要么在 `engine-capabilities.md` 与 `game-design.md` 明确登记为"未消费 + 何时消费"。
+- **降级确认**：**无降级**（§1.6 已记：本步只做"清单 + 加载"，是 V2~V5 的必要前置）。
+- 验证（命令 + 真实结果）：
+  1. **构建**：同一命令内 `Launch-VsDevShell.ps1` → `cmake --build --preset debug` → 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug -j 6` → **518/518 passed**（504 → 518，新增 14 项 `LevelManifest.*`）。
+  3. **门禁**：`check-banned-identifiers.ps1` → `scanned 183 file(s), 0 violation(s)` / `PASS`（180 → 183）。
+  4. **运行冒烟**（`--auto-test`）：
+     - `--world=world_b`（`build\v1_smoke_b.log` / `.err.log`）：`世界清单（V1）：id=world_b … 族=instance_premade 来源=premade；
+       破坏=开 持久化=是 换种子=否；… 半径 8×8、种子 20261006、出生 (0.0, 0.0)`；`预设地图已加载：…（1×1 km）… tile 半径 [8, 8]（289 个 tile）`；
+       `stderr` **1 行 = 预期的 WARN**（"预制读取将在 V4 接入"）。
+     - `--world=world_c`（`build\v1_smoke_c.log` / `.err.log`）：`id=world_c … 族=instance_roguelike … 换种子=是`；
+       1 km 世界（289 tile、**0 条编辑**）；`物件层就绪…放置 5 / 5`；`stderr` **为空**（0 行）。
+- 下一步 / 遗留：
+  1. **V2（世界切换管理器 + 加载界面）**：进程内切换（卸载当前 → 加载 / 生成目标 → 重建玩家与相机），持续出帧 + 进度可见。
+  2. **未消费（已登记）**：`premade_file` 的读取（V4）、`randomize_seed_on_entry`（V5）、`persistent`（存档未开始）。
+  3. **本批（W0~W6h + W7 + V0 + V0b + V0c + V1）尚未提交**。
+
+---
+
+## 2026-10-06  V2a 落地：**`WorldManager` 逻辑层**（清单注册表 + 切换请求状态机）
+
+- 背景：所有者"进行下一步开发" ⇒ 推进 **V2（世界切换管理器 + 加载界面）**。
+- **尺寸发现（先报告，再改计划）**：`game/main.cpp` **3701 行**，含**世界级局部状态 40+ 个**
+  （`TerrainWorld` / `DigVolumeWorld` + 调度器 + 槽位表 / 地表壳 / tile 数组与调度器 / 两种碰撞体 / `PhysicsWorld` /
+  物件层 / `WorldBounds` / 角色 / 相机 / 延后队列…），而**纹理 / 环境 IBL / 渲染器 / 窗口必须跨世界复用**
+  （重建它们既慢又违背 ADR 0028 决策四）⇒ **V2 不能一步到位**，拆为 **V2a / V2b / V2c**。
+  **这不是降级**（V2 的最终形态与验收不变），是按 SKILL「任务下发」把大重构拆成**可独立验证的小步**；
+  §1.1 原写"V2 = WorldManager + 加载界面"一行，现细化为 §1.7。
+- 做了什么（V2a）：
+  1. **新增 `game/world_manager.hpp`**（header-only，便于单测）：`WorldManager` = **清单注册表**（`id → LevelManifest`，
+     重复 id / 非法清单即抛）+ **当前世界记账**（`SetActive` / `Active` / `ActiveId`）+ **切换请求状态机**
+     （`Idle` / `Requested`；`RequestSwitch` 拒绝**未知 id / 目标即当前世界 / 已有待处理请求**并写出原因；
+     `TakePendingSwitch` **只取出一次**且**当前世界不变**；`CommitActive` 才改名 ⇒ 装载失败不会留下"半个新世界"）。
+  2. **`game/main.cpp` 的初始世界选择改走管理器**：`--world=<裸 id>` 先注册三份清单再 `SetActive`（**未知 id ⇒ ERROR +
+     退出码 1**）；`--world=<路径>` 注册该文件；**`--map=` 与缺省路径完全不变**。
+  3. **新增 `tests/world_manager_test.cpp` 7 项**：注册三份发布清单并逐 id 查（含 A=10 km / B=premade / C=roguelike 的字段）、
+     `Register` 返回 id 且重复 id 抛、未设定当前世界时 `Active()` 抛、未知 id 拒绝、同世界拒绝、重复请求拒绝且**原请求不被覆盖**、
+     取出一次 + 未确认前当前世界不变 + `CommitActive` 生效、取消后可重新请求、非法清单注册即抛。
+- 为什么：
+  1. **"取出"与"确认"分离**：切换可能失败（清单合法但装载中出错）—— 只有装载成功才 `CommitActive`，**当前世界始终是有效的那个**。
+  2. **纯逻辑层优先**（沿用本项目既有节奏：`terrain_tile_residency` 先做策略层、`object_support` 先做探测纯函数）⇒
+     可单测、与 GPU / 物理解耦；V2b 只需在帧循环里查询 `HasPendingSwitch` / `TakePendingSwitch` 并执行装载。
+  3. **不静默**：所有拒绝路径都返回原因；未知 id 在启动期直接报 ERROR 并以退出码 1 结束（不让用户看到"加载了错的世界的"）。
+- **降级确认**：**无降级**（V2a 是 V2 的纯逻辑层，V2b / V2c 紧随；拆步只为可验证性，已写入 §1.7）。
+- 验证（命令 + 真实结果）：
+  1. **构建**：同一命令内 `Launch-VsDevShell.ps1` → `cmake --build --preset debug` → 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug -j 6` → **525/525 passed**（518 → 525，新增 7 项 `WorldManager.*`）。
+  3. **门禁**：`check-banned-identifiers.ps1` → `scanned 185 file(s), 0 violation(s)` / `PASS`（183 → 185）。
+  4. **运行冒烟**：`--world=world_b`（`build\v2a_smoke_b.log`）⇒ `世界清单（V1/V2a）：… ；注册表 3 个世界` + 1 km 世界正常启动
+     （stderr 仅 1 行预期 WARN）；`--world=nope` ⇒ **退出码 1** + `[ERROR] 启动或主循环失败：未知世界 id [nope]（未注册）`。
+- **踩坑（记录）**：`LNK1168 无法打开 bin\voxel_game.exe` —— 上一次冒烟留下的 `voxel_game.exe` 进程仍持有 exe，
+  需先 `Get-Process voxel_game | Stop-Process -Force` 再构建（冒烟脚本务必确认进程真的退出）。
+- 下一步 / 遗留：
+  1. **V2b**：`RunWorld` 提取（把"建一个世界"变成可重复调用；纹理 / 环境 / 渲染器 / 窗口留外层）+ **`Unload`**
+     （释放该世界的 GPU 网格、移除其物理体、复位调度器与表）+ **调试键触发切换** + 复用加载分片与进度。
+  2. **V2c**：切换验收（不冻结、有进度、同种子可复现）；随后 **V3**（A 上两个交互点，F 触发）。
+  3. **本批（W0~W6h + W7 + V0 + V0b + V0c + V1 + V2a）尚未提交**。
+
+---
+
+## 2026-10-06  V2b 落地：**运行期世界切换**（世界装载循环 + 显式卸载；进城不再冻结）
+
+- 背景：接 V2a（`WorldManager` 逻辑层）推进 **V2b** —— 真正把"建一个世界"变成**可重复调用**，并能在运行期切换
+  （[ADR 0028](adr/0028-world-families-and-static-asset-first.md) 决策四"进程内真切世界"）。
+- 做了什么（口径）：
+  1. **`for (;;)` 世界装载循环**：把"装配一个世界"的整段（**世界级状态全部是本轮局部变量**）包进循环；
+     **纹理 / 环境 IBL / 渲染器 / 窗口 / 系统面板 / 用户设置移到循环之外复用**
+     （对照 UE5 关卡流式不重建 UEngine/渲染器、Unity `LoadSceneAsync` 不重建图形设置）。
+     每轮开头按 `worldManager.Active().terrain` **重新解析地形预设**（`--map=` 路径下注册表为空 ⇒ 保持原样，
+     行为与从前**逐位一致**）。
+  2. **显式卸载**（每轮末尾）：把该世界创建的 GPU 网格**交还渲染器** —— tile / 体积块 / 地表壳 / 物件 / 光球 /
+     水面 / 主角 / 倒塌网格池。**为什么必须显式**：这些句柄是本轮局部变量，析构只销毁句柄值、**不会**把槽位还给
+     `MeshRenderer`；不交还的话每切一次世界槽位就永久多一批（验收判据 = "卸载不留残"）。
+     Jolt 物体无需逐个移除：`PhysicsWorld` 等世界级对象随作用域析构。
+  3. **触发**：`--switch-test=<世界 id>@<秒>`（**可重复给出**，按会话墙钟排序触发；仅测试用）——
+     本环境无法向前台窗口注入按键（同 `--autofly` 的理由）；**正式触发是 V3 的交互点**。
+     主循环**帧末**发现待处理请求即 `break`（保证退出前那一帧是完整的一帧），由循环尾部卸载并在下一轮装配新世界。
+  4. **配套新增 API**：`RigidCollapseRuntime::ReleasePool(renderer)`（`Clear` 只隐藏、不交还池 ⇒ 切换会泄漏 `slotCount` 个槽位）、
+     `MeshRenderer::MeshSlotCount()`（**卸载泄漏的观测判据**）。
+- **踩坑（两处，均由冒烟暴露，已修）**：
+  1. **请求记账了但主循环没退出** ⇒ 第一次冒烟里"切换"只打印了请求日志、**卸载 / 重载从未发生**。
+     根因：`while (true)` 只在退出时 `break`，我漏了"有待处理请求也结束本轮"。修：帧末新增
+     `if (worldManager.HasPendingSwitch()) break;`。
+  2. **会话时钟恒为 0** ⇒ `--switch-test=@20` 永不触发。根因：`vx::Clock::ElapsedSeconds()` 只在 `Tick()` 时累计，
+     而我的 `sessionClock` 从未 `Tick`。修：帧末推进一次 `(void)sessionClock.Tick();`。
+  3. 编译期补齐：`panelContext`（面板 + 用户设置）与"会话计时"原在世界作用域内 ⇒ 上移到世界装载循环之外。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`Launch-VsDevShell.ps1` → `cmake --build --preset debug` → 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug -j 6` → **525/525 passed**；门禁 → `scanned 185 file(s), 0 violation(s)` / `PASS`。
+  3. **运行冒烟（切换链）**：`build\v2b_chain.log`，`--world=world_b --switch-test=world_c@20 --switch-test=world_b@50`：
+     B 装载 5.98 s → **会话 20.00 s 请求切 C** → **卸载（槽位 485）** → C 装载 **1.36 s** → 会话 50.02 s 请求切回 B →
+     **卸载（槽位 486）** → B 装载 **1.34 s**；全程 **0 条帧尖峰**（无 > 50 ms 单帧 ⇒ **切换不冻结**）；
+     `stderr` 仅 1 条预期 WARN（world_b 的 premade 未接入）。
+     **关键读数**：二次装载仅 **1.3 s**（vs 首次 6.0 s）⇒ 证明纹理 / 环境 / 渲染器**确实没有重建**。
+- **已知限制 / 待查（不静默）**：
+  1. 两次卸载的槽位数 **485 → 486（+1）**：远小于"未卸载"应有的数百级 ⇒ 卸载确实生效；**+1 的确切来源未定位**
+     （疑为流式瞬时高水位），登记为 **V2c** 用更长切换链核对。
+  2. **装载失败不回退**：若下一轮装载抛异常，进程直接退出（**不会**留下"半个新世界"）——
+     若要"失败回退到原世界"，把 `CommitActive` 移到该轮世界阶段全部完成之后（已在代码注释标明）。
+  3. ⚠️ 循环体**沿用原缩进**（未再缩进一级）以免产生万行级纯空白 diff —— 代码注释与本节均已记明；
+     如需整洁可在后续用 `clang-format --lines` 单独整理。
+  4. **玩家 / 相机状态**：切换后按新世界的 `spawn` 重建（角色与相机在下一轮重新创建）—— 即"传送"语义；
+     尚未做"保留装备 / 状态"（等存档）。
+- 下一步 / 遗留：
+  1. **V2c**：切换验收（更长切换链核对 +1 槽位；同种子切回逐位可复现）。
+  2. **V3**：把触发换成 **A 上两个交互点**（走近提示 + `F`）。
+  3. **本批（W0~W6h + W7 + V0 + V0b + V0c + V1 + V2a + V2b）尚未提交**。
+
+---
+
+## 2026-10-06  V3 落地：**传送装置（门实体 + 走近按 `E`；不自动切换）**
+
+- 背景（所有者 2026-10-06 明确）：**"地图切换要在地图上放置传送装置，不能自动切换"** —— A 世界放 **B / C 两个传送门**，
+  **走到附近后按 `E`** 触发；B、C 世界各放一个**传送到 A 的门**。本要求**取代**计划中 V3 原写的"F 键交互点"
+  （且 `F` 已被飞行模式开关占用，`E` 空闲）。施工细则见 [`plans/v0.5.md`](plans/v0.5.md) §1.8；依据
+  [ADR 0028](adr/0028-world-families-and-static-asset-first.md)（差异全部落在清单）与 [ADR 0004](adr/0004-hybrid-layered-world-representation.md) 层③。
+- 做了什么（V3a 数据与内容 → V3b 交互）：
+  1. **物件层增 `Portal`**（`object_layer.*`）：`ObjectAssetKind::Portal` + `ObjectPlacement::targetWorldId`（配置
+     `target_world`）。**校验即抛**：`Portal` 缺 `target_world` / 为空 ⇒ 抛；**非 `Portal` 带 `target_world` ⇒ 抛**
+     （避免"写了却不生效"的静默配置）。`ParseKind` 增 `"portal"`。
+  2. **程序化代形 = 立起来的门环**（`object_mesh.hpp` 的 `AppendPortalRing`）：椭圆**环面**、轴沿 `+Z`、门洞在环心
+     ⇒ **可从中间走过**；环心线半轴 = `half_extent − 管半径` ⇒ 外形**正好**装进 `half_extent` 包围盒（与盒 / 椭球 / 锥同守
+     "底面 `y = 0`、顶面 `2*halfY`"的约定）。
+  3. **清单增 `objects_file`**（`LevelManifest`，可选）：**给出 ⇒ 按清单所在目录解析**（与 `terrain_preset` 同口径）；
+     **缺省 ⇒ 全局默认 `assets/config/objects.toml`**（`is_absolute()` 分流由 game 层做）。⇒ **每个世界有自己的放置清单**。
+  4. **三份每世界清单**：`assets/maps/world_a_objects.toml`（**2 门 → B / C** + 1 土堆）、`world_b_objects.toml` /
+     `world_c_objects.toml`（各 **1 门 → A** + 1 土堆）；三份世界清单各配 `objects_file`。门为**不可破坏**、挡路但门洞可过。
+  5. **最近门纯函数**（**新增** `game/portal_interaction.hpp`）：`PortalEntry`（世界坐标 + 目标世界 id）+ `FindNearestPortal`
+     （半径内取最近；**等距取先出现者** ⇒ 确定性，红线 7）+ `kPortalPromptRadius`。
+  6. **交互**：`ActionId::Interact`（**追加**，`input.BindKey(Interact, SDL_SCANCODE_E)`）；`game/main.cpp` 按**清单指定的**
+     物件文件加载 + 放置时从 `ObjectPlacement.targetWorldId` 收集门 → 每帧取角色位置查最近门 →
+     **走近出 HUD 提示**（`debug_overlay.*` + `ui_text.hpp` 新增 `PortalPromptFormat`，含目标世界 **id**（ASCII ⇒ 无 CJK 字体也不缺字））→
+     按 `E` 调 `WorldManager::RequestSwitch`（**复用 V2b 的卸载 / 重载**）。**不按 `E` 绝不切换。**
+- 为什么：
+  1. **门是"可走近、可站、挡路"的真实实体**（不是隐形触发器）—— 环面门洞**留通道**，不把人卡住（SKILL「世界内一致性」）。
+  2. **"不自动切换"落到架构上**：唯一正式触发路径 = `E` + 门；`--switch-test` **仅在显式传参时**生效（测试设施，
+     按 SKILL「已实现能力只允许配置项关闭」保留）。
+  3. **纯函数 + 确定性**：最近门查询与"等距取先出现者"可单测钉死；门数据在**放置顺序**上收集 ⇒ 遍历顺序确定。
+- **降级确认（按 SKILL「降级必须先问」，已在 §1.8 登记并确认）**：① 门为**程序化代形**（无 glTF / kit 资产）；② 提示为
+  **HUD 文本**（无 3D 世界空间标记 / 准星吸附）；③ **无传送特效**（粒子 / 光柱 / 过场）。切换条件：kit 就位 ⇒ 换 glTF 门；表现阶段 ⇒ 特效。
+- **踩坑（记录，值得复用）**：初版 `AppendPortalRing` 的**绕序反了**（`(p00,p10,p01)` 在环面上给出**朝内**面法线）——
+  被既有不变量单测"逐三角形绕序 vs 逐顶点法线"当场抓出（`∂P/∂theta × ∂P/∂phi` 才是朝外）⇒ 改为 `(p00,p01,p11)` / `(p00,p11,p10)`。
+  **教训**：新增程序化形态时，把它加进既有形态集合（`AllKinds`）让不变量单测覆盖，比肉眼看快得多。
+- 验证（命令 + 真实结果）：
+  1. **构建**：同一命令内 `Launch-VsDevShell.ps1` → `cmake --build --preset debug` → 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug` → **541/541 passed**（新增 16 项：`PortalInteraction.*` 6、`ObjectTable.*` 5、
+     `ObjectMesh.PortalRingLeavesWalkThroughAperture` 1、`LevelManifest.*` 4）。
+  3. **门禁**：`check-banned-identifiers.ps1` → `scanned 187 file(s), 0 violation(s)` / `PASS`。
+  4. **运行冒烟**（`build\v3_smoke.log`，`--world=world_a --switch-test=world_b@12 --switch-test=world_a@24`）：
+     - **物件清单按世界生效**：A ⇒ `清单 …world_a_objects.toml；放置 3 / 3 …（其中传送门 **2**）`；B ⇒ `…world_b_objects.toml；2 / 2 …（门 **1**）`；
+       C ⇒ `…world_c_objects.toml；2 / 2 …（门 **1**）`。
+     - **门 + `E` 端到端可用**（该次运行确有真实输入）：日志出现 `世界切换（传送门）：走近门后按 E ⇒ 请求切到 [X]` ——
+       **A→B、B→A、A→C、C→A 各一次**（即 **A 的两个门与 B / C 的回程门都工作**）；同一运行里还记录了 `F1` 面板开关与角色走动
+       （`脚底 (9.34, 120.01, -0.48)` —— 走到 `(12, 0)` 的 B 门提示半径内），佐证输入真实。
+       **注意**：该日志行**只在"门在提示半径内且 `E` 本帧按下"时**打印 ⇒ 它本身就是"按了 `E`"的证据。
+     - **不自动切换**：切换只有两条代码路径 —— 显式 `--switch-test`（测试设施）与"门 + `E`"；除二者外**没有任何切换**发生。
+     - **卸载不留残**：四次卸载（A→B / B→A / A→C / C→A）后渲染器网格槽位**恒为 4656**（无累积）。
+- 下一步 / 遗留：
+  1. **V2c**：切换验收（更长切换链核对 §1.7 记的 **+1 槽位**；同种子切回逐位可复现）。
+  2. **V4 / V5**：B 预制世界实际内容 / C 随机（含 `randomize_seed_on_entry` 消费）。
+  3. **待人工目视确认（部分已由冒烟日志佐证）**：A 出生平台东 / 西各一个门（`(±12, 0)`）—— 冒烟日志已记录**走到门附近按 `E` 成功切换**
+     （A→B→A→C→A）；**仍需肉眼确认**：HUD 走近提示文字是否清晰可见、门**挡路而门洞可过**（可站 / 不卡人）。
+  4. **待所有者提供**：传送门的**命名与世界观解释**（当前占位形态 + 通用文案；AI 不代拟，见 [world-setting](world-setting.md) §3）。
+  5. **本批（W0~W6h + W7 + V0 + V0b + V0c + V1 + V2a + V2b + V3）尚未提交**。
+
+---
+
+## 2026-10-06  V8 落地：**A 世界素材充实**（公共 CC0 素材 + 模型形态 + 程序化散布）
+
+- 背景（所有者 2026-10-06）：**"在公共资源库寻找素材，充实 A 世界"**。动手前按 SKILL「降级必须先问 / 任务下发先落计划」
+  做了三轮**事前提问**并获确认：① **范围 = 最小可玩版**（几何 + 现有地表材质着色）；② **内容 = 自然植被 + 岩石 / 巨石 +
+  水系点缀 + 中立小道具**（四类全选）；③ **来源 = Kenney《Nature Kit》**（所有者原选 Quaternius，但其官方渠道 **itch.io
+  在本环境不可达**（实测 `无法连接到远程服务器`）、Cinevva 镜像又无法批量检索文件名 ⇒ 经确认改用**同为 CC0 低模 + 游戏就绪**
+  的 Kenney，**官方直链实测可达**）。细则见 [`plans/v0.5.md`](plans/v0.5.md) §1.9。
+- 做了什么：
+  1. **素材链（V8a）**：`tools/fetch_assets.ps1` 增 **`modelzip` 模式** —— 下载整包 ZIP（10.5 MB / 329 个 GLB）后
+     **只抽选定 12 个**（名字**大小写敏感**比对，找不到即 `throw`，不静默少抽）⇒ `assets/models/nature/`；
+     `-Record` 重录 `tools/assets.sha256`（**30 项**）；`NOTICE.md` 台账增来源行 + 12 条文件 / SHA-256 + V8 规格说明。
+  2. **物件层：模型形态（V8b）**：`ObjectAssetKind::Model` + `ObjectType::modelFile`（**仅 `model` 必填非空、其它必须为空**）+
+     `ObjectType::materialSlot`（**仅 `model` 可给**，0 草 / 1 土 / 2 岩 / 3 沙，`-1` = 未指定 ⇒ 草；越界 / 用于非 `model` 即抛）；
+     纯函数 **`BuildObjectMeshFromModel`**：把 `Model` 的全部网格合并，**等比缩放"装进" `2*half_extent` 的盒**（各轴比例取最小 ⇒
+     **不拉伸**）、**底面贴 `y = 0`**、**水平居中**；空 / 退化模型返回空网格（不产生除零 / NaN）。
+     **为什么用 `half_extent` 当"目标盒"而不是按原尺寸**：GLB 的建模单位与轴向各异（Kenney 的树约 1~2 单位），
+     由配置统一给尺寸 ⇒ 落点 / 剔除包围盒 / 碰撞体与程序化形态**共用同一套下游逻辑，零分叉**。
+  3. **程序化散布（V8c）**：**新增** `world/object/object_scatter.hpp` 的 **`PlanObjectScatter`**（**纯函数**）：
+     **分块抖动网格**（红线 15）+ **有界抖动**（`±0.25 × 步长`）⇒ **最小间距 ≥ 0.5 × 步长**；格点过多时用**确定性洗牌**
+     取前 `count` 个（抖网格的任意子集都保持间距与均匀性）⇒ **恰好 `count` 个**且不偏向某一角；抖动 / 朝向由
+     `splitmix64(seed, 格子索引)` 给 ⇒ **同种子逐位可复现**（红线 7）。配置增 `[[scatter]]`（`type` / `center` / `radius` /
+     `count` / `seed`，非法即抛）。
+  4. **内容 + 接线**：`assets/maps/world_a_objects.toml` 配 **12 个模型类型**（3 树 / 灌木 / 草丛 / 花 / 蘑菇 / 高草（水系点缀）/
+     巨石 / 散石 / 营火 / 木栅；**尺寸按各 GLB 的 POSITION 包围盒实测换算**）+ **10 条散布（132 点，半径 80 格）** +
+     **一个小营地**（营火 + 3 段木栅，朝向出生点留口）；`game/main.cpp` 加**模型按路径缓存** + `buildLocalMesh` 分流
+     （程序化 / 模型）+ 显式与散布**合成落点清单**（顺序固定 ⇒ 遍历顺序 = 放置顺序仍成立），Y 仍按**地表高度**求解。
+- 为什么：
+  1. **"最小可玩版"是本阶段的正确形态**：贴图 / 实例化属**表现与深度**（`tech-plan-v2.0`），而当前阶段 = **世界成立**；
+     先让 A 从"只有地形 + 2 门 + 1 土堆"变成"有植被 / 岩石 / 营地的世界"，代价小、可立即验收。
+  2. **数据驱动 + 纯函数**：尺寸 / 数量 / 半径 / 种子全在清单里；布局由纯函数给 ⇒ **不写死坐标、可复现、可单测**（红线 7 / 15）。
+  3. **零分叉**：模型与程序化形态产出的都是同一 `vx::MeshData` ⇒ 渲染 / 碰撞（"谁画谁挡"）/ 视锥剔除 / 支撑探测**全部复用**。
+- **降级确认（已提前提问并获确认）**：① **模型自带贴图 / UV 不出**（渲染器只有地表 4 槽材质 ⇒ 按**材质槽**着色：
+  树 / 草 = 草槽、石 = 岩槽、木器 = 土槽）；② **无实例化 / HLOD**（每实例一份 GPU 网格 + 一个 Jolt 静态网体 ⇒
+  **数量必须受控**、**不能全图铺开**）；③ 不可采集 / 不可破坏 / 无 LOD 与风动。**切换条件**：进入表现阶段 ⇒ 逐模型贴图 + 实例化 / HLOD。
+  **木桥本轮未摆放**：A 出生平台附近**无水体可跨**，摆了违反「世界内一致性」⇒ 登记待有河区域 / B / C 内容时补。
+- **世界内一致性**：树 / 石是**可挡路、可站**的实体（静态三角网，与渲染同源）；底面按**地表高度**求解 ⇒ **不悬空**；
+  抖动网格保证**不重叠堆叠**。内容为**通用自然物**（无宗门 / 秘境 / 遗迹等设定语义）⇒ **无需新增世界观解释**
+  （`world-setting.md` 未改；若要赋予设定含义须先由所有者给命名）。
+- 验证（命令 + 真实结果）：
+  1. **素材**：`fetch_assets.ps1 -Record` ⇒ 12 个 GLB 落到 `assets/models/nature/`、校验和 30 项；
+     **既有资源哈希未变**（如 grass albedo `8a8bfcff…`）⇒ 取回可复现。
+  2. **构建**：`Launch-VsDevShell.ps1` → `cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4 /WX`）。
+     **踩坑**：`C4456: "plan" 的声明隐藏了上一个本地声明` —— 新加的落点清单变量与主循环里既有的固定步 `plan` 同名 ⇒ 改名 `objectPlan`。
+  3. **测试**：`ctest --preset debug` ⇒ **560/560 passed**（541 → 560，新增 19 项）。
+  4. **门禁**：`check-banned-identifiers.ps1` ⇒ `scanned 189 file(s), 0 violation(s)` / `PASS`。
+  5. **运行冒烟**（`build\v8_smoke.log`，`--world=world_a --manual-test=…`）：`物件层就绪（V0b/V0c/V3/V8）：…放置 **139 / 139** 个物件
+     （…传送门 2、**散布点 132**、模型文件 12 个），类型表 14 项`；**0 条"落点无地表数据 ⇒ 跳过"**；
+     首帧剔除 `物件 82/139 通过`；**物件层耗时与引入前同量级**（23.5 s vs 24.0 s ⇒ 139 个静态体的建造成本可忽略）；
+     运行期帧尖峰 **≤ 38 ms**（**无 > 50 ms**），主导项是**既有的渲染提交**（S4 已登记瓶颈；draw call ≈5.9k），**V8 未引入新的尖峰类型**。
+- 下一步 / 遗留：
+  1. **待人工目视确认**：A 出生点附近**成片树木 / 灌木 / 花草 / 岩石**可见；**小营地**（营火 + 木栅）可见；
+     树与石**挡路**且**可站上去**。
+  2. **后续（表现阶段）**：**逐模型贴图 / UV**、**实例化 / HLOD**（解数量上限）、**全图铺开**、**木桥**（待有河区域）。
+  3. **V2c / V4 / V5 / V6 / V7** 仍未做（切换验收 / B / C 内容 / 可破坏土堆 / 性能验收）。
+  4. **本批（W0~W6h + W7 + V0 + V0b + V0c + V1 + V2a + V2b + V3 + V8）在写入本条时尚未提交**（随后由本次提交收录）。
+
 

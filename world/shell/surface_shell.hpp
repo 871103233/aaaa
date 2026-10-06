@@ -53,6 +53,25 @@ struct ShellBlockSpan {
                                                     const SurfaceShellParams& params, int blockX,
                                                     int blockZ) noexcept;
 
+/// **粗采样 Y 块范围的默认口径**（W7-S3b①）：每 `kShellSpanSampleStepBlocks` 列采一次高度，
+/// 再对高度加 `kShellSpanMarginHeightBlocks` 的**保守余量**（单位：世界格，不是 Y 块）。
+///
+/// 为什么：`ComputeShellBlockSpanY` 逐列采 `34×34` 次高度 ⇒ 实测 ≈ `0.9 ms/列块`；壳流式按窗口规划
+/// （上千列块）会在主线程造成秒级冻结。粗采样把单列块降到 ≈ `1/16`。
+/// 余量取**高度**而非"Y 块"：`16 格` 余量把 Y 范围最多外扩 1 个块（`16/32 = 0.5`），
+/// 而按"Y 块"余量（如 ±2 块）会把平坦区的块数翻数倍 —— 后者直接抬高枚举与建块量。
+inline constexpr int kShellSpanSampleStepBlocks   = 4;
+inline constexpr int kShellSpanMarginHeightBlocks = 16;
+
+/// **粗采样 + 安全余量**的 Y 块范围（纯函数；W7-S3b① 性能口径）。
+///
+/// 语义（**保守**）：返回的范围 **⊇** `ComputeShellBlockSpanY` 的范围（`marginHeightBlocks` 覆盖采样点之间的
+/// 高度变化）⇒ 只会**多**枚举若干（多半为空的）块，**不会漏**含表面的块。空块由 worker 网格化后返回空
+/// `MeshData`（不产生 GPU 上传与碰撞体）⇒ 代价只落在 worker 侧。
+[[nodiscard]] ShellBlockSpan ComputeShellBlockSpanYCoarse(const TerrainNoiseGenerator& noise,
+                                                          const SurfaceShellParams& params, int blockX, int blockZ,
+                                                          int sampleStepBlocks, int marginHeightBlocks) noexcept;
+
 /// 地表壳的密度采样器：把"距地表的**有符号距离** + 悬垂 3D 噪声 + **洞穴隧道雕刻量**"量化成
 /// `volume_mesher` 的密度口径。
 ///

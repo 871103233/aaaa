@@ -491,4 +491,17 @@ void RigidCollapseRuntime::Clear(PhysicsWorld& physics, MeshRenderer& renderer) 
     m_active.clear();
 }
 
+/// V2b：世界卸载 —— 把**池里所有槽位**的 GPU 网格交还渲染器（`Clear` 只隐藏、不交还）。
+void RigidCollapseRuntime::ReleasePool(MeshRenderer& renderer) {
+    for (const MeshHandle handle : m_pool) {
+        if (handle.IsValid()) {
+            renderer.ReleaseMesh(handle);
+        }
+    }
+    m_pool.clear();
+    m_active.clear();  // 活跃整体随 `PhysicsWorld` 一并析构；这里只清句柄，避免留下悬空引用
+    m_capacityVerts   = 0;
+    m_capacityIndices = 0;
+}
+
 }  // namespace vx

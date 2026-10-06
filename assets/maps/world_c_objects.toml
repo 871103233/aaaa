@@ -1,0 +1,31 @@
+# 物件放置清单：**随机小世界 C**（被 assets/maps/world_c.toml 的 `objects_file` 引用）
+#
+# 内容（V3）：一个**通往 A 的传送门**（走到附近按 `E` 切回大世界）+ 一个土堆对照。
+# 口径同 world_a_objects.toml。**待补（世界观，SKILL 六.9）**：门的命名与设定由所有者提供。
+
+schema_version = 1
+destructible_enabled = true
+
+[[type]]
+id = "portal_gate"
+kind = "portal"
+half_extent = [1.0, 1.5, 0.2]
+destructible = false
+
+[[type]]
+id = "dirt_pile"
+kind = "dirt_pile"
+half_extent = [1.0, 0.75, 1.0]
+destructible = true
+
+# ---- 通往 A 的传送门：出生点东侧（C 无出生平台 ⇒ 底面高度由地表求解）----
+[[placement]]
+type = "portal_gate"
+position = [12.0, 0.0, 0.0]
+yaw_deg = 90.0
+target_world = "world_a"
+
+# ---- 土堆对照 ----
+[[placement]]
+type = "dirt_pile"
+position = [-8.0, 0.0, 8.0]

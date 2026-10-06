@@ -1,0 +1,19 @@
+# 世界清单 C：**随机小世界**（≈1×1 km，肉鸽，[ADR 0028](../../docs/adr/0028-world-families-and-static-asset-first.md) §一）
+#
+# 数据来源 = `procedural`：按**种子**运行期生成。
+# `randomize_seed_on_entry = true` ⇒ 每次进入更换种子（同一世界再次进入可复现由"记录本次种子"保证，
+#   V5 消费该开关；**V1 只解析 + 校验**，尚不消费）。
+# `persistent = false` ⇒ 退出即丢（roguelike 的既定口径，见 ADR 0028 §一的世界族表）。
+
+schema_version = 1
+id   = "world_c"
+name = "随机小世界 C（1×1 km，肉鸽）"
+
+family = "instance_roguelike"
+source = "procedural"
+terrain_preset = "world_c_terrain.toml"
+objects_file   = "world_c_objects.toml"   # V3：本世界的物件 / 传送门放置清单（相对本文件目录）
+
+destruction_enabled     = true   # 破坏策略：可破坏范围最大
+persistent              = false  # 退出即丢
+randomize_seed_on_entry = true
