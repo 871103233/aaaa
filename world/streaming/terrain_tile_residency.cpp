@@ -41,14 +41,22 @@ namespace {
     TerrainTileResidencyPlan plan;
     plan.desiredCount = desired.size();
 
-    std::vector<TileCoord> sortedResident = resident;
-    std::sort(sortedResident.begin(), sortedResident.end());
+    // P6 收尾（2026-10-06）：`resident` **已升序**时直接引用，省掉一次整窗拷贝 + 排序。
+    // 为什么安全：对已排序区间再排序是**空操作**，两条路径的结果**逐位一致**（红线 7 不受影响）；
+    // 而 `TerrainWorld::ResidentTiles()`（`std::map` 迭代）产出的就是升序 ⇒ 运行期恒走快路径。
+    std::vector<TileCoord>       sortedResidentCopy;
+    const std::vector<TileCoord>* sortedResident = &resident;
+    if (!std::is_sorted(resident.begin(), resident.end())) {
+        sortedResidentCopy = resident;
+        std::sort(sortedResidentCopy.begin(), sortedResidentCopy.end());
+        sortedResident = &sortedResidentCopy;
+    }
 
-    std::set_difference(desired.begin(), desired.end(), sortedResident.begin(), sortedResident.end(),
+    std::set_difference(desired.begin(), desired.end(), sortedResident->begin(), sortedResident->end(),
                         std::back_inserter(plan.toLoad));
 
     std::vector<TileCoord> leaving;
-    std::set_difference(sortedResident.begin(), sortedResident.end(), desired.begin(), desired.end(),
+    std::set_difference(sortedResident->begin(), sortedResident->end(), desired.begin(), desired.end(),
                         std::back_inserter(leaving));
 
     // ADR 0020 决策五口径：**已被玩家改动的 tile 不得卸载**（否则玩家改过的地形会随走远而消失）。
@@ -152,6 +160,7 @@ TerrainTileResidencyPlan PlanTerrainTileResidency(const TerrainTileWindow& windo
                                                   const std::function<bool(const TileCoord&)>& isEdited,
                                                   std::size_t maxKeptEdited) {
     std::vector<TileCoord> desired;
+    desired.reserve(window.TileCount());  // P6 收尾：一次到位，避免 10km 窗口（4489）逐次扩容 + 搬移
     // **只遍历窗口矩形**（O(窗口)），不扫描世界总量（ADR 0024 决策一的不变量）。
     // 循环按 x → z 升序 ⇒ `desired` 天然升序。
     for (int x = window.MinTileX(); x <= window.MaxTileX(); ++x) {
@@ -247,8 +256,13 @@ bool TerrainTileScheduler::Update(const TerrainWorld& world, double playerX, dou
         return m_isEdited ? m_isEdited(coord) : false;
     };
 
+    // P6 收尾（2026-10-06）：**只物化一次** `ResidentTiles()`（`TerrainWorld` 每次调用都要遍历整张
+    // `std::map` 重建一个 4489 元素向量；原先"规划 + relod 扫描"各来一次 = 白付一倍）。
+    // 两次调用之间世界未变 ⇒ 结果逐位相同，语义不变。
+    const std::vector<TileCoord> resident = world.ResidentTiles();
+
     const TerrainTileResidencyPlan plan = PlanTerrainTileResidency(m_residencyWindow, isAvailable,
-                                                                  world.ResidentTiles(), isEdited,
+                                                                  resident, isEdited,
                                                                   kMaxKeptEditedTiles);
 
     m_pendingLoad   = plan.toLoad;
@@ -259,12 +273,12 @@ bool TerrainTileScheduler::Update(const TerrainWorld& world, double playerX, dou
     m_unloadCursor  = 0;
     m_desiredCount  = plan.desiredCount;
 
-    // **待 relod**：常驻集合中目标 LOD 与"上次告诉调用方的 LOD"不同的 tile（升序；`ResidentTiles` 已升序）。
+    // **待 relod**：常驻集合中目标 LOD 与"上次告诉调用方的 LOD"不同的 tile（升序；`resident` 已升序）。
     // 新加载的 tile 不在常驻集合里 ⇒ **不进 relod 清单**（`Step` 加载时已按目标 LOD 建）。
     m_pendingRelod.clear();
     m_relodCursor = 0;
     if (m_hasRings) {
-        for (const TileCoord& coord : world.ResidentTiles()) {
+        for (const TileCoord& coord : resident) {
             const auto recorded = m_residentLod.find(coord);
             if (recorded == m_residentLod.end() || recorded->second != LodLevelForTile(coord)) {
                 m_pendingRelod.push_back(coord);

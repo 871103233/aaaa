@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -85,6 +86,8 @@ public:
     void Submit(TerrainTileBuildRequest request);
 
     /// 取回一个**已完成**的结果；完成队列为空 ⇒ 返回 false（**不阻塞**）。
+    /// 副作用（P6 收尾，2026-10-06）：在返回 false（= 本轮收包已弹空）的那一刻顺带回收已结束的任务对象，
+    /// **一次/轮**（原先每次弹都重扫在飞列表 ⇒ O(队列长 × 在飞数)）。
     [[nodiscard]] bool TakeCompleted(TerrainTileBuildResult& out);
 
     /// **尚未回收**的任务数（含"已完成但结果还没被取走"的；调用时顺带回收已结束的任务对象）。
@@ -119,7 +122,10 @@ private:
     std::vector<std::unique_ptr<Job>> m_inFlight;  ///< 主线程独占（无需锁）
 
     std::mutex                     m_completedMutex;  ///< **只保护完成队列**（worker push / 主线程 pop）
-    std::vector<TerrainTileBuildResult> m_completed;  ///< worker 产出 → 主线程消费
+    /// worker 产出 → 主线程消费。**用 `deque` 而不是 `vector`**（P6 收尾，2026-10-06）：主线程按 FIFO 弹空时
+    /// `pop_front()` 是 O(1)，而 `vector::erase(begin())` 要搬移整队；元素含 8 KB `TerrainTile`，
+    /// 且队列长度可达预取提前量上限（192）⇒ 搬移量按 MB 计。语义（FIFO）不变。
+    std::deque<TerrainTileBuildResult> m_completed;
 
     Stats m_stats {};  ///< 只在主线程更新（`TakeCompleted` 时累加）
 };

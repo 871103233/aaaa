@@ -131,8 +131,30 @@ public:
     /// 预取缓存中的条目数（观测：预取提前量 / 内存有界）。
     [[nodiscard]] std::size_t StagedTileCount() const noexcept { return m_staged.size(); }
 
-    /// 清空预取缓存（窗口中心变化 ⇒ LOD / 集合口径随之变化，旧条目作废）。
+    /// 清空预取缓存（**整批作废**）。
+    ///
+    /// P6-B（2026-10-06）起，运行期的"窗口中心变化"**不再**走这里（整批作废会让 worker 刚算好的瓦片全白算，
+    /// 飞行时表现为可见 pop-in），改用下面的 `PruneStagedTiles`。本函数保留给"确实要全清"的场合。
     void ClearStagedTiles() noexcept { m_staged.clear(); }
+
+    /// 按谓词**裁剪**预取缓存：`keep(tileX, tileZ, lodLevel) == false` 的条目丢弃，其余保留。
+    ///
+    /// P6-B（2026-10-06）：窗口中心变化时**不再整批作废**（原 `ClearStagedTiles` 会把 worker 刚算好的
+    /// 一整圈预取全丢掉 —— 飞行时窗口每跨一个 tile 就丢一次 ⇒ 表现为**可见的 pop-in**）。改为只丢弃
+    /// "真的作废"的条目：① 已出常驻窗口（永远装不上，白占预取提前量 / 内存）；② 暂存 LOD 与目标 LOD 不符
+    /// （`LoadTile` 命中不了，只能同步重建）。
+    ///
+    /// 谓词用模板参数（不引入 `std::function` 依赖；稳态零分配）。
+    template <typename KeepFn>
+    void PruneStagedTiles(KeepFn&& keep) {
+        for (auto it = m_staged.begin(); it != m_staged.end();) {
+            if (keep(it->first.x, it->first.z, it->second.mesh.lodLevel)) {
+                ++it;
+            } else {
+                it = m_staged.erase(it);
+            }
+        }
+    }
 
     /// `LoadTile` **回退到同步生成**的累计次数（命中缓存 = 0；线程池不可用时回退属预期）。
     /// 观测用：10km 实测要求该值稳定为 0（有 worker 时不得在渲染帧内同步生成）。

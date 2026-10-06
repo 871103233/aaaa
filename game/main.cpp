@@ -161,7 +161,12 @@ constexpr float kCameraFollowDistance = 14.0F;                    ///< 第三人
 /// 是否在等交换链）—— 这是 SKILL「卡顿消除」第五硬规则"观测先于结论"的落地。
 constexpr double kHitchThresholdMs = 33.0;
 
+/// P6 收尾（2026-10-06）：**硬尖峰**阈值（毫秒）。判据口径见 `SKILL` 第四节的"密度阈值型"表述
+/// （`> kHitchThresholdMs` 看**密度**，`> kHitchHardSpikeMs` 是**必须逐帧可解释**的那一档）。
+constexpr double kHitchHardSpikeMs = 50.0;
+
 /// 尖峰日志的最小间隔（毫秒）：持续低帧时避免把日志刷爆（观测本身不能制造新的卡顿）。
+/// **注意**：节流只影响**日志条数**，**不影响**帧末无条件累加的 hitch 计数器（后者才是判据来源）。
 constexpr double kHitchLogMinIntervalMs = 200.0;
 
 /// P3 / [ADR 0031](../../docs/adr/0031-occlusion-culling-software.md)：CPU 软件遮挡的参数（**保守优先**）。
@@ -1429,8 +1434,14 @@ DetonationOutcome Detonate(WorldEditContext& context, const glm::dvec3& point, c
 struct DestructionProcessor {
     /// 处理至多 `budgetMs` 毫秒的延后工作，返回本帧处理的单位数（供面板显示"本帧重网格单元"）。
     ///
-    /// **每帧至少处理一个单位**：单个单位（一个体积块的重网格 + 上传，或一次碰撞体重建）实测 5~9 ms，
-    /// 可能超过预算，但让出本帧没有任何意义（进度会停），故"超预算也做一件"是刻意的取舍。
+    /// **每帧至少处理一个单位**：单个单位（一个体积块的重网格 + 上传，或一次碰撞体重建）实测数毫秒，
+    /// 可能超过预算，但让出本帧没有意义（进度会停），故"超预算也做一件"是刻意的取舍。
+    ///
+    /// **P5 缺陷修复（2026-10-06）**：预算判据必须是**累计**耗时，而不是"**单个单位**"的耗时 ——
+    /// `vx::Clock::Tick()` 返回的是"距上次 `Tick` 的增量"，旧写法 `clock.Tick() >= budgetMs` 因此只判
+    /// "这一个单位是否超 3 ms"；只要每个单位都小于预算，循环就**永不退出** ⇒ 实测单帧 `破坏` 高达
+    /// **45.8 ms**（A 世界 10 km），与"至多 `budgetMs` 毫秒"的契约矛盾，也违反 SKILL 第四节「不冻结画面」。
+    /// 修法 = 每次迭代推进时钟并用 `ElapsedSeconds()`（**自构造以来累计**）判预算。
     std::size_t Process(WorldEditContext& context, double budgetMs) {
         if (context.pending.Empty()) {
             return 0;
@@ -1441,8 +1452,9 @@ struct DestructionProcessor {
         while (context.pending.TakeNext(unit)) {
             Apply(context, unit);
             ++processed;
-            if (clock.Tick() * 1000.0 >= budgetMs) {
-                break;
+            (void)clock.Tick();  // 推进累计时间（Tick 返回增量，累计值在 `ElapsedSeconds()`）
+            if (clock.ElapsedSeconds() * 1000.0 >= budgetMs) {
+                break;  // 累计预算已用完（单位粒度的 overshoot 仍可能出现，已由"至少一件"吸收）
             }
         }
         if (context.pending.Empty()) {
@@ -1639,6 +1651,28 @@ constexpr std::size_t kTerrainRelodUploadsPerFrame = 4;
 
 /// W7-S3b：**每帧最多建 / 撤几个地表 tile 的碰撞体**（Jolt 高度场体构建是毫秒级 ⇒ 必须分帧、有上界）。
 constexpr std::size_t kTerrainCollisionActionsPerFrame = 2;
+
+/// P6-A（2026-10-06）：地表常驻段「**安装 / 上传 / LOD 重网格 / 碰撞体同步**」的**共享每帧预算**（毫秒）。
+///
+/// 为什么需要"共享"：四段各自有固定**件数**上界，但件数不等于时间（一次 Jolt 高度场建 / 撤或一次 GPU 上传
+/// 是毫秒级）⇒ 单帧总量 = 四段之和（实测窗口调整收尾帧 26–41 ms，整帧 60–94 ms）。共享一条**毫秒**预算，
+/// 才能把该段整体钉住；超出即就地停手，余下由调度器游标 / 待传队列排到后续帧。
+/// 语义要点：只改变"**何时**可见"，不改变"**最终**结果"（红线 7 / 11 不受影响）。
+///
+/// **标定依据（实测，2026-10-06 两次长跑对照）**：预算若小于"追平所需的稳态吞吐"，积压会**单调增长**
+/// （安装从 4 件/帧 掉到 1–2 件/帧 ⇒ 跨 tile 时的一整列 67 个 tile 追不完，`常驻集合已随窗口调整完毕`
+/// 一次都不再打印，尖峰反而更多）。因此标定必须**先满足吞吐、再压峰值**：
+///   - 安装：跨 tile 一次要装 **67** 个（窗口 67×67，中心移 1 格进出一整列），跨 tile 间隔 0.7–1.5 s
+///     ⇒ 需要 ≈ 4 件/帧 × ~1.5 ms ≈ 6 ms 才追得平；
+///   - 因此把"安装的累计截止点"定在能容纳**满批**（`kTerrainResidencyActionsPerFrame` 件）的位置，
+///     预算的作用是**掐掉"四段叠加"的峰值**（26–41 ms → ≤ 本上限），而不是把单段本身压到极限。
+///   - 单件的**不可分割**重活（一次 GPU 上传偶发停顿、一次 Jolt 高度场建体）预算是挡不住的 —— 那属 C 的范围。
+constexpr double kTerrainStreamBudgetMs = 12.0;
+
+/// P6-A：各段在共享预算里的**累计截止点**（毫秒，自预算起算）。未用尽的份额顺延给后段；
+/// 保留分段截止点是为了**不让任何一段饿死**——碰撞重扫饿死会让玩家**穿地**，安装饿死会让地表出现**空洞**。
+constexpr double kTerrainInstallDeadlineMs = 7.0;   ///< 安装段：容纳满批 4 件（4 × ~1.5 ms）后仍有余量
+constexpr double kTerrainRelodDeadlineMs   = 10.0;  ///< LOD 重网格（含重传）段；碰撞重扫用剩余到总上限
 
 /// W7-S3b：tile 是否需要**高度场碰撞体**（Chebyshev 距离 <= `kTerrainCollisionRadiusTiles`）。
 /// 距离口径与 LOD 分环**同源**（`TerrainTileWindow::TileDistanceFromCenter`）。
@@ -2355,6 +2389,15 @@ int main(int argc, char** argv) {
         // V2b：**跨世界**的会话计时（只用于退出日志）——循环内的 `clock` 是每轮重建的帧计时器。
         vx::Clock sessionClock;
 
+        // P6 收尾（2026-10-06）：**稳态 hitch 累计计数（不节流）** —— V7 判据改为"密度阈值型"后的**唯一可判定来源**。
+        // 为什么必须不节流：尖峰**日志**有 200 ms 节流 ⇒ 日志条数**系统性偏少**，拿它算密度会低估；
+        // 这里在**帧末无条件**累加，退出时打一行汇总（`帧数 / >33 ms / >50 ms / 最坏单帧`）。
+        // 为什么放在**世界循环外**：判定口径是"稳态"，而世界循环每切一次世界就重建一轮；汇总取**整程**（含各轮）。
+        std::size_t steadyFrameCount    = 0;  ///< 稳态主循环的帧数（不含加载阶段）
+        std::size_t hitchFramesOver33Ms = 0;  ///< 其中 `> kHitchThresholdMs`
+        std::size_t hitchFramesOver50Ms = 0;  ///< 其中 `> kHitchHardSpikeMs`（须逐帧可解释的那一档）
+        double      hitchWorstFrameMs   = 0.0;  ///< 最坏单帧（毫秒）
+
         for (;;) {
         // V2b：本轮要装配的世界 = `worldManager.Active()`（首轮由 `--world=` 决定；切换后由请求更新）。
         // 走 `--map=` 时注册表为空 ⇒ 保持外面那份 `MapPreset` 不变（行为与从前**逐位一致**）。
@@ -2574,6 +2617,22 @@ int main(int argc, char** argv) {
                 }
             }
             return true;
+        };
+
+        // 门控（**游标感知**；P6-A 新增）：检查"调度器**当前**的下一个待加载 tile"是否已就绪。
+        // 为什么必须按游标而不是按 `terrainPendingLoadScratch` 的下标：P6-A 把安装改成**逐 tile** 推进，
+        // 若仍按"快照里的第 0 个"判断，则在装完第 0 个之后 `scratch[0]` 的暂存条目已被 `LoadTile` 消费
+        // ⇒ `HasStagedTile` 恒为 false ⇒ 每帧**只装 1 个**（实测正是如此：加载游标推不动 ⇒ 卸载永远轮不到，
+        // `待卸` 单调增长 67→1132，`常驻集合已随窗口调整完毕` 一次都不再打印）。
+        const auto terrainNextStepReady = [&]() {
+            if (!terrainHasWorkers) {
+                return true;  // 无 worker：`Step` 走同步回退（预期路径）
+            }
+            const vx::TileCoord* next = tileScheduler.NextPendingLoadTile();
+            if (next == nullptr) {
+                return true;  // 没有待加载 ⇒ 下一步必然是卸载，无需等 worker
+            }
+            return world.HasStagedTile(next->x, next->z, tileScheduler.LodLevelForTile(*next));
         };
 
         // W7-S3b：**碰撞体随窗口重扫**的游标（只在窗口中心变化时开启一轮；每帧只做 `kTerrainCollisionActionsPerFrame`
@@ -3301,6 +3360,13 @@ int main(int argc, char** argv) {
         vx::FixedStepAccumulator accumulator(vx::kFixedDt);
         // T24：CPU 帧时间分解的相位计时器（逻辑步 / UI 构建 / 渲染提交）。
         PhaseTimer   logicTimer;
+        // P5（2026-10-06）：**逻辑相位的子相位计时** —— 把"逻辑"这一个笼统数字拆开，才能把尖峰定位到具体子相位
+        // （SKILL「观测先于结论」：无子相位数据不得动逻辑代码）。5 段互不重叠，其和 ≈ `logicMs`。
+        PhaseTimer   stepTimer;         ///< 固定步循环（物理 + 动画 + 光球 + 出界）
+        PhaseTimer   collapseTimer;     ///< 倒塌落定回写与渲染同步
+        PhaseTimer   volumeResidencyTimer;  ///< 可挖体积常驻集合同步（worker 收包 / 建卸 / 入表 / 上传 / 碰撞）
+        PhaseTimer   terrainResidencyTimer; ///< 地表 tile 常驻集合（收包 / 预取 / 门控 Step / relod / 碰撞）
+        PhaseTimer   destructionTimer;  ///< 延后破坏队列（按 `kDestructionBudgetMs` 推进）
         PhaseTimer   uiTimer;
         PhaseTimer   renderTimer;
         // T45：把原先落在"未计时区"的三段显式量出来 —— **动态顶点上传 / uniform 构建 / 限帧与呈现**。
@@ -3320,6 +3386,25 @@ int main(int argc, char** argv) {
         /// 本帧各段耗时（毫秒）。尖峰日志移到**帧末**打印 ⇒ 读到的都是本帧的值（见帧首的采样点说明）。
         double       inputMs  = 0.0;
         double       cullMs   = 0.0;
+        // P5：本帧**逻辑相位**的子相位耗时（毫秒）—— 与 `cpuCost.logicMs` 同区间、互不重叠。
+        double       stepMs = 0.0;
+        double       collapseMs = 0.0;
+        double       volumeResidencyMs = 0.0;
+        double       terrainResidencyMs = 0.0;
+        double       terrainCollisionSyncMs = 0.0;  ///< P5：其中「地形碰撞体同步（Jolt 高度场建 / 删）」的耗时
+        // P6：把「地表常驻」再下一层拆开（**先定位再分帧**，不预设哪一段最贵）。
+        double       terrainStreamUpdateMs  = 0.0;  ///< 更新计划 + 收包 + 预取
+        // P6 收尾（2026-10-06）：把「更新收包」再拆一层 —— 先定位到 `Update` 整窗重规划 / 收包 / 预取，
+        // 再决定优化谁（SKILL：观测先于结论）。
+        double       terrainStreamPlanMs     = 0.0;  ///< 其中 `TerrainTileScheduler::Update`（整窗重规划 + 失效对账）
+        double       terrainStreamDrainMs    = 0.0;  ///< 其中 worker 收包（`drainTerrainTileBuilds`）
+        double       terrainStreamPrefetchMs = 0.0;  ///< 其中预取提交（`prefetchTerrainTiles`）
+        double       terrainStreamInstallMs = 0.0;  ///< 安装（`Step` + 登记 + GPU 上传）
+        double       terrainRelodMs         = 0.0;  ///< LOD 切换（提交 + 重传）
+        double       terrainStreamSweepMs   = 0.0;  ///< 碰撞体随窗口重扫
+        /// P6：本帧地表流式**是否已追平**（供帧末"流式积压"读数用；定义见 `terrainCaughtUp`）。
+        bool         terrainCaughtUpThisFrame = false;
+        double       destructionMs = 0.0;
         double       rebaseMs = 0.0;
         /// 本帧的**限帧**耗时（毫秒；日志在帧末打印 ⇒ 是本帧的值）。
         double       throttleMs = 0.0;
@@ -3591,6 +3676,7 @@ int main(int argc, char** argv) {
             settledCollapseUnits.clear();
             // V0c：物件支撑检查的固定步节拍（成本与物件数成正比 ⇒ 不每步做）。
             int objectSupportStepCounter = 0;
+            stepTimer.Begin();  // P5：固定步子相位
             for (int step = 0; step < plan.steps; ++step) {
                 StepCharacter(physics, character, camera, command, flying, jumpAssist);
 
@@ -3701,6 +3787,7 @@ int main(int argc, char** argv) {
                     CheckObjectSupports(objectSlots, orbQuery, physics);
                 }
             }
+            stepMs = stepTimer.EndMs();  // P5：固定步子相位（到此结束）
             // 至少跑过一个逻辑步后，锁存的跳跃请求已被判定过（含"不满足着地条件而放弃"），消费掉。
             if (plan.steps > 0) {
                 jumpRequested = false;
@@ -3802,6 +3889,7 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            collapseTimer.Begin();  // P5：倒塌回写与同步子相位
             // T33：把本帧**落定**的倒塌整体体素化回写为地形（残骸可站、可继续挖），
             // 其重网格 / 碰撞体重建 / GPU 上传交给 T37 的延后队列按每帧预算推进。
             // 回写按最终姿态把体素落位到最近格 ⇒ 重叠 / 越界时可能少量丢弃（ADR 0015 后果 3 已登记）。
@@ -3829,12 +3917,14 @@ int main(int argc, char** argv) {
 
             // T33：把活跃倒塌整体的位姿推给渲染器（每帧一次 64 B 推送 / 个，**不重烘焙顶点**）。
             rigidCollapse.SyncRender(renderer);
+            collapseMs = collapseTimer.EndMs();  // P5：倒塌回写与同步子相位（到此结束）
 
             // ---- T61（ADR 0020 决策二 / 四）：**常驻集合随玩家移动** ----
             // 每帧按预算建 / 卸少量块（一个动作 ≈ 1~5 ms，见 `kVolumeResidencyActionsPerFrame`）；
             // 建 / 卸引起的**重网格、GPU 上传、碰撞体增删**不在这里同步做，一律入既有的延后队列，
             // 由下面的 `destructionProcessor` 按 `kDestructionBudgetMs` 摊平（重活不得留在渲染帧里）。
             // 为什么跟着窗口走：静态全图在 1 km 下要 69~549 MB，而窗口内只需 ≈ 7~10 MB（ADR 0020）。
+            volumeResidencyTimer.Begin();  // P5：体积常驻子相位
             {
                 const vx::PhysicsWorld::CharacterState playerState = physics.GetCharacterState(character);
                 // T81：`在飞` 也算"忙"（异步建块期间 `Step` 不会报告动作，但窗口调整并未真正结束）。
@@ -3905,83 +3995,163 @@ int main(int argc, char** argv) {
                                 volumeBuildPipeline.WorkerThreadCount());
                 }
 
+                volumeResidencyMs = volumeResidencyTimer.EndMs();  // P5：体积常驻子相位（到此结束）
+
                 // ---- W7-S3b：地表 tile 常驻集合随窗口调整（ADR 0024 决策一）----
+                terrainResidencyTimer.Begin();  // P5：地表常驻子相位
+                terrainCollisionSyncMs = 0.0;
+                terrainStreamUpdateMs  = 0.0;
+                terrainStreamInstallMs = 0.0;
+                terrainRelodMs         = 0.0;
+                terrainStreamSweepMs   = 0.0;
+                vx::Clock terrainStreamClock;  // P6：地表常驻内部的下一层拆分（每次 Tick 取增量并重置基准）
+                (void)terrainStreamClock.Tick();
+                // P5 观测：把「地形碰撞体同步」的成本单独量出来（它建 / 删 Jolt 高度场，是"地表常驻"的头号嫌疑）。
+                const auto syncTerrainCollision = [&](std::size_t index, bool want) {
+                    vx::Clock clock;
+                    (void)SyncResidentTileCollision(tileResidency, index, want);
+                    terrainCollisionSyncMs += clock.Tick() * 1000.0;
+                };
+                // P6-C（2026-10-06）：**碰撞体的"存在对账"（不重建高度场）**。
+                //
+                // relod / 重传只改**网格 LOD**，tile 的**高度一字未变** ⇒ Jolt 高度场的内容也不变，
+                // 于是"重建"是纯浪费 —— 实测单次 `UpdateHeightField` 4–6 ms，是「LOD 重网格」段的头号成本
+                //（`TerrainCollision::SyncTile` 对已有体会无条件 `UpdateHeightField`，不看内容是否变化）。
+                // 这里只做**存在性的对账**：该有（距离碰撞半径内 **且** 网格非空）却没有 ⇒ 建；不该有却还在 ⇒ 撤；
+                // 与当前状态一致 ⇒ **一个字节都不动**。语义与"每次都重建"**最终一致**（红线 7：只改何时，不改结果）。
+                // 注：真正的"重建"只可能来自**高度变化**（笔刷 / 爆破），那些路径本就显式 `SyncTiles`，不受影响。
+                const auto reconcileTerrainCollision = [&](std::size_t index, const vx::TileCoord& coord) {
+                    const vx::TerrainTileMesh* tileMesh = world.FindMesh(coord.x, coord.z);
+                    const bool emptyNow   = (tileMesh != nullptr) && tileMesh->meshEmpty;
+                    const bool shouldHave = NeedsTerrainCollision(tileScheduler.Window(), coord) && !emptyNow;
+                    if (shouldHave != (tileResidency.collisionActive[index] != 0U)) {
+                        syncTerrainCollision(index, shouldHave);
+                    }
+                };
                 // 生成 + 网格化**下沉 worker**（ADR 0022 形态）：主线程只做"收包 + 过滤 + 安装 + GPU 上传"，
                 // 每帧成本**有上界**（见 `kTerrain*PerFrame`）；`Update` 只重算计划（幂等）。
+                (void)terrainStreamClock.Tick();
                 terrainResidencyChanged.clear();
                 terrainRelodChanged.clear();
                 const bool tileWasBusy = tileScheduler.HasPendingWork();
                 (void)tileScheduler.Update(world, playerState.position.x, playerState.position.z);
-                // 窗口中心变化 ⇒ 预取缓存（按旧中心的集合 / LOD 口径）作废，重新预取。
+                // 窗口中心变化 ⇒ 预取缓存按旧中心 / 旧 LOD 口径作废。
+                //
+                // P6-B（2026-10-06）：**不再整批清空**（原为 `ClearStagedTiles() + terrainBuildInFlight.clear()`）。
+                // 整批清空会把 worker 刚算好的瓦片全部丢掉 —— 飞行时窗口中心每 0.7–1.5 s 就跨一个 tile，
+                // 于是"刚预取好的一整圈"每次跨越都被丢弃、必须重算 ⇒ 表现为**可见的 pop-in（闪烁）**。
+                // 改为只失效**真的作废**的条目（其余保留，已算好的结果能被 `Step` 直接用上）：
+                //   ① 已不在新常驻窗口内 —— 永远装不上，只会白占预取提前量 / 内存；
+                //   ② 暂存 LOD 与新窗口的目标 LOD 不符 —— `LoadTile` 命中不了，只能同步重建。
+                // **在飞任务同样不清空**：陈旧结果会在 `drainTerrainTileBuilds` 按窗口过滤丢弃（只改"何时可见"）。
                 if (tileScheduler.Window().centerTileX != terrainPrefetchCenterX ||
                     tileScheduler.Window().centerTileZ != terrainPrefetchCenterZ) {
                     terrainPrefetchCenterX = tileScheduler.Window().centerTileX;
                     terrainPrefetchCenterZ = tileScheduler.Window().centerTileZ;
-                    world.ClearStagedTiles();
-                    terrainBuildInFlight.clear();
+                    world.PruneStagedTiles([&tileScheduler](int tileX, int tileZ, int lodLevel) {
+                        const vx::TileCoord coord { tileX, tileZ };
+                        return tileScheduler.ResidencyWindow().Contains(coord) &&
+                               tileScheduler.LodLevelForTile(coord) == lodLevel;
+                    });
                 }
                 // 先收包（安装已算好的结果），再**提前**预取，最后**门控**推进 `Step` 做廉价安装。
+                terrainStreamPlanMs = terrainStreamClock.Tick() * 1000.0;  // 到此 = 计划（含上面那次失效对账）
                 drainTerrainTileBuilds();
+                terrainStreamDrainMs = terrainStreamClock.Tick() * 1000.0;
                 prefetchTerrainTiles();
-                // 门控：本帧 `Step` 会加载的**整批** tile 都已就绪才推进（等 worker；**绝不**在渲染帧内同步生成）。
-                const bool canStep = terrainStepReady(kTerrainResidencyActionsPerFrame);
-                if (canStep && tileScheduler.HasPendingWork()) {
-                    (void)tileScheduler.Step(world, kTerrainResidencyActionsPerFrame, terrainResidencyChanged);
-                }
-                for (const vx::TileCoord& coord : terrainResidencyChanged) {
-                    // `Step` 已经改过世界：**世界里有 ⇒ 这是新建**（登记 + 上传 + 碰撞）；否则是卸载。
-                    if (world.HasTile(coord.x, coord.z)) {
-                        const std::size_t index = AppendResidentTile(tileResidency, coord);
-                        UploadResidentTile(tileResidency, index);
-                        // 新 tile 只可能出现在窗口边缘（Chebyshev 33）⇒ 通常不在碰撞半径内；这里按判据如实处理。
-                        (void)SyncResidentTileCollision(tileResidency, index,
-                                                        NeedsTerrainCollision(tileScheduler.Window(), coord));
-                    } else {
-                        (void)RemoveResidentTile(tileResidency, coord);
+                terrainStreamPrefetchMs = terrainStreamClock.Tick() * 1000.0;
+                terrainStreamUpdateMs   = terrainStreamPlanMs + terrainStreamDrainMs + terrainStreamPrefetchMs;
+
+                // P6-A：**共享每帧预算**（自"更新收包之后"起算）—— A 的范围是安装 / 上传 / LOD 重网格 / 碰撞体同步。
+                // 每次判定都顺带采样一次（`Tick` 取增量并重置基准），`terrainBudgetSpentMs` 即该段已用毫秒。
+                vx::Clock terrainBudgetClock;
+                double     terrainBudgetSpentMs = 0.0;
+                const auto terrainWithinBudget  = [&](double deadlineMs) {
+                    terrainBudgetSpentMs += terrainBudgetClock.Tick() * 1000.0;
+                    return terrainBudgetSpentMs < deadlineMs;
+                };
+
+                // **安装**：`Step` **逐 tile** 推进（一次一个），每步前查共享预算。
+                // 为什么不再"整批 4 个"：整批里只要有一个 tile 的 GPU 上传贵（实测安装峰值 19.28 ms），整批就一起贵；
+                // 逐 tile + 预算才能在超预算时**就地停手**，而 `Step` 的游标天然可续 ⇒ 余下的排到后续帧。
+                // 门控：下一个要加载的 tile 必须已被 worker 建好，否则本帧不再推进（**绝不**在渲染帧内同步生成）。
+                {
+                    std::size_t installActions = 0;
+                    while (installActions < kTerrainResidencyActionsPerFrame &&
+                           tileScheduler.PendingActionCount() > 0U &&
+                           terrainWithinBudget(kTerrainInstallDeadlineMs)) {
+                        if (!terrainNextStepReady()) {
+                            break;  // 下一个 tile 还没被 worker 建好 ⇒ 等（**绝不**在渲染帧内同步生成）
+                        }
+                        terrainResidencyChanged.clear();
+                        (void)tileScheduler.Step(world, 1, terrainResidencyChanged);
+                        for (const vx::TileCoord& coord : terrainResidencyChanged) {
+                            // `Step` 已经改过世界：**世界里有 ⇒ 这是新建**（登记 + 上传 + 碰撞）；否则是卸载。
+                            if (world.HasTile(coord.x, coord.z)) {
+                                const std::size_t index = AppendResidentTile(tileResidency, coord);
+                                UploadResidentTile(tileResidency, index);
+                                // 新 tile 只可能出现在窗口边缘（Chebyshev 33）⇒ 通常不在碰撞半径内；按判据如实处理。
+                                syncTerrainCollision(index, NeedsTerrainCollision(tileScheduler.Window(), coord));
+                            } else {
+                                (void)RemoveResidentTile(tileResidency, coord);
+                            }
+                        }
+                        ++installActions;
                     }
                 }
+                terrainStreamInstallMs = terrainStreamClock.Tick() * 1000.0;
 
                 // **LOD 切换（relod）**：只改**网格**，不改世界数据。
                 // 有 worker ⇒ 提交**重网格任务**（高度快照进 worker，网格化离开渲染帧）；结果在 `drain` 里安装、
-                // 随后按预算重传。无 worker ⇒ 回退主线程重建（有界由 `kTerrainRelodPerFrame` 保证）。
-                (void)tileScheduler.StepRelod(kTerrainRelodPerFrame, terrainRelodChanged);
-                for (const vx::TileCoord& coord : terrainRelodChanged) {
-                    std::size_t index = 0;
-                    if (!world.HasTile(coord.x, coord.z) ||
-                        !FindResidentTileIndex(tileResidency, coord, index)) {
-                        continue;  // 同一帧里已被卸掉（relod 清单可能含"随后卸载"的 tile）⇒ 跳过
-                    }
-                    const int lod = tileScheduler.LodLevelForTile(coord);
-                    if (terrainHasWorkers) {
-                        if (terrainRelodInFlight.find(coord) != terrainRelodInFlight.end()) {
-                            continue;  // 已在飞 ⇒ 不重复提交
+                // 随后按预算重传。无 worker ⇒ 回退主线程重建（有界由 `kTerrainRelodPerFrame` + 共享预算保证）。
+                // P6-A：同样**逐 tile** 推进 + 查共享预算；`StepRelod` 的游标天然可续 ⇒ 余下的排到后续帧。
+                {
+                    std::size_t relodActions = 0;
+                    while (relodActions < kTerrainRelodPerFrame &&
+                           tileScheduler.PendingRelodCount() > 0U &&
+                           terrainWithinBudget(kTerrainRelodDeadlineMs)) {
+                        terrainRelodChanged.clear();
+                        (void)tileScheduler.StepRelod(1, terrainRelodChanged);
+                        for (const vx::TileCoord& coord : terrainRelodChanged) {
+                            std::size_t index = 0;
+                            if (!world.HasTile(coord.x, coord.z) ||
+                                !FindResidentTileIndex(tileResidency, coord, index)) {
+                                continue;  // 同一帧里已被卸掉（relod 清单可能含"随后卸载"的 tile）⇒ 跳过
+                            }
+                            const int lod = tileScheduler.LodLevelForTile(coord);
+                            if (terrainHasWorkers) {
+                                if (terrainRelodInFlight.find(coord) != terrainRelodInFlight.end()) {
+                                    continue;  // 已在飞 ⇒ 不重复提交
+                                }
+                                const vx::TerrainTile* tile = world.FindTile(coord.x, coord.z);
+                                if (tile == nullptr) {
+                                    continue;
+                                }
+                                vx::TerrainTileBuildRequest request;
+                                request.coord      = coord;
+                                request.lodLevel   = lod;
+                                request.remeshOnly = true;
+                                request.tile       = *tile;  // 高度快照（8 KB）⇒ worker 只读、不碰世界
+                                terrainBuildPipeline.Submit(std::move(request));
+                                terrainRelodInFlight.insert(coord);
+                                continue;
+                            }
+                            world.MeshTile(coord.x, coord.z, lod);
+                            if (tileResidency.handles[index].IsValid()) {
+                                tileResidency.renderer.ReleaseMesh(tileResidency.handles[index]);
+                                tileResidency.handles[index] = vx::MeshHandle {};
+                            }
+                            UploadResidentTile(tileResidency, index);
+                            reconcileTerrainCollision(index, coord);  // P6-C：只对账存在性，不重建高度场
                         }
-                        const vx::TerrainTile* tile = world.FindTile(coord.x, coord.z);
-                        if (tile == nullptr) {
-                            continue;
-                        }
-                        vx::TerrainTileBuildRequest request;
-                        request.coord      = coord;
-                        request.lodLevel   = lod;
-                        request.remeshOnly = true;
-                        request.tile       = *tile;  // 高度快照（8 KB）⇒ worker 只读、不碰世界
-                        terrainBuildPipeline.Submit(std::move(request));
-                        terrainRelodInFlight.insert(coord);
-                        continue;
+                        ++relodActions;
                     }
-                    world.MeshTile(coord.x, coord.z, lod);
-                    if (tileResidency.handles[index].IsValid()) {
-                        tileResidency.renderer.ReleaseMesh(tileResidency.handles[index]);
-                        tileResidency.handles[index] = vx::MeshHandle {};
-                    }
-                    UploadResidentTile(tileResidency, index);
-                    (void)SyncResidentTileCollision(tileResidency, index,
-                                                    NeedsTerrainCollision(tileScheduler.Window(), coord));
                 }
-                // 重传本帧（含上帧残留）已安装的 relod 网格（有上界）。
+                // 重传本帧（含上帧残留）已安装的 relod 网格（有上界 + 共享预算；余下留到后续帧）。
                 {
                     std::size_t relodUploads = 0;
-                    while (relodUploads < kTerrainRelodUploadsPerFrame && !terrainRelodUploads.empty()) {
+                    while (relodUploads < kTerrainRelodUploadsPerFrame && !terrainRelodUploads.empty() &&
+                           terrainWithinBudget(kTerrainRelodDeadlineMs)) {
                         const vx::TileCoord coord = terrainRelodUploads.front();
                         terrainRelodUploads.erase(terrainRelodUploads.begin());
                         ++relodUploads;
@@ -3995,10 +4165,10 @@ int main(int argc, char** argv) {
                             tileResidency.handles[index] = vx::MeshHandle {};
                         }
                         UploadResidentTile(tileResidency, index);
-                        (void)SyncResidentTileCollision(tileResidency, index,
-                                                        NeedsTerrainCollision(tileScheduler.Window(), coord));
+                        reconcileTerrainCollision(index, coord);  // P6-C：只对账存在性，不重建高度场
                     }
                 }
+                terrainRelodMs = terrainStreamClock.Tick() * 1000.0;
 
                 // **碰撞体随窗口重扫**（W7-S3b）：只在窗口中心变化时**开启一轮**，每帧只做固定个**状态跃迁**。
                 // 为什么必须收敛半径：碰撞只在近场有意义（角色 / 弹道 / 爆炸都在玩家附近），而常驻集合要到 33 tile；
@@ -4014,8 +4184,11 @@ int main(int argc, char** argv) {
                     const int   half = kTerrainCollisionRadiusTiles + 1;  // 多扫一圈：让"刚离开的"也走到撤销
                     const int   side = 2 * half + 1;
                     std::size_t used = 0;
+                    // P6-A：碰撞体建 / 撤（Jolt 高度场）是**最贵**的一段 ⇒ 同样受共享预算约束（用剩余到总上限）。
+                    // 游标不推进即"本帧到此为止"，下一帧从同一格续扫（**不改最终结果**）。
                     while (terrainCollisionSweepCursor < side * side &&
-                           used < kTerrainCollisionActionsPerFrame) {
+                           used < kTerrainCollisionActionsPerFrame &&
+                           terrainWithinBudget(kTerrainStreamBudgetMs)) {
                         const int dx = (terrainCollisionSweepCursor % side) - half;
                         const int dz = (terrainCollisionSweepCursor / side) - half;
                         ++terrainCollisionSweepCursor;
@@ -4026,18 +4199,20 @@ int main(int argc, char** argv) {
                         }
                         const bool want = NeedsTerrainCollision(tileScheduler.Window(), coord);
                         if (want == (tileResidency.collisionActive[index] != 0U)) {
-                            continue;  // 状态一致 ⇒ 不付重活（游标继续扫，不占预算）
+                            continue;  // 状态一致 ⇒ 不付重活（游标继续扫）
                         }
-                        (void)SyncResidentTileCollision(tileResidency, index, want);
+                        syncTerrainCollision(index, want);
                         ++used;
                     }
                     if (terrainCollisionSweepCursor >= side * side) {
                         terrainCollisionSweepActive = false;
                     }
                 }
+                terrainStreamSweepMs = terrainStreamClock.Tick() * 1000.0;
                 // "窗口调整完毕" = 调度器无待办 **且** worker 在飞 / 待重传都已排空（**真正追上飞行**的可观测判据）。
                 const bool terrainCaughtUp = !tileScheduler.HasPendingWork() && terrainBuildInFlight.empty() &&
                                              terrainRelodInFlight.empty() && terrainRelodUploads.empty();
+                terrainCaughtUpThisFrame = terrainCaughtUp;  // P6：供帧末"流式积压"读数
                 if (tileWasBusy && terrainCaughtUp) {
                     // 一次"窗口调整"收尾后记一条（跨越 tile 边界一条，不逐帧刷屏）——走动验收的可观测证据。
                     const vx::TerrainTileBuildPipeline::Stats buildStats = terrainBuildPipeline.SnapshotStats();
@@ -4052,12 +4227,15 @@ int main(int argc, char** argv) {
                                 buildStats.computeMsMax, world.SyncFallbackCount());
                 }
             }
+            terrainResidencyMs = terrainResidencyTimer.EndMs();  // P5：地表常驻子相位（到此结束）
 
+            destructionTimer.Begin();  // P5：延后破坏子相位
             const std::size_t destructionUnits = destructionProcessor.Process(editContext, kDestructionBudgetMs);
             if (terrainExplosionSeen) {
                 // 地表爆破的外环会抬高地形 ⇒ 复用缺陷 B2 的救场：把被埋住的角色顶回地面。
                 LiftCharacterIfBuried(physics, character, camera, world);
             }
+            destructionMs = destructionTimer.EndMs();  // P5：延后破坏子相位（到此结束）
             const double logicMs = logicTimer.EndMs();
 
             // 浮点原点重定基（T41）：渲染原点漂移过远时把它搬到相机附近。
@@ -4591,6 +4769,11 @@ int main(int argc, char** argv) {
             // 一条日志里同时给出各段 CPU + draw call + 提交网格数 + 等交换链耗时，据此可立刻区分
             // 「CPU 忙 / GPU 忙 / 在空等」。
             const double frameMs = frameTimer.EndMs();
+            // P6 收尾：**无条件**累加（判据来源；与下面那条带节流的日志**无关**）。
+            ++steadyFrameCount;
+            if (frameMs > kHitchThresholdMs) { ++hitchFramesOver33Ms; }
+            if (frameMs > kHitchHardSpikeMs) { ++hitchFramesOver50Ms; }
+            if (frameMs > hitchWorstFrameMs) { hitchWorstFrameMs = frameMs; }
             if (frameMs > kHitchThresholdMs && hitchLogClock.Tick() * 1000.0 >= kHitchLogMinIntervalMs) {
                 (void)hitchLogClock.Tick();  // 重置节流窗口（节流口径不变，观测本身不制造新卡顿）
                 const double measuredMs = inputMs + cpuCost.logicMs + cpuCost.uiMs + cullMs + rebaseMs +
@@ -4605,6 +4788,28 @@ int main(int argc, char** argv) {
                             (renderStats.swapchainWaitMs > cpuCost.renderMs * 0.5)
                                 ? "等交换链（GPU / 呈现）"
                                 : "CPU 侧（逻辑 / UI / 提交）");
+                // P5（2026-10-06）：把"逻辑"这一个笼统数字拆成子相位 —— 尖峰定位到具体段才允许改逻辑代码。
+                const double logicBreakdownMs = stepMs + collapseMs + volumeResidencyMs + terrainResidencyMs + destructionMs;
+                VX_LOG_WARN("  └ 逻辑拆分（P5）：固定步 %.2f + 倒塌 %.2f + 体积常驻 %.2f + 地表常驻 %.2f"
+                            "（其中**碰撞体同步 %.2f**）+ 破坏 %.2f = %.2f（逻辑其余 %.2f）",
+                            stepMs, collapseMs, volumeResidencyMs, terrainResidencyMs, terrainCollisionSyncMs,
+                            destructionMs, logicBreakdownMs, std::max(0.0, cpuCost.logicMs - logicBreakdownMs));
+                // P6（2026-10-06）：把「地表常驻」再拆一层 —— 飞行卡顿的定位依据（先定位，再分帧）。
+                VX_LOG_WARN("      └ 地表常驻拆分（P6）：更新收包 %.2f（计划 %.2f + 收包 %.2f + 预取 %.2f）"
+                            " + 安装 %.2f + LOD 重网格 %.2f + 碰撞重扫 %.2f（其中碰撞体同步 %.2f）",
+                            terrainStreamUpdateMs, terrainStreamPlanMs, terrainStreamDrainMs,
+                            terrainStreamPrefetchMs, terrainStreamInstallMs, terrainRelodMs,
+                            terrainStreamSweepMs, terrainCollisionSyncMs);
+                // P6（2026-10-06）：**流式积压**读数 —— 判断"是否在追平"的可判定依据。
+                // 为什么必须有：预算标定若小于"追平所需吞吐"，积压会**单调增长**而尖峰反而更多（实测踩到过一次）。
+                // 口径：`load/unload/relod` = 调度器尚未移除的动作数；`staged` = worker 已建好、等 `Step` 安装的 tile；
+                // `inflight` = 已提交、尚未收包的任务。**计数键与 `caught_up` 用 ASCII**（`(P6-A)` 为机器可读标记），
+                // 供 `tools/vx_stream_regression.ps1` 断言"积压不增长 / 追得平"，不依赖中文字面。
+                VX_LOG_WARN("      └ 流式积压（P6-A）：load=%zu + unload=%zu + relod=%zu；staged=%zu + inflight=%zu "
+                            "⇒ caught_up=%s",
+                            tileScheduler.PendingLoadCount(), tileScheduler.PendingUnloadCount(),
+                            tileScheduler.PendingRelodCount(), world.StagedTileCount(),
+                            terrainBuildInFlight.size(), terrainCaughtUpThisFrame ? "yes" : "no");
             }
 
             // V2b：会话墙钟推进 —— `Clock::ElapsedSeconds()` **只在 `Tick()` 时累计**，
@@ -4676,7 +4881,14 @@ int main(int argc, char** argv) {
             VX_LOG_WARN("设置保存失败：%s", saveError.what());
         }
 
-        VX_LOG_INFO("收到退出请求，主循环结束（累计 %.1f s）", sessionClock.ElapsedSeconds());
+        // P6 收尾（2026-10-06）：**稳态 hitch 汇总**（不节流累计 ⇒ 判据的唯一可判定来源）。
+        // 口径 = `SKILL` 第四节的"密度阈值型"：`> kHitchThresholdMs`(33 ms) 看**密度**、`> kHitchHardSpikeMs`(50 ms)
+        // 必须逐帧可解释、并给出**最坏单帧**。计数键用 **ASCII**（`frames/over33/over50/worst_ms` + `hitch` 标记）
+        // ⇒ 供 `tools/vx_stream_regression.ps1` 直接断言，不依赖中文字面。
+        VX_LOG_INFO("收到退出请求，主循环结束（累计 %.1f s）；稳态 hitch 汇总（V7）："
+                    "frames=%zu over33=%zu over50=%zu worst_ms=%.1f",
+                    sessionClock.ElapsedSeconds(), steadyFrameCount, hitchFramesOver33Ms, hitchFramesOver50Ms,
+                    hitchWorstFrameMs);
     } catch (const std::exception& error) {
         VX_LOG_ERROR("启动或主循环失败：%s", error.what());
         return EXIT_FAILURE;

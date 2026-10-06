@@ -70,17 +70,25 @@ void TerrainTileBuildPipeline::ReapFinishedJobs() {
 }
 
 bool TerrainTileBuildPipeline::TakeCompleted(TerrainTileBuildResult& out) {
-    // 先回收：任务结束 ⇒ 它的结果已经（或正在）push，请求不再被读取 ⇒ 可以释放 Job。
-    ReapFinishedJobs();
-
     TerrainTileBuildResult result;
+    bool                   have = false;
     {
         const std::lock_guard<std::mutex> lock(m_completedMutex);
-        if (m_completed.empty()) {
-            return false;
+        if (!m_completed.empty()) {
+            result = std::move(m_completed.front());
+            m_completed.pop_front();  // P6 收尾：O(1)（原先 `erase(begin())` 要搬移整队；元素含 8 KB `TerrainTile`）
+            have = true;
         }
-        result = std::move(m_completed.front());
-        m_completed.erase(m_completed.begin());  // 队列长度 ≤ 在飞任务数（数十量级）⇒ 搬移成本可忽略
+    }
+    if (!have) {
+        // P6 收尾（2026-10-06）：**只在"本轮收包已弹空"时回收一次**。
+        // 为什么：`drainTerrainTileBuilds` 一帧内**多次**调用本函数把队列弹空，而原先**每次**都重扫在飞列表
+        // ⇒ 成本 = O(队列长 × 在飞数)；预取提前量上限 192 ⇒ 该乘积可达 ≈3.7 万次扫描/帧（实测 `收包` 段
+        // 均值 3.4 / 峰值 11.9 ms）。放到"弹空"这一刻 ⇒ 一次/帧。
+        // 语义不变：任务结束 ⇒ 结果已 push ⇒ `Job` 可释放（延迟到同一帧的收包收尾，仍在本帧内）。
+        // 刻意放在锁外：`ReapFinishedJobs` 只碰 `m_inFlight`（主线程独占）⇒ 不必占着完成队列的锁。
+        ReapFinishedJobs();
+        return false;
     }
 
     m_stats.completed += 1U;

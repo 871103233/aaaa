@@ -1145,8 +1145,72 @@ TOML 的整数是**有符号 64 位**（toml++ 存 `int64_t`），而实例种�
 
 **可复用的教训**：判定"业界标准能不能用"必须**落到本仓库的实际配置**上核实（默认 MSAA 档、SDK 是否暴露该 API），
 不能只看"业界都这么做"；而且"能跑"不等于"有收益"——**先量收益再决定是否启用**。
-
 **相关**：`engine/render/software_occlusion.*`、`game/main.cpp` 的 `--occlusion`；[ADR 0031](adr/0031-occlusion-culling-software.md)。
+
+### Q38 把流式安装改成"逐 tile 推进"后，门控为什么必须改成"游标感知"？（P6-A 缺陷）
+
+**症状**：帧时间**反而更差**（最坏 95.7 ms，改前 63.2 ms），且"常驻集合已随窗口调整完毕"**一次都不再打印**。
+
+**机制**：门控原本按**一帧的批量大小**判定"前 N 个待加载 tile 是否都已就绪"，其中用的是一个**每帧开始时的快照**
+（`terrainPendingLoadScratch[0..N)`）。改成逐 tile（每次 `Step(1)`）之后，若仍按"快照里的第 0 个"判断，
+则装完第 0 个后它的暂存条目已被 `LoadTile` 消费 ⇒ `HasStagedTile` 恒为 false ⇒ **每帧只装 1 个**。
+后果不是"慢一点"，而是**结构性**的：加载游标推不动 ⇒ `Step` 的"先加载后卸载"永远轮不到卸载分支 ⇒
+`待卸` 单调增长 **67 → 1132** ⇒ 常驻集合无限膨胀、始终"未追平"。
+
+**正解**：门控必须查**调度器当前的游标**（`NextPendingLoadTile()`），而不是一帧一次的快照下标。
+
+**可复用的教训**：① 把"批量"改成"逐件"时，**所有以批量为前提的判据都要一起改**（这是"语义变了、判据没变"的典型）；
+② "慢"要看**积压是否单调增长**才能区分"慢"与"追不上"——为此加了永久观测行
+`流式积压（P6-A）：load= unload= relod= staged= inflight= caught_up=`；③ 该缺陷**在帧时间里看不出来**
+（只表现为"尖峰变多"），故必须有**积压/追平的专用读数**，并已由 `tools/vx_stream_regression.ps1` 变成**失败退出码**。
+**相关**：`docs/plans/v0.5.md` §1.17.1 / §1.17.2、`tools/vx_stream_regression.ps1`。
+
+### Q39 为什么"帧尖峰日志的**条数**"不能用来算 hitch 密度？
+
+因为尖峰日志有**节流**（`kHitchLogMinIntervalMs = 200 ms`，避免持续低帧把日志刷爆）⇒ 日志条数**系统性偏少**，
+拿它算"每秒多少帧超阈值"会**低估**，判据因此**不可判定**（实测：同一份日志里"尖峰"条目 36 条，而不节流的真实计数是几百帧）。
+
+**正解**：另设**不节流**的累计计数（帧末无条件累加），**退出时打一行**
+`稳态 hitch 汇总（V7）：frames= over33= over50= worst_ms=`；节流日志只用于**定位**（看某一帧花在哪一段）。
+**可复用的教训**：**"给人看的日志"和"给判据用的数据"要分开**——前者可以节流/采样，后者必须完整。
+**相关**：`game/main.cpp` 的 `kHitchHardSpikeMs` / 不节流计数器、`references/performance-and-hitches.md`「总判据」。
+
+### Q40 在本项目的机器上，为什么"绝对帧时间阈值"要改成"密度阈值型"？（V7 重校准）
+
+**原判据**："不存在 > 50 ms 的单帧"。**问题**：本机（VM / 共享环境）实测存在**不可分割的单件停顿** ——
+SDL_gpu 缓冲创建 / 上传偶发 30+ ms、进程 / GPU 被调度器挂起（本仓曾实测 **1410 ms** 单帧）—— 任何"分帧"都挡不住，
+因此该判据**不具区分度**（本仓 `docs/devlog.md` 早有同类登记）。
+
+**新判据**（所有者 2026-10-06 裁定）：`P99 ≤ 2× 帧预算` + **`> 50 ms 帧 ≤ 6 帧 / 60 s`（且每帧须可解释）** + **最坏单帧 ≤ 80 ms**；
+阈值按**干净 debug 长跑**标定（实测 1–2 帧 / 60 s、最坏 58–73 ms）留 ~3× 余量。
+**可复用的教训**：① 判据要**先确认自己测得准**（见 Q39），再谈阈值；② 阈值必须**可达成**，否则等于没有判据；
+③ 改判据属**降级**，必须走"降级必须先问"；④ 同代码在本机波动可达 **1–9 帧 / 60 s** ⇒ 回归脚本里这条默认记 **WARN**
+（`-StrictV7` 才升级为失败），避免噪声误报。
+**相关**：`SKILL.md` 第四节、`references/performance-and-hitches.md`「总判据」、`docs/plans/v0.5.md` §1.17.2 ④。
+
+### Q41 worker 线程里测出的耗时，为什么不能当"CPU 成本"用？（P6 release 复测）
+
+`TerrainTileBuildPipeline` 在 worker 里用 `Clock` 量"单 tile 计算耗时"并上报峰值（实测 debug 110 ms、
+release 148 ms）。但该读数是**墙钟**：只要线程被调度器**抢占**，被抢占的时间也会算进去 ⇒
+它**不是** CPU 成本，而是"墙钟 + 排队 + 抢占"。因此拿它论证"worker 侧太慢 ⇒ 主线程被背压"**证据不足**。
+
+**正解**：要判定 CPU 成本，须做**进程内 min-of-N 基准**（取多次的**最小值**，受抢占影响最小）。
+**可复用的教训**：**线程内量自己的耗时，只能说明"多久返回"，不能说明"花了多少 CPU"**；
+凡跨线程 / 有抢占的场景，峰值读数只能当**上界**，不能当成本。
+**相关**：`docs/plans/v0.5.md` §1.17.2（登记为待办：worker min-of-N 基准）。
+
+### Q42 新增一个 CMake preset（如 `release`）时 vcpkg 配置失败怎么办？（环境）
+
+**症状**：`cmake --preset release` 在 `Running vcpkg install - failed` 处失败，日志尾部为
+`failed to unpack tree object <sha>` + `vcpkg was cloned as a shallow repository`。
+**根因**：`D:\dev\vcpkg` 是**浅克隆**，缺该 port（本次是 `spirv-cross`）对应版本的 git tree；
+而每个 preset 的 `binaryDir` 各自有一份 `vcpkg_installed` ⇒ 新 preset 必须重新 install。
+**正解（两条）**：① 彻底解：`git -C D:\dev\vcpkg fetch --unshallow`（随后 install 会走 vcpkg 二进制缓存，通常很快）；
+② 应急绕：**复用已有 preset 实例的 `vcpkg_installed`**（`x64-windows` 三连包**同时含 release / debug 两套 lib**，
+实测可行）—— `cmake --preset release -DVCPKG_MANIFEST_INSTALL=OFF -DVCPKG_INSTALLED_DIR=<已有实例>/vcpkg_installed`。
+**可复用的教训**：vcpkg 的依赖是**按 preset 实例**安装的，"debug 能编"不代表"release 能配"；
+另注意 VS 开发环境会覆盖 `VCPKG_ROOT`，必须"先起 DevShell、再设 `VCPKG_ROOT`"（见 Q6）。
+**相关**：`CMakePresets.json`、`docs/plans/v0.5.md` §1.17.2（环境登记）。
 
 
 
