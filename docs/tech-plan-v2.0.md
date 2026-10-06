@@ -55,7 +55,7 @@
 | # | 待定项 | 收敛时限 | 登记位置 |
 | --- | --- | --- | --- |
 | 1 | 地表 LOD 方案与接缝策略 | LOD 任务开工前经 ADR 收敛 | SKILL「待收敛项」表 **#4（开放）** |
-| 2 | 遮挡剔除（方案未定） | V0.5 开工前经 ADR 收敛 | SKILL「待收敛项」表 **#6（开放）** |
+| 2 | 遮挡剔除（方案**已定**：CPU 软件遮挡，见 [ADR 0031](adr/0031-occlusion-culling-software.md)） | V0.5 开工前经 ADR 收敛 | **已收敛（2026-10-06）** → [ADR 0031](adr/0031-occlusion-culling-software.md)：`SKILL`「待收敛项」表 **#6 已关闭**；能力**已实现但默认休眠**（实测该最小路线零收益） |
 | 3 | 存档 `.voxr` v2 的精确字节布局 | **首次存档实现前**冻结 | `../.trae/skills/voxel-engine-dev-standards/references/save-and-serialization.md` §2（执行层待定） |
 
 **规则**：待定项收敛前，本版正文与对应 `references` **不得**出现并列候选；与之绑定的验收维度（长视距 Draw Call、长视距内存）**只记录、不验收**（见 §7.3 与 [ADR 0008](adr/0008-sizes-precision-budget.md) §2）。

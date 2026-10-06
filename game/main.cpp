@@ -43,6 +43,7 @@
 #include "render/mesh_renderer.hpp"
 #include "render/model_loader.hpp"
 #include "render/shadow_cascade.hpp"
+#include "render/software_occlusion.hpp"
 #include "render/texture_loader.hpp"
 #include "rigid_collapse.hpp"
 #include "terrain/material_table.hpp"
@@ -162,6 +163,17 @@ constexpr double kHitchThresholdMs = 33.0;
 
 /// 尖峰日志的最小间隔（毫秒）：持续低帧时避免把日志刷爆（观测本身不能制造新的卡顿）。
 constexpr double kHitchLogMinIntervalMs = 200.0;
+
+/// P3 / [ADR 0031](../../docs/adr/0031-occlusion-culling-software.md)：CPU 软件遮挡的参数（**保守优先**）。
+///
+/// 遮挡体 = **地形高度场**（在高度场世界里地形就是主要遮挡体）；每帧按列投影进一张低分辨率 NDC 深度图，
+/// 再对静态网格 AABB 做层级 Z 测试。**只影响主通道提交**（阴影列表不动 —— 被遮的投射体仍可能投影）。
+constexpr int   kOcclusionGridWidth       = 160;     ///< 深度图列数（低分辨率即可）
+constexpr int   kOcclusionGridHeight      = 90;      ///< 深度图行数
+constexpr float kOcclusionSampleSpacing   = 8.0F;    ///< 地形采样间距（格）；越大越省 CPU、遮挡面越稀
+constexpr float kOcclusionSampleExtent    = 128.0F;  ///< 采样半径（格，以相机为中心的正方形）
+constexpr float kOcclusionDepthBias       = 1.0e-3F; ///< NDC 深度偏置（吸收采样 / 浮点误差，偏保守）
+constexpr int   kOcclusionMaxCoveredCells = 1024;    ///< 候选覆盖格数上限；超过即不做判定（近处大网格）
 
 /// **延后破坏工作的每帧预算**（毫秒，T37）。
 ///
@@ -493,32 +505,34 @@ bool RemoveResidentTile(TileResidencyResources& res, const vx::TileCoord& coord)
     return relative;
 }
 
-/// 视锥剔除判据（T39）：世界 AABB → 渲染空间 → 与相机视锥做**保守**相交。
+/// **主通道**剔除判据（T39）：世界 AABB → 渲染空间 → 与相机视锥做**保守**相交。
 ///
-/// 为什么不能只按相机视锥剔除：**影子可以落在"看不到投射体"的地方**（高塔在画面外、影子在画面内）。
-/// 只按视锥剔除会重现"阴影随视角消失"—— 那正是 B6 / B8 修过的缺陷。故这里先把 AABB 沿**太阳方向
-/// 的反向**扫掠到地面（= 该物体最坏情况下能投影到的区域），取"物体 ∪ 影子落点"的并集再判可见性：
-/// 保守（可能多留几个网格），但**不会丢阴影**。
+/// P1（2026-10-06）起**不再**叠"沿太阳方向扫掠"：影子改由**逐级联**的判据单独保证（见 `ShadowCastsInto`），
+/// 主通道只管"相机看不看得见"。这样既保住"影子不随视角消失"（B6 / B8 契约），又把主通道提交量降下来
+/// （原先扫掠会为一堆"画面外、只有影子在画面内"的网格多付 draw call）。
 ///
-/// 渲染空间：上传的顶点是**相机相对**坐标，故 AABB 也要减去渲染原点（红线 6）。
-[[nodiscard]] bool VisibleToCamera(const vx::Frustum& frustum, const WorldAabb& bounds, const glm::dvec3& renderOrigin,
-                                   const glm::vec3& sunDirection) {
+/// 渲染空间：上传的顶点是**渲染原点相对**坐标，故 AABB 也要减去渲染原点（红线 6）。
+[[nodiscard]] bool VisibleToFrustum(const vx::Frustum& frustum, const WorldAabb& bounds,
+                                    const glm::dvec3& renderOrigin) {
     if (!bounds.valid) {
         return true;  // 无包围盒 ⇒ 保守提交
     }
-    glm::vec3 minimum = bounds.min;
-    glm::vec3 maximum = bounds.max;
-
-    // 影子的水平位移 ≈ (太阳方向的水平分量) × (高度 / 太阳高度的正弦)；竖直方向落到地面（y = 0）。
-    const float     sunY  = std::max(sunDirection.y, 1.0e-3F);  // 太阳近地平线时钳一个下限，避免扫掠发散
-    const float     top   = std::max(maximum.y, 0.0F);
-    const float     reach = top / sunY;
-    const glm::vec3 offset(-sunDirection.x * reach, -top, -sunDirection.z * reach);
-    minimum = glm::min(minimum, minimum + offset);
-    maximum = glm::max(maximum, maximum + offset);
-
     const glm::vec3 origin = glm::vec3(renderOrigin);  // 渲染原点取整，float 可精确表示
-    return vx::FrustumIntersectsAabb(frustum, minimum - origin, maximum - origin);
+    return vx::FrustumIntersectsAabb(frustum, bounds.min - origin, bounds.max - origin);
+}
+
+/// **阴影某一级**的剔除判据（P1）：AABB 减去渲染原点后与该级**光空间盒**求交。
+///
+/// 为什么这样不会丢阴影：盒 = 该级阴影图**实际覆盖并光栅化**的区域（已含投射体扩展，见
+/// `BuildCascadeLightMatrix`）；盒外的几何本来就会被该级正交投影裁掉、写不进该级阴影图。
+/// 判据本体是纯函数 `AabbCastsIntoLightSpace`（可单测）。
+[[nodiscard]] bool ShadowCastsInto(const glm::mat4& lightMatrix, const WorldAabb& bounds,
+                                   const glm::dvec3& renderOrigin) {
+    if (!bounds.valid) {
+        return true;  // 无包围盒 ⇒ 保守提交
+    }
+    const glm::vec3 origin = glm::vec3(renderOrigin);
+    return vx::AabbCastsIntoLightSpace(lightMatrix, bounds.min - origin, bounds.max - origin);
 }
 
 /// 把主角胶囊的**局部**顶点（脚底为原点）搬到**渲染相对**空间：`渲染相对 = 脚底 + 局部 − 渲染原点`。
@@ -1805,6 +1819,30 @@ int main(int argc, char** argv) {
               [](const std::pair<double, std::string>& left, const std::pair<double, std::string>& right) {
                   return left.first < right.first;
               });
+
+    // P3（[ADR 0031](../../docs/adr/0031-occlusion-culling-software.md)）：`--occlusion=on|off` —— 遮挡剔除开关。
+    // **缺省 off（休眠）**：实测（2026-10-06，A 世界 10 km）"地形高度场逐点投影"这条最小路线
+    // **覆盖太稀**（1089 采样点只填 293/14400 格 = 2%）⇒ **零剔除**，却使剔除相位 +21 ms。
+    // 故按 SKILL 第五节：**保留能力代码 / 单测 / ADR，只关闭行为**，默认关闭即逐位回退到"不剔"。
+    bool occlusionEnabled = false;
+    for (const std::string& argument : arguments) {
+        constexpr const char* kOcclusionPrefix = "--occlusion=";
+        if (argument.rfind(kOcclusionPrefix, 0) != 0) {
+            continue;
+        }
+        const std::string value = argument.substr(std::char_traits<char>::length(kOcclusionPrefix));
+        if (value == "off" || value == "0" || value == "false") {
+            occlusionEnabled = false;
+        } else if (value == "on" || value == "1" || value == "true") {
+            occlusionEnabled = true;
+        } else {
+            VX_LOG_WARN("`--occlusion` 取值非法（应为 on|off）：%s ⇒ 忽略（保持 %s）", value.c_str(),
+                        occlusionEnabled ? "on" : "off");
+        }
+    }
+    VX_LOG_INFO("遮挡剔除（P3 / ADR 0031）：%s",
+                occlusionEnabled ? "启用（CPU 软件遮挡，遮挡体 = 地形高度场；--occlusion=off 可关闭）"
+                                 : "关闭（休眠：实测该最小路线零收益，见 ADR 0031；--occlusion=on 可启用）");
 
     // T85：把测试模式打进日志（自动测试 ⇒ 勿动键鼠；人工测试 ⇒ 逐条列出验收项）。
     // 即便本机未加载 CJK 字体、面板不渲染非 ASCII 动态文本，日志里仍有完整信息。
@@ -3242,6 +3280,18 @@ int main(int argc, char** argv) {
         std::vector<vx::MeshHandle> frameHandles;
         frameHandles.reserve(tileHandles.size() + volumeSlots.Size() + 1 + orbHandles.size() +
                              objectSlots.size() + static_cast<std::size_t>(collapseSpec.maxActiveUnits));
+        // P1（2026-10-06）：**逐级联**的阴影绘制列表 —— 与主通道列表同批构建（容量预留 ⇒ 稳态零分配）。
+        // 每级只收"能落进该级光空间盒"的静态网格 + 全部动态网格（主角 / 光球 / 倒塌整体，数量少）。
+        std::vector<vx::MeshHandle> shadowCascadeHandles[vx::kMaxShadowCascades];
+        vx::ShadowCascadeDrawList   shadowCascadeLists[vx::kMaxShadowCascades] {};
+        for (std::vector<vx::MeshHandle>& cascadeHandles : shadowCascadeHandles) {
+            cascadeHandles.reserve(frameHandles.capacity());
+        }
+        std::vector<vx::MeshHandle> shadowDynamicHandles;
+        shadowDynamicHandles.reserve(2 + orbHandles.size() + static_cast<std::size_t>(collapseSpec.maxActiveUnits));
+        // P3（ADR 0031）：遮挡剔除的 CPU 深度图 —— 跨帧复用（尺寸固定 ⇒ 稳态零分配）。
+        vx::OcclusionDepthGrid occlusionGrid;
+        vx::ResetOcclusionDepthGrid(occlusionGrid, kOcclusionGridWidth, kOcclusionGridHeight);
 
         /// T33：本帧**落定**（倒了、停住了）的倒塌整体 —— 帧末统一体素化回写（缓冲复用，稳态零分配）。
         std::vector<vx::ActiveCollapseUnit> settledCollapseUnits;
@@ -3349,14 +3399,6 @@ int main(int argc, char** argv) {
         // T38：帧尖峰打点所需的状态（跨帧保持）。
         vx::Clock           hitchLogClock;           ///< 尖峰日志的节流时钟（最多每 `kHitchLogMinIntervalMs` 一条）
         bool                cullingLogged = false;   ///< T39：剔除结果只打一条日志（启动后第一次提交时）
-
-        // T39：剔除所需的**太阳方向**（来自配置、不随帧变化，只算一次）。影子往太阳的反方向落。
-        const glm::vec3 sunDirection = [&lighting]() {
-            const glm::vec3 direction(lighting.Sun().direction[0], lighting.Sun().direction[1],
-                                      lighting.Sun().direction[2]);
-            const float     length = glm::length(direction);
-            return (length > 0.0F) ? (direction / length) : glm::vec3(0.0F, 1.0F, 0.0F);
-        }();
 
         // W6：水面流动时间（秒）—— 累加**固定步**时间（与物理同步 ⇒ 确定性，不受帧率影响）。
         double waterTimeSeconds = 0.0;
@@ -4142,50 +4184,202 @@ int main(int argc, char** argv) {
                 slot.bounds.valid = true;
             }
 
-            // T79②：**剔除与绘制列表构建**独立计时（原先落在"未计时"里）。
+            // T79②：**剔除与绘制列表构建**独立计时（原先落在"未计时"里）。P1 起把"阴影矩阵构建"
+            // 一并计入本相位 —— 它是"逐级剔除"的输入（各级光空间矩阵）。
             cullTimer.Begin();
 
-            // T39：**先剔除再提交**（`references/performance-and-hitches.md` §1.3 硬规则 3）。
-            // 判据 = 相机视锥 ∩（物体 ∪ 其影子落点）：前者去掉"背后 / 侧向"的网格，后者保证不丢阴影。
+            // T21b（P1 起**前移到剔除之前**）：级联分割与各级光空间矩阵由 game 每帧按相机参数算出
+            // （engine 不认识相机设置），经 BuildShadowUniform 单入口投影成片元 uniform 槽 2 的参数块。
+            // 为什么要前移：P1 的"阴影按级联剔除"需要各级的光空间矩阵（判据见 `ShadowCastsInto`）。
+            // 缺陷 1：投射体扩展需要"最高投射体相对渲染原点的高度"——由已加载地形推导：
+            //   casterTopRelative = 最高地表高度（世界 Y，格）− 渲染原点 Y
+            // 与级联中心同坐标系（都是渲染原点相对），故引擎侧 `casterTopRelative − center.y` 即
+            // "最高地形高度 − 该级切片中心高度"。地形可被笔刷挖/堆，故每帧重算（仅遍历已加载 tile）。
+            const vx::CameraSettings& cameraSettings    = camera.Settings();
+            const float               maxSurfaceBlocks  = world.MaxSurfaceHeightBlocks();
+            const float               casterTopRelative =
+                std::max(0.0F, maxSurfaceBlocks - static_cast<float>(renderOrigin.y));
+            const vx::ShadowUniform   shadowUniform = vx::BuildShadowUniform(
+                lighting, relativeView.view, cameraSettings.fieldOfViewDegrees, cameraSettings.aspectRatio,
+                cameraSettings.nearPlane, cameraSettings.farPlane, casterTopRelative);
+            renderer.SetShadowCascades(shadowUniform, static_cast<std::uint32_t>(lighting.Shadow().cascadeCount),
+                                       static_cast<std::uint32_t>(lighting.Shadow().resolution));
+            // 本帧**生效**的阴影级数（与 `SetShadowCascades` 收到的数一致；阴影关闭时为 0）。
+            const int shadowCascades =
+                (shadowUniform.enabled > 0.5F) ? static_cast<int>(shadowUniform.cascadeCount) : 0;
+
+            // P1 预筛（性能，2026-10-06）：把每级**光空间盒**的 8 个 NDC 角点经光矩阵的**逆**变回
+            // **渲染相对世界空间**，取世界 AABB。逐网格先做 6 次比较的廉价相交 —— 盒 ⊆ 其世界 AABB，
+            // 故"与该 AABB 不相交"⇒ 必然不在盒内，可安全跳过精确判定。**为什么必须预筛**：精确判定是
+            // 每帧对**全部常驻 tile × 每一级**做矩阵运算（baseline 实测：加逐级判定后剔除相位由 ~5 ms 升到 ~20 ms）；
+            // 预筛后绝大多数 tile 只付 6 次比较，从而把"逐级判定"的增量成本压回去。
+            glm::vec3 cascadeBoxMin[vx::kMaxShadowCascades] {};
+            glm::vec3 cascadeBoxMax[vx::kMaxShadowCascades] {};
+            // 并集（所有**有效**级联盒世界 AABB 的并）—— 逐网格先做**一次** 6 次比较的预筛：
+            // 与并集不相交 ⇒ 任何一级都不可能含它 ⇒ 连"逐级预筛"都不必做。这是第 2 档（剔除相位）的主要手段：
+            // 把"每 tile × 3 级"的预筛摊成"每 tile 1 次"，绝大多数 tile 在此直接跳过。
+            glm::vec3 shadowUnionMin(std::numeric_limits<float>::max());
+            glm::vec3 shadowUnionMax(std::numeric_limits<float>::lowest());
+            for (int cascade = 0; cascade < shadowCascades; ++cascade) {
+                const glm::mat4 inverseLight =
+                    glm::inverse(shadowUniform.lightMatrices[static_cast<std::size_t>(cascade)]);
+                glm::vec3 minimum(std::numeric_limits<float>::max());
+                glm::vec3 maximum(std::numeric_limits<float>::lowest());
+                for (int corner = 0; corner < 8; ++corner) {
+                    const float x = ((corner & 1) != 0) ? 1.0F : -1.0F;
+                    const float y = ((corner & 2) != 0) ? 1.0F : -1.0F;
+                    const float z = ((corner & 4) != 0) ? 1.0F : 0.0F;  // SDL_gpu 的 NDC z ∈ [0,1]
+                    const glm::vec4 cornerClip = inverseLight * glm::vec4(x, y, z, 1.0F);
+                    const glm::vec3 point      = glm::vec3(cornerClip) / cornerClip.w;
+                    minimum = glm::min(minimum, point);
+                    maximum = glm::max(maximum, point);
+                }
+                cascadeBoxMin[cascade] = minimum;
+                cascadeBoxMax[cascade] = maximum;
+                shadowUnionMin = glm::min(shadowUnionMin, minimum);
+                shadowUnionMax = glm::max(shadowUnionMax, maximum);
+            }
+
+            // T39 / P1：**先剔除再提交**（`references/performance-and-hitches.md` §1.3 硬规则 3）。
+            //   - **主通道** = **纯相机视锥**（去掉"背后 / 侧向"的网格）；
+            //   - **阴影第 i 级** = 与该级**光空间盒**相交的网格（`ShadowCastsInto`）。该盒已含投射体扩展，
+            //     盒外几何本来就会被该级正交投影裁掉 ⇒ **不丢阴影**；draw call 由此不再 = 提交网格 ×（1 + 级数）。
             const vx::Frustum frustum = vx::FrustumFromViewProjection(relativeView.viewProjection);
 
-            // T27：本帧绘制列表 = 地表 tile + 可挖体积块 + 主角 + **活动**光球（失效槽位不进列表，
-            // 因此不会为它们付出 draw call 与统计）。容量在启动时已预留，稳态零分配。
+            // P3（[ADR 0031](../../docs/adr/0031-occlusion-culling-software.md)）：CPU 软件遮挡 —— 遮挡体 = **地形高度场**。
+            // 以相机为中心做一次**固定顺序**的正方形采样（确定性），逐点投影进低分辨率 NDC 深度图；
+            // 只影响**主通道**列表（阴影列表不动：被相机遮住的投射体仍可能把影子投进画面）。
+            std::size_t occlusionSamplesHit  = 0;  // 观测（ADR 0031）：本次命中的地形采样点数
+            std::size_t occlusionFilledCells = 0;  // 观测（ADR 0031）：深度图被填的格数
+            if (occlusionEnabled) {
+                vx::ResetOcclusionDepthGrid(occlusionGrid, kOcclusionGridWidth, kOcclusionGridHeight);
+                const int steps = static_cast<int>(kOcclusionSampleExtent / kOcclusionSampleSpacing);
+                for (int iz = -steps; iz <= steps; ++iz) {
+                    for (int ix = -steps; ix <= steps; ++ix) {
+                        const double worldX = view.eye.x + static_cast<double>(ix) *
+                                                            static_cast<double>(kOcclusionSampleSpacing);
+                        const double worldZ = view.eye.z + static_cast<double>(iz) *
+                                                            static_cast<double>(kOcclusionSampleSpacing);
+                        float        height = 0.0F;
+                        if (!world.QueryHeight(static_cast<float>(worldX), static_cast<float>(worldZ), height)) {
+                            continue;  // 未加载 / 无数据 ⇒ 不制造遮挡面（保守：只少剔，不误剔）
+                        }
+                        ++occlusionSamplesHit;
+                        vx::SplatOccluderPoint(occlusionGrid, relativeView.viewProjection,
+                                               glm::vec3(static_cast<float>(worldX - renderOrigin.x),
+                                                         static_cast<float>(static_cast<double>(height) -
+                                                                            renderOrigin.y),
+                                                         static_cast<float>(worldZ - renderOrigin.z)));
+                    }
+                }
+                // 观测（ADR 0031）：遮挡面覆盖度 —— 用于判断"零剔除"是覆盖不足还是逻辑问题。
+                for (const float value : occlusionGrid.depth) {
+                    if (value > vx::kNoOccluderDepth) {
+                        ++occlusionFilledCells;
+                    }
+                }
+            }
+            /// P3：静态网格是否**确定被地形遮挡**（保守：条件不齐即 false）。关闭遮挡剔除时恒 false。
+            const auto occludedStatic = [&](const WorldAabb& bounds) {
+                if (!occlusionEnabled || !bounds.valid) {
+                    return false;
+                }
+                const glm::vec3 origin = glm::vec3(renderOrigin);
+                return vx::IsAabbOccluded(occlusionGrid, relativeView.viewProjection, bounds.min - origin,
+                                          bounds.max - origin, kOcclusionDepthBias, kOcclusionMaxCoveredCells);
+            };
+
             frameHandles.clear();
+            shadowDynamicHandles.clear();
+            for (std::vector<vx::MeshHandle>& cascadeHandles : shadowCascadeHandles) {
+                cascadeHandles.clear();
+            }
+            // 把一个**静态**网格按两套判据分发：主通道视锥 → 主列表；各级光空间盒 → 对应级列表。
+            const auto submitStaticCasters = [&](const vx::MeshHandle& handle, const WorldAabb& bounds) {
+                if (shadowCascades <= 0) {
+                    return;  // 阴影关闭 ⇒ 无逐级列表
+                }
+                if (!bounds.valid) {
+                    // 无包围盒（空网格 / 未上传）⇒ 保守进每一级（这类网格极少，代价可忽略）。
+                    for (int cascade = 0; cascade < shadowCascades; ++cascade) {
+                        shadowCascadeHandles[cascade].push_back(handle);
+                    }
+                    return;
+                }
+                const glm::vec3 origin  = glm::vec3(renderOrigin);
+                const glm::vec3 minimum = bounds.min - origin;
+                const glm::vec3 maximum = bounds.max - origin;
+                // ① 并集预筛（第 2 档）：与所有级盒的并集不相交 ⇒ 任何一级都不会含它，直接跳过全部逐级判定。
+                if (maximum.x < shadowUnionMin.x || minimum.x > shadowUnionMax.x ||
+                    maximum.y < shadowUnionMin.y || minimum.y > shadowUnionMax.y ||
+                    maximum.z < shadowUnionMin.z || minimum.z > shadowUnionMax.z) {
+                    return;
+                }
+                // ② 命中并集者才逐级：先各段预筛，再精确判定。
+                for (int cascade = 0; cascade < shadowCascades; ++cascade) {
+                    // 廉价预筛：与该级盒的世界 AABB 不相交 ⇒ 必然不在盒内 ⇒ 跳过精确判定。
+                    if (maximum.x < cascadeBoxMin[cascade].x || minimum.x > cascadeBoxMax[cascade].x ||
+                        maximum.y < cascadeBoxMin[cascade].y || minimum.y > cascadeBoxMax[cascade].y ||
+                        maximum.z < cascadeBoxMin[cascade].z || minimum.z > cascadeBoxMax[cascade].z) {
+                        continue;
+                    }
+                    if (ShadowCastsInto(shadowUniform.lightMatrices[static_cast<std::size_t>(cascade)], bounds,
+                                        renderOrigin)) {
+                        shadowCascadeHandles[cascade].push_back(handle);
+                    }
+                }
+            };
+
             std::size_t visibleTiles   = 0;
             std::size_t visibleVolumes = 0;
             std::size_t visibleShells  = 0;
             std::size_t visibleObjects = 0;
             for (std::size_t i = 0; i < tileHandles.size(); ++i) {
-                if (tileHandles[i].IsValid() && VisibleToCamera(frustum, tileBounds[i], renderOrigin, sunDirection)) {
+                if (!tileHandles[i].IsValid()) {
+                    continue;
+                }
+                if (VisibleToFrustum(frustum, tileBounds[i], renderOrigin) && !occludedStatic(tileBounds[i])) {
                     frameHandles.push_back(tileHandles[i]);
                     ++visibleTiles;
                 }
+                submitStaticCasters(tileHandles[i], tileBounds[i]);
             }
             for (const auto& entry : volumeSlots) {
-                if (entry.second.handle.IsValid() &&
-                    VisibleToCamera(frustum, entry.second.bounds, renderOrigin, sunDirection)) {
+                if (!entry.second.handle.IsValid()) {
+                    continue;
+                }
+                if (VisibleToFrustum(frustum, entry.second.bounds, renderOrigin) &&
+                    !occludedStatic(entry.second.bounds)) {
                     frameHandles.push_back(entry.second.handle);
                     ++visibleVolumes;
                 }
+                submitStaticCasters(entry.second.handle, entry.second.bounds);
             }
-            // W4：地表壳的近场块（静网格，与 tile / 体积同走 T39 视锥剔除）。
+            // W4：地表壳的近场块（静网格，与 tile / 体积同走 T39 视锥剔除 + P1 逐级阴影剔除）。
             for (std::size_t i = 0; i < shellHandles.size(); ++i) {
-                if (shellHandles[i].IsValid() &&
-                    VisibleToCamera(frustum, shellBounds[i], renderOrigin, sunDirection)) {
+                if (!shellHandles[i].IsValid()) {
+                    continue;
+                }
+                if (VisibleToFrustum(frustum, shellBounds[i], renderOrigin) && !occludedStatic(shellBounds[i])) {
                     frameHandles.push_back(shellHandles[i]);
                     ++visibleShells;
                 }
+                submitStaticCasters(shellHandles[i], shellBounds[i]);
             }
-            // V0b：物件层（ADR 0004 层③）—— **静网格**，与 tile / 体积 / 地表壳同走 T39 视锥剔除。
+            // V0b：物件层（ADR 0004 层③）—— **静网格**，同走两套剔除。
             // 提交量由剔除结果决定（SKILL 第四节硬规则 3）；物件不移动 ⇒ 位姿在上传时一次登记。
             for (const ObjectSlot& slot : objectSlots) {
-                if (slot.handle.IsValid() && VisibleToCamera(frustum, slot.bounds, renderOrigin, sunDirection)) {
+                if (!slot.handle.IsValid()) {
+                    continue;
+                }
+                if (VisibleToFrustum(frustum, slot.bounds, renderOrigin) && !occludedStatic(slot.bounds)) {
                     frameHandles.push_back(slot.handle);
                     ++visibleObjects;
                 }
+                submitStaticCasters(slot.handle, slot.bounds);
             }
-            // W6：水面（半透明；在主通道**最后**绘制 ⇒ 追加在列表末尾）。
+            // W6：水面（半透明；在主通道**最后**绘制 ⇒ 追加在列表末尾）。水面**不投影阴影**
+            // （`DrawMeshes` 在阴影通道按 `waterPass` 跳过它）⇒ 不进任何阴影列表。
             if (waterHandle.IsValid()) {
                 frameHandles.push_back(waterHandle);
             }
@@ -4193,13 +4387,16 @@ int main(int argc, char** argv) {
             // 不透明度由纯函数给出（开阔处 = 1 = 不透明）；实际淡出在片元侧按 **Bayer 抖动 discard** 实现
             // （保持不透明管线 ⇒ 无深度排序问题）。
             // W6d 的"过近隐藏"能力仍保留、仍关闭（`targetHideDistance = 0` ⇒ 判据恒 false ⇒ 主角恒提交）。
+            // 动态网格（主角 / 光球 / 倒塌整体）数量少且每帧在动 ⇒ 不参与静态盒剔除，进**每一级**阴影。
             if (characterMesh.IsValid() && !vx::ShouldHideFollowTarget(view, camera.Settings())) {
                 renderer.SetMeshOpacity(characterMesh, vx::FollowTargetFadeOpacity(view, camera.Settings()));
                 frameHandles.push_back(characterMesh);
+                shadowDynamicHandles.push_back(characterMesh);
             }
             for (std::size_t i = 0; i < orbHandles.size(); ++i) {
                 if (orbPool.Orbs()[i].active && orbHandles[i].IsValid()) {
                     frameHandles.push_back(orbHandles[i]);
+                    shadowDynamicHandles.push_back(orbHandles[i]);
                 }
             }
             // T33：活跃倒塌整体的网格（落定后即移出列表 ⇒ 不再为它付 draw call）。
@@ -4207,8 +4404,23 @@ int main(int argc, char** argv) {
             for (const vx::ActiveCollapseUnit& unit : rigidCollapse.Active()) {
                 if (unit.mesh.IsValid()) {
                     frameHandles.push_back(unit.mesh);
+                    shadowDynamicHandles.push_back(unit.mesh);
                 }
             }
+
+            // 动态网格并入**每一级**阴影；随后把各级列表交给 `RenderFrame`（P1）。
+            // 阴影关闭 / 级数 < 4 时，剩余槽位显式置空 ⇒ 不把上一帧的旧列表传下去。
+            for (int cascade = 0; cascade < shadowCascades; ++cascade) {
+                std::vector<vx::MeshHandle>& cascadeHandles = shadowCascadeHandles[cascade];
+                cascadeHandles.insert(cascadeHandles.end(), shadowDynamicHandles.begin(), shadowDynamicHandles.end());
+                shadowCascadeLists[cascade].meshes = cascadeHandles.data();
+                shadowCascadeLists[cascade].count  = cascadeHandles.size();
+            }
+            for (int cascade = shadowCascades; cascade < vx::kMaxShadowCascades; ++cascade) {
+                shadowCascadeLists[cascade].meshes = nullptr;
+                shadowCascadeLists[cascade].count  = 0;
+            }
+
             // 提交量（T38）：在 `RenderFrame` 之后记录，**下一帧**的尖峰日志才能与同批实测值（draw call /
             // 三相耗时 / 帧时长）对齐 —— 三者都取"最近一次"的实测值，混帧会让定位结论失真。
             const std::size_t submittedThisFrame = frameHandles.size();
@@ -4216,12 +4428,19 @@ int main(int argc, char** argv) {
 
             // T39：剔除结果**首次可观测**（`references/performance-and-hitches.md` §3"提交量必须由剔除结果
             // 决定"）：只打一条，用于确认剔除真的在起作用（而不是把整个世界都提交了）。
+            // P1：同时打印**各级阴影**的提交数 —— 用于核对"逐级剔除"确实生效（对照 draw call 的下降）。
             if (!cullingLogged) {
                 cullingLogged = true;
-                VX_LOG_INFO("首帧视锥剔除（T39）：地表 tile %zu/%zu、可挖体积块 %zu/%zu、地表壳块 %zu/%zu、"
-                            "物件 %zu/%zu 通过（含阴影扫掠余量）；本帧提交网格 %zu 个",
+                VX_LOG_INFO("首帧视锥剔除（T39 / P1）：地表 tile %zu/%zu、可挖体积块 %zu/%zu、地表壳块 %zu/%zu、"
+                            "物件 %zu/%zu 通过；本帧提交网格 %zu 个；阴影各级提交 %zu/%zu/%zu/%zu（级数 %d）",
                             visibleTiles, tileHandles.size(), visibleVolumes, volumeSlots.Size(), visibleShells,
-                            shellHandles.size(), visibleObjects, objectSlots.size(), submittedThisFrame);
+                            shellHandles.size(), visibleObjects, objectSlots.size(), submittedThisFrame,
+                            shadowCascadeHandles[0].size(), shadowCascadeHandles[1].size(),
+                            shadowCascadeHandles[2].size(), shadowCascadeHandles[3].size(), shadowCascades);
+                // P3 观测（ADR 0031）：遮挡面覆盖度 —— "零剔除"时用它区分"覆盖不足"与"逻辑问题"。
+                VX_LOG_INFO("遮挡剔除（P3 / ADR 0031）：%s；地形采样命中 %zu 点、深度图填充 %zu/%d 格",
+                            occlusionEnabled ? "启用" : "关闭", occlusionSamplesHit, occlusionFilledCells,
+                            kOcclusionGridWidth * kOcclusionGridHeight);
             }
 
             // 调试面板：统计经独立接口采集，只在渲染线程构建，不进世界层热路径。
@@ -4313,7 +4532,8 @@ int main(int argc, char** argv) {
                 break;
             }
 
-            // T45：**uniform 构建**独立计时（材质 / 光照 / 相机 / 渲染原点 / 阴影级联，原先落在未计时区）。
+            // T45：**uniform 构建**独立计时（材质 / 光照 / 相机 / 渲染原点，原先落在未计时区）。
+            // P1 起"阴影级联"的构建前移到**剔除相位**（逐级剔除需要各级光空间矩阵），不再计在本段。
             uniformTimer.Begin();
             // 材质参数（高度带 / 坡度带 / UV 尺度 / 层色）来自与 TerrainWorld **同一份**材质表；
             // 渲染原点每次重定基后都要刷新（原点进 uniform，片元据此把渲染相对坐标还原为世界坐标）。
@@ -4342,25 +4562,15 @@ int main(int argc, char** argv) {
             // W6：推进水面流动时间并下发（`water.frag` 的滚动波据此流动）。
             waterTimeSeconds += static_cast<double>(plan.steps) * vx::kFixedDt;
             renderer.SetWaterTime(static_cast<float>(waterTimeSeconds));
-            // T21b：级联分割与各级光空间矩阵由 game 每帧按相机参数算出（engine 不认识相机设置），
-            // 经 BuildShadowUniform 单入口投影成片元 uniform 槽 2 的参数块；级数 / 分辨率来自配置。
-            // 缺陷 1：投射体扩展需要"最高投射体相对渲染原点的高度"——由已加载地形推导：
-            //   casterTopRelative = 最高地表高度（世界 Y，格）− 渲染原点 Y
-            // 与级联中心同坐标系（都是渲染原点相对），故引擎侧 `casterTopRelative − center.y` 即
-            // "最高地形高度 − 该级切片中心高度"。地形可被笔刷挖/堆，故每帧重算（仅遍历已加载 tile）。
-            const vx::CameraSettings& cameraSettings = camera.Settings();
-            const float               maxSurfaceBlocks = world.MaxSurfaceHeightBlocks();
-            const float               casterTopRelative =
-                std::max(0.0F, maxSurfaceBlocks - static_cast<float>(renderOrigin.y));
-            const vx::ShadowUniform   shadowUniform  = vx::BuildShadowUniform(
-                lighting, relativeView.view, cameraSettings.fieldOfViewDegrees, cameraSettings.aspectRatio,
-                cameraSettings.nearPlane, cameraSettings.farPlane, casterTopRelative);
-            renderer.SetShadowCascades(shadowUniform, static_cast<std::uint32_t>(lighting.Shadow().cascadeCount),
-                                       static_cast<std::uint32_t>(lighting.Shadow().resolution));
+            // T21b（P1 起**在剔除之前**构建，见那里的说明：逐级剔除需要各级光空间矩阵）；
+            // 此处只结束 uniform 相位（材质 / 光照 / 相机 / 渲染原点 / 水面时间）。
             const double uniformMs = uniformTimer.EndMs();
             // T24：渲染提交相位（RenderFrame 内含相机常量与动态顶点等内部上传）。
             renderTimer.Begin();
-            if (!renderer.RenderFrame(frameHandles.data(), frameHandles.size(), clearColor, &debugOverlay)) {
+            // P1：把**逐级联**的阴影绘制列表交给渲染器（`RenderFrame` 内每级只画自己那份，
+            // 不再对每级重画主通道列表）⇒ draw call 由「提交网格 ×（1 + 级数）」降下来。
+            if (!renderer.RenderFrame(frameHandles.data(), frameHandles.size(), clearColor, &debugOverlay,
+                                      shadowCascadeLists, vx::kMaxShadowCascades)) {
                 VX_LOG_DEBUG("本帧未取得交换链纹理（窗口最小化？），跳过渲染");
             }
             const double renderMs = renderTimer.EndMs();

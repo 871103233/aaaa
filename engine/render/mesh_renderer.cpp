@@ -2096,7 +2096,8 @@ void MeshRenderer::UploadCameraUniform(SDL_GPUCommandBuffer* commandBuffer) {
 }
 
 bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, const SDL_FColor& clearColor,
-                               IRenderOverlay* overlay) {
+                               IRenderOverlay* overlay, const ShadowCascadeDrawList* shadowLists,
+                               std::size_t shadowListCount) {
     SDL_GPUCommandBuffer* commandBuffer = SDL_AcquireGPUCommandBuffer(m_device);
     if (commandBuffer == nullptr) {
         throw std::runtime_error(std::string("SDL_AcquireGPUCommandBuffer 失败：") + SDL_GetError());
@@ -2182,9 +2183,18 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
             SDL_GPUBuffer* matrixBuffers[1] = { m_shadowMatrixBuffers[cascade] };
             SDL_BindGPUVertexStorageBuffers(shadowPass, 0, matrixBuffers, 1);
 
+            // P1：该级若有**逐级绘制列表**则用它 —— 盒外几何进不了该级阴影图（判据见
+            // `AabbCastsIntoLightSpace`）；`shadowLists` 为空 / 该级无列表时退回主通道列表（逐位一致）。
+            const MeshHandle* cascadeMeshes    = meshes;
+            std::size_t       cascadeMeshCount = meshCount;
+            if (shadowLists != nullptr && static_cast<std::size_t>(cascade) < shadowListCount) {
+                cascadeMeshes    = shadowLists[cascade].meshes;
+                cascadeMeshCount = shadowLists[cascade].count;
+            }
+
             // T78：阴影通道**不使用**深度偏移变体（传 nullptr）⇒ 保持阴影现状、逐网格不切管线。
             // T69：蒙皮网格（主角）在阴影通道走蒙皮阴影管线 —— 否则换成模型后主角会不再投影（可见回退）。
-            DrawMeshes(commandBuffer, shadowPass, meshes, meshCount, /*pushEmissive=*/false,
+            DrawMeshes(commandBuffer, shadowPass, cascadeMeshes, cascadeMeshCount, /*pushEmissive=*/false,
                        /*basePipeline=*/m_shadowPipeline, /*depthBiasedPipeline=*/nullptr,
                        /*skinnedPipeline=*/m_shadowSkinnedPipeline,
                        /*primaryStorageBuffer=*/m_shadowMatrixBuffers[cascade], shadowEmissiveState,

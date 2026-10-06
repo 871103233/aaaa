@@ -549,3 +549,51 @@ TEST(ShadowCascade, CascadeBlendWeightTransitionsSmoothly) {
     EXPECT_FLOAT_EQ(CascadeBlendWeight(splitInner - 1.0F, splitInner, 0.0F), 1.0F);
     EXPECT_FLOAT_EQ(CascadeBlendWeight(splitInner + 5.0F, splitInner, 0.0F), 1.0F);
 }
+
+// ---- 性能收口 P1（2026-10-06）：AabbCastsIntoLightSpace —— 阴影"按级联剔除"的判据 ----
+//
+// 契约：
+//   ① **盒内 / 跨界 ⇒ 保留**（不丢阴影）；
+//   ② **盒外 ⇒ 剔除**（省 draw call）；
+//   ③ 与"投射体扩展"一致：带扩展时高投射体必须保留（B6 / B8 契约在剔除侧不回归）。
+// 正确性依据：该盒就是这一级阴影图**实际覆盖并光栅化**的区域 ⇒ 盒外几何本来就会被裁掉 ⇒ 等价变换。
+
+TEST(ShadowCascade, LightSpaceCullingKeepsInsideAndCrossingBox) {
+    const glm::vec3 sunDirection = glm::normalize(glm::vec3(0.5F, 0.8F, 0.3F));
+    const glm::vec3 center(3.0F, 4.0F, 5.0F);
+    const float     radius = 10.0F;
+    const float     texel  = 2.0F * radius / 1024.0F;
+    const glm::mat4 matrix = BuildCascadeLightMatrix(sunDirection, center, radius, texel);
+
+    // ① 盒正中的小球 ⇒ 保留。
+    EXPECT_TRUE(vx::AabbCastsIntoLightSpace(matrix, center - glm::vec3(1.0F), center + glm::vec3(1.0F)));
+    // ② 跨界（AABB 远大于盒）⇒ 保留（保守，绝不误剔）。
+    EXPECT_TRUE(vx::AabbCastsIntoLightSpace(matrix, center - glm::vec3(3.0F * radius),
+                                            center + glm::vec3(3.0F * radius)));
+    // ③ 沿光平面（光空间 x）偏出 1000 格 ⇒ 剔除。取垂直于太阳方向与世界上的水平轴 —
+    //    即 `BuildCascadeLightMatrix` 内部的量化轴 `right`（太阳非近垂直时 reference = 世界上向）。
+    const glm::vec3 lightRight = glm::normalize(glm::cross(sunDirection, glm::vec3(0.0F, 1.0F, 0.0F)));
+    const glm::vec3 farCenter  = center + lightRight * 1000.0F;
+    EXPECT_FALSE(vx::AabbCastsIntoLightSpace(matrix, farCenter - glm::vec3(1.0F), farCenter + glm::vec3(1.0F)));
+}
+
+TEST(ShadowCascade, LightSpaceCullingKeepsTallCasterWhenExtended) {
+    const glm::vec3 sunDirection = glm::normalize(glm::vec3(0.5F, 0.8F, 0.3F));
+    const glm::vec3 center(3.0F, 4.0F, 5.0F);
+    const float     radius       = 10.0F;
+    const float     texel        = 2.0F * radius / 1024.0F;
+    const float     casterHeight = 60.0F;
+    const glm::vec3 casterTop    = center + glm::vec3(0.0F, casterHeight, 0.0F);
+    const glm::vec3 low          = casterTop - glm::vec3(1.0F);
+    const glm::vec3 high         = casterTop + glm::vec3(1.0F);
+
+    // 带投射体扩展 ⇒ 高投射体必须保留（否则"塔在画面外、影子在画面内"会丢影子）。
+    const glm::mat4 extended = BuildCascadeLightMatrix(sunDirection, center, radius, texel, casterHeight);
+    EXPECT_TRUE(vx::AabbCastsIntoLightSpace(extended, low, high))
+        << "带投射体扩展时，中心上方 " << casterHeight << " 格的投射体必须保留";
+
+    // 反证（对照）：无扩展时它本就在盒外 ⇒ 剔除。证明本测不是恒真。
+    const glm::mat4 legacy = BuildCascadeLightMatrix(sunDirection, center, radius, texel, 0.0F);
+    EXPECT_FALSE(vx::AabbCastsIntoLightSpace(legacy, low, high))
+        << "无扩展时该投射体落在盒外（对照，证明判据确实在区分）";
+}

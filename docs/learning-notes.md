@@ -1122,3 +1122,31 @@ TOML 的整数是**有符号 64 位**（toml++ 存 `int64_t`），而实例种�
 **一般规则**：任何"无符号 64 位或更大"的量落到 TOML / JSON 时都要先确认其数字类型的位宽与符号 —— TOML 整数 = **有符号 64 位**；JSON 更只有 IEEE 双精度浮点（**> 2⁵³ 起就不精确**）。
 **相关**：[ADR 0030](adr/0030-instance-save-slot.md)（秘境存档槽）、`world/save/world_instance_save.hpp`。
 
+### Q36 什么是"阴影按级联剔除"（per-cascade culling），为什么它**不丢阴影**？
+
+- **一句话**：级联阴影（CSM）有几级，就把几何按"能否落进**该级**的光空间盒"分成几份分别提交，而不是每一级都把**同一份完整绘制表**重画一遍。
+- **为什么需要**：`draw call ≈ 提交网格 ×（1 + 级数）` —— 本项目旧实现里 3 级阴影各重画全表 ⇒ A 世界 10 km 实测 draw call 5853（提交网格 1464 × 4）。
+- **为什么等价（关键）**：每级的光空间**正交盒**就是"这一级阴影图**实际覆盖并光栅化**的区域"（含"投射体扩展"）。几何落在盒外 ⇒ 它本来就会被该级正交投影**裁剪掉**、写不进该级阴影图 ⇒ 提前剔掉它**不改变该级任何像素**。这不是近似，是等价变换。（业界同做法：UE5 Shadow Depth Pass 的 per-cascade 剔除、Unity URP/HDRP per-cascade culling。）
+- **易错点**：① 盒的边界要按渲染后端的 NDC 约定（SDL_gpu：x/y ∈ [-1,1]、z ∈ **[0,1]**）判交；② 别退化成"对全部常驻块 × 每一级做矩阵运算"——本项目实测那会把剔除相位从 ~5 ms 推到 ~20 ms，必须先做**世界 AABB 预筛**（把盒的 8 个 NDC 角点用光矩阵的**逆**变回世界空间取 AABB，6 次比较即可排除绝大多数块）；③ 把 AABB 变到光空间时可用**仿射 AABB 变换**（中心 = M·center、半长 = |M3×3|·extent），比"变换 8 个角点"便宜一个数量级、结果逐位等价（正交 ⇒ w 恒为 1）。
+- **相关**：`engine/render/shadow_cascade.hpp` 的 `AabbCastsIntoLightSpace`、`mesh_renderer.hpp` 的 `ShadowCascadeDrawList`；[ADR 0010](adr/0010-render-quality-pipeline.md)（渲染质量线）；`docs/devlog.md` 2026-10-06「P1 落地」。
+
+### Q37 在本项目里，"遮挡剔除"为什么既不能用硬件遮挡查询、也不能用深度回读？
+
+两条都被**本项目的实际约束**堵死（实测于仓库内的依赖与配置，非泛泛而谈）：
+
+1. **硬件遮挡查询（UE5 的 HOQ 路线）**：SDK 根本没有该 API —— vcpkg 的 `SDL3_gpu.h` 全文只有 `SDL_QueryGPUFence`
+   （栅栏），没有遮挡查询。要用手写 Vulkan（属**暂缓项**，V1.0 之后）。
+2. **上一帧深度回读 → HZB**：**默认 `MSAA = 2×`**（`engine/platform/settings.hpp`）⇒ 主深度目标是**多采样**纹理，
+   而 SDL_gpu **不支持深度 / 模板的多采样解析** ⇒ **无法下载**；要回读就得再加一条 **1× 深度预通道**（多一趟几何）。
+
+⇒ 收敛结论（[ADR 0031](adr/0031-occlusion-culling-software.md)）：取最接近的替代 = **CPU 软件遮挡**
+（地形高度场作遮挡体 → 低分辨率 NDC 深度图 → 保守层级 Z 测试）。**但实测该最小路线零收益**
+（覆盖仅 2%、draw call 不变、剔除相位 +21 ms）⇒ 能力**默认休眠**。
+
+**可复用的教训**：判定"业界标准能不能用"必须**落到本仓库的实际配置**上核实（默认 MSAA 档、SDK 是否暴露该 API），
+不能只看"业界都这么做"；而且"能跑"不等于"有收益"——**先量收益再决定是否启用**。
+
+**相关**：`engine/render/software_occlusion.*`、`game/main.cpp` 的 `--occlusion`；[ADR 0031](adr/0031-occlusion-culling-software.md)。
+
+
+

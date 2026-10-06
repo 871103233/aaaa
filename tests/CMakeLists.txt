@@ -51,6 +51,7 @@ add_executable(voxel_tests
     render_stats_test.cpp
     river_test.cpp
     shadow_cascade_test.cpp
+    software_occlusion_test.cpp
     shell_block_build_pipeline_test.cpp
     shell_block_residency_test.cpp
     surface_shell_test.cpp

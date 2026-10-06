@@ -224,6 +224,19 @@ protected:
     IRenderOverlay() = default;
 };
 
+/// 一个**阴影级联**的绘制列表（性能收口 P1，2026-10-06）。
+///
+/// 为什么需要它：阴影通道原先对**每一级级联**都用主通道的**同一份完整绘制表**重画
+/// ⇒ draw call ≈ 提交网格 ×（1 + 级数）；而每一级阴影图只覆盖它自己的光空间盒，
+/// 盒外的几何本来就会被裁剪、写不进该级 ⇒ 逐级传入"只含可能落进该级盒内"的列表可无损降 draw call
+/// （判据见 `render/shadow_cascade.hpp` 的 `AabbCastsIntoLightSpace`）。
+///
+/// 缺省（`RenderFrame` 不传 / 传 nullptr）⇒ 每级退回"用主通道列表"，与引入前逐位一致。
+struct ShadowCascadeDrawList {
+    const MeshHandle* meshes = nullptr;  ///< 该级的网格句柄数组（可为 nullptr / count = 0 ⇒ 该级无投射体）
+    std::size_t       count  = 0;        ///< 该级的网格句柄数
+};
+
 /// 通用网格渲染路径：图形管线 + 顶点 / 索引缓冲 + 每帧相机常量 + 索引绘制。
 ///
 /// 与 `TriangleRenderer` 的分工：后者是 PoC 冒烟路径（顶点写死在 Shader 内、无相机），
@@ -477,8 +490,15 @@ public:
     ///
     /// `meshes` 中被跳过的情况：指针为空、句柄无效、或该槽位已释放。
     /// 返回 false 表示本帧拿不到交换链纹理（如窗口最小化），调用方可直接跳过。
+    ///
+    /// `shadowLists` / `shadowListCount`（P1，可选）：**逐级联**的阴影绘制列表。非空且
+    /// `cascade < shadowListCount` 时，第 `cascade` 级阴影通道改用 `shadowLists[cascade]`；
+    /// 否则该级退回 `meshes`（引入前行为，逐位一致）。列表里的水面网格在阴影通道会被
+    /// `DrawMeshes` 自动跳过（水面不投影阴影）。
     [[nodiscard]] bool RenderFrame(const MeshHandle* meshes, std::size_t meshCount, const SDL_FColor& clearColor,
-                                   IRenderOverlay* overlay = nullptr);
+                                   IRenderOverlay* overlay = nullptr,
+                                   const ShadowCascadeDrawList* shadowLists = nullptr,
+                                   std::size_t shadowListCount = 0);
 
 private:
     struct MeshResources {

@@ -102,6 +102,22 @@ inline constexpr int kMaxShadowCascades = 4;
                                                 float cascadeRadius, float cascadeTexelSize,
                                                 float casterHeight = 0.0F) noexcept;
 
+/// 判断一个（**渲染原点相对**）的 AABB 是否可能向**某一级级联**投射阴影（性能收口 P1，2026-10-06）。
+///
+/// 判据：把 AABB 的 8 个角点经该级的**光空间矩阵**（`BuildShadowUniform` 产出的 `lightMatrices[i]`，
+/// 作用在渲染相对坐标上）变到 NDC，取 8 点在 NDC 的 AABB，与光空间盒
+/// `[-1,1] × [-1,1] × [0,1]`（SDL_gpu 的 NDC 约定，见 `BuildCascadeLightMatrix` 的说明）求交。
+///
+/// **为什么不会丢阴影**：该盒就是这一级阴影图**实际覆盖并光栅化**的区域（`BuildCascadeLightMatrix`
+/// 的正交盒，且**已含投射体扩展**）。落在盒外的几何本来就会被该级正交投影裁剪掉、写不进该级阴影图
+/// ⇒ 把它剔掉不改变该级的任何像素。故"按级联剔除"是**等价变换**，不是近似（对应
+/// `docs/devlog.md` 的 T40 欠账："需要把级联盒交给 CPU 侧"）。
+///
+/// 前置条件：`lightMatrix` 来自 `BuildShadowUniform`（正交 ⇒ `w == 1`）；`minimum` / `maximum` 各分量
+/// 满足 `minimum <= maximum`。不读全局、不分配。
+[[nodiscard]] bool AabbCastsIntoLightSpace(const glm::mat4& lightMatrix, const glm::vec3& minimum,
+                                           const glm::vec3& maximum) noexcept;
+
 /// 片元槽 2（`set = 3, binding = 2`）的阴影 uniform 块，std140 布局。
 ///
 /// 字段排布与 `assets/shaders/mesh.frag` 的 `ShadowBlock` **逐字对应**：

@@ -5,6 +5,8 @@
 #include <glm/common.hpp>          // glm::min / glm::max
 #include <glm/geometric.hpp>       // glm::cross / dot / length / normalize
 #include <glm/gtc/matrix_transform.hpp>  // glm::lookAt / orthoRH_ZO / radians
+#include <glm/mat3x3.hpp>          // glm::mat3（AabbCastsIntoLightSpace 的线性部分）
+#include <glm/vec4.hpp>            // glm::vec4（AabbCastsIntoLightSpace 的中心变换）
 
 #include <algorithm>
 #include <cmath>
@@ -144,6 +146,45 @@ glm::mat4 BuildCascadeLightMatrix(const glm::vec3& sunDirection, const glm::vec3
     const glm::mat4 projection =
         glm::orthoRH_ZO(-halfExtent, halfExtent, -halfExtent, halfExtent, 0.0F, farDepth);
     return projection * view;
+}
+
+bool AabbCastsIntoLightSpace(const glm::mat4& lightMatrix, const glm::vec3& minimum,
+                             const glm::vec3& maximum) noexcept {
+    // 光空间盒在 NDC 的边界（SDL_gpu：x/y ∈ [-1,1]、z ∈ [0,1]）。留一个极小的余量，
+    // 吸收浮点舍入：边界上恰好贴合的几何宁可多提交，也绝不因舍入被误剔（"不丢阴影"优先）。
+    constexpr float kMargin = 1.0e-3F;
+
+    // 正交投影（w 恒为 1）⇒ 仿射变换。把 AABB 变换到光空间 NDC 的**精确**包围盒：
+    //   中心 = M · center；半长 = |M[3×3]| · extent（逐轴绝对值乘半长，标准 AABB 变换）。
+    // 为什么不用"变换 8 个角点"：本函数每帧对**全部常驻 tile × 每一级**调用（见 game 侧剔除），
+    // 8 角点法在 debug 下要几十毫秒；本式只需 1 次 mat4×vec4 + 9 次乘加，结果**逐位等价**
+    // （仿射下 AABB→平行六面体，其轴对齐包围盒正是 center ± |M3x3|·extent）。
+    const glm::vec3 center = (minimum + maximum) * 0.5F;
+    const glm::vec3 extent = (maximum - minimum) * 0.5F;
+
+    const glm::vec4 centerClip = lightMatrix * glm::vec4(center, 1.0F);
+    if (std::abs(centerClip.w) <= 1.0e-6F) {
+        return true;  // 退化（不该发生）：保守提交，不冒丢阴影的风险
+    }
+    const glm::mat3 linear(lightMatrix);
+    const glm::vec3 extentClip(std::abs(linear[0][0]) * extent.x + std::abs(linear[1][0]) * extent.y +
+                                   std::abs(linear[2][0]) * extent.z,
+                               std::abs(linear[0][1]) * extent.x + std::abs(linear[1][1]) * extent.y +
+                                   std::abs(linear[2][1]) * extent.z,
+                               std::abs(linear[0][2]) * extent.x + std::abs(linear[1][2]) * extent.y +
+                                   std::abs(linear[2][2]) * extent.z);
+    const float     inverseW  = 1.0F / centerClip.w;
+    const glm::vec3 ndcCenter = glm::vec3(centerClip) * inverseW;
+    const glm::vec3 ndcExtent = extentClip * std::abs(inverseW);
+
+    const glm::vec3 ndcMinimum = ndcCenter - ndcExtent;
+    const glm::vec3 ndcMaximum = ndcCenter + ndcExtent;
+
+    // AABB（NDC 空间）与盒求交：任一轴上完全分离 ⇒ 该级阴影图不会包含它 ⇒ 剔除。
+    const bool separated = ndcMaximum.x < -1.0F - kMargin || ndcMinimum.x > 1.0F + kMargin ||
+                           ndcMaximum.y < -1.0F - kMargin || ndcMinimum.y > 1.0F + kMargin ||
+                           ndcMaximum.z < 0.0F - kMargin || ndcMinimum.z > 1.0F + kMargin;
+    return !separated;
 }
 
 ShadowUniform BuildShadowUniform(const LightingTable& table, const glm::mat4& viewRelative, float fieldOfViewDegrees,

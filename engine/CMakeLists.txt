@@ -28,6 +28,7 @@ add_library(voxel_engine STATIC
     render/mesh_renderer.cpp
     render/model_loader.cpp
     render/shadow_cascade.cpp
+    render/software_occlusion.cpp
     render/texture_loader.cpp
     render/triangle_renderer.cpp
 )
