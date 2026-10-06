@@ -71,6 +71,20 @@ struct LevelManifest {
     /// （缺省时）—— 由 game 层按 `is_absolute()` 分流（见 `plans/v0.5.md` §1.8）。
     std::filesystem::path objectsFile = "assets/config/objects.toml";
 
+    /// 该世界的**可编辑层**（阶段 V0.5 的 E1：手工摆放静态资产的落点；可选）。
+    ///
+    /// 解析口径（`plans/v0.5.md` §1.18）：
+    ///   - **给出** `objects_edit_file`（非空）⇒ 相对**清单所在目录**解析；
+    ///   - **未给出** ⇒ **派生默认** = 与 `objects_file` 同目录、同主名 + `.edit.toml`
+    ///     （例：`world_a_objects.toml` ⇒ `world_a_objects.edit.toml`）。
+    ///
+    /// **缺失语义**（由 game 层执行）：**显式给出却不存在 ⇒ 抛**（不静默）；**派生默认却不存在 ⇒ 跳过**
+    /// （编辑层按需生成，不改变既有行为）。加载顺序 = **发布清单（只读）→ 编辑层（叠加）**。
+    std::filesystem::path objectsEditFilePath;
+
+    /// `objectsEditFilePath` 来自**显式配置**（true）还是**派生默认**（false）—— 决定"文件不存在"是抛还是跳过。
+    bool objectsEditFileExplicit = false;
+
     /// 该世界的**破坏能力**（ADR 0028 §一 的"破坏策略"）。
     bool destructionEnabled = true;
 

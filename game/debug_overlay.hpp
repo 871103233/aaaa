@@ -1,5 +1,7 @@
 #pragma once
 
+#include "object_palette.hpp"
+#include "object_preview.hpp"
 #include "portal_menu.hpp"
 #include "render/mesh_renderer.hpp"
 #include "system_panel.hpp"
@@ -17,6 +19,38 @@
 struct ImGuiContext;
 
 namespace vx {
+
+/// 物件选择器的显示数据（V0.5 E3；[ADR 0032](../../docs/adr/0032-object-palette-and-placement-mode.md)）。
+///
+/// **只存字符串 id，不存 `ObjectType*`** ⇒ 面板与世界切换 / 类型表重建**无生命周期耦合**（避免悬垂指针）。
+struct PaletteModel {
+    std::vector<std::string>              categoryNames;        ///< 一级：仓库（类别）
+    std::vector<std::vector<std::string>> typeIdsByCategory;    ///< 二级：每个类别下的类型 id
+    PaletteState                          state;                ///< 当前选择
+
+    /// V0.5 E4：**当前选中类型的预览小图**（屏幕空间归一化三角形；由 game 层用**同一份**
+    /// `buildLocalMesh` 几何算出，见 `game/object_preview.hpp`）。面板**只读**并画出来
+    /// ⇒ 与 `MeshData` / `ObjectType*` 的**生命周期解耦**（同 `typeIdsByCategory` 的口径）。
+    /// 空 = 该类型没有可预览的几何（面板显示 `ObjectPalettePreviewEmpty`）。
+    std::vector<PreviewTriangle> previewTriangles;
+
+    /// V0.5 E4：预览的**用户拖动朝向偏移**（弧度）。面板在拖动时累加；game 层把它叠加到自动旋转角上。
+    /// 归零 = 只看自动旋转。
+    float previewYawRadians = 0.0F;
+};
+
+/// 选择器上"用户做了什么"（每帧最多取走一次；见 `TakePaletteRequest`）。
+struct PaletteRequest {
+    enum class Action {
+        None,
+        EnterPlacement,  ///< 进入摆放模式（`typeId` = 当前选中类型）
+        Save,            ///< 保存到可编辑层
+        Cancel,          ///< 关闭面板，不改变状态
+    };
+
+    Action      action = Action::None;
+    std::string typeId;  ///< `EnterPlacement` 时的选中类型 id
+};
 
 /// 调试面板的统计快照：由 game 每帧填充，面板**只读**，不回写任何模拟状态（红线 11）。
 struct DebugStats {
@@ -56,6 +90,18 @@ struct DebugStats {
     /// V3/V9：角色附近（提示半径内）传送门的**提示显示名**（已按字体解析好：有 CJK 字体 ⇒ 门名，
     /// 否则 ⇒ **纯 ASCII** 的目标世界 id）；空串 = 附近没有门（HUD 不显示提示）。见 `ui_text.hpp` 的"绝不缺字"口径。
     std::string   nearbyPortalPromptName;
+
+    /// V0.5 E2：坐标拾取辅助当前输出的**物件类型 id**（空串 = 未启用 / 类型表为空 ⇒ HUD 不显示该行）。
+    ///
+    /// 类型 id 是**纯 ASCII**（配置里的 id），因此无 CJK 字体时该行也不会缺字（标签经 `ui_text` 标签缝取）。
+    std::string   placementTypeId;
+
+    /// V0.5 E2：坐标拾取辅助的**最近一次反馈**（`"(12.3, 8.1) h 64.2"` / `"no ground hit"` / `"no type"`；
+    /// 空串 = 还没按过 ⇒ HUD 不显示该行）。**内容恒为纯 ASCII** ⇒ 无 CJK 字体时也不缺字。
+    std::string   lastPickFeedback;
+
+    /// V0.5 E3：是否处于**摆放模式**（true ⇒ HUD 显示摆放模式横幅 `PlacementModeHintFormat`）。
+    bool          placementModeActive = false;
 };
 
 /// 极简 ImGui 调试面板（T9）。基于 imgui 的 **SDL3 平台后端 + SDL3_gpu 渲染后端**。
@@ -119,9 +165,36 @@ public:
         return taken;
     }
 
-    /// 任意面板（系统面板 或 传送门菜单）是否打开 —— 供 main 的捕获 / 输入抑制决策统一使用。
+    /// 任意面板（系统面板 / 传送门菜单 / 物件选择器）是否打开 —— 供 main 的捕获 / 输入抑制决策统一使用。
     [[nodiscard]] bool AnyBlockingPanelOpen() const noexcept {
-        return m_systemPanel.IsOpen() || m_portalMenuOpen;
+        return m_systemPanel.IsOpen() || m_portalMenuOpen || m_objectPaletteOpen;
+    }
+
+    // ---- V0.5 E3：物件选择器（`F2`；[ADR 0032](../../docs/adr/0032-object-palette-and-placement-mode.md)）----
+    /// 打开选择器（数据由 game 层组装；只存 id 字符串 ⇒ 无生命周期耦合）。已打开时按新数据覆盖。
+    void OpenObjectPalette(PaletteModel model) {
+        m_palette           = std::move(model);
+        m_objectPaletteOpen = true;
+        m_paletteRequest    = PaletteRequest {};  // 新开一次 ⇒ 清掉上次未取走的动作
+    }
+
+    /// 关闭选择器（`F2` / `Esc` / 取消 / 选择后由 game 层调用）。**不产生动作**。
+    void CloseObjectPalette() noexcept {
+        m_objectPaletteOpen = false;
+        m_paletteRequest    = PaletteRequest {};
+    }
+
+    [[nodiscard]] bool ObjectPaletteOpen() const noexcept { return m_objectPaletteOpen; }
+
+    /// 就地访问面板数据（`main` 读回"当前选中类型"；面板构建时也会改写 `state`）。
+    [[nodiscard]] PaletteModel&       MutablePalette() noexcept { return m_palette; }
+    [[nodiscard]] const PaletteModel& Palette() const noexcept { return m_palette; }
+
+    /// **取走**一次选择器动作；取走后清零 ⇒ **只生效一次**。
+    [[nodiscard]] PaletteRequest TakePaletteRequest() noexcept {
+        PaletteRequest taken = std::move(m_paletteRequest);
+        m_paletteRequest     = PaletteRequest {};
+        return taken;
     }
 
     /// 设置**测试模式**（T85）：驱动调试面板顶部的只读横幅（自动测试 / 人工测试 + 人工验收项）。
@@ -183,6 +256,9 @@ private:
     /// 构建**传送门交互菜单**（V9；居中模态窗口）。前置条件：已调用 `BeginFrame`；未打开时无操作。
     void BuildPortalMenu();
 
+    /// 构建**物件选择器**（V0.5 E3；居中模态窗口，二级列表）。前置条件：已调用 `BeginFrame`；未打开时无操作。
+    void BuildObjectPalette();
+
     ImGuiContext* m_context = nullptr;
     bool          m_visible = true;
 
@@ -200,6 +276,11 @@ private:
     PortalMenuModel   m_portalMenu;
     bool              m_portalMenuOpen = false;
     PortalMenuRequest m_portalMenuRequest;
+
+    // V0.5 E3：物件选择器 —— 显示数据（只存 id）+ 是否打开 + 本帧待取走的"动作"。
+    PaletteModel   m_palette;
+    bool           m_objectPaletteOpen = false;
+    PaletteRequest m_paletteRequest;
 
     /// 测试模式（T85）：由 `SetTestMode` 在启动时设置一次，面板顶部据此显示只读横幅。
     TestModeInfo m_testMode;

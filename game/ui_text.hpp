@@ -125,6 +125,23 @@ enum class UiLabel : int {
     PortalMenuSessionHint,       ///< 说明：已存入存档槽 ⇒ 跨启动仍进入同一个（重置才会换）
     PortalResetDoneFormat,       ///< 重置完成（`已重置秘境 [%s]：新种子 %llu`）
 
+    // ---- 坐标拾取辅助（V0.5 E2；HUD 一行）----
+    PlacementHintFormat,         ///< HUD 摆放辅助提示（`摆放（F2）：当前类型「%s」……`；`%s` = 类型 id（纯 ASCII））
+    PlacementPickedFormat,       ///< HUD 最近一次摆放 / 删除反馈（`上次摆放：%s`；`%s` 恒为纯 ASCII）
+
+    // ---- 物件选择器与摆放模式（V0.5 E3；见 ADR 0032）----
+    ObjectPaletteTitle,           ///< 面板标题
+    ObjectPaletteCategoryHeader,  ///< 一级列标题：仓库（类别）
+    ObjectPaletteTypeHeader,      ///< 二级列标题：模型
+    ObjectPaletteEnter,           ///< 按钮：进入摆放模式
+    ObjectPaletteSave,            ///< 按钮：保存到可编辑层
+    ObjectPaletteCancel,          ///< 按钮：取消
+    PlacementModeHintFormat,      ///< 摆放模式横幅（`%s` = 当前类型 id）
+    PlacementSaveFailedFormat,    ///< 保存失败（`%s` = 原因）
+    ObjectPalettePreviewHeader,   ///< V0.5 E4 预览区标题
+    ObjectPalettePreviewHint,     ///< V0.5 E4 预览区操作提示（自动旋转 + 拖动转向）
+    ObjectPalettePreviewEmpty,    ///< V0.5 E4 预览不可用（该类型几何为空）
+
     kCount  ///< 标签总数（必须保持在最后）
 };
 
@@ -231,6 +248,19 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsEnglish = {
     "generation %u",
     "Saved to the save slot: the same realm persists across restarts (reset re-rolls it)",
     "Realm [%s] reset: new seed %llu",
+    "Place (F2): type '%s' - press F2 to open the object palette",
+    "Last place: %s",
+    "Object palette (F2)",
+    "Warehouse (category)",
+    "Model",
+    "Enter placement mode",
+    "Save to edit layer",
+    "Cancel",
+    "PLACEMENT MODE: '%s'  |  Q/E rotate  |  LMB place  |  RMB delete  |  F5 save  |  Esc exit",
+    "Save failed: %s",
+    "Preview",
+    "spins automatically - drag to turn",
+    "no preview (empty geometry)",
 };
 
 /// 中文标签表：仅当**成功加载 CJK 字体**时启用（此时不可能缺字）。
@@ -333,6 +363,19 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsChinese = {
     "第 %u 次生成",
     "已存入存档槽：跨启动仍进入同一个（重置才会换）",
     "已重置秘境 [%s]：新种子 %llu",
+    "摆放（F2）：当前类型「%s」—— 按 F2 打开物件选择器",
+    "上次摆放：%s",
+    "物件选择器（F2）",
+    "仓库（类别）",
+    "模型",
+    "进入摆放模式",
+    "保存到可编辑层",
+    "取消",
+    "摆放模式：「%s」  |  Q/E 旋转  |  左键放下  |  右键删除  |  F5 保存  |  Esc 退出",
+    "保存失败：%s",
+    "预览",
+    "自动旋转 · 拖动可转向",
+    "无预览（该类型几何为空）",
 };
 
 /// 纯函数：判断字符串是否**只含 ASCII 字节**（`cjkFontAvailable = false` 时的硬约束）。

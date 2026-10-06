@@ -694,6 +694,28 @@
   ② 鼠标点击面板按钮**绝不能同时**挖/堆地形（否则"点一下设置"会改地形）；③ 是否暂停模拟要**显式决定并写明**——本项目选择**不暂停**（世界暂无自主运动实体，暂停会给固定步长引入第二个时间状态）。
 - **相关**：`game/gameplay_input.hpp`、`game/system_panel.*`、`engine/platform/window.hpp`、`docs/ui-inventory.md` §2.1
 
+### 资产选择器的"模型预览"：离屏真缩略图 vs CPU 投影小图
+
+- **一句话定义**：给"选择资产"的界面加预览有两条路 —— **① 离屏真缩略图**：把模型渲进一张小纹理（独立相机 + 小目标），
+  UI 当图片显示（**业界标准**：UE5 Content Browser / Place Actors、Unity Project 窗口、Fortnite Creative 建造目录）；
+  **② CPU 投影小图**：在 CPU 上把几何**正交投影**成 2D 三角形，交给 UI 的绘制列表直接画（零 GPU 资源）。
+- **在本项目里是什么 / 为什么需要**：V0.5 E4 的选择器预览选了 **②**（[ADR 0032](../adr/0032-object-palette-and-placement-mode.md) 决策八）。
+  **原因（具体约束）**：本项目 `MeshRenderer::RenderFrame` **只输出到交换链**，没有"渲到任意纹理"的公开 API；
+  主通道颜色目标格式固定为 `R16G16B16A16_FLOAT` + 独立色调映射通道 ⇒ 走 ① 要新增渲染器公开 API + LDR 小管线 / 目标 +
+  ImGui 纹理接线 + 资源缓存 / 分帧（SKILL 硬规则 4：渲染热路径不得创建资源）。
+  ② 的代价是**只能表达形状与明暗，不表达材质 / 贴图**，但换来：**零 GPU 资源、零渲染器改动、纯函数可单测**，
+  且成本只随**面数**（常数级）、与世界总量无关，只在面板打开时发生。
+- **两个必要前提（否则②画出来是错的）**：
+  - **画家算法（Painter's Algorithm）**：无深度缓冲 ⇒ 必须**先画远、再画近**（按平均深度升序排序），近处覆盖远处；
+  - **背面剔除**：本项目用**顶点法线的平均**判正反面（`normal.z ≤ 0` 即背面），**不依赖三角形绕序** ⇒
+    对外部 GLB（绕序由美术工具决定）也稳健；用绕序会在 CW 网格上把整只模型剔没。
+  另：归一化基准要取**未旋转的包围球**（旋转不变量），否则转动到对角线时物体忽大忽小（"呼吸"）。
+- **易错点或关键取舍**：① 预览几何**必须与最终产物同源**（本项目用**同一个** `buildLocalMesh`），
+  否则"看着是这个、放下是另一个"；② 拖动累加的角度要**回绕到 `[−π, π]`**（float 的 `cos/sin` 在极大角度上丢精度）；
+  ③ 界面数据（`PaletteModel`）**只存显示用的 2D 结果**，不持有 `MeshData` / `ObjectType*` ⇒ 与世界切换 / 类型表重建无生命周期耦合。
+- **相关**：`game/object_preview.hpp`、`game/debug_overlay.cpp` 的 `BuildObjectPalette`、[ADR 0032](../adr/0032-object-palette-and-placement-mode.md) 决策八与备选表、
+  `engine/render/mesh_renderer.hpp` 的 `RenderFrame`、`docs/plans/v0.5.md` §1.20
+
 ### ImGui 默认字体不含 CJK 字形
 
 - **一句话定义**：Dear ImGui 内置的默认字体只有 ASCII 字形，**直接写中文会显示为缺字方块**（不是乱码，是"豆腐块"）。

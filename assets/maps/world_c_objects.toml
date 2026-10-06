@@ -11,12 +11,14 @@ id = "portal_gate"
 kind = "portal"
 half_extent = [1.0, 1.5, 0.2]
 destructible = false
+category = "portal"             # E3：选择器一级列表（portal 形态必须归 portal）
 
 [[type]]
 id = "dirt_pile"
 kind = "dirt_pile"
 half_extent = [1.0, 0.75, 1.0]
 destructible = true
+category = "prop"
 
 # ---- 通往 A 的传送门：出生点东侧（C 无出生平台 ⇒ 底面高度由地表求解）----
 # `portal_name` = **占位命名**（直白占位，措辞待所有者补，见 world-setting §1.5 / §3）。

@@ -23,18 +23,21 @@ id = "dirt_pile"
 kind = "dirt_pile"
 half_extent = [1.0, 0.75, 1.0]
 destructible = true
+category = "prop"              # E3：选择器一级列表（vegetation / rock / prop / building / portal / misc）
 
 [[type]]
 id = "stone_boulder"
 kind = "stone"
 half_extent = [1.2, 0.9, 1.2]
 destructible = false
+category = "rock"
 
 [[type]]
 id = "wooden_crate"
 kind = "crate"
 half_extent = [0.5, 0.5, 0.5]
 destructible = true
+category = "prop"
 
 # 放置清单（世界坐标，米）：示例摆在原点附近，供 V0b 接线验证与 V6「土堆」复用。
 [[placement]]

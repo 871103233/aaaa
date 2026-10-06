@@ -53,6 +53,13 @@ struct ObjectType {
     /// 因此外观由本字段给出 —— 树给草槽、岩石给岩槽、营地小道具给土槽（模型自带贴图本阶段不出，见 §1.9）。
     /// 规则：**仅 `Model` 可给**；`-1` = 未指定 ⇒ 取 `0`（草）；非 `Model` 给出（≠ -1）⇒ 非法即抛。
     int materialSlot = -1;
+
+    /// **仓库 / 类别**（阶段 V0.5 的 E3，配置 `category`；**可选**，缺省 `misc`）。
+    ///
+    /// 用途：`F2` 物件选择器的**一级列表**（按类别分组；顺序 = 配置中**首次出现**顺序，确定性）。
+    /// 值域固定（`IsValidObjectCategory`，非法即抛）：`vegetation` / `rock` / `prop` / `building` / `portal` / `misc`。
+    /// **不按文件名 / 形态推断**（显式字段才可校验、可判定，见 [ADR 0032](../../docs/adr/0032-object-palette-and-placement-mode.md) 决策二）。
+    std::string category = "misc";
 };
 
 /// 一条放置（配置表 `[[placement]]`）：把某个类型摆到世界坐标。
@@ -109,6 +116,17 @@ struct ObjectScatter {
     std::uint64_t seed    = 0;       ///< 确定性种子（同种子 ⇒ 同一布局）
 };
 
+/// **一条删除项**（阶段 V0.5 的 E3，可编辑层配置 `[[remove]]`）：表达"删掉发布清单里的某个落点"。
+///
+/// 匹配口径（[ADR 0032](../../docs/adr/0032-object-palette-and-placement-mode.md) 决策五）：**同 `typeId` 且平面距离 ≤ `tolerance`**。
+/// **已知限制**：同类型同位置的多个落点**无法区分**（登记为该 ADR 的后果）；后续若要精确，改为给落点分配稳定 id。
+struct ObjectRemoval {
+    std::string typeId;            ///< 引用类型表里的 id（必须存在）
+    float       x = 0.0F;          ///< 目标落点的平面坐标（格）
+    float       z = 0.0F;
+    float       tolerance = 0.5F;  ///< 匹配容差（格，> 0）
+};
+
 /// 物件配置：**类型表 + 放置清单**，来自同一个 TOML（`assets/config/objects.toml`）。
 ///
 /// 加载失败（文件缺失 / 语法错 / 字段缺失 / 取值非法 / `id` 重复 / `placement` 引用不存在的类型）
@@ -130,13 +148,43 @@ struct ObjectTable {
     std::vector<ObjectType>      types;       ///< 按文件顺序（确定性）
     std::vector<ObjectPlacement> placements;  ///< 按文件顺序（确定性）
     std::vector<ObjectScatter>   scatters;    ///< 按文件顺序（确定性；V8）
+    std::vector<ObjectRemoval>   removals;    ///< 按文件顺序（确定性；E3：可编辑层的删除项）
 
     /// 从 TOML 文件加载并校验；失败抛 `std::runtime_error`。
     [[nodiscard]] static ObjectTable LoadFromFile(const std::filesystem::path& path);
 
+    /// 从 **TOML 可编辑层文件**（阶段 V0.5 的 E1）加载并校验（`base` = 该世界的**发布清单**）。
+    ///
+    /// 与 `LoadFromFile` 的差异 —— 可编辑层**只放落点**：
+    ///   - `[[type]]` **可选**（省略 = 只放落点；给出则**新增类型**，但**不得与 `base` 重复**）；
+    ///   - `[[placement]]` / `[[scatter]]` 引用的类型必须存在于 `base` **或**本文件新增的类型中；
+    ///   - `destructible_enabled` 若给出，**必须与 `base` 一致**（编辑层不得改变破坏总开关）。
+    /// 失败抛 `std::runtime_error`。加载顺序 = 发布清单 → 本层（见 `plans/v0.5.md` §1.18）。
+    [[nodiscard]] static ObjectTable LoadOverlayFromFile(const std::filesystem::path& path, const ObjectTable& base);
+
     /// 按 `id` 查类型；不存在返回 `nullptr`。
     [[nodiscard]] const ObjectType* Find(const std::string& id) const noexcept;
 };
+
+/// 把**可编辑层**（`overlay`，手工摆放的落点）**叠加**到**发布清单**（`base`）之上（阶段 V0.5 的 E1）。
+///
+/// 语义（确定性，红线 7）：
+///   - 加载顺序 = **发布清单 → 应用 `overlay.removals` → 追加 `overlay.placements` → 追加 `overlay.scatters`**
+///     （[ADR 0032](../../docs/adr/0032-object-palette-and-placement-mode.md) 决策五）：先按删除项过滤 `base` 的落点
+///     （`RemovePlacementsByRemoval`），再**按文件顺序追加**本层条目（不排序、不合并同 id 的条目）；
+///   - `overlay` 的类型 id 与 `base` **重复 ⇒ 抛**（同一类型在两处定义 = 静默歧义，必须由作者消歧）；
+///   - `destructible_enabled` 两表**必须一致**（编辑层不得悄悄改变破坏总开关）⇒ 不一致即抛。
+/// 为什么需要：可编辑层是"自己摆放"的落点，必须与**发布清单分开存、叠加读**（ADR 0028 的"A 不入库"口径）。
+[[nodiscard]] ObjectTable MergeObjectTables(const ObjectTable& base, const ObjectTable& overlay);
+
+/// 类别值域校验（`ObjectType.category`，[ADR 0032](../../docs/adr/0032-object-palette-and-placement-mode.md) 决策二）。
+[[nodiscard]] bool IsValidObjectCategory(const std::string& category) noexcept;
+
+/// 应用**删除项**：返回过滤后的落点 —— 同 `typeId` 且**平面距离 ≤ `tolerance`** 的落点被剔除。
+///
+/// **纯函数、确定性**（保持原顺序）；用于"发布清单 → 应用编辑层 `[[remove]]` → 追加 `[[placement]]`"。
+[[nodiscard]] std::vector<ObjectPlacement> RemovePlacementsByRemoval(const std::vector<ObjectPlacement>& placements,
+                                                                    const std::vector<ObjectRemoval>& removals);
 
 /// **物件层**：持有世界中的"物件实体"（**EnTT 注册表**，见 ADR 0003 / 0004 层③）。
 ///

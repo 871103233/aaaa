@@ -165,6 +165,66 @@ TEST(LevelManifest, ObjectsFileNonStringThrows) {
     ExpectThrows(dir.Path("world.toml"));
 }
 
+// --------------------------- 可编辑层（objects_edit_file，V0.5 E1）---------------------------
+
+TEST(LevelManifest, ObjectsEditFileDerivesDefaultNextToObjectsFile) {
+    const TempDir dir("vx_level_manifest_edit_default");
+    dir.Write("terrain_ok.toml", kTerrainOk);
+    dir.Write("world.toml", ValidManifest("objects_file = \"world_x_objects.toml\"\n"));
+
+    const LevelManifest manifest = LevelManifest::LoadFromFile(dir.Path("world.toml"));
+    EXPECT_FALSE(manifest.objectsEditFileExplicit);
+    EXPECT_EQ(manifest.objectsEditFilePath, dir.Path("world_x_objects.edit.toml"));
+}
+
+TEST(LevelManifest, ObjectsEditFileDerivesFromGlobalDefaultWhenObjectsFileMissing) {
+    const TempDir dir("vx_level_manifest_edit_global");
+    dir.Write("terrain_ok.toml", kTerrainOk);
+    dir.Write("world.toml", ValidManifest());  // 未给 objects_file ⇒ 派生自全局默认
+
+    const LevelManifest manifest = LevelManifest::LoadFromFile(dir.Path("world.toml"));
+    EXPECT_FALSE(manifest.objectsEditFileExplicit);
+    EXPECT_EQ(manifest.objectsEditFilePath, std::filesystem::path("assets/config/objects.edit.toml"));
+}
+
+TEST(LevelManifest, ExplicitObjectsEditFileResolvesRelativeToManifestDirectory) {
+    const TempDir dir("vx_level_manifest_edit_ref");
+    dir.Write("terrain_ok.toml", kTerrainOk);
+    dir.Write("world.toml", ValidManifest("objects_edit_file = \"my_edits.toml\"\n"));
+
+    const LevelManifest manifest = LevelManifest::LoadFromFile(dir.Path("world.toml"));
+    EXPECT_TRUE(manifest.objectsEditFileExplicit);
+    EXPECT_EQ(manifest.objectsEditFilePath, dir.Path("my_edits.toml"));
+}
+
+TEST(LevelManifest, EmptyObjectsEditFileThrows) {
+    const TempDir dir("vx_level_manifest_edit_empty");
+    dir.Write("terrain_ok.toml", kTerrainOk);
+    dir.Write("world.toml", ValidManifest("objects_edit_file = \"\"\n"));
+    ExpectThrows(dir.Path("world.toml"));
+}
+
+TEST(LevelManifest, ObjectsEditFileNonStringThrows) {
+    const TempDir dir("vx_level_manifest_edit_type");
+    dir.Write("terrain_ok.toml", kTerrainOk);
+    dir.Write("world.toml", ValidManifest("objects_edit_file = 3\n"));
+    ExpectThrows(dir.Path("world.toml"));
+}
+
+TEST(LevelManifest, RepoManifestsDeriveEditLayerPaths) {
+#ifdef VOXEL_SOURCE_DIR
+    const std::filesystem::path maps = std::filesystem::path(VOXEL_SOURCE_DIR) / "assets" / "maps";
+    EXPECT_EQ(LevelManifest::LoadFromFile(maps / "world_a.toml").objectsEditFilePath,
+              maps / "world_a_objects.edit.toml");
+    EXPECT_EQ(LevelManifest::LoadFromFile(maps / "world_b.toml").objectsEditFilePath,
+              maps / "world_b_objects.edit.toml");
+    EXPECT_EQ(LevelManifest::LoadFromFile(maps / "world_c.toml").objectsEditFilePath,
+              maps / "world_c_objects.edit.toml");
+#else
+    GTEST_SKIP() << "VOXEL_SOURCE_DIR 未定义";
+#endif
+}
+
 TEST(LevelManifest, MissingIdThrows) {
     const TempDir dir("vx_level_manifest_no_id");
     dir.Write("terrain_ok.toml", kTerrainOk);

@@ -28,6 +28,7 @@ add_executable(voxel_tests
     frame_limiter_test.cpp
     frustum_test.cpp
     gameplay_input_test.cpp
+    ground_pick_test.cpp
     input_map_test.cpp
     landform_test.cpp
     level_manifest_test.cpp
@@ -35,7 +36,10 @@ add_executable(voxel_tests
     map_preset_test.cpp
     model_loader_test.cpp
     mouse_capture_test.cpp
+    object_edit_save_test.cpp
     object_layer_test.cpp
+    object_palette_test.cpp
+    object_preview_test.cpp
     object_mesh_test.cpp
     object_scatter_test.cpp
     object_support_test.cpp

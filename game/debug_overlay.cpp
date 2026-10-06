@@ -25,6 +25,14 @@ namespace {
 /// 调试面板行标签列的固定宽度（像素）：数值列据此对齐，使各行数字成列。
 constexpr float kLabelColumnWidth = 176.0F;
 
+/// V0.5 E4：物件选择器**预览区**的固定尺寸（像素）。高度与两侧列表子窗口一致 ⇒ 三列视觉成一行。
+constexpr float kPalettePreviewWidth  = 200.0F;
+constexpr float kPalettePreviewHeight = 240.0F;
+/// 预览区圆角（与面板其余控件的圆角一致）。
+constexpr float kPalettePreviewRounding = 4.0F;
+/// 预览区拖动灵敏度（弧度 / 像素）：整块预览宽度拖满 ≈ 2π 的一半，手感适中。
+constexpr float kPalettePreviewDragRadiansPerPixel = 0.01F;
+
 /// 一行"标签 : 数值（格式化）"：标签列定宽，数值列对齐到同一 x。
 ///
 /// 标签与格式串一律经 [`UiText`](ui_text.hpp) 取得，本函数不接收字符串字面量。
@@ -106,7 +114,8 @@ void DebugOverlay::OnSdlEvent(void* userData, const SDL_Event& event) {
 void DebugOverlay::BeginFrame() {
     // 只要还有任一 ImGui 窗口可见就必须起帧（系统面板打开时调试面板可能隐藏；加载画面 / 常驻 HUD 同样要出帧）。
     m_frameActive =
-        m_visible || m_systemPanel.IsOpen() || m_portalMenuOpen || m_loadingActive || m_hudVisible;
+        m_visible || m_systemPanel.IsOpen() || m_portalMenuOpen || m_objectPaletteOpen || m_loadingActive ||
+        m_hudVisible;
     if (!m_frameActive) {
         m_wantCaptureMouse    = false;
         m_wantCaptureKeyboard = false;
@@ -187,6 +196,22 @@ void DebugOverlay::BuildHud(const DebugStats& stats) {
         ImGui::Text(UiText(UiLabel::PortalPromptFormat, cjk), stats.nearbyPortalPromptName.c_str());
     }
 
+    // V0.5 E2：坐标拾取辅助提示（一行）。当前类型 id 是纯 ASCII ⇒ 无 CJK 字体时也不缺字。
+    if (!stats.placementTypeId.empty()) {
+        ImGui::Separator();
+        ImGui::Text(UiText(UiLabel::PlacementHintFormat, cjk), stats.placementTypeId.c_str());
+    }
+    // 最近一次拾取反馈（按 F2 后出现）—— 让按键在游戏内**可见**，不依赖控制台（空串则不占一行）。
+    if (!stats.lastPickFeedback.empty()) {
+        ImGui::Text(UiText(UiLabel::PlacementPickedFormat, cjk), stats.lastPickFeedback.c_str());
+    }
+
+    // V0.5 E3：摆放模式横幅 —— 模式内**显式**告知键位（模式内左键/Esc/E 让位，见 ADR 0032）。
+    if (stats.placementModeActive && !stats.placementTypeId.empty()) {
+        ImGui::Separator();
+        ImGui::Text(UiText(UiLabel::PlacementModeHintFormat, cjk), stats.placementTypeId.c_str());
+    }
+
     // 记录实际高度：F1 面板据此把初始位置排在 HUD 下方（避免左上角重叠）。
     m_hudHeight = ImGui::GetWindowSize().y;
     ImGui::End();
@@ -243,6 +268,146 @@ void DebugOverlay::BuildPortalMenu() {
     ImGui::End();
 }
 
+void DebugOverlay::BuildObjectPalette() {
+    if (!m_frameActive || !m_objectPaletteOpen) {
+        return;
+    }
+    const bool cjk = m_cjkFontLoaded;
+
+    PaletteModel& palette = m_palette;
+    // 规整一次（列表可能在打开后变化；纯函数保证不越界；与 `ClampPaletteState` 同口径）。
+    if (!palette.categoryNames.empty()) {
+        if (palette.state.categoryIndex >= palette.categoryNames.size()) {
+            palette.state.categoryIndex = 0U;
+        }
+        const std::size_t typeCount = palette.typeIdsByCategory[palette.state.categoryIndex].size();
+        if (typeCount == 0U) {
+            palette.state.typeIndex = 0U;
+        } else if (palette.state.typeIndex >= typeCount) {
+            palette.state.typeIndex = typeCount - 1U;
+        }
+    }
+
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Always, ImVec2(0.5F, 0.5F));
+    ImGui::SetNextWindowBgAlpha(0.92F);
+    ImGui::Begin(UiText(UiLabel::ObjectPaletteTitle, cjk), nullptr,
+                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize);
+
+    // 左列：仓库（一级）
+    ImGui::BeginGroup();
+    ImGui::TextUnformatted(UiText(UiLabel::ObjectPaletteCategoryHeader, cjk));
+    ImGui::BeginChild("##palette_categories", ImVec2(180.0F, 240.0F), ImGuiChildFlags_None);
+    for (std::size_t index = 0; index < palette.categoryNames.size(); ++index) {
+        const bool selected = (index == palette.state.categoryIndex);
+        if (ImGui::Selectable(palette.categoryNames[index].c_str(), selected)) {
+            palette.state.categoryIndex = index;
+            palette.state.typeIndex     = 0U;  // 换仓库 ⇒ 二级归零
+        }
+    }
+    ImGui::EndChild();
+    ImGui::EndGroup();
+
+    ImGui::SameLine();
+
+    // 右列：模型（二级）
+    ImGui::BeginGroup();
+    ImGui::TextUnformatted(UiText(UiLabel::ObjectPaletteTypeHeader, cjk));
+    ImGui::BeginChild("##palette_types", ImVec2(240.0F, 240.0F), ImGuiChildFlags_None);
+    if (palette.state.categoryIndex < palette.typeIdsByCategory.size()) {
+        const std::vector<std::string>& typeIds = palette.typeIdsByCategory[palette.state.categoryIndex];
+        for (std::size_t index = 0; index < typeIds.size(); ++index) {
+            const bool selected = (index == palette.state.typeIndex);
+            if (ImGui::Selectable(typeIds[index].c_str(), selected)) {
+                palette.state.typeIndex = index;
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+    }
+    ImGui::EndChild();
+    ImGui::EndGroup();
+
+    ImGui::SameLine();
+
+    // 右列：**预览**（V0.5 E4）—— CPU 正交投影 + 朗伯明暗的小图（与最终摆放**同一份**几何）。
+    // 几何由 game 层算好放进 `palette.previewTriangles`（面板只画）；未拖动时由 game 层给自动旋转角。
+    ImGui::BeginGroup();
+    ImGui::TextUnformatted(UiText(UiLabel::ObjectPalettePreviewHeader, cjk));
+    {
+        const ImVec2 previewSize(kPalettePreviewWidth, kPalettePreviewHeight);
+        const ImVec2 previewOrigin = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton("##palette_preview", previewSize);
+        if (ImGui::IsItemActive()) {
+            // 拖动改朝向（累加到 game 层给的自动旋转角之上）；**回绕到 [−π, π]** ⇒ 长时间拖动不会让角度无界增长
+            // （`cos/sin` 在极大角度上会丢精度）。
+            constexpr float kPi    = 3.14159265358979323846F;
+            constexpr float kTwoPi = 6.28318530717958647692F;
+            palette.previewYawRadians += ImGui::GetIO().MouseDelta.x * kPalettePreviewDragRadiansPerPixel;
+            if (palette.previewYawRadians > kPi) {
+                palette.previewYawRadians -= kTwoPi;
+            } else if (palette.previewYawRadians < -kPi) {
+                palette.previewYawRadians += kTwoPi;
+            }
+        }
+        ImGui::TextDisabled("%s", UiText(UiLabel::ObjectPalettePreviewHint, cjk));
+
+        const ImVec2  previewEnd(previewOrigin.x + previewSize.x, previewOrigin.y + previewSize.y);
+        ImDrawList*   drawList = ImGui::GetWindowDrawList();
+        drawList->AddRectFilled(previewOrigin, previewEnd, IM_COL32(18, 20, 24, 235), kPalettePreviewRounding);
+        if (palette.previewTriangles.empty()) {
+            const char*  hint     = UiText(UiLabel::ObjectPalettePreviewEmpty, cjk);
+            const ImVec2 hintSize = ImGui::CalcTextSize(hint);
+            drawList->AddText(ImVec2(previewOrigin.x + (previewSize.x - hintSize.x) * 0.5F,
+                                     previewOrigin.y + (previewSize.y - hintSize.y) * 0.5F),
+                              IM_COL32(150, 155, 165, 255), hint);
+        } else {
+            const auto toScreen = [&](const glm::vec2& point) {
+                return ImVec2(previewOrigin.x + point.x * previewSize.x, previewOrigin.y + point.y * previewSize.y);
+            };
+            for (const vx::PreviewTriangle& triangle : palette.previewTriangles) {
+                const float  shade = std::clamp(triangle.shade, 0.0F, 1.0F);
+                const int    level = static_cast<int>(shade * 255.0F + 0.5F);
+                // 轻微冷调（B 略降）⇒ 与暗色主题协调；明暗由 `shade` 单独承担。
+                const ImU32  color = IM_COL32(level, level, static_cast<int>(static_cast<float>(level) * 0.94F), 255);
+                drawList->AddTriangleFilled(toScreen(triangle.a), toScreen(triangle.b), toScreen(triangle.c), color);
+            }
+        }
+        drawList->AddRect(previewOrigin, previewEnd, IM_COL32(90, 95, 105, 255), kPalettePreviewRounding);
+    }
+    ImGui::EndGroup();
+
+    // 当前选中的类型 id（按钮的"名义承诺"依据；空 = 二级列表为空 ⇒ 禁「进入」）。
+    std::string selectedTypeId;
+    if (palette.state.categoryIndex < palette.typeIdsByCategory.size()) {
+        const std::vector<std::string>& typeIds = palette.typeIdsByCategory[palette.state.categoryIndex];
+        if (palette.state.typeIndex < typeIds.size()) {
+            selectedTypeId = typeIds[palette.state.typeIndex];
+        }
+    }
+
+    ImGui::Separator();
+    ImGui::BeginDisabled(selectedTypeId.empty());
+    if (ImGui::Button(UiText(UiLabel::ObjectPaletteEnter, cjk))) {
+        m_paletteRequest    = PaletteRequest { PaletteRequest::Action::EnterPlacement, selectedTypeId };
+        m_objectPaletteOpen = false;  // 关面板 → 进摆放模式（捕获由 game 层恢复）
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button(UiText(UiLabel::ObjectPaletteSave, cjk))) {
+        m_paletteRequest = PaletteRequest { PaletteRequest::Action::Save, std::string {} };
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(UiText(UiLabel::ObjectPaletteCancel, cjk))) {
+        m_paletteRequest    = PaletteRequest { PaletteRequest::Action::Cancel, std::string {} };
+        m_objectPaletteOpen = false;
+    }
+
+    ImGui::End();
+}
+
 void DebugOverlay::BuildUI(const DebugStats& stats, SystemPanelContext& panelContext) {
     if (!m_frameActive) {
         return;
@@ -255,6 +420,9 @@ void DebugOverlay::BuildUI(const DebugStats& stats, SystemPanelContext& panelCon
 
     // V9：传送门菜单（居中模态）。放在 `!m_visible` 早退**之前** —— 它不依赖 F1 面板是否显示。
     BuildPortalMenu();
+
+    // V0.5 E3：物件选择器（居中模态二级列表）。同样放在 `!m_visible` 早退**之前**。
+    BuildObjectPalette();
 
     // 常驻坐标 HUD（屏幕左上角，只读）：与 F1 面板相互独立，不需要开面板就能看到当前位置。
     if (m_hudVisible) {

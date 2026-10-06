@@ -20,15 +20,18 @@
 #include "debug_overlay.hpp"
 #include "destruction_queue.hpp"
 #include "gameplay_input.hpp"
+#include "ground_pick.hpp"  // E2：坐标拾取辅助（准星射线求地表交点，纯函数）
 #include "generation/level_manifest.hpp"
 #include "generation/map_preset.hpp"
 #include "generation/terrain_params.hpp"
 #include "input/input_map.hpp"
 #include "mouse_capture.hpp"
+#include "object/object_edit_save.hpp"  // V0.5 E3：保存可编辑层
 #include "object/object_layer.hpp"
 #include "object/object_mesh.hpp"
 #include "object/object_scatter.hpp"  // V8：程序化散布（纯函数）
 #include "object/object_support.hpp"
+#include "object_palette.hpp"  // V0.5 E3：选择器纯逻辑
 #include "orb.hpp"
 #include "out_of_bounds.hpp"
 #include "physics/physics_world.hpp"
@@ -83,6 +86,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <map>
 #include <cstddef>
 #include <cstdint>
@@ -319,6 +323,74 @@ struct WorldAabb {
     bounds.max   = maximum;
     bounds.valid = true;
     return bounds;
+}
+
+/// 射线 vs 世界 AABB（slab 法；V0.5 E3 的"右键删除指向物件"用）。命中返回 true 并给出最近正交点距离。
+[[nodiscard]] bool RayHitsAabb(const glm::vec3& origin, const glm::vec3& direction, const WorldAabb& bounds,
+                               float& outT) noexcept {
+    if (!bounds.valid) {
+        return false;
+    }
+    float tMin = 0.0F;
+    float tMax = std::numeric_limits<float>::max();
+    for (int axis = 0; axis < 3; ++axis) {
+        const float originAxis = origin[axis];
+        const float dirAxis    = direction[axis];
+        if (std::abs(dirAxis) < 1e-6F) {
+            if (originAxis < bounds.min[axis] || originAxis > bounds.max[axis]) {
+                return false;
+            }
+            continue;
+        }
+        float t1 = (bounds.min[axis] - originAxis) / dirAxis;
+        float t2 = (bounds.max[axis] - originAxis) / dirAxis;
+        if (t1 > t2) {
+            std::swap(t1, t2);
+        }
+        tMin = std::max(tMin, t1);
+        tMax = std::min(tMax, t2);
+        if (tMin > tMax) {
+            return false;
+        }
+    }
+    outT = tMin;
+    return true;
+}
+
+/// 由类型表构造**选择器显示数据**（V0.5 E3）：一级 = 类别、二级 = 类型 id；并把 `currentTypeId` 位置作为初始选中。
+[[nodiscard]] vx::PaletteModel BuildPaletteModelFrom(const vx::ObjectTable& table, const std::string& currentTypeId) {
+    vx::PaletteModel                       model;
+    const std::vector<vx::PaletteCategory> categories = vx::BuildPalette(table);
+    std::size_t                            selectedCategory = 0;
+    std::size_t                            selectedType     = 0;
+    for (std::size_t categoryIndex = 0; categoryIndex < categories.size(); ++categoryIndex) {
+        model.categoryNames.push_back(categories[categoryIndex].name);
+        std::vector<std::string> ids;
+        ids.reserve(categories[categoryIndex].types.size());
+        for (std::size_t typeIndex = 0; typeIndex < categories[categoryIndex].types.size(); ++typeIndex) {
+            ids.push_back(categories[categoryIndex].types[typeIndex]->id);
+            if (categories[categoryIndex].types[typeIndex]->id == currentTypeId) {
+                selectedCategory = categoryIndex;
+                selectedType     = typeIndex;
+            }
+        }
+        model.typeIdsByCategory.push_back(std::move(ids));
+    }
+    model.state.categoryIndex = selectedCategory;
+    model.state.typeIndex     = selectedType;
+    return model;
+}
+
+/// 从"编辑层新增落点"里按（类型 + 平面位置 + ε）删掉一条；删到返回 true（V0.5 E3 的删除分流）。
+[[nodiscard]] bool EraseEditLayerPlacement(std::vector<vx::ObjectPlacement>& placements, const std::string& typeId,
+                                          float x, float z, float tolerance) {
+    for (auto it = placements.begin(); it != placements.end(); ++it) {
+        if (it->typeId == typeId && std::abs(it->x - x) <= tolerance && std::abs(it->z - z) <= tolerance) {
+            placements.erase(it);
+            return true;
+        }
+    }
+    return false;
 }
 
 /// W7-S3b：地表 **LOD 分环**（[ADR 0024](../../docs/adr/0024-terrain-streaming-and-lod.md) 决策二）。
@@ -630,6 +702,24 @@ constexpr float kMuzzleForwardOffset = 1.2F;
 
 /// 枪口高度（角色总高的比例）：约胸口位置。
 constexpr float kMuzzleHeightRatio = 0.75F;
+
+/// V0.5 E2：坐标拾取辅助的射线参数（准星 → 地表）。
+constexpr float kPickMaxDistance  = 256.0F;  ///< 最大拾取距离（格）—— 覆盖近场常驻窗口内的目视范围
+constexpr float kPickStepDistance = 0.5F;    ///< 射线步进距离（格）
+
+/// V0.5 E3：摆放模式里 `Q`/`E` 每次旋转的步进（度）；按住 `Shift` 时吸附到 90°（`ADR 0032`）。
+constexpr float kPlacementRotateStepDeg = 15.0F;
+
+/// V0.5 E3：幽灵预览的不透明度（抖动淡出）—— `SetMeshOpacity` 保持**不透明管线**、不引入 alpha 混合
+/// ⇒ 不破坏深度排序（`ADR 0032` 决策三）。
+constexpr float kPlacementPreviewOpacity = 0.5F;
+
+/// V0.5 E3：`[[remove]]` 的平面匹配容差（格）—— 与 `ObjectRemoval::tolerance` 的缺省值一致。
+constexpr float kPlacementRemoveTolerance = 0.5F;
+
+/// V0.5 E4：物件选择器**预览小图**的自动旋转角速度（弧度 / 秒）。慢转 ⇒ 静止时也能看出立体形状；
+/// 用户的拖动偏移叠加在它之上（见 `PaletteModel::previewYawRadians`）。
+constexpr float kPalettePreviewSpinRadiansPerSecond = 0.6F;
 
 /// 相机视线方向 = 屏幕中心"准星"的方向。
 ///
@@ -1808,6 +1898,16 @@ int main(int argc, char** argv) {
         }
     }
 
+    // V0.5 E2：`--place-type=<物件类型 id>` —— 坐标拾取辅助（`F2`）输出的类型；缺省 = 该世界类型表首项。
+    // 指定的 id 必须存在于**该世界的**类型表（校验在物件层加载后做；不存在 ⇒ 启动失败，不静默）。
+    std::string placeTypeArg;
+    for (const std::string& argument : arguments) {
+        constexpr const char* kPlaceTypePrefix = "--place-type=";
+        if (argument.rfind(kPlaceTypePrefix, 0) == 0) {
+            placeTypeArg = argument.substr(std::char_traits<char>::length(kPlaceTypePrefix));
+        }
+    }
+
     // W7-S4：`--autofly=<秒>` —— **确定性自动化飞行**（仅测试用；缺省 0 = 不启用）。
     // 为什么需要：W7 的验收判据要求"10km 飞越全图"的实测证据，而本环境无法用
     // `tools/vx_perf_input.ps1` 向游戏注入按键（注入只到达**前台**窗口，CI / 无头会话抢不到，
@@ -2171,7 +2271,14 @@ int main(int argc, char** argv) {
         input.BindKey(vx::ActionId::FlyDown, SDL_SCANCODE_LCTRL);       // T12：飞行时下降
         input.BindKey(vx::ActionId::ToggleSystemPanel, SDL_SCANCODE_ESCAPE);  // T15：Esc 开关系统面板（语义已统一）
         input.BindKey(vx::ActionId::Interact, SDL_SCANCODE_E);                // V3：走近传送门按 E 触发切换
-        input.BindMouseButton(vx::ActionId::Attack, SDL_BUTTON_LEFT);   // T27：左键 = 发射光球
+        input.BindKey(vx::ActionId::PickPlacement, SDL_SCANCODE_F2);          // V0.5 E2/E3：坐标拾取 / 物件选择器
+        input.BindKey(vx::ActionId::PaletteConfirm, SDL_SCANCODE_RETURN);      // V0.5 E3：选择器确认
+        input.BindKey(vx::ActionId::PlacementRotateLeft, SDL_SCANCODE_Q);      // V0.5 E3：摆放模式左旋
+        input.BindKey(vx::ActionId::PlacementRotateRight, SDL_SCANCODE_E);     // V0.5 E3：摆放模式右旋（模式内让位）
+        input.BindKey(vx::ActionId::PlacementRepeatLast, SDL_SCANCODE_F3);     // V0.5 E3：重复上次
+        input.BindKey(vx::ActionId::PlacementSave, SDL_SCANCODE_F5);           // V0.5 E3：保存可编辑层
+        input.BindMouseButton(vx::ActionId::PlacementRemove, SDL_BUTTON_RIGHT);  // V0.5 E3：摆放模式删除
+        input.BindMouseButton(vx::ActionId::Attack, SDL_BUTTON_LEFT);   // T27：左键 = 发射光球（摆放模式内 = 放下）
         input.BindMouseAxis(vx::ActionId::LookX, vx::MouseAxis::X);
         input.BindMouseAxis(vx::ActionId::LookY, vx::MouseAxis::Y);
 
@@ -2979,7 +3086,58 @@ int main(int argc, char** argv) {
             }
             return SourceAssetPath("assets/config/objects.toml");
         }();
-        vx::ObjectTable objects = vx::ObjectTable::LoadFromFile(objectsPath);
+        const vx::ObjectTable objectsPublished = vx::ObjectTable::LoadFromFile(objectsPath);
+
+        // V0.5 E1：**可编辑层**（手工摆放静态资产的落点）—— 与发布清单**分开存、叠加读**（ADR 0028 的"A 不入库"口径）。
+        //   - 显式给出 `objects_edit_file` 却不存在 ⇒ **抛**（不静默）；
+        //   - 派生默认（与 objects_file 同目录、同主名 + `.edit.toml`）却不存在 ⇒ **跳过**（编辑层按需生成）。
+        // 叠加顺序 = 发布清单 → 编辑层 ⇒ 遍历顺序仍 = 放置顺序（确定性，红线 7）。
+        const std::filesystem::path objectsEditPath = [&]() -> std::filesystem::path {
+            if (worldManager.Count() > 0U) {
+                const std::filesystem::path& declared = worldManager.Active().objectsEditFilePath;
+                return declared.is_absolute() ? declared : SourceAssetPath(declared);
+            }
+            return SourceAssetPath("assets/config/objects.edit.toml");
+        }();
+        const bool objectsEditExplicit =
+            worldManager.Count() > 0U && worldManager.Active().objectsEditFileExplicit;
+
+        // V0.5 E3：**本层增量**（保存用）—— 本层新增类型 / 落点、删除项、散布（读入时原样保留）。
+        // 保存时**原样写回** `objects_edit_file`（ADR 0032 决策六）：只写增量，发布清单保持**只读**。
+        vx::ObjectTable editLayerState;
+        editLayerState.destructibleEnabled = objectsPublished.destructibleEnabled;
+
+        std::error_code editExistsError;
+        const bool      objectsEditExists = std::filesystem::exists(objectsEditPath, editExistsError);
+        vx::ObjectTable objects           = objectsPublished;
+        if (objectsEditExists && !editExistsError) {
+            const vx::ObjectTable overlay = vx::ObjectTable::LoadOverlayFromFile(objectsEditPath, objectsPublished);
+            objects        = vx::MergeObjectTables(objectsPublished, overlay);
+            editLayerState = overlay;  // 保存时把读入的本层条目**原样写回**（往返一致）
+            VX_LOG_INFO("可编辑层已叠加（V0.5 E1）：%s（类型 +%zu、放置 +%zu、删除 %zu、散布 +%zu）",
+                        objectsEditPath.string().c_str(), overlay.types.size(), overlay.placements.size(),
+                        overlay.removals.size(), overlay.scatters.size());
+        } else if (objectsEditExplicit) {
+            throw std::runtime_error("显式给出的可编辑层不存在：" + objectsEditPath.string());
+        } else {
+            VX_LOG_INFO("可编辑层（V0.5 E1）：%s（不存在 ⇒ 跳过；按 F2 拾取坐标后按日志提示创建）",
+                        objectsEditPath.string().c_str());
+        }
+
+        // V0.5 E2：坐标拾取辅助（`F2`）当前输出的类型 —— 缺省 = 类型表首项；`--place-type=<id>` 必须是该表内的 id。
+        std::string placeTypeId;
+        if (!placeTypeArg.empty()) {
+            if (objects.Find(placeTypeArg) == nullptr) {
+                throw std::runtime_error("--place-type 指定的类型不存在于该世界的物件清单：" + placeTypeArg);
+            }
+            placeTypeId = placeTypeArg;
+        } else if (!objects.types.empty()) {
+            placeTypeId = objects.types.front().id;
+        }
+        VX_LOG_INFO("物件摆放（V0.5 E2/E3）：缺省类型 [%s]（按 F2 打开**物件选择器**：一级 = 仓库、二级 = 模型；"
+                    "选「进入」⇒ 摆放模式；--place-type=<id> 指定缺省类型）",
+                    placeTypeId.empty() ? "无（类型表为空）" : placeTypeId.c_str());
+
         vx::ObjectLayer objectLayer;
         std::vector<ObjectSlot> objectSlots;
 
@@ -3028,36 +3186,19 @@ int main(int argc, char** argv) {
         objectSlots.reserve(objectPlan.size());
         std::vector<vx::PortalEntry> portals;  // V3：供"最近门"查询（交互用）
         portals.reserve(2U);
-        std::size_t objectSkipped = 0;
-        for (const vx::ObjectPlacement& declared : objectPlan) {
-            vx::ObjectPlacement placed = declared;
-            float                surface = 0.0F;
-            if (!world.QueryHeight(placed.x, placed.z, surface)) {
-                // 不静默：落点没有地表数据时**跳过并告警**，绝不猜一个高度把物件放到错的地方。
-                VX_LOG_WARN("物件 [%s] 的落点 (%.1f, %.1f) 无地表数据 ⇒ 跳过该条放置",
-                            placed.typeId.c_str(), static_cast<double>(placed.x), static_cast<double>(placed.z));
-                ++objectSkipped;
-                continue;
-            }
-            placed.y = surface;  // 底面贴地表（`objects.toml` 的 y 分量当前不生效）
 
-            const std::uint32_t id = objectLayer.Place(objects, placed);
-            vx::ObjectInstance  instance;
-            (void)objectLayer.Get(id, instance);
-
+        // 建一个**物件槽**（GPU 网格 + 静态三角网碰撞体 + 剔除包围盒）并登记。
+        // **加载期与运行期（`F2` 就地摆放）共用同一实现** ⇒ "谁画谁挡"同源、包围盒口径一致，不会出现两套几何。
+        const auto addObjectSlot = [&](const vx::ObjectInstance& instance) {
             const vx::MeshData localMesh    = buildLocalMesh(*instance.type);
             const vx::MeshData colliderMesh = vx::RotateMeshAboutY(localMesh, instance.yawDegrees);
             const glm::dvec3   origin(static_cast<double>(instance.x), static_cast<double>(instance.y),
                                       static_cast<double>(instance.z));
-            // V3：传送门登记到交互表（`target_world` / `portal_name` 来自放置条目 —— `ObjectInstance` 不带这些）。
-            if (instance.type->kind == vx::ObjectAssetKind::Portal) {
-                portals.push_back(vx::PortalEntry { origin, placed.targetWorldId, placed.portalName });
-            }
             const glm::quat rotation =
                 glm::angleAxis(glm::radians(instance.yawDegrees), glm::vec3(0.0F, 1.0F, 0.0F));
 
             ObjectSlot slot;
-            slot.id         = id;
+            slot.id         = instance.id;
             slot.type       = instance.type;
             slot.localMesh  = localMesh;
             slot.position   = origin;
@@ -3088,6 +3229,33 @@ int main(int argc, char** argv) {
             }
 
             objectSlots.push_back(std::move(slot));
+        };
+
+        std::size_t objectSkipped = 0;
+        for (const vx::ObjectPlacement& declared : objectPlan) {
+            vx::ObjectPlacement placed = declared;
+            float                surface = 0.0F;
+            if (!world.QueryHeight(placed.x, placed.z, surface)) {
+                // 不静默：落点没有地表数据时**跳过并告警**，绝不猜一个高度把物件放到错的地方。
+                VX_LOG_WARN("物件 [%s] 的落点 (%.1f, %.1f) 无地表数据 ⇒ 跳过该条放置",
+                            placed.typeId.c_str(), static_cast<double>(placed.x), static_cast<double>(placed.z));
+                ++objectSkipped;
+                continue;
+            }
+            placed.y = surface;  // 底面贴地表（`objects.toml` 的 y 分量当前不生效）
+
+            const std::uint32_t id = objectLayer.Place(objects, placed);
+            vx::ObjectInstance  instance;
+            (void)objectLayer.Get(id, instance);
+
+            // V3：传送门登记到交互表（`target_world` / `portal_name` 来自放置条目 —— `ObjectInstance` 不带这些）。
+            if (instance.type->kind == vx::ObjectAssetKind::Portal) {
+                portals.push_back(vx::PortalEntry {
+                    glm::dvec3(static_cast<double>(instance.x), static_cast<double>(instance.y),
+                               static_cast<double>(instance.z)),
+                    placed.targetWorldId, placed.portalName});
+            }
+            addObjectSlot(instance);
         }
         VX_LOG_INFO("物件层就绪（V0b/V0c/V3/V8）：清单 %s；放置 %zu / %zu 个物件（渲染 + 静态碰撞：其中传送门 %zu、"
                     "散布点 %zu、模型文件 %zu 个），类型表 %zu 项；可破坏总开关 = %s%s",
@@ -3476,6 +3644,9 @@ int main(int argc, char** argv) {
                     "（原鼠标挖 / 堆 / 爆破笔刷已解绑：地形破坏只由光球触发）；"
                     "**E = 走近传送门时传送**（HUD 出提示后按 E 切换到门的目标世界；**不自动切换**）；"
                     "Esc = 开关系统面板（打开时释放鼠标、关闭时恢复）；"
+                    "**F2 = 物件选择器**（二级列表：一级 = 仓库 / 类别、二级 = 模型）⇒ 选「进入」⇒ **摆放模式**"
+                    "（幽灵预览 + Q/E 旋转 15°（Shift 吸附 90°）+ 左键放下 + 右键删除 + F3 重复上次 + F5 保存到可编辑层 + Esc 退出；"
+                    "**模式内左键不发光球、E 不传送**）；"
                     "点击窗口 = 重新捕获（**该次点击不会发射**）；F1 = 调试面板；关闭窗口 = 退出",
                     orbSpec.id.c_str(), static_cast<double>(orbSpec.fireIntervalSeconds),
                     static_cast<double>(orbSpec.gravityScale), static_cast<double>(orbSpec.explosionRadiusBlocks),
@@ -3487,6 +3658,178 @@ int main(int argc, char** argv) {
 
         // W6：水面流动时间（秒）—— 累加**固定步**时间（与物理同步 ⇒ 确定性，不受帧率影响）。
         double waterTimeSeconds = 0.0;
+
+        // V0.5 E2：坐标拾取辅助的**最近一次反馈**（跨帧保持，进入新世界即重置）—— 让"按 F2"在游戏内**可见**，
+        // 避免"只有控制台日志、看起来没反应"（2026-10-06 缺陷修复）。内容恒为纯 ASCII。
+        std::string pickFeedback;
+
+        // ---- V0.5 E3：摆放模式状态（跨帧保持；进入新世界即重置；[ADR 0032](../../docs/adr/0032-object-palette-and-placement-mode.md)）----
+        bool          placementMode   = false;  ///< 是否处于摆放模式（模式内左键放下 / 右键删除 / Q,E 旋转）
+        float         placementYawDeg = 0.0F;   ///< 预览与放下时的朝向（度）
+        std::string   lastPlaceTypeId;          ///< `F3` 重复上次**实际放下**的类型（空 = 还没放过）
+        float         lastPlaceYawDeg = 0.0F;   ///< `F3` 重复上次**实际放下**的朝向（度）
+        vx::MeshHandle previewHandle {};        ///< 幽灵预览的 GPU 网格（仅模式内有效）
+        std::string   previewTypeId;            ///< 预览网格对应的类型（变了才重建）
+        /// 本帧的预览落点（模式内每帧刷新；`nullopt` = 准星没命中地表 / 无类型 ⇒ 不显示预览、不可放下）。
+        std::optional<vx::GroundPick> previewHit;
+
+        const auto enterPlacement = [&](const std::string& typeId) {
+            const vx::ObjectType* type = objects.Find(typeId);
+            if (type == nullptr) {
+                VX_LOG_WARN("摆放模式（E3）：类型 [%s] 不在当前世界的类型表内 ⇒ 不进入摆放模式", typeId.c_str());
+                return;
+            }
+            if (type->kind == vx::ObjectAssetKind::Portal) {
+                // 传送门需要 `target_world`（见 `ObjectPlacement`），**不能**就地摆放 ⇒ 明确拒绝并说明。
+                VX_LOG_WARN("摆放模式（E3）：传送门 [%s] 需要 target_world ⇒ 不能就地摆放（请写进可编辑层）",
+                            typeId.c_str());
+                return;
+            }
+            placeTypeId     = typeId;
+            lastPlaceTypeId = typeId;
+            lastPlaceYawDeg = 0.0F;
+            placementYawDeg = 0.0F;
+            placementMode   = true;
+            // 抑制"进模式那一帧的这次点击"：面板按钮的那次按下在松手前一直有效
+            // （否则关面板恢复捕获后会立刻射出一颗光球，见 `fireSuppressUntilRelease` 的说明）。
+            fireSuppressUntilRelease = true;
+            mouseCaptured            = window.SetRelativeMouseMode(captureBeforePanel);  // 关面板 ⇒ 恢复打开前捕获
+            VX_LOG_INFO("摆放模式（E3）：进入，类型 [%s]（Q/E 旋转、左键放下、右键删除、F3 重复、F5 保存、Esc 退出）",
+                        typeId.c_str());
+        };
+        const auto exitPlacement = [&]() {
+            placementMode = false;
+            previewHit.reset();
+            if (previewHandle.IsValid()) {
+                renderer.ReleaseMesh(previewHandle);
+                previewHandle = vx::MeshHandle {};
+            }
+            previewTypeId.clear();
+            VX_LOG_INFO("摆放模式（E3）：退出");
+        };
+        const auto saveEditLayer = [&]() {
+            try {
+                vx::SaveObjectEditLayer(objectsEditPath, editLayerState);
+                pickFeedback = "saved";
+                VX_LOG_INFO("可编辑层已保存（E3）：%s（类型 %zu、放置 %zu、删除 %zu、散布 %zu）",
+                            objectsEditPath.string().c_str(), editLayerState.types.size(),
+                            editLayerState.placements.size(), editLayerState.removals.size(),
+                            editLayerState.scatters.size());
+            } catch (const std::exception& error) {
+                VX_LOG_ERROR("可编辑层保存失败（E3）：%s", error.what());
+            }
+        };
+
+        /// 幽灵预览（模式内每帧一次）：准星 → 地表射线 ⇒ **同源几何**半透明网格的位姿 / 不透明度。
+        /// 成本为**常数级**（一次射线 + 一次 64 B 位姿推送），不随世界总量增长；**不建碰撞体、不进物件槽表**
+        /// （不参与剔除 / 支撑 / 破坏；ADR 0032 决策七）。
+        const auto updatePlacementPreview = [&]() {
+            const vx::ObjectType* type = objects.Find(placeTypeId);
+            if (type == nullptr || type->kind == vx::ObjectAssetKind::Portal) {
+                previewHit.reset();
+                return;
+            }
+            if (previewTypeId != placeTypeId || !previewHandle.IsValid()) {
+                if (previewHandle.IsValid()) {
+                    renderer.ReleaseMesh(previewHandle);
+                }
+                previewHandle = renderer.UploadMesh(buildLocalMesh(*type), glm::dvec3(0.0));
+                previewTypeId = placeTypeId;
+                if (!previewHandle.IsValid()) {
+                    VX_LOG_WARN("摆放模式（E3）：类型 [%s] 的预览网格上传失败（网格为空）", placeTypeId.c_str());
+                }
+            }
+            const vx::CameraView previewView = camera.Evaluate(1.0, &cameraQuery);
+            const glm::vec3      previewDir  = AimDirection(camera, cameraQuery);
+            previewHit = vx::RaycastGround(previewView.eye.x, previewView.eye.y, previewView.eye.z, previewDir.x,
+                                           previewDir.y, previewDir.z, kPickMaxDistance, kPickStepDistance,
+                                           [&](float x, float z, float& outHeight) {
+                                               return world.QueryHeight(x, z, outHeight);
+                                           });
+            if (!previewHit.has_value() || !previewHandle.IsValid()) {
+                return;
+            }
+            const glm::dvec3 origin(static_cast<double>(previewHit->x), static_cast<double>(previewHit->surfaceY),
+                                    static_cast<double>(previewHit->z));
+            const glm::quat rotation = glm::angleAxis(glm::radians(placementYawDeg), glm::vec3(0.0F, 1.0F, 0.0F));
+            renderer.SetMeshTransform(previewHandle, origin, rotation);
+            renderer.SetMeshOpacity(previewHandle, kPlacementPreviewOpacity);
+        };
+
+        /// 右键删除：拾取准星指向的**最近**物件 ⇒ 释放网格 + 碰撞体 + 实体，并记入**编辑层**。
+        /// 记账分流（ADR 0032 决策五）：**本层新增**的落点直接从本层删掉；**发布清单 / 散布**来的落点记一条 `[[remove]]`。
+        const auto deleteObjectUnderCrosshair = [&]() {
+            const vx::CameraView deleteView = camera.Evaluate(1.0, &cameraQuery);
+            const glm::vec3      deleteDir  = AimDirection(camera, cameraQuery);
+            ObjectSlot*          target     = nullptr;
+            float                bestT      = kPickMaxDistance;
+            for (ObjectSlot& slot : objectSlots) {
+                if (slot.removed || !slot.bounds.valid) {
+                    continue;
+                }
+                float t = 0.0F;
+                if (RayHitsAabb(deleteView.eye, deleteDir, slot.bounds, t) && t < bestT) {
+                    bestT  = t;
+                    target = &slot;
+                }
+            }
+            if (target == nullptr) {
+                pickFeedback = "no object";
+                VX_LOG_WARN("摆放模式（E3）：右键指向 %.0f 格内没有可删除的物件", static_cast<double>(kPickMaxDistance));
+                return;
+            }
+            const std::string typeId = (target->type != nullptr) ? target->type->id : std::string {};
+            const float       x      = static_cast<float>(target->position.x);
+            const float       z      = static_cast<float>(target->position.z);
+            DestroyObjectSlot(*target, objectLayer, physics, renderer);
+            if (!EraseEditLayerPlacement(editLayerState.placements, typeId, x, z, kPlacementRemoveTolerance)) {
+                vx::ObjectRemoval removal;
+                removal.typeId    = typeId;
+                removal.x         = x;
+                removal.z         = z;
+                removal.tolerance = kPlacementRemoveTolerance;
+                editLayerState.removals.push_back(std::move(removal));
+            }
+            pickFeedback = "deleted";
+            VX_LOG_INFO("摆放模式（E3）：**已删除**物件 [%s] @ (%.2f, %.2f)（F5 保存后重启不再出现；发布清单文件未被改动）",
+                        typeId.c_str(), static_cast<double>(x), static_cast<double>(z));
+        };
+
+        // ---- V0.5 E4：物件选择器的**预览小图**（CPU 正交投影；与最终摆放几何**同源**）----
+        // 网格按类型缓存（`buildLocalMesh` 只在换类型时跑一次）；每帧只重投影（面数级、**零 GPU 资源**、
+        // 不改渲染器）⇒ 符合 SKILL「重活离开渲染帧」：单帧成本随**面数**（常数级）、与**世界总量无关**。
+        std::string  palettePreviewTypeId;          ///< 当前预览几何对应的类型（变了才重建）
+        vx::MeshData palettePreviewMesh;            ///< 预览用**局部**网格（与放置用的那份同源）
+        bool         palettePreviewMeshReady = false;  ///< 该类型是否有可预览几何
+        float        palettePreviewSpinSeconds = 0.0F;  ///< 自动旋转相位（秒；只在面板打开时推进）
+
+        /// 左键放下：与加载期**同一** `addObjectSlot` 路径（渲染 / 碰撞同源），并记入**本层新增落点**。
+        const auto placeObjectAtPreview = [&]() {
+            if (!previewHit.has_value()) {
+                pickFeedback = "no ground hit";
+                VX_LOG_WARN("摆放模式（E3）：准星 %.0f 格内未命中地表 ⇒ 本次未放下",
+                            static_cast<double>(kPickMaxDistance));
+                return;
+            }
+            vx::ObjectPlacement placed;
+            placed.typeId     = placeTypeId;
+            placed.x          = previewHit->x;
+            placed.y          = previewHit->surfaceY;  // 底面贴地表（与加载期同口径 ⇒ 不悬空）
+            placed.z          = previewHit->z;
+            placed.yawDegrees = placementYawDeg;
+            const std::uint32_t placedId = objectLayer.Place(objects, placed);
+            vx::ObjectInstance  instance;
+            (void)objectLayer.Get(placedId, instance);
+            addObjectSlot(instance);
+            editLayerState.placements.push_back(placed);  // 本层增量（F5 保存即持久化）
+
+            lastPlaceYawDeg = placementYawDeg;
+            pickFeedback    = "placed";
+            VX_LOG_INFO("摆放模式（E3）：**已放下** [%s] #%u @ (%.2f, %.2f) h %.2f、朝向 %.1f°"
+                        "（本次运行内可见；F5 保存到可编辑层后重启仍在）",
+                        placeTypeId.c_str(), placedId, static_cast<double>(placed.x), static_cast<double>(placed.z),
+                        static_cast<double>(placed.y), static_cast<double>(placementYawDeg));
+        };
 
         while (true) {
             // T79②（T74 打点拆分，**先量后改**）：帧周期的采样点必须在**帧首**。
@@ -3517,7 +3860,22 @@ int main(int argc, char** argv) {
             // 打开面板 → 释放捕获并记住打开前状态；关闭面板 → 恢复到打开前状态。
             // 与 T14 的捕获状态机共存于 `mouse_capture.hpp`，不是第二套机制。
             if (input.ConsumePressed(vx::ActionId::ToggleSystemPanel)) {
-                if (debugOverlay.PortalMenuOpen()) {
+                if (debugOverlay.ObjectPaletteOpen()) {
+                    // V0.5 E3：Esc 先关**物件选择器**（与传送门菜单同一套捕获语义），**不**顺带打开系统面板。
+                    debugOverlay.CloseObjectPalette();
+                    const vx::PanelCaptureTransition transition =
+                        vx::DecidePanelCaptureTransition(/*opening=*/false, captureBeforePanel);
+                    if (transition.captureRequested) {
+                        mouseCaptured = window.SetRelativeMouseMode(true);
+                    }
+                    jumpRequested = false;
+                    VX_LOG_INFO("物件选择器（E3）：关闭（Esc）；鼠标捕获：%s",
+                                mouseCaptured ? "开（已恢复打开前状态）" : "关");
+                } else if (placementMode) {
+                    // V0.5 E3：摆放模式内 `Esc` **先退模式**（**不**打开系统面板；模式外行为与从前逐位一致）。
+                    exitPlacement();
+                    jumpRequested = false;
+                } else if (debugOverlay.PortalMenuOpen()) {
                     // V9：Esc 先关**传送门菜单**（与系统面板同一套捕获语义），**不**顺带打开系统面板。
                     debugOverlay.ClosePortalMenu();
                     const vx::PanelCaptureTransition transition =
@@ -3612,15 +3970,171 @@ int main(int argc, char** argv) {
             }
 
             // T27：发射意图在**帧边界**采样一次（按住 = 连发，由固定步内的冷却控制射速）。
-            // 这里仍消费"本帧按下"边沿，避免边沿残留到下一帧被重复消费。
-            (void)input.ConsumePressed(vx::ActionId::Attack);
+            // 这里仍消费"本帧按下"边沿，避免边沿残留到下一帧被重复消费；边沿另供摆放模式"左键放下"使用。
+            const bool attackPressedEdge = input.ConsumePressed(vx::ActionId::Attack);
             if (!input.Held(vx::ActionId::Attack)) {
                 fireSuppressUntilRelease = false;  // 松开左键即解除"捕获点击"抑制
             }
+            // **模式内让位**（ADR 0032 决策四）：摆放模式里左键是"放下"，不再发射光球；模式外逐位不变。
             const bool fireHeld = mouseCaptured && !suppression.mouseAction && !fireSuppressUntilRelease &&
-                                  input.Held(vx::ActionId::Attack);
+                                  !placementMode && input.Held(vx::ActionId::Attack);
             // 瞄准方向每帧算一次（相机视线；见 `AimDirection` 的说明），供本帧全部固定步复用。
             const glm::vec3 aimDirection = fireHeld ? AimDirection(camera, cameraQuery) : glm::vec3(0.0F);
+
+            // ---- V0.5 E3：物件选择器（`F2`）+ 摆放模式（[ADR 0032](../../docs/adr/0032-object-palette-and-placement-mode.md)）----
+            //
+            // 契约（与 `F1` 同口径）：`F2` 是**编辑辅助键**、**不受玩法输入抑制**，总是消费边沿并给出可见反馈
+            //（HUD + 日志），避免"按了没反应"。
+            // 形态：`F2` ⇒ 二级列表（一级 = 仓库 / 类别、二级 = 模型 / 类型）⇒ 选「进入」⇒ 摆放模式：
+            //   幽灵预览（同源几何 + 抖动淡出）+ `Q`/`E` 旋转 + 左键放下 + 右键删除 + `F3` 重复 + `F5` 保存 + `Esc` 退出。
+            // **模式内让位**：左键不发光球（上面的 `fireHeld`）、`E` 不触发传送门交互（下面消费 `Interact`）、`Esc` 先退模式。
+            {
+                // 消费选择器动作（由**上一帧末**的 ImGui 构建产生；`Take` 后清零 ⇒ 只生效一次）。
+                const vx::PaletteRequest paletteRequest = debugOverlay.TakePaletteRequest();
+                if (paletteRequest.action != vx::PaletteRequest::Action::None) {
+                    jumpRequested = false;
+                    if (paletteRequest.action == vx::PaletteRequest::Action::EnterPlacement) {
+                        // 面板在按钮点击时已关闭；`enterPlacement` 负责恢复捕获（回到打开前的状态）。
+                        enterPlacement(paletteRequest.typeId);
+                    } else if (paletteRequest.action == vx::PaletteRequest::Action::Save) {
+                        saveEditLayer();  // 面板保持打开 ⇒ 不恢复捕获（仍释放，供继续点控件）
+                    } else {
+                        // Cancel：面板已关闭 ⇒ 恢复打开前的捕获状态。
+                        const vx::PanelCaptureTransition transition =
+                            vx::DecidePanelCaptureTransition(/*opening=*/false, captureBeforePanel);
+                        if (transition.captureRequested) {
+                            mouseCaptured = window.SetRelativeMouseMode(true);
+                        }
+                        VX_LOG_INFO("物件选择器（E3）：取消（不改变任何状态）");
+                    }
+                }
+            }
+
+            // `Enter` = 确认（与面板「进入摆放」按钮**等效**；`ui-inventory.md` §2.5 的名义承诺）：
+            // 由 game 层读取面板**当前选中项**后进入摆放模式，并关闭面板（键盘路径下 UI 不会自己关）。
+            if (debugOverlay.ObjectPaletteOpen() && input.ConsumePressed(vx::ActionId::PaletteConfirm)) {
+                const vx::PaletteModel& palette = debugOverlay.Palette();
+                std::string             selectedTypeId;
+                if (palette.state.categoryIndex < palette.typeIdsByCategory.size()) {
+                    const std::vector<std::string>& typeIds = palette.typeIdsByCategory[palette.state.categoryIndex];
+                    if (palette.state.typeIndex < typeIds.size()) {
+                        selectedTypeId = typeIds[palette.state.typeIndex];
+                    }
+                }
+                if (selectedTypeId.empty()) {
+                    VX_LOG_WARN("物件选择器（E3）：二级列表为空 ⇒ `Enter` 无法进入摆放模式");
+                } else {
+                    enterPlacement(selectedTypeId);
+                    if (placementMode) {
+                        debugOverlay.CloseObjectPalette();
+                    }
+                }
+            }
+
+            if (input.ConsumePressed(vx::ActionId::PickPlacement)) {
+                if (debugOverlay.ObjectPaletteOpen()) {
+                    debugOverlay.CloseObjectPalette();
+                    const vx::PanelCaptureTransition transition =
+                        vx::DecidePanelCaptureTransition(/*opening=*/false, captureBeforePanel);
+                    if (transition.captureRequested) {
+                        mouseCaptured = window.SetRelativeMouseMode(true);
+                    }
+                    jumpRequested = false;
+                    VX_LOG_INFO("物件选择器（E3）：关闭（F2）；鼠标捕获：%s",
+                                mouseCaptured ? "开（已恢复打开前状态）" : "关");
+                } else {
+                    if (placementMode) {
+                        exitPlacement();  // 模式内按 F2 ⇒ 先退模式，再开选择器（换类型）
+                    }
+                    debugOverlay.OpenObjectPalette(BuildPaletteModelFrom(objects, placeTypeId));
+                    captureBeforePanel = mouseCaptured;
+                    (void)window.SetRelativeMouseMode(false);
+                    mouseCaptured = false;
+                    jumpRequested = false;
+                    pickFeedback.clear();
+                    VX_LOG_INFO("物件选择器（E3）：打开（F2；一级 = 仓库、二级 = 模型）；鼠标捕获：关（供点击控件）");
+                }
+            }
+
+            // V0.5 E4：选择器**预览**（CPU 正交投影 + 朗伯明暗）—— 仅在面板打开时计算，每帧一次。
+            // 与最终摆放**同一份** `buildLocalMesh` 几何 ⇒ 所见即所得；零 GPU 资源、零渲染器改动；
+            // 成本 = 面数级（Kenney 低模数十~数百面）⇒ 与"面板打开"这一用户动作绑定，不进入玩法热路径。
+            if (debugOverlay.ObjectPaletteOpen()) {
+                vx::PaletteModel& palette = debugOverlay.MutablePalette();
+                std::string       selectedTypeId;
+                if (palette.state.categoryIndex < palette.typeIdsByCategory.size()) {
+                    const std::vector<std::string>& typeIds = palette.typeIdsByCategory[palette.state.categoryIndex];
+                    if (palette.state.typeIndex < typeIds.size()) {
+                        selectedTypeId = typeIds[palette.state.typeIndex];
+                    }
+                }
+                if (selectedTypeId != palettePreviewTypeId) {
+                    palettePreviewTypeId    = selectedTypeId;
+                    palettePreviewMeshReady = false;
+                    const vx::ObjectType* type = objects.Find(selectedTypeId);
+                    if (type != nullptr) {
+                        palettePreviewMesh      = buildLocalMesh(*type);
+                        palettePreviewMeshReady = !palettePreviewMesh.vertices.empty();
+                    }
+                }
+                if (palettePreviewMeshReady) {
+                    palettePreviewSpinSeconds += static_cast<float>(frameDeltaSeconds);
+                    const float yaw =
+                        kPalettePreviewSpinRadiansPerSecond * palettePreviewSpinSeconds + palette.previewYawRadians;
+                    palette.previewTriangles =
+                        vx::BuildObjectPreview(palettePreviewMesh, yaw, vx::kObjectPreviewPitchRadians);
+                } else {
+                    palette.previewTriangles.clear();
+                }
+            }
+
+            if (placementMode) {
+                // 模式内让位：`E` 同时绑定了传送门交互 ⇒ 这里先消费掉，避免"旋转的同时触发开门"。
+                (void)input.ConsumePressed(vx::ActionId::Interact);
+                // `Q` / `E` 旋转（步进 15°；按住 `Shift` 吸附 90°）。
+                const float rotateStep = input.Held(vx::ActionId::Sprint) ? 90.0F : kPlacementRotateStepDeg;
+                if (input.ConsumePressed(vx::ActionId::PlacementRotateLeft)) {
+                    placementYawDeg -= rotateStep;
+                }
+                if (input.ConsumePressed(vx::ActionId::PlacementRotateRight)) {
+                    placementYawDeg += rotateStep;
+                }
+                placementYawDeg = std::fmod(placementYawDeg + 360.0F, 360.0F);  // 归一化到 [0, 360)
+
+                updatePlacementPreview();
+                if (attackPressedEdge) {
+                    placeObjectAtPreview();
+                }
+                if (input.ConsumePressed(vx::ActionId::PlacementRemove)) {
+                    deleteObjectUnderCrosshair();
+                }
+            }
+
+            // `F3` 重复上次 / `F5` 保存：面板打开时**不生效**（避免与面板控件抢输入；边沿照常消费）。
+            if (debugOverlay.AnyBlockingPanelOpen()) {
+                (void)input.ConsumePressed(vx::ActionId::PlacementRepeatLast);
+                (void)input.ConsumePressed(vx::ActionId::PlacementSave);
+            } else {
+                if (input.ConsumePressed(vx::ActionId::PlacementRepeatLast)) {
+                    const std::string repeatTypeId = lastPlaceTypeId;
+                    const float       repeatYawDeg = lastPlaceYawDeg;
+                    if (repeatTypeId.empty()) {
+                        pickFeedback = "no last type";
+                        VX_LOG_WARN("摆放模式（E3）：`F3` 还没有「上次」可重复（先按 F2 选一个模型并放下）");
+                    } else {
+                        enterPlacement(repeatTypeId);
+                        if (placementMode) {
+                            placementYawDeg = repeatYawDeg;  // 重复"上次"的类型**与朝向**
+                            lastPlaceYawDeg = repeatYawDeg;
+                            VX_LOG_INFO("摆放模式（E3）：`F3` 重复上次 —— 类型 [%s]、朝向 %.1f°",
+                                        repeatTypeId.c_str(), static_cast<double>(repeatYawDeg));
+                        }
+                    }
+                }
+                if (input.ConsumePressed(vx::ActionId::PlacementSave)) {
+                    saveEditLayer();
+                }
+            }
 
             // 空格跳跃：本帧按下边沿先**锁存**，不在此帧边界丢弃（缺陷 B3，见 jumpRequested 的说明）。
             // T14/T15：未捕获、或 ImGui 接管键盘时不接受移动 / 跳跃输入；
@@ -4556,6 +5070,11 @@ int main(int argc, char** argv) {
                 }
                 submitStaticCasters(slot.handle, slot.bounds);
             }
+            // V0.5 E3：摆放模式的**幽灵预览**（半透明抖动淡出）—— 只进主通道，**不投影阴影**
+            // （它是"还没放下的东西"）；预览网格独立于 `objectSlots`（不建碰撞体、不进剔除 / 支撑 / 破坏）。
+            if (placementMode && previewHit.has_value() && previewHandle.IsValid()) {
+                frameHandles.push_back(previewHandle);
+            }
             // W6：水面（半透明；在主通道**最后**绘制 ⇒ 追加在列表末尾）。水面**不投影阴影**
             // （`DrawMeshes` 在阴影通道按 `waterPass` 跳过它）⇒ 不进任何阴影列表。
             if (waterHandle.IsValid()) {
@@ -4646,6 +5165,9 @@ int main(int argc, char** argv) {
             stats.lastDirtyTileCount = destructionUnits;
             stats.tileBodyCount     = terrainCollision.TileBodyCount();
             stats.nearbyPortalPromptName = nearbyPortalPromptName;  // V3/V9：走近传送门的提示（空串 = 不显示）
+            stats.placementTypeId        = placeTypeId;             // V0.5 E2：坐标拾取辅助当前类型（空串 = 不显示）
+            stats.lastPickFeedback       = pickFeedback;            // V0.5 E2：最近一次拾取反馈（空串 = 不显示）
+            stats.placementModeActive    = placementMode;           // V0.5 E3：摆放模式横幅（true ⇒ HUD 显示键位提示）
             stats.physicsReady      = true;
 
             // T24：渲染开销取自引擎的通用统计；绘制数为**最近一次** RenderFrame（面板早于本帧渲染）。
@@ -4842,6 +5364,8 @@ int main(int argc, char** argv) {
         for (ObjectSlot& slot : objectSlots) {
             if (slot.handle.IsValid()) { renderer.ReleaseMesh(slot.handle); }
         }
+        // V0.5 E3：摆放模式的**幽灵预览**网格（若有）也一并交还，避免切换世界时泄漏一个网格槽位。
+        if (previewHandle.IsValid()) { renderer.ReleaseMesh(previewHandle); }
         for (vx::MeshHandle& handle : orbHandles) {
             if (handle.IsValid()) { renderer.ReleaseMesh(handle); }
         }

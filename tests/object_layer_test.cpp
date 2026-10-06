@@ -15,10 +15,12 @@
 
 namespace {
 
+using vx::MergeObjectTables;
 using vx::ObjectAssetKind;
 using vx::ObjectInstance;
 using vx::ObjectLayer;
 using vx::ObjectPlacement;
+using vx::ObjectScatter;
 using vx::ObjectTable;
 using vx::ObjectType;
 
@@ -262,6 +264,7 @@ id = "gate"
 kind = "portal"
 half_extent = [1.0, 1.5, 0.2]
 destructible = false
+category = "portal"
 
 [[placement]]
 type = "gate"
@@ -279,6 +282,7 @@ id = "gate"
 kind = "portal"
 half_extent = [1.0, 1.5, 0.2]
 destructible = false
+category = "portal"
 
 [[placement]]
 type = "gate"
@@ -297,6 +301,7 @@ id = "gate"
 kind = "portal"
 half_extent = [1.0, 1.5, 0.2]
 destructible = false
+category = "portal"
 
 [[placement]]
 type = "gate"
@@ -341,6 +346,7 @@ id = "gate"
 kind = "portal"
 half_extent = [1.0, 1.5, 0.2]
 destructible = false
+category = "portal"
 
 [[placement]]
 type = "gate"
@@ -630,6 +636,323 @@ TEST(ObjectLayer, ClearResetsCountAndIds) {
 
     const std::uint32_t first = layer.Place(table, table.placements[0]);
     EXPECT_EQ(first, 1U);
+}
+
+// --------------------------- 可编辑层叠加（V0.5 E1）---------------------------
+
+[[nodiscard]] ObjectTable MakeEmptyTable(bool destructibleEnabled) {
+    ObjectTable table;
+    table.schemaVersion       = ObjectTable::kSchemaVersion;
+    table.destructibleEnabled = destructibleEnabled;
+    return table;
+}
+
+TEST(MergeObjectTables, AppendsTypesPlacementsAndScattersInFileOrder) {
+    ObjectTable base = MakeEmptyTable(true);
+    base.types.push_back(ObjectType { "base_type", ObjectAssetKind::Stone, 1.0F, 1.0F, 1.0F, false });
+    base.placements.push_back(ObjectPlacement { "base_type", 1.0F, 2.0F, 3.0F, 0.0F });
+
+    ObjectTable overlay = MakeEmptyTable(true);
+    overlay.types.push_back(ObjectType { "edit_type", ObjectAssetKind::Crate, 1.0F, 1.0F, 1.0F, false });
+    overlay.placements.push_back(ObjectPlacement { "edit_type", 4.0F, 5.0F, 6.0F, 45.0F });
+    overlay.scatters.push_back(ObjectScatter { "edit_type", 0.0F, 0.0F, 10.0F, 3, 7U });
+
+    const ObjectTable merged = MergeObjectTables(base, overlay);
+    ASSERT_EQ(merged.types.size(), 2U);
+    EXPECT_EQ(merged.types[0].id, "base_type");
+    EXPECT_EQ(merged.types[1].id, "edit_type");  // 编辑层**追加**在发布清单之后
+    ASSERT_EQ(merged.placements.size(), 2U);
+    EXPECT_EQ(merged.placements[0].typeId, "base_type");
+    EXPECT_EQ(merged.placements[1].typeId, "edit_type");
+    ASSERT_EQ(merged.scatters.size(), 1U);
+    EXPECT_EQ(merged.scatters[0].typeId, "edit_type");
+    EXPECT_TRUE(merged.destructibleEnabled);
+}
+
+TEST(MergeObjectTables, DuplicateTypeIdThrows) {
+    ObjectTable base = MakeEmptyTable(true);
+    base.types.push_back(ObjectType { "dup", ObjectAssetKind::Stone, 1.0F, 1.0F, 1.0F, false });
+
+    ObjectTable overlay = MakeEmptyTable(true);
+    overlay.types.push_back(ObjectType { "dup", ObjectAssetKind::Crate, 1.0F, 1.0F, 1.0F, false });
+
+    EXPECT_THROW(static_cast<void>(MergeObjectTables(base, overlay)), std::runtime_error);
+}
+
+TEST(MergeObjectTables, DestructibleToggleMismatchThrows) {
+    ObjectTable base    = MakeEmptyTable(true);
+    ObjectTable overlay = MakeEmptyTable(false);
+    EXPECT_THROW(static_cast<void>(MergeObjectTables(base, overlay)), std::runtime_error);
+}
+
+// --------------------------- 可编辑层加载（LoadOverlayFromFile，V0.5 E1）---------------------------
+
+TEST(ObjectTable, OverlayWithoutTypeSectionParsesPlacementsOverBaseTypes) {
+    const TempToml baseFile("voxel_object_overlay_base.toml", kValid);
+    const ObjectTable base = ObjectTable::LoadFromFile(baseFile.path());
+
+    const TempToml overlayFile("voxel_object_overlay_placements.toml", R"(
+schema_version = 1
+destructible_enabled = true
+
+[[placement]]
+type = "dirt_pile"
+position = [1.0, 0.0, 1.0]
+yaw_deg = 15.0
+)");
+    const ObjectTable overlay = ObjectTable::LoadOverlayFromFile(overlayFile.path(), base);
+    EXPECT_TRUE(overlay.types.empty());  // 省略 [[type]] 合法 = "只放落点"
+    ASSERT_EQ(overlay.placements.size(), 1U);
+    EXPECT_EQ(overlay.placements[0].typeId, "dirt_pile");
+    EXPECT_TRUE(overlay.destructibleEnabled);
+}
+
+TEST(ObjectTable, OverlayAllowsNewTypeReferencedByItsOwnPlacement) {
+    const TempToml baseFile("voxel_object_overlay_base2.toml", kValid);
+    const ObjectTable base = ObjectTable::LoadFromFile(baseFile.path());
+
+    const TempToml overlayFile("voxel_object_overlay_newtype.toml", R"(
+schema_version = 1
+
+[[type]]
+id = "edit_crate"
+kind = "crate"
+half_extent = [0.5, 0.5, 0.5]
+destructible = false
+
+[[placement]]
+type = "edit_crate"
+position = [0.0, 0.0, 4.0]
+)");
+    const ObjectTable overlay = ObjectTable::LoadOverlayFromFile(overlayFile.path(), base);
+    ASSERT_EQ(overlay.types.size(), 1U);
+    EXPECT_EQ(overlay.types[0].id, "edit_crate");
+    ASSERT_EQ(overlay.placements.size(), 1U);
+    EXPECT_EQ(overlay.placements[0].typeId, "edit_crate");
+}
+
+TEST(ObjectTable, OverlayDuplicateTypeIdWithBaseThrows) {
+    const TempToml baseFile("voxel_object_overlay_base3.toml", kValid);
+    const ObjectTable base = ObjectTable::LoadFromFile(baseFile.path());
+
+    const TempToml overlayFile("voxel_object_overlay_dup.toml", R"(
+schema_version = 1
+
+[[type]]
+id = "dirt_pile"
+kind = "crate"
+half_extent = [1.0, 1.0, 1.0]
+destructible = false
+)");
+    EXPECT_THROW(static_cast<void>(ObjectTable::LoadOverlayFromFile(overlayFile.path(), base)), std::runtime_error);
+}
+
+TEST(ObjectTable, OverlayPlacementOfUnknownTypeThrows) {
+    const TempToml baseFile("voxel_object_overlay_base4.toml", kValid);
+    const ObjectTable base = ObjectTable::LoadFromFile(baseFile.path());
+
+    const TempToml overlayFile("voxel_object_overlay_unknown.toml", R"(
+schema_version = 1
+
+[[placement]]
+type = "does_not_exist"
+position = [0.0, 0.0, 0.0]
+)");
+    EXPECT_THROW(static_cast<void>(ObjectTable::LoadOverlayFromFile(overlayFile.path(), base)), std::runtime_error);
+}
+
+TEST(ObjectTable, OverlayDestructibleToggleMismatchThrows) {
+    const TempToml baseFile("voxel_object_overlay_base5.toml", kValid);
+    const ObjectTable base = ObjectTable::LoadFromFile(baseFile.path());
+
+    const TempToml overlayFile("voxel_object_overlay_toggle.toml", R"(
+schema_version = 1
+destructible_enabled = false
+)");
+    EXPECT_THROW(static_cast<void>(ObjectTable::LoadOverlayFromFile(overlayFile.path(), base)), std::runtime_error);
+}
+
+// --------------------------- 仓库 / 类别（`category`，V0.5 E3）---------------------------
+
+TEST(ObjectTable, CategoryDefaultsToMiscWhenOmitted) {
+    const TempToml file("voxel_object_category_default.toml", kValid);
+    const ObjectTable table = ObjectTable::LoadFromFile(file.path());
+    const ObjectType* pile  = table.Find("dirt_pile");
+    ASSERT_NE(pile, nullptr);
+    EXPECT_EQ(pile->category, "misc");  // 缺省 = `misc`（不按形态 / 文件名推断）
+}
+
+TEST(ObjectTable, CategoryIsParsedWhenGiven) {
+    const TempToml file("voxel_object_category_given.toml", R"(
+schema_version = 1
+
+[[type]]
+id = "tree_default"
+kind = "crate"
+half_extent = [1.0, 2.0, 1.0]
+destructible = false
+category = "vegetation"
+)");
+    const ObjectTable table = ObjectTable::LoadFromFile(file.path());
+    const ObjectType* type  = table.Find("tree_default");
+    ASSERT_NE(type, nullptr);
+    EXPECT_EQ(type->category, "vegetation");
+    EXPECT_TRUE(vx::IsValidObjectCategory(type->category));
+}
+
+TEST(ObjectTable, InvalidCategoryThrows) {
+    const TempToml file("voxel_object_category_invalid.toml", R"(
+schema_version = 1
+
+[[type]]
+id = "weird"
+kind = "stone"
+half_extent = [1.0, 1.0, 1.0]
+destructible = false
+category = "banana"
+)");
+    ExpectLoadThrows(file.path());
+}
+
+TEST(ObjectTable, NonStringCategoryThrows) {
+    const TempToml file("voxel_object_category_nonstring.toml", R"(
+schema_version = 1
+
+[[type]]
+id = "weird"
+kind = "stone"
+half_extent = [1.0, 1.0, 1.0]
+destructible = false
+category = 3
+)");
+    ExpectLoadThrows(file.path());
+}
+
+TEST(ObjectTable, PortalCategoryMustBePortal) {
+    const TempToml file("voxel_object_category_portal.toml", R"(
+schema_version = 1
+
+[[type]]
+id = "gate"
+kind = "portal"
+half_extent = [1.0, 1.5, 0.2]
+destructible = false
+category = "prop"
+)");
+    ExpectLoadThrows(file.path());  // portal 形态必须归 `portal` 类别（否则会混进别的一级列表）
+}
+
+// --------------------------- 删除项（`[[remove]]`，V0.5 E3）---------------------------
+
+TEST(RemovePlacementsByRemoval, FiltersByTypeAndPlanarToleranceKeepingOrder) {
+    std::vector<ObjectPlacement> placements;
+    placements.push_back(ObjectPlacement { "a", 1.0F, 0.0F, 1.0F, 0.0F });
+    placements.push_back(ObjectPlacement { "b", 2.0F, 0.0F, 2.0F, 0.0F });
+    placements.push_back(ObjectPlacement { "a", 5.0F, 0.0F, 5.0F, 0.0F });
+
+    std::vector<vx::ObjectRemoval> removals;
+    vx::ObjectRemoval              matched;
+    matched.typeId    = "a";
+    matched.x         = 1.2F;
+    matched.z         = 0.9F;
+    matched.tolerance = 0.5F;
+    removals.push_back(matched);
+
+    const std::vector<ObjectPlacement> kept = vx::RemovePlacementsByRemoval(placements, removals);
+    ASSERT_EQ(kept.size(), 2U);
+    EXPECT_EQ(kept[0].typeId, "b");  // 顺序保持（确定性；红线 7）
+    EXPECT_EQ(kept[1].typeId, "a");
+    EXPECT_FLOAT_EQ(kept[1].x, 5.0F);
+}
+
+TEST(RemovePlacementsByRemoval, TypeMismatchDoesNotRemove) {
+    std::vector<ObjectPlacement> placements;
+    placements.push_back(ObjectPlacement { "a", 1.0F, 0.0F, 1.0F, 0.0F });
+
+    std::vector<vx::ObjectRemoval> removals;
+    vx::ObjectRemoval              other;
+    other.typeId    = "b";
+    other.x         = 1.0F;
+    other.z         = 1.0F;
+    other.tolerance = 0.5F;
+    removals.push_back(other);
+
+    EXPECT_EQ(vx::RemovePlacementsByRemoval(placements, removals).size(), 1U);
+}
+
+TEST(ObjectTable, OverlayParsesRemovals) {
+    const TempToml baseFile("voxel_object_remove_base.toml", kValid);
+    const ObjectTable base = ObjectTable::LoadFromFile(baseFile.path());
+
+    const TempToml overlayFile("voxel_object_remove_overlay.toml", R"(
+schema_version = 1
+
+[[remove]]
+type = "dirt_pile"
+position = [6.0, 6.0]
+
+[[remove]]
+type = "stone_boulder"
+position = [-8.0, 4.0]
+tolerance = 1.25
+)");
+    const ObjectTable overlay = ObjectTable::LoadOverlayFromFile(overlayFile.path(), base);
+    ASSERT_EQ(overlay.removals.size(), 2U);
+    EXPECT_EQ(overlay.removals[0].typeId, "dirt_pile");
+    EXPECT_FLOAT_EQ(overlay.removals[0].x, 6.0F);
+    EXPECT_FLOAT_EQ(overlay.removals[0].z, 6.0F);
+    EXPECT_FLOAT_EQ(overlay.removals[0].tolerance, 0.5F);  // 缺省 0.5 格
+    EXPECT_FLOAT_EQ(overlay.removals[1].tolerance, 1.25F);
+}
+
+TEST(ObjectTable, RemoveOfUnknownTypeThrows) {
+    const TempToml baseFile("voxel_object_remove_base2.toml", kValid);
+    const ObjectTable base = ObjectTable::LoadFromFile(baseFile.path());
+
+    const TempToml overlayFile("voxel_object_remove_unknown.toml", R"(
+schema_version = 1
+
+[[remove]]
+type = "does_not_exist"
+position = [0.0, 0.0]
+)");
+    EXPECT_THROW(static_cast<void>(ObjectTable::LoadOverlayFromFile(overlayFile.path(), base)), std::runtime_error);
+}
+
+TEST(ObjectTable, NonPositiveRemoveToleranceThrows) {
+    const TempToml baseFile("voxel_object_remove_base3.toml", kValid);
+    const ObjectTable base = ObjectTable::LoadFromFile(baseFile.path());
+
+    const TempToml overlayFile("voxel_object_remove_bad_tolerance.toml", R"(
+schema_version = 1
+
+[[remove]]
+type = "dirt_pile"
+position = [0.0, 0.0]
+tolerance = 0.0
+)");
+    EXPECT_THROW(static_cast<void>(ObjectTable::LoadOverlayFromFile(overlayFile.path(), base)), std::runtime_error);
+}
+
+TEST(MergeObjectTables, AppliesOverlayRemovalsToBaseBeforeAppending) {
+    ObjectTable base = MakeEmptyTable(true);
+    base.types.push_back(ObjectType { "base_type", ObjectAssetKind::Stone, 1.0F, 1.0F, 1.0F, false });
+    base.placements.push_back(ObjectPlacement { "base_type", 1.0F, 2.0F, 3.0F, 0.0F });
+
+    ObjectTable overlay = MakeEmptyTable(true);
+    overlay.placements.push_back(ObjectPlacement { "base_type", 9.0F, 0.0F, 9.0F, 0.0F });
+    vx::ObjectRemoval removal;
+    removal.typeId    = "base_type";
+    removal.x         = 1.0F;
+    removal.z         = 3.0F;
+    removal.tolerance = 0.5F;
+    overlay.removals.push_back(removal);
+
+    const ObjectTable merged = MergeObjectTables(base, overlay);
+    // 发布清单里的 (1,3) 被删除项剔除 ⇒ 只剩本层新增的 (9,9)（顺序 = 发布清单 → 删除 → 追加）。
+    ASSERT_EQ(merged.placements.size(), 1U);
+    EXPECT_FLOAT_EQ(merged.placements[0].x, 9.0F);
+    EXPECT_FLOAT_EQ(merged.placements[0].z, 9.0F);
 }
 
 }  // namespace

@@ -25,6 +25,7 @@ add_library(voxel_world STATIC
     generation/map_preset.cpp
     generation/terrain_noise.cpp
     generation/terrain_params.cpp
+    object/object_edit_save.cpp
     object/object_layer.cpp
     premade/premade_bake.cpp
     premade/premade_map.cpp

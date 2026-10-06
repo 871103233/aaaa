@@ -181,6 +181,23 @@ LevelManifest LevelManifest::LoadFromFile(const std::filesystem::path& path) {
         manifest.objectsFile = ResolveReference(path, *file);
     }
 
+    // `objects_edit_file`（可选，阶段 V0.5 的 E1）：**相对清单所在目录**解析（与 objects_file 同口径）。
+    // 未给出 ⇒ **派生默认** = 与 objects_file 同目录、同主名 + `.edit.toml`（编辑层按需生成，不改变既有行为）。
+    if (const toml::node* node = document.get("objects_edit_file"); node != nullptr) {
+        const std::optional<std::string> file = node->value<std::string>();
+        if (!file.has_value()) {
+            throw std::runtime_error(Describe(path, "objects_edit_file") + "不是字符串");
+        }
+        if (file->empty()) {
+            throw std::runtime_error(path.string() + ": 字段 [objects_edit_file] 不能为空");
+        }
+        manifest.objectsEditFilePath   = ResolveReference(path, *file);
+        manifest.objectsEditFileExplicit = true;
+    } else {
+        const std::filesystem::path stemPath = manifest.objectsFile.stem();
+        manifest.objectsEditFilePath = manifest.objectsFile.parent_path() / (stemPath.string() + ".edit.toml");
+    }
+
     return manifest;
 }
 

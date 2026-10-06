@@ -27,15 +27,18 @@ id = "portal_gate"
 kind = "portal"
 half_extent = [1.0, 1.5, 0.2]   # 门洞半宽 0.6 格、半高 1.1 格（环心线 = 半尺寸 − 管半径）
 destructible = false            # 传送装置不可破坏
+category = "portal"             # E3：选择器一级列表（portal 形态必须归 portal）
 
 [[type]]
 id = "dirt_pile"
 kind = "dirt_pile"
 half_extent = [1.0, 0.75, 1.0]
 destructible = true
+category = "prop"
 
 # ---- 自然植被（V8；half_extent = 模型原始半尺寸 × 目标缩放，三者同倍 ⇒ 等比、不拉伸）----
 # 原始尺寸见各 GLB 的 POSITION 包围盒（例：tree_default 0.76 × 1.71 × 0.65 ⇒ ×3.5 ≈ 6.0 格高）。
+# category = "vegetation" | "rock" | "prop" | "building" | "portal" | "misc"（E3：选择器一级列表；非法即抛）
 
 [[type]]
 id = "tree_default"
@@ -44,6 +47,7 @@ model_file = "assets/models/nature/tree_default.glb"
 half_extent = [1.33, 2.99, 1.14]   # ×3.5 ⇒ 高 ≈ 6.0 格
 material_slot = 0                  # 草
 destructible = false
+category = "vegetation"
 
 [[type]]
 id = "tree_pine"
@@ -52,6 +56,7 @@ model_file = "assets/models/nature/tree_pineTallB.glb"
 half_extent = [0.68, 3.38, 0.68]   # ×3.5 ⇒ 高 ≈ 6.8 格
 material_slot = 0
 destructible = false
+category = "vegetation"
 
 [[type]]
 id = "tree_oak"
@@ -60,6 +65,7 @@ model_file = "assets/models/nature/tree_oak.glb"
 half_extent = [1.44, 2.77, 1.67]   # ×4.5 ⇒ 高 ≈ 5.5 格
 material_slot = 0
 destructible = false
+category = "vegetation"
 
 [[type]]
 id = "bush"
@@ -68,6 +74,7 @@ model_file = "assets/models/nature/plant_bush.glb"
 half_extent = [0.60, 0.36, 0.60]   # ×3.0 ⇒ 高 ≈ 0.72 格
 material_slot = 0
 destructible = false
+category = "vegetation"
 
 [[type]]
 id = "grass_tuft"
@@ -76,6 +83,7 @@ model_file = "assets/models/nature/grass.glb"
 half_extent = [0.48, 0.31, 0.49]   # ×2.5 ⇒ 高 ≈ 0.63 格
 material_slot = 0
 destructible = false
+category = "vegetation"
 
 [[type]]
 id = "flower_red"
@@ -84,6 +92,7 @@ model_file = "assets/models/nature/flower_redA.glb"
 half_extent = [0.20, 0.36, 0.23]   # ×2.5 ⇒ 高 ≈ 0.73 格
 material_slot = 0
 destructible = false
+category = "vegetation"
 
 [[type]]
 id = "mushroom"
@@ -92,6 +101,7 @@ model_file = "assets/models/nature/mushroom_red.glb"
 half_extent = [0.21, 0.25, 0.25]   # ×2.5 ⇒ 高 ≈ 0.50 格
 material_slot = 1                  # 土（占位：无独立菌类材质）
 destructible = false
+category = "vegetation"
 
 # 水系点缀：高叶丛（芦苇 / 水草的通用替代；沿水边撒）
 [[type]]
@@ -101,6 +111,7 @@ model_file = "assets/models/nature/plant_flatTall.glb"
 half_extent = [0.41, 0.42, 0.41]   # ×3.0 ⇒ 高 ≈ 0.84 格
 material_slot = 0
 destructible = false
+category = "vegetation"
 
 # ---- 岩石 / 巨石 ----
 [[type]]
@@ -110,6 +121,7 @@ model_file = "assets/models/nature/rock_largeA.glb"
 half_extent = [1.37, 0.46, 1.79]   # ×3.5 ⇒ 高 ≈ 0.91 格 / 长 ≈ 3.6 格
 material_slot = 2                  # 岩
 destructible = false
+category = "rock"
 
 [[type]]
 id = "pebble"
@@ -118,6 +130,7 @@ model_file = "assets/models/nature/rock_smallB.glb"
 half_extent = [0.54, 0.27, 0.54]   # ×3.0 ⇒ 高 ≈ 0.54 格
 material_slot = 2
 destructible = false
+category = "rock"
 
 # ---- 中立小道具（营火 / 木栅；无世界观语义）----
 [[type]]
@@ -127,6 +140,7 @@ model_file = "assets/models/nature/campfire_logs.glb"
 half_extent = [0.87, 0.18, 0.87]   # ×6.0 ⇒ 直径 ≈ 1.7 格
 material_slot = 1                  # 土（木料占位）
 destructible = false
+category = "prop"
 
 [[type]]
 id = "fence"
@@ -135,6 +149,7 @@ model_file = "assets/models/nature/fence_simple.glb"
 half_extent = [1.75, 0.61, 0.12]   # ×3.5 ⇒ 长 ≈ 3.5 格 / 高 ≈ 1.2 格
 material_slot = 1                  # 土（木料占位）
 destructible = false
+category = "prop"
 
 # ---------------------------------------------------------------------------
 # 显式放置（2 个传送门 + 1 个土堆 + 一个小营地）

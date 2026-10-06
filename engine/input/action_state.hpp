@@ -25,6 +25,13 @@ enum class ActionId : std::uint8_t {
     ReleaseMouseCapture,  ///< 释放鼠标相对模式（T14 遗留；T15 起 `Esc` 改绑 `ToggleSystemPanel`，本动作不再绑定）
     ToggleSystemPanel,    ///< 开关系统面板（T15；`Esc`；只在 game/ 消费，不参与模拟）
     Interact,             ///< 交互（V3；`E`；走近传送门按 E 触发切换；只在 game/ 消费，不参与模拟）
+    PickPlacement,        ///< 坐标拾取辅助（V0.5 E2；`F2`；只在 game/ 消费）
+    PaletteConfirm,       ///< 物件选择器确认（V0.5 E3；`Enter`；只在 game/ 消费）
+    PlacementRotateLeft,  ///< 摆放模式：左旋（V0.5 E3；`Q`）
+    PlacementRotateRight, ///< 摆放模式：右旋（V0.5 E3；`E`；与 `Interact` 同键 ⇒ **模式内让位**）
+    PlacementRepeatLast,  ///< 摆放模式：重复上次类型 + 朝向（V0.5 E3；`F3`）
+    PlacementSave,        ///< 保存到可编辑层（V0.5 E3；`F5`；模式内外均可）
+    PlacementRemove,      ///< 摆放模式：删除指向的物件（V0.5 E3；鼠标右键）
 
     Count,
 };
