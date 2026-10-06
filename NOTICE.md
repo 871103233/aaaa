@@ -101,6 +101,26 @@ powershell -ExecutionPolicy Bypass -File tools\fetch_assets.ps1            # 之
 **规格**（V8 消费者需要）：**自然物**模型 = **单文件 GLB**（Kenney《Nature Kit》**选抽 12 个**：`tree_default` / `tree_pineTallB` / `tree_oak` / `plant_bush` / `grass` / `flower_redA` / `mushroom_red` / `plant_flatTall` / `rock_largeA` / `rock_smallB` / `campfire_logs` / `fence_simple`），落到 `assets/models/nature/`。
 **注意**：这些 GLB 自带贴图 / UV，但**本项目当前不渲染模型自带贴图**（渲染器只有地表 4 槽材质）⇒ 按**地表材质槽**着色（见 [`docs/plans/v0.5.md`](docs/plans/v0.5.md) §1.9 的已确认降级）；**逐模型贴图**登记为后续能力。
 
+## 预制地图烘焙产物台账（**按尺寸分流：小世界入库 / 大世界不入库**）
+
+> **入库口径**（[ADR 0026](docs/adr/0026-premade-map-format-and-bake-tool.md) §四，**2026-10-06 修订：由"一律不入库"改为按尺寸分流** + [`docs/plans/v0.5.md`](docs/plans/v0.5.md) §1.12）：
+> `.vxmap` 是**离线烘焙产物**，由脚本**确定性**生成（同一输入 ⇒ 逐字节相同）。
+> - **小世界预制（≈1 km，如 B）⇒ 产物入库**：干净克隆即可玩，满足"**写在程序里、何时访问都一样**"；
+> - **大世界预制（10 km 级，≈200 MB）⇒ 不入库**，由脚本按需生成。
+>
+> **生成命令**：`powershell -ExecutionPolicy Bypass -File tools\bake_premade_maps.ps1`
+> （脚本按世界清单自动发现 `source = "premade"` 的世界并调用 `voxel_bake`）。
+> `.gitignore` 为**按需白名单**：`assets/maps/*.vxmap` 被排除、`!assets/maps/world_b.vxmap` 例外放行。
+
+| 产物 | 是否入库 | 来源（清单 → 地形预设） | 生成命令 | 大小 | SHA-256 |
+| --- | --- | --- | --- | --- | --- |
+| `assets/maps/world_b.vxmap` | **入库**（小世界，1 km） | `assets/maps/world_b.toml` → `assets/maps/world_b_terrain.toml`（种子 20261006，tile 半径 [8, 8]，289 块） | `voxel_bake assets/config/terrain.toml assets/maps/world_b_terrain.toml assets/maps/world_b.vxmap` | 1741224 字节 | `51b37e218ba8bff5f314895e9a3586e59e141c8b717144ca28ffa9537dbc4db4` |
+| （10 km 大世界，如 A） | 不入库 | 按世界清单 | 同上脚本 | ≈200 MB 级 | 每次核对后回填 |
+
+> **注意**：改动任何**入库输入**（地形预设 / `assets/config/terrain.toml` / 烘焙代码）都会改变 SHA-256 ⇒
+> 需重新运行脚本、更新本表与 `.gitignore` 白名单（与"美术资源台账"同一口径：脚本 + 校验和 + 台账）；
+> **入库**的产物还必须与代码**同一次提交**更新，否则干净克隆会与输入不一致。
+
 ## 待办
 
 - [ ] 填入 `LICENSE` 中的 `<COPYRIGHT HOLDER>`（当前为占位符）
@@ -108,3 +128,4 @@ powershell -ExecutionPolicy Bypass -File tools\fetch_assets.ps1            # 之
 - [ ] 首次发布前生成完整的许可原文归档（如 `licenses/` 目录）
 - [x] 首套美术资源（地表 PBR 4 套 + 1 张 HDRI，全部 CC0）来源 / 许可 / 作者 / 采集日期 / SHA-256 已登记（2026-09-29）
 - [x] **自然物素材（Kenney Nature Kit 选抽 12 个 GLB，CC0）**来源 / 许可 / 作者 / 采集日期 / SHA-256 已登记（2026-10-06，V8）
+- [x] **预制地图烘焙产物（`world_b.vxmap`）**来源 / 生成命令 / 大小 / SHA-256 已登记（2026-10-06，V4）

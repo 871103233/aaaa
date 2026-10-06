@@ -2,6 +2,9 @@
 
 - **状态**：已采纳（2026-10-05）
 - **日期**：2026-10-05
+- **被部分取代（2026-10-06）**：本 ADR 的两处口径已由 [ADR 0028](0028-world-families-and-static-asset-first.md) **部分取代** ——
+  ① 「**破坏子系统全局休眠**」不再成立（改为**按标记区域分区启用**）；② 「层② = **全图**预烘焙只读地表体积壳」收敛为
+  「**只在需要挖穿的标记区域内**使用」（W7-S3b① 的 Ring 0 壳流式已回滚）。**本 ADR 其余内容（宏高度场 + 水体层 + "未用到的能力不删除代码只休眠"）仍有效。**
 - **相关**：ADR [0004](0004-hybrid-layered-world-representation.md)（分层混合，**本 ADR 扩展其层②的覆盖与读写口径**）、[0007](0007-volume-meshing-algorithm.md)（Surface Nets）、[0008](0008-sizes-precision-budget.md)（尺寸精度）、[0011](0011-layer-transition-volume-takeover.md) / [0012](0012-collision-takeover-by-volumes.md)（层间接管）、[0013](0013-destructible-elements.md)（岩不可破坏）、[0019](0019-ambiguous-cell-vertex-splitting.md)、[0020](0020-dig-volume-vertical-band-and-dynamic-residency.md)（本 ADR **部分取代**其"可挖区域随玩家窗口"的适用范围）、[0024](0024-terrain-streaming-and-lod.md) / [0025](0025-large-world-coordinate-precision.md) / [0026](0026-premade-map-format-and-bake-tool.md) / [0027](0027-water-representation.md)
 - **来源**：项目所有者 2026-10-05 裁定 —— 按**架构路线 A** 做 **10km×10km 大世界**：预制地图、流式加载、**暂不做破坏**、山川/平原/丘陵、河流+水体、**真三维洞穴+悬垂**；并明确"**未用到的能力不删除代码，只休眠**"
 - **触发**：ADR 0004「何时需要重新审视」第 1 条（全世界任意方向三维重塑成为需求）与第 2 条（可挖范围显著扩大）**同时被触发**

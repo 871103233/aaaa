@@ -1,5 +1,6 @@
 #pragma once
 
+#include "portal_menu.hpp"
 #include "render/mesh_renderer.hpp"
 #include "system_panel.hpp"
 #include "test_mode.hpp"
@@ -52,9 +53,9 @@ struct DebugStats {
     double        cpuUiMs       = 0.0;  ///< 最近一帧 UI 构建耗时（毫秒）
     double        cpuRenderMs   = 0.0;  ///< 最近一帧渲染提交耗时（`RenderFrame` 及其内部上传，毫秒）
     double        swapchainWaitMs = 0.0;  ///< 最近一帧**等待交换链纹理**的毫秒数（T38；取自 `RenderStats`）
-    /// V3：角色附近（提示半径内）传送门的**目标世界 id**；空串 = 附近没有门（HUD 不显示提示）。
-    /// 用目标世界 **id**（而非显示名）是为了在无 CJK 字体时也能纯 ASCII 显示（见 `ui_text.hpp`）。
-    std::string   nearbyPortalTargetId;
+    /// V3/V9：角色附近（提示半径内）传送门的**提示显示名**（已按字体解析好：有 CJK 字体 ⇒ 门名，
+    /// 否则 ⇒ **纯 ASCII** 的目标世界 id）；空串 = 附近没有门（HUD 不显示提示）。见 `ui_text.hpp` 的"绝不缺字"口径。
+    std::string   nearbyPortalPromptName;
 };
 
 /// 极简 ImGui 调试面板（T9）。基于 imgui 的 **SDL3 平台后端 + SDL3_gpu 渲染后端**。
@@ -93,6 +94,35 @@ public:
     /// 系统面板（T15）开关 / 查询。
     void               ToggleSystemPanel() noexcept { m_systemPanel.Toggle(); }
     [[nodiscard]] bool SystemPanelOpen() const noexcept { return m_systemPanel.IsOpen(); }
+
+    // ---- V9：传送门交互菜单（走近门按 `E` 打开；与 ESC 面板**同一套**捕获 / 抑制口径）----
+
+    /// 打开菜单（数据由 game 层组装；见 `BuildPortalMenuModel`）。已打开时按新数据覆盖。
+    void OpenPortalMenu(PortalMenuModel model) {
+        m_portalMenu        = std::move(model);
+        m_portalMenuOpen    = true;
+        m_portalMenuRequest = PortalMenuRequest {};  // 新开一次 ⇒ 清掉上次未取走的动作
+    }
+
+    /// 关闭菜单（`Esc` / 取消 / 选择后由 game 层调用）。**不产生动作**。
+    void ClosePortalMenu() noexcept {
+        m_portalMenuOpen    = false;
+        m_portalMenuRequest = PortalMenuRequest {};
+    }
+
+    [[nodiscard]] bool PortalMenuOpen() const noexcept { return m_portalMenuOpen; }
+
+    /// **取走**一次选择（动作 + 目标世界）；取走后清零 ⇒ **只生效一次**。
+    [[nodiscard]] PortalMenuRequest TakePortalMenuRequest() noexcept {
+        PortalMenuRequest taken = std::move(m_portalMenuRequest);
+        m_portalMenuRequest     = PortalMenuRequest {};
+        return taken;
+    }
+
+    /// 任意面板（系统面板 或 传送门菜单）是否打开 —— 供 main 的捕获 / 输入抑制决策统一使用。
+    [[nodiscard]] bool AnyBlockingPanelOpen() const noexcept {
+        return m_systemPanel.IsOpen() || m_portalMenuOpen;
+    }
 
     /// 设置**测试模式**（T85）：驱动调试面板顶部的只读横幅（自动测试 / 人工测试 + 人工验收项）。
     /// 全运行期不变，启动时设置一次。
@@ -150,6 +180,9 @@ private:
     /// 构建**常驻坐标 HUD**（屏幕左上角，只读、不接管输入）。前置条件：已调用 `BeginFrame`。
     void BuildHud(const DebugStats& stats);
 
+    /// 构建**传送门交互菜单**（V9；居中模态窗口）。前置条件：已调用 `BeginFrame`；未打开时无操作。
+    void BuildPortalMenu();
+
     ImGuiContext* m_context = nullptr;
     bool          m_visible = true;
 
@@ -162,6 +195,11 @@ private:
     bool m_cjkFontLoaded = false;
 
     SystemPanel m_systemPanel;
+
+    // V9：传送门交互菜单 —— 显示数据 + 是否打开 + 本帧待取走的"选择"。
+    PortalMenuModel   m_portalMenu;
+    bool              m_portalMenuOpen = false;
+    PortalMenuRequest m_portalMenuRequest;
 
     /// 测试模式（T85）：由 `SetTestMode` 在启动时设置一次，面板顶部据此显示只读横幅。
     TestModeInfo m_testMode;

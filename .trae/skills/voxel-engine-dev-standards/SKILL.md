@@ -301,14 +301,14 @@ description: Enforces this voxel engine repo's architecture and coding standards
 | Shader 与工具链 | **SPIR-V + DXIL 双格式**；`glslc` → `SDL_shadercross` 两段式 | ADR 0002 |
 | 任务调度 | **enkits**（vcpkg 端口 `enkits`） | ADR 0003 |
 | ECS | **EnTT**（服务动态实体与地图元素；**地形绝不进 ECS**） | ADR 0003 |
-| **世界表示** | **分层混合（v2，2026-10-05）**：① 宏高度场（全图）② **全图预烘焙只读地表体积壳**（近场真三维：洞穴/悬垂）③ 水体 ④ 实体；**破坏子系统休眠保留** | ADR 0004 + **ADR 0023** |
-| **可挖范围** | 由**标记区域**决定（程序化规则 + 数据文件两者结合）；区域外不可三维挖掘。**2026-09-29 起另加两条约束**（[ADR 0020](../../../docs/adr/0020-dig-volume-vertical-band-and-dynamic-residency.md)）：① **竖向**——体积只建在**地表附近的带宽**内；② **平面**——只在**玩家为中心的常驻窗口**内存在（窗口外只能炸地表坑、挖不出三维洞）。**2026-10-05 起（阶段 W / [ADR 0023](../../../docs/adr/0023-world-representation-v2-hybrid-shell.md)）**：世界表示升级为 v2，层② 改为**全图预烘焙只读地表体积壳**（不可挖）；**破坏子系统休眠保留、代码不删除**（启用时回到本行 ADR 0020 的口径） | ADR 0004 + **ADR 0020** + **ADR 0023** |
+| **世界表示** | **分层混合（v2，2026-10-05）**：① 宏高度场（全图）② **地表体积壳**（近场真三维：洞穴/悬垂；**按 ADR 0028 收敛为"只在需要挖穿的标记区域内使用"**）③ 水体 ④ 实体；**破坏子系统保留（按标记区域分区启用，不再全局休眠）** | ADR 0004 + **ADR 0023** + **ADR 0028** |
+| **可挖范围** | 由**标记区域**决定（程序化规则 + 数据文件两者结合）；区域外不可三维挖掘。**2026-09-29 起另加两条约束**（[ADR 0020](../../../docs/adr/0020-dig-volume-vertical-band-and-dynamic-residency.md)）：① **竖向**——体积只建在**地表附近的带宽**内；② **平面**——只在**玩家为中心的常驻窗口**内存在（窗口外只能炸地表坑、挖不出三维洞）。**2026-10-05 起（阶段 W / [ADR 0023](../../../docs/adr/0023-world-representation-v2-hybrid-shell.md)）**：世界表示升级为 v2，层② 改为**地表体积壳**。**2026-10-06 起（[ADR 0028](../../../docs/adr/0028-world-families-and-static-asset-first.md)）**：**取代"破坏全局休眠"** ⇒ 破坏能力**保留、按标记区域分区启用**（层② 收敛为"只在需要挖穿的标记区域内使用"）；**能力代码一律不得删除**（第五节硬规则） | ADR 0004 + **ADR 0020** + **ADR 0023** + **ADR 0028** |
 | **可破坏性模型** | 地形体量 = 「材质**坚固度** × 伤害预算」**逐格³ 结算**（软材质先被挖掉）；固定器物 = **几何不可变**、状态 `Intact` / `Broken`（破坏即替换外观） | [ADR 0013](../../../docs/adr/0013-destructible-elements.md) |
 | **浮空与建造** | 归**物件/建造层**（EnTT 实体 + Jolt 碰撞体），**绝不写入地形场** | ADR 0004 |
 | **地形网格化** | 地表：高度场网格（LOD 方案待收敛）；可挖区域：**Surface Nets 局部等值面网格**（歧义 cell / 歧义面按**实体侧连通分量拆顶点**） | ADR 0004 + ADR 0007 + ADR 0019 + 待收敛项 4 |
 | **材质与光照** | 地表**多纹理权重混合（splat）**（权重**逐像素**算 + 分层 albedo / 法线，见 ADR 0009）；**渲染质量线按 ADR 0010 的四步顺序**：HDR + 色调映射 → 方向光 + CSM + 天空光 + 雾 → PBR + roughness/AO → MSAA 与细节法线 | ADR 0004 + ADR 0009 + ADR 0010 |
 | **物理与角色** | **Jolt**：地表 `HeightFieldShape`（分块）+ 可挖体积 `MeshShape`（分块）+ 角色 `CharacterVirtual`（胶囊） | ADR 0004 |
-| 存档 | **自定义二进制 + zstd**；只存脏数据（高度场脏列 / 脏体积 / 物件与建造 / 实体状态） | ADR 0004 |
+| 存档 | **世界状态 = 自定义二进制 + zstd**；只存脏数据（高度场脏列 / 脏体积 / 物件与建造 / 实体状态）。**元数据（世界种子 / 实例绑定）用 TOML + `schema_version`**（与 `level.dat` 同类），见 **ADR 0030** | ADR 0004 + **ADR 0030** |
 | 程序化生成 | **FastNoiseLite** + **分块确定性**（元素放置为纯函数，沿用网格抖动思路） | 方案 §4.2 |
 | 预算与精度 | 内存 / Draw Call / 密度精度 / 区块尺寸**口径待重算**（旧的 96 KB、≤700 draw call、16×16×384 均已失效） | 待收敛项 5 |
 | 单元测试 | **GoogleTest + CTest** | 方案 §9.3 |
@@ -387,9 +387,9 @@ description: Enforces this voxel engine repo's architecture and coding standards
 | 1 | 配置解析（材质表 / 可挖区域表 / 生成参数）方案 | V0.1 前置条件完成前 | **已收敛 → [ADR 0005](../../../docs/adr/0005-config-parsing.md)**（toml++） |
 | 2 | 可挖区域标记的产生规则与数据文件格式 | V0.1 前置条件完成前 | **已收敛 → [ADR 0006](../../../docs/adr/0006-diggable-region-marking.md)**（规则 + TOML 叠加） |
 | 3 | 可挖体积的网格化算法 | V0.1 网格化任务开工前 | **已收敛 → [ADR 0007](../../../docs/adr/0007-volume-meshing-algorithm.md)**（Surface Nets 起步） |
-| 4 | 地表 LOD 方案与接缝策略（CDLOD / Geometry Clipmaps + 顶点过渡） | LOD 任务开工前经 ADR 收敛 | **已收敛 → [ADR 0024](../../../docs/adr/0024-terrain-streaming-and-lod.md)**（窗口流式 + CDLOD 分环：Ring0 512 m 体积壳 / Ring1 1 km 高模 / Ring2 2 km 低模；2026-10-05） |
+| 4 | 地表 LOD 方案与接缝策略（CDLOD / Geometry Clipmaps + 顶点过渡） | LOD 任务开工前经 ADR 收敛 | **已收敛 → [ADR 0024](../../../docs/adr/0024-terrain-streaming-and-lod.md)**（窗口流式 + CDLOD 分环：Ring1 1 km 高模 / Ring2 2 km 低模；2026-10-05）。**2026-10-06 修订**：原「Ring0 512 m 体积壳」口径**已由 [ADR 0028](../../../docs/adr/0028-world-families-and-static-asset-first.md) 取代** ⇒ 运行期只流式**地表 tile**，人工可进入空间改用**静态资产**（W7-S3b① 的壳流式已回滚） |
 | 5 | 预算与精度口径重算（内存 / Draw Call / 密度精度 / 块尺寸） | `tech-plan-v2.0.md` 落地时 | **已收敛 → [ADR 0008](../../../docs/adr/0008-sizes-precision-budget.md)**（尺寸精度冻结；Draw Call 转为"只记录"） |
-| 6 | 遮挡剔除：硬件遮挡查询 vs 软件分层 | V0.5 开工前经 ADR 收敛 | **开放** |
+| 6 | 遮挡剔除：硬件遮挡查询 vs 软件分层 | V0.5 开工前经 ADR 收敛 | **开放（时限已过）** —— V0.5 已于 2026-10-06 开工，本项仍未落 ADR；**2026-10-06 识别，须尽快收敛**（建议与 Draw Call 预算一并裁决：V8 实测 ≈**5.9k/帧**，逼近本节第 4 节的 6000/帧上限，而物件层尚无实例化 / HLOD） |
 | 7 | **物理层的世界坐标精度方案**：vcpkg 的 `joltphysics` 5.6.0 未开 `JPH_DOUBLE_PRECISION`（`RVec3` = `Vec3`，单精度），与"世界定位用 `int` / `double`"的红线 6 在大坐标上冲突 | **坐标量级超出 `float32` 精度时**（= 世界需要变大 / 跨区域）经 ADR 收敛 | **已收敛 → [ADR 0025](../../../docs/adr/0025-large-world-coordinate-precision.md)**（**物理原点重定基**：`PhysicsWorld` 持世界原点，进出 Jolt 的位置减 / 加原点，跨阈值整体平移；默认原点 ⇒ 与现状逐位等价。**触发**：所有者 2026-10-05 把世界扩到 10km ⇒ 坐标量级 10,000 格超出单精度适用区间）。**历史沿革（已失效）**：2026-09-29 曾记"1 km 内 `float32` 足够 ⇒ 本项不阻塞当前工作"——该前提随 10km 世界作废 |
 | 8 | **NPC 决策模型与感知方案**（状态机 / 行为树 / 效用 / GOAP 等） | **NPC 任务开工前**经 ADR 收敛 | **开放**（占位文档：[`docs/npc-behavior.md`](../../../docs/npc-behavior.md) §2.3） |
 | 9 | **NPC 寻路与导航表示**（导航网格 / 高度场图 / 体积体素图），以及地形被挖掘后导航如何失效与重建 | **NPC 任务开工前**经 ADR 收敛 | **开放**（占位文档：同上 §2.4） |

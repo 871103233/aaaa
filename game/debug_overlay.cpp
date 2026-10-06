@@ -105,7 +105,8 @@ void DebugOverlay::OnSdlEvent(void* userData, const SDL_Event& event) {
 
 void DebugOverlay::BeginFrame() {
     // 只要还有任一 ImGui 窗口可见就必须起帧（系统面板打开时调试面板可能隐藏；加载画面 / 常驻 HUD 同样要出帧）。
-    m_frameActive = m_visible || m_systemPanel.IsOpen() || m_loadingActive || m_hudVisible;
+    m_frameActive =
+        m_visible || m_systemPanel.IsOpen() || m_portalMenuOpen || m_loadingActive || m_hudVisible;
     if (!m_frameActive) {
         m_wantCaptureMouse    = false;
         m_wantCaptureKeyboard = false;
@@ -179,14 +180,66 @@ void DebugOverlay::BuildHud(const DebugStats& stats) {
                 static_cast<int>(std::floor(stats.characterPosition.y)),
                 static_cast<int>(std::floor(stats.characterPosition.z)));
 
-    // V3：走近传送门时的交互提示（一行）。目标世界 id 为 ASCII ⇒ 无 CJK 字体时也不会出现缺字。
-    if (!stats.nearbyPortalTargetId.empty()) {
+    // V3/V9：走近传送门时的交互提示（一行；按 `E` **打开菜单**）。
+    // 显示名已在 game 层按字体解析好（无 CJK 字体 ⇒ 退化为纯 ASCII 的 world id）⇒ 不会缺字。
+    if (!stats.nearbyPortalPromptName.empty()) {
         ImGui::Separator();
-        ImGui::Text(UiText(UiLabel::PortalPromptFormat, cjk), stats.nearbyPortalTargetId.c_str());
+        ImGui::Text(UiText(UiLabel::PortalPromptFormat, cjk), stats.nearbyPortalPromptName.c_str());
     }
 
     // 记录实际高度：F1 面板据此把初始位置排在 HUD 下方（避免左上角重叠）。
     m_hudHeight = ImGui::GetWindowSize().y;
+    ImGui::End();
+}
+
+void DebugOverlay::BuildPortalMenu() {
+    if (!m_frameActive || !m_portalMenuOpen) {
+        return;
+    }
+    const bool cjk = m_cjkFontLoaded;
+
+    // 居中、固定、自动尺寸；不可移动 / 折叠 / 缩放，不落盘布局。
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Always, ImVec2(0.5F, 0.5F));
+    ImGui::SetNextWindowBgAlpha(0.92F);
+    ImGui::Begin(UiText(UiLabel::PortalMenuTitle, cjk), nullptr,
+                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize);
+
+    // 标题行：「门名 → 秘境名」。无 CJK 字体 ⇒ 秘境名退化为**纯 ASCII** 的 world id（绝不出缺字）。
+    const std::string realmDisplay = cjk ? m_portalMenu.realmName : m_portalMenu.targetWorldId;
+    char              title[256]    = {};
+    std::snprintf(title, sizeof(title), UiText(UiLabel::PortalMenuTitleFormat, cjk),
+                  m_portalMenu.portalName.c_str(), realmDisplay.c_str());
+    ImGui::TextUnformatted(title);
+
+    if (m_portalMenu.canReset) {
+        // `generation` = **已重置次数**（0 = 尚未重置）⇒ 显示为 1 起的"第 N 次生成"（首次 = 第 1 次）。
+        char generation[64] = {};
+        std::snprintf(generation, sizeof(generation), UiText(UiLabel::PortalMenuGenerationFormat, cjk),
+                      m_portalMenu.generation + 1U);
+        ImGui::TextUnformatted(generation);
+    }
+    ImGui::TextUnformatted(UiText(UiLabel::PortalMenuSessionHint, cjk));
+    ImGui::Separator();
+
+    // 三个动作：进入 / 重置（仅肉鸽秘境）/ 取消。点任一即**关菜单并产生一次请求**（由 game 层取走执行）。
+    if (ImGui::Button(UiText(UiLabel::PortalMenuEnter, cjk))) {
+        m_portalMenuRequest = PortalMenuRequest { PortalAction::Enter, m_portalMenu.targetWorldId };
+        m_portalMenuOpen    = false;
+    }
+    if (m_portalMenu.canReset) {
+        ImGui::SameLine();
+        if (ImGui::Button(UiText(UiLabel::PortalMenuReset, cjk))) {
+            m_portalMenuRequest = PortalMenuRequest { PortalAction::Reset, m_portalMenu.targetWorldId };
+            m_portalMenuOpen    = false;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(UiText(UiLabel::PortalMenuCancel, cjk))) {
+        m_portalMenuRequest = PortalMenuRequest { PortalAction::Cancel, m_portalMenu.targetWorldId };
+        m_portalMenuOpen    = false;
+    }
     ImGui::End();
 }
 
@@ -199,6 +252,9 @@ void DebugOverlay::BuildUI(const DebugStats& stats, SystemPanelContext& panelCon
     const bool cjk = m_cjkFontLoaded;
 
     m_systemPanel.Build(panelContext, cjk);
+
+    // V9：传送门菜单（居中模态）。放在 `!m_visible` 早退**之前** —— 它不依赖 F1 面板是否显示。
+    BuildPortalMenu();
 
     // 常驻坐标 HUD（屏幕左上角，只读）：与 F1 面板相互独立，不需要开面板就能看到当前位置。
     if (m_hudVisible) {

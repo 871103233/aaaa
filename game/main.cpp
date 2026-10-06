@@ -51,10 +51,14 @@
 #include "terrain/terrain_types.hpp"
 #include "terrain/terrain_world.hpp"
 #include "terrain/world_bounds.hpp"
+#include "premade/premade_map.hpp"
+#include "premade/premade_terrain_source.hpp"
+#include "save/world_instance_save.hpp"
 #include "shell/surface_shell.hpp"
 #include "water/river.hpp"
 #include "test_mode.hpp"
 #include "ui_text.hpp"
+#include "world_fingerprint.hpp"
 #include "world_manager.hpp"
 #include "dig/collapse_table.hpp"
 #include "dig/destruction_table.hpp"
@@ -85,11 +89,48 @@
 #include <exception>
 #include <filesystem>
 #include <limits>
+#include <random>
 #include <set>
 #include <unordered_map>
 #include <vector>
 
 namespace {
+
+/// V5：为一个**新建的秘境实例**取一个种子 —— 这是全流程里**唯一**的非确定性输入；
+/// 一旦记入 `WorldManager` 的实例账本，之后的生成 / 流式 / 物理**全部**由它决定（红线 7）。
+///
+/// 为什么用 `std::random_device`：MSVC 上它是 OS 提供的可信熵源（不是 `rand()`）——  // vx-allow: no-rand
+/// SKILL 红线 7 禁止的是"**生成**依赖随机数"，而不是"**种子**由随机数取得"。
+[[nodiscard]] std::uint64_t RollInstanceSeed() {
+    std::random_device  device;
+    const std::uint64_t high = static_cast<std::uint64_t>(device()) << 32U;
+    const std::uint64_t low  = static_cast<std::uint64_t>(device());
+    const std::uint64_t seed = high ^ low;
+    return (seed == 0U) ? 1U : seed;  // 避开 0（合法，但日志里不好认）
+}
+
+// ---------------------------------------------------------------
+// V10：秘境存档槽（单槽自动；只存**秘境绑定** —— 世界 id + 实例种子 + 已重置次数）
+// 口径见 docs/plans/v0.5.md §1.13.1（所有者 2026-10-06：单槽 / 仅绑定 / `%APPDATA%\...\saves\`）。
+// ---------------------------------------------------------------
+
+/// 本机**秘境存档槽**路径：`<设置目录>/saves/instances.toml`（与 `settings.toml` 同根）。
+///
+/// 前置条件：SDL 已初始化（`SystemSettingsPath` 用 `SDL_GetPrefPath`，它保证**根目录**存在）⇒ 只补建 `saves\`。
+[[nodiscard]] std::filesystem::path WorldInstanceSavePath() {
+    return vx::SystemSettingsPath().parent_path() / "saves" / vx::kWorldInstanceSaveFileName;
+}
+
+/// 把 `WorldManager` 的秘境实例账本**快照**成存档内容（按**注册顺序**遍历 ⇒ 文件内容确定，便于比对）。
+[[nodiscard]] vx::WorldInstanceSave BuildWorldInstanceSave(const vx::WorldManager& manager) {
+    vx::WorldInstanceSave save;
+    for (const std::string& id : manager.Order()) {
+        if (const vx::WorldInstance* instance = manager.FindInstance(id); instance != nullptr) {
+            save.instances.push_back(vx::SavedWorldInstance { id, instance->seed, instance->generation });
+        }
+    }
+    return save;
+}
 
 // ---------------------------------------------------------------
 // 场景参数（默认加载 3×3 tile 的预设地图 test_range，范围由地图文件决定）
@@ -1917,13 +1958,9 @@ int main(int argc, char** argv) {
             const vx::LevelManifest& manifest = worldManager.Active();
             preset                            = manifest.terrain;
             presetSourceLabel                 = "清单 " + ResolveWorldManifestPath(worldManifestFile).string();
-            if (manifest.source == vx::WorldSource::Premade) {
-                // 不静默：V1 只做"清单 + 加载"，**预制容器（ADR 0026）的读取在 V4 接入** ——
-                // 因此本次仍按 `terrain_preset` **程序化生成**，`premade_file` 尚未被读取。
-                VX_LOG_WARN("世界 [%s] 声明 source = premade（预制文件 %s），但**预制读取将在 V4 接入** ⇒ "
-                            "本次仍按引用的地形预设程序化生成",
-                            manifest.id.c_str(), manifest.premadeFile.c_str());
-            }
+            // V4（ADR 0026）：`source = premade` 的**预制文件不在启动期打开**（此处只做清单注册与日志）；
+            // 实际的"打开 + 校验 + 注入地表数据源"发生在**每轮世界装载**时（见世界装载循环里的
+            // `PremadeTerrainTileSource` 段）——这样切换世界也会按各自清单重新打开自己的预制文件。
             VX_LOG_INFO("世界清单（V1/V2a）：id=%s 名称=\"%s\" 族=%s 来源=%s；破坏=%s 持久化=%s 换种子=%s；"
                         "清单=%s 地形预设=%s（半径 %d×%d、种子 %llu、出生 (%.1f, %.1f)）；注册表 %zu 个世界",
                         manifest.id.c_str(), manifest.name.c_str(), vx::ToString(manifest.family),
@@ -1957,6 +1994,53 @@ int main(int argc, char** argv) {
                     systemSettings.frameRateCap, static_cast<double>(systemSettings.exposure),
                     systemSettings.msaaSamples);
         VX_LOG_INFO("显示器刷新率：%d Hz（未知时回退 %d Hz）", displayRefreshRate, vx::kFallbackRefreshRate);
+
+        // ---- V10：读**秘境存档槽**（单槽自动；只存秘境绑定，见 plans/v0.5.md §1.13.1）----
+        // 走 `--map=` 时注册表为空 ⇒ 无秘境可恢复，跳过（也避免把未知 id 的旧档刷成 WARN）。
+        // 读档失败（语法错 / 未知版本）⇒ **抛**（被外层捕获并报出，不静默误读）——与 `settings.toml` 同口径。
+        const std::filesystem::path worldInstanceSavePath = WorldInstanceSavePath();
+        if (worldManager.Count() > 0U) {
+            std::error_code mkdirError;
+            std::filesystem::create_directories(worldInstanceSavePath.parent_path(), mkdirError);
+            if (mkdirError) {
+                // 不静默：目录建不出来 ⇒ 后续写入会失败（只 WARN，不影响本次游戏）。
+                VX_LOG_WARN("秘境存档（V10）：无法创建目录 %s —— %s（写入将失败）",
+                            worldInstanceSavePath.parent_path().string().c_str(), mkdirError.message().c_str());
+            }
+            const vx::WorldInstanceSave save = vx::LoadWorldInstanceSave(worldInstanceSavePath);  // 无档 ⇒ 空（不报错）
+            std::size_t                 restored = 0;
+            std::size_t                 skipped  = 0;
+            for (const vx::SavedWorldInstance& record : save.instances) {
+                std::string reason;
+                if (worldManager.RestoreInstance(record.worldId, record.seed, record.generation, reason)) {
+                    ++restored;
+                    VX_LOG_INFO("秘境存档（V10）：恢复 [%s] 的绑定 —— 实例种子 %llu（第 %u 次生成）",
+                                record.worldId.c_str(), static_cast<unsigned long long>(record.seed),
+                                record.generation + 1U);
+                } else {
+                    ++skipped;
+                    VX_LOG_WARN("秘境存档（V10）：跳过 [%s] —— %s（世界清单已变？）", record.worldId.c_str(),
+                                reason.c_str());
+                }
+            }
+            VX_LOG_INFO("秘境存档（V10）：%s；恢复 %zu 个实例绑定%s —— **跨启动保持**（重启仍进入同一个秘境）",
+                        worldInstanceSavePath.string().c_str(), restored,
+                        (skipped == 0U) ? "" : "（有跳过，见上）");
+        }
+
+        /// V10：把当前秘境实例账本**写回**存档槽（单槽；**原子替换**）。失败只 WARN —— **不影响游戏**
+        /// （下次变更再试）；属**极低频非热路径**写入（首次进入 / 重置），与 `settings.toml` 同口径。
+        const auto persistWorldInstances = [&worldManager, &worldInstanceSavePath](const char* trigger) {
+            const vx::WorldInstanceSave save = BuildWorldInstanceSave(worldManager);
+            try {
+                vx::SaveWorldInstanceSave(worldInstanceSavePath, save);
+                VX_LOG_INFO("秘境存档（V10）：已写入 %s（%zu 个实例；触发：%s）",
+                            worldInstanceSavePath.string().c_str(), save.instances.size(), trigger);
+            } catch (const std::exception& error) {
+                VX_LOG_WARN("秘境存档（V10）：写入失败（触发：%s）⇒ 本次未持久化、下次变更再试：%s", trigger,
+                            error.what());
+            }
+        };
 
         // 应用设置：窗口模式恢复客户区尺寸；全屏走桌面无边框全屏。
         if (vx::IsResolutionEditable(systemSettings.displayMode)) {
@@ -2236,9 +2320,35 @@ int main(int argc, char** argv) {
         for (;;) {
         // V2b：本轮要装配的世界 = `worldManager.Active()`（首轮由 `--world=` 决定；切换后由请求更新）。
         // 走 `--map=` 时注册表为空 ⇒ 保持外面那份 `MapPreset` 不变（行为与从前**逐位一致**）。
+        const vx::LevelManifest* roundManifest = nullptr;
         if (worldManager.Count() > 0U) {
             preset            = worldManager.Active().terrain;
             presetSourceLabel = "清单 " + worldManager.ActiveId();
+            roundManifest     = &worldManager.Active();
+        }
+
+        // ---- V5（[plans/v0.5.md](../docs/plans/v0.5.md) §1.13）：肉鸽秘境的**实例种子** ----
+        // 口径（所有者 2026-10-06）：**首次进入 roll 一次 ⇒ 之后反复进入复用 ⇒ 重置（V9 菜单）才换**。
+        // 只有**种子**被实例覆盖；半径 / 出生点 / 编辑仍以引用的地形预设为**单一事实来源**。
+        if (roundManifest != nullptr && roundManifest->randomizeSeedOnEntry) {
+            const bool existedBefore = worldManager.FindInstance(roundManifest->id) != nullptr;
+            std::string instanceReason;
+            if (!worldManager.EnsureInstance(roundManifest->id, RollInstanceSeed(), instanceReason)) {
+                throw std::runtime_error("秘境实例化失败（世界 [" + roundManifest->id + "]）：" + instanceReason);
+            }
+            const vx::WorldInstance* instance = worldManager.FindInstance(roundManifest->id);
+            if (instance == nullptr) {
+                throw std::logic_error("秘境实例化后查不到实例（世界 [" + roundManifest->id + "]）");
+            }
+            preset.seed = instance->seed;
+            VX_LOG_INFO("秘境实例（V5）：世界 [%s] 使用**实例种子 %llu**（第 %u 次生成）—— "
+                        "**跨启动**复用同一种子（存档槽 V10；本次%s）⇒ 同一个世界；只有重置才会换新种子",
+                        roundManifest->id.c_str(), static_cast<unsigned long long>(instance->seed),
+                        instance->generation + 1U, existedBefore ? "沿用存档里的绑定" : "新建并写入存档");
+            // V10：**首次**进入该秘境（实例由本次创建）⇒ 立刻持久化绑定（重置走 V9 菜单的另一条写入）。
+            if (!existedBefore) {
+                persistWorldInstances("首次进入肉鸽秘境");
+            }
         }
 
         // ---- T61 / ADR 0020 决策二：**常驻集合 = 玩家窗口 ∩ 可挖区域** ----
@@ -2271,8 +2381,39 @@ int main(int argc, char** argv) {
         std::vector<vx::BlockCoord> volumeCreated;           ///< 本帧新建的块（入延后队列，复用缓冲）
         std::vector<vx::TileCoord>  volumeTouchedTiles;      ///< 本帧接管状态翻转的 tile（入延后队列，复用缓冲）
 
+        // ---- V4（[ADR 0026](../docs/adr/0026-premade-map-format-and-bake-tool.md)）：`source = premade` ⇒
+        // 地表数据来自**离线烘焙的预制文件**（不再程序化生成）。**校验即抛**：文件缺失 / 魔数错 / 版本不符 /
+        // （半径, 种子）与清单引用的地形预设不一致 ⇒ 直接失败，**不静默回退**到程序化。
+        std::unique_ptr<vx::PremadeTerrainTileSource> premadeTerrainSource;
+        if (roundManifest != nullptr && roundManifest->source == vx::WorldSource::Premade) {
+            try {
+                vx::PremadeMapReader reader = vx::PremadeMapReader::Open(roundManifest->premadeFilePath);
+                if (reader.TileRadiusX() != preset.tileRadiusX || reader.TileRadiusZ() != preset.tileRadiusZ ||
+                    reader.Seed() != preset.seed) {
+                    throw std::runtime_error(
+                        "预制文件的（半径 / 种子）与清单引用的地形预设不一致：文件 [" +
+                        std::to_string(reader.TileRadiusX()) + "×" + std::to_string(reader.TileRadiusZ()) +
+                        "，种子 " + std::to_string(reader.Seed()) + "]；清单 [" +
+                        std::to_string(preset.tileRadiusX) + "×" + std::to_string(preset.tileRadiusZ) +
+                        "，种子 " + std::to_string(preset.seed) + "]（说明该文件是用别的预设烘焙的）");
+                }
+                VX_LOG_INFO("预制地图已打开（V4 / ADR 0026）：世界 [%s] 的地表数据来自 %s"
+                            "（schema %u、种子 %llu、tile 半径 [%d, %d]、块数 %zu）—— **不再程序化生成**",
+                            roundManifest->id.c_str(), roundManifest->premadeFilePath.string().c_str(),
+                            reader.SchemaVersion(), static_cast<unsigned long long>(reader.Seed()),
+                            reader.TileRadiusX(), reader.TileRadiusZ(), reader.ChunkCount());
+                premadeTerrainSource = std::make_unique<vx::PremadeTerrainTileSource>(std::move(reader));
+            } catch (const std::exception& error) {
+                throw std::runtime_error(std::string("预制世界 [") + roundManifest->id + "] 的预制文件无法加载（" +
+                                         roundManifest->premadeFilePath.string() + "）：" + error.what() +
+                                         "；请先运行 tools\\bake_premade_maps.ps1 生成（ADR 0026）");
+            }
+        }
+
         vx::TerrainWorld world(preset.seed, materials, terrainParams);
         world.SetMapPreset(preset);  // 噪声先行、编辑覆盖其上（必须在 LoadTile 之前）
+        // V4：注入地表数据源（`nullptr` ⇒ 程序化，与从前**逐位一致**）。必须在 LoadTile 之前。
+        world.SetTileSource(premadeTerrainSource.get());
         // T8 层间交接（ADR 0011）＋ T61：判据 = **当前常驻集合**（ADR 0020 决策三），故必须在 LoadTile 之前设置。
         // W4：**地表壳**的近场区域 + 级联四边形过滤器（可挖体积接管 ∪ 地表壳接管）。
         // 区域按 tile 对齐 ⇒ 被跳过的四边形整块落在若干 tile 内 ⇒ 那些 tile 的网格变空 ⇒
@@ -2314,7 +2455,9 @@ int main(int argc, char** argv) {
         // 形态与可挖体积（T81）同源：worker 只跑纯函数（生成 + 网格化），主线程只做"收包 + 过滤 + 安装 + GPU 上传"。
         // 逐个 worker 各自持有由 `(seed, params)` 构造的 `TerrainNoiseGenerator`（不共用 `TerrainWorld` 的）。
         // 线程池不可用时自动回落同步路径（结果不变、只是尖峰回到从前；`TaskScheduler` 会 WARN 一次，不静默）。
-        vx::TerrainTileBuildPipeline terrainBuildPipeline(preset.seed, terrainParams, preset.edits);
+        // V4：worker 侧同样优先读**预制数据源**（否则流式建块会绕过它、又变回程序化生成）。
+        vx::TerrainTileBuildPipeline terrainBuildPipeline(preset.seed, terrainParams, preset.edits, 0,
+                                                          premadeTerrainSource.get());
         const bool                   terrainHasWorkers = terrainBuildPipeline.HasWorkers();
         VX_LOG_INFO(
             "地表 tile 构建（W7-S3b / ADR 0022 形态）：%s（worker 线程 %u 个；主线程只做「收包 + 过滤 + 安装 + GPU 上传」）",
@@ -2449,6 +2592,33 @@ int main(int argc, char** argv) {
                     kGameTerrainLodRings.radii[2], kGameTerrainLodRings.radii[2] * vx::kTerrainTileSize,
                     vx::kTerrainResidencyPrefetchTiles, tileCoords.size(), worldTilesX * worldTilesZ,
                     tileScheduler.DesiredCount());
+
+        // V2c（细则 plans/v0.5.md §1.10）：**世界指纹** —— 同种子切回同一世界必须逐位相同（红线 7）。
+        // 冒烟日志只能证明"没崩"，指纹给"是不是同一个世界"一个**可判定**的数字：
+        // 种子 + 常驻 tile（**升序** ⇒ 与流式到达顺序无关）的**全分辨率高度**（与 LOD 无关）⇒ 一个 64 位摘要。
+        {
+            const std::vector<vx::TileCoord>     fingerprintCoords = world.ResidentTiles();
+            std::vector<vx::FingerprintTileView> fingerprintViews;
+            fingerprintViews.reserve(fingerprintCoords.size());
+            for (const vx::TileCoord& coord : fingerprintCoords) {
+                const vx::TerrainTile* tile = world.FindTile(coord.x, coord.z);
+                if (tile == nullptr) {
+                    continue;  // 与 `ResidentTiles` 同源，正常不会发生；异常时下面单独告警（不静默）
+                }
+                fingerprintViews.push_back(
+                    vx::FingerprintTileView { coord.x, coord.z, tile->heights.data(), tile->heights.size() });
+            }
+            const std::uint64_t worldFingerprint =
+                vx::ComputeTerrainFingerprint(preset.seed, fingerprintViews.data(), fingerprintViews.size());
+            VX_LOG_INFO("世界指纹（V2c）：%016llx —— 种子 %llu、常驻 tile %zu（升序 + 全分辨率高度；"
+                        "同种子切回必须**完全相同**）",
+                        static_cast<unsigned long long>(worldFingerprint),
+                        static_cast<unsigned long long>(preset.seed), fingerprintViews.size());
+            if (fingerprintViews.size() != fingerprintCoords.size()) {
+                VX_LOG_WARN("世界指纹（V2c）：%zu 个常驻 tile 无高度数据（已跳过）⇒ 指纹只覆盖有数据的部分",
+                            fingerprintCoords.size() - fingerprintViews.size());
+            }
+        }
 
         // 物理世界 + 碰撞体。T28 / ADR 0012：**地表高度场只在"可见地表不归体积画"的 tile 上建**，
         // 其余 tile 的碰撞改由可挖体积的三角网提供（否则隐形高度场会把角色挡在自己挖的洞口外）。
@@ -2782,9 +2952,9 @@ int main(int argc, char** argv) {
             const vx::MeshData colliderMesh = vx::RotateMeshAboutY(localMesh, instance.yawDegrees);
             const glm::dvec3   origin(static_cast<double>(instance.x), static_cast<double>(instance.y),
                                       static_cast<double>(instance.z));
-            // V3：传送门登记到交互表（`target_world` 来自放置条目 —— `ObjectInstance` 不带目标世界）。
+            // V3：传送门登记到交互表（`target_world` / `portal_name` 来自放置条目 —— `ObjectInstance` 不带这些）。
             if (instance.type->kind == vx::ObjectAssetKind::Portal) {
-                portals.push_back(vx::PortalEntry { origin, placed.targetWorldId });
+                portals.push_back(vx::PortalEntry { origin, placed.targetWorldId, placed.portalName });
             }
             const glm::quat rotation =
                 glm::angleAxis(glm::radians(instance.yawDegrees), glm::vec3(0.0F, 1.0F, 0.0F));
@@ -3220,23 +3390,36 @@ int main(int argc, char** argv) {
             // 打开面板 → 释放捕获并记住打开前状态；关闭面板 → 恢复到打开前状态。
             // 与 T14 的捕获状态机共存于 `mouse_capture.hpp`，不是第二套机制。
             if (input.ConsumePressed(vx::ActionId::ToggleSystemPanel)) {
-                const bool opening = !debugOverlay.SystemPanelOpen();
-                debugOverlay.ToggleSystemPanel();
-                const vx::PanelCaptureTransition transition =
-                    vx::DecidePanelCaptureTransition(opening, opening ? mouseCaptured : captureBeforePanel);
-                if (transition.rememberCaptureState) {
-                    captureBeforePanel = mouseCaptured;
+                if (debugOverlay.PortalMenuOpen()) {
+                    // V9：Esc 先关**传送门菜单**（与系统面板同一套捕获语义），**不**顺带打开系统面板。
+                    debugOverlay.ClosePortalMenu();
+                    const vx::PanelCaptureTransition transition =
+                        vx::DecidePanelCaptureTransition(/*opening=*/false, captureBeforePanel);
+                    if (transition.captureRequested) {
+                        mouseCaptured = window.SetRelativeMouseMode(true);
+                    }
+                    jumpRequested = false;
+                    VX_LOG_INFO("传送门菜单（V9）：关闭（Esc）；鼠标捕获：%s",
+                                mouseCaptured ? "开（已恢复打开前状态）" : "关");
+                } else {
+                    const bool opening = !debugOverlay.SystemPanelOpen();
+                    debugOverlay.ToggleSystemPanel();
+                    const vx::PanelCaptureTransition transition =
+                        vx::DecidePanelCaptureTransition(opening, opening ? mouseCaptured : captureBeforePanel);
+                    if (transition.rememberCaptureState) {
+                        captureBeforePanel = mouseCaptured;
+                    }
+                    if (transition.releaseRequested) {
+                        (void)window.SetRelativeMouseMode(false);
+                        mouseCaptured = false;
+                    }
+                    if (transition.captureRequested) {
+                        mouseCaptured = window.SetRelativeMouseMode(true);
+                    }
+                    jumpRequested = false;  // 面板开关不应遗留锁存的跳跃请求
+                    VX_LOG_INFO("系统面板：%s；鼠标捕获：%s", opening ? "打开（置于屏幕中央）" : "关闭",
+                                mouseCaptured ? "开（已恢复打开前状态）" : "关（光标可见，可点击窗口重新捕获）");
                 }
-                if (transition.releaseRequested) {
-                    (void)window.SetRelativeMouseMode(false);
-                    mouseCaptured = false;
-                }
-                if (transition.captureRequested) {
-                    mouseCaptured = window.SetRelativeMouseMode(true);
-                }
-                jumpRequested = false;  // 面板开关不应遗留锁存的跳跃请求
-                VX_LOG_INFO("系统面板：%s；鼠标捕获：%s", opening ? "打开（置于屏幕中央）" : "关闭",
-                            mouseCaptured ? "开（已恢复打开前状态）" : "关（光标可见，可点击窗口重新捕获）");
             }
 
             // 起 ImGui 帧（任一面板可见时）：必须先于读取捕获标志，且早于玩法输入处理。
@@ -3249,14 +3432,16 @@ int main(int argc, char** argv) {
 
             // T15：玩法输入抑制——面板打开或 ImGui 想接管鼠标 / 键盘时，吞掉对应类别，
             // 使"点按钮"不会挖地、"拖音量"不会转相机。决策为纯函数（见 `gameplay_input.hpp`）。
+            // V9：**任一面板打开**（系统面板 或 传送门菜单）都全量抑制玩法输入。
             const vx::InputSuppression suppression =
-                vx::DecideInputSuppression(debugOverlay.SystemPanelOpen(), debugOverlay.WantsCaptureMouse(),
+                vx::DecideInputSuppression(debugOverlay.AnyBlockingPanelOpen(), debugOverlay.WantsCaptureMouse(),
                                            debugOverlay.WantsCaptureKeyboard());
 
-            // T14 捕获状态机（仅在系统面板关闭时）：未捕获时的点击用于重新捕获，状态机把它标记为
+            // T14 捕获状态机（仅在**任一面板关闭**时）：未捕获时的点击用于重新捕获，状态机把它标记为
             // "已被捕获消费"，随后消费掉鼠标左键边沿，使这次点击绝不会落到发射上。
-            // 面板打开时整体跳过：此时点击属于面板控件，绝不能触发重捕获。该顺序由单测钉死。
-            if (!debugOverlay.SystemPanelOpen()) {
+            // 面板（系统面板 / V9 传送门菜单）打开时整体跳过：此时点击属于面板控件，绝不能触发重捕获。
+            // 该顺序由单测钉死。
+            if (!debugOverlay.AnyBlockingPanelOpen()) {
                 const bool anyClickEdge = input.Pressed(vx::ActionId::Attack);
                 // `escapePressed` 恒为 false：Esc 已改由上面的系统面板消费（T15 统一语义）。
                 const vx::MouseCaptureDecision captureDecision =
@@ -3494,26 +3679,84 @@ int main(int argc, char** argv) {
                 ++switchTestNext;
             }
 
-            // V3：传送门交互 —— **走近（≤ 提示半径）出提示；按 E 触发切到该门的目标世界**；
-            //     **不自动切换**（正式玩家路径只有"门 + E"；`--switch-test` 保留为测试设施）。
+            // V3：传送门交互 —— **走近（≤ 提示半径）出提示；按 E 打开交互菜单**（V9 起**不再直接切换**）；
+            //     **不自动切换**（正式玩家路径只有"门 + E ⇒ 菜单 ⇒ 进入"；`--switch-test` 保留为测试设施）。
             // 位置取本帧固定步之后的角色状态；`ConsumePressed` 只在门附近消费（pressed 边沿本就不跨帧残留）。
-            // `nearbyPortalTargetId` 在帧末填入 `DebugStats` 交给 HUD（空串 = 不显示提示）。
-            std::string nearbyPortalTargetId;
+            // `nearbyPortalPromptName` 在帧末填入 `DebugStats` 交给 HUD（空串 = 不显示提示）。
+            std::string nearbyPortalPromptName;
             if (!portals.empty()) {
                 const vx::PortalEntry* portal =
                     vx::FindNearestPortal(portals, physics.GetCharacterState(character).position,
                                           vx::kPortalPromptRadius);
                 if (portal != nullptr) {
-                    nearbyPortalTargetId = portal->targetWorldId;
-                    if (mouseCaptured && !suppression.keyboardGameplay &&
+                    // 提示显示名：有 CJK 字体 ⇒ 门名（配置未给 ⇒ 缺省「神秘传送门」）；否则 ⇒ **纯 ASCII** 的目标世界 id。
+                    const bool cjkLabels = debugOverlay.UsesCjkLabels();
+                    nearbyPortalPromptName = cjkLabels && !portal->name.empty()
+                                                 ? portal->name
+                                                 : (cjkLabels ? vx::UiText(vx::UiLabel::PortalDefaultName, true)
+                                                              : portal->targetWorldId);
+                    // V9：按 E **打开菜单**（数据由 game 层组装；UI 只画）—— 与 ESC 面板同一套捕获语义（打开即释放捕获）。
+                    if (mouseCaptured && !suppression.keyboardGameplay && !debugOverlay.PortalMenuOpen() &&
                         input.ConsumePressed(vx::ActionId::Interact)) {
+                        debugOverlay.OpenPortalMenu(vx::BuildPortalMenuModel(
+                            *portal, worldManager.Find(portal->targetWorldId),
+                            worldManager.FindInstance(portal->targetWorldId), cjkLabels));
+                        captureBeforePanel = mouseCaptured;
+                        (void)window.SetRelativeMouseMode(false);
+                        mouseCaptured = false;
+                        jumpRequested = false;
+                        VX_LOG_INFO("传送门菜单（V9）：打开（门「%s」⇒ 目标世界 [%s]）；鼠标捕获：关（已释放，供点击控件）",
+                                    nearbyPortalPromptName.c_str(), portal->targetWorldId.c_str());
+                    }
+                }
+            }
+
+            // V9：消费**传送门菜单**的一次选择 —— 请求由**上一帧末**的 ImGui 构建（`BuildUI`）产生，
+            // `Take` 后清零 ⇒ **只生效一次**；`Esc` 关闭路径不产生动作（见上面 ToggleSystemPanel 分支）。
+            {
+                const vx::PortalMenuRequest portalRequest = debugOverlay.TakePortalMenuRequest();
+                if (portalRequest.action != vx::PortalAction::None) {
+                    // 菜单已关（UI 在按钮点击时即关闭）⇒ 恢复**打开前**的鼠标捕获状态（复用同一状态机）。
+                    const vx::PanelCaptureTransition transition =
+                        vx::DecidePanelCaptureTransition(/*opening=*/false, captureBeforePanel);
+                    if (transition.captureRequested) {
+                        mouseCaptured = window.SetRelativeMouseMode(true);
+                    }
+                    jumpRequested = false;
+
+                    if (portalRequest.action == vx::PortalAction::Enter) {
                         std::string switchReason;
-                        if (worldManager.RequestSwitch(portal->targetWorldId, switchReason)) {
-                            VX_LOG_INFO("世界切换（传送门）：走近门后按 E ⇒ 请求切到 [%s]（本帧末执行卸载 / 重载）",
-                                        portal->targetWorldId.c_str());
+                        if (worldManager.RequestSwitch(portalRequest.targetWorldId, switchReason)) {
+                            VX_LOG_INFO("世界切换（传送门菜单 · 进入）：请求切到 [%s]（本帧末执行卸载 / 重载；"
+                                        "**复用已有秘境实例** ⇒ 同一会话内反复进入 ⇒ 同一世界）",
+                                        portalRequest.targetWorldId.c_str());
                         } else {
-                            VX_LOG_WARN("世界切换（传送门）被拒绝：%s", switchReason.c_str());
+                            VX_LOG_WARN("世界切换（传送门菜单 · 进入）被拒绝：%s", switchReason.c_str());
                         }
+                    } else if (portalRequest.action == vx::PortalAction::Reset) {
+                        // V9b：**销毁并重生** —— roll 新种子、`generation + 1`；**不自动进入**（与"不自动切换"一致）。
+                        // 尚无实例 ⇒ 首次生成（`EnsureInstance`）；已有 ⇒ 销毁旧实例（`ResetInstance`）。
+                        const std::uint64_t newSeed   = RollInstanceSeed();
+                        std::string         resetReason;
+                        const bool          resetOk =
+                            (worldManager.FindInstance(portalRequest.targetWorldId) != nullptr)
+                                ? worldManager.ResetInstance(portalRequest.targetWorldId, newSeed, resetReason)
+                                : worldManager.EnsureInstance(portalRequest.targetWorldId, newSeed, resetReason);
+                        if (resetOk) {
+                            char message[256] = {};
+                            std::snprintf(message, sizeof(message),
+                                          vx::UiText(vx::UiLabel::PortalResetDoneFormat, debugOverlay.UsesCjkLabels()),
+                                          portalRequest.targetWorldId.c_str(),
+                                          static_cast<unsigned long long>(newSeed));
+                            VX_LOG_INFO("传送门菜单（V9b · 重置）：%s；**不自动进入** ⇒ 再按 E 进入的是**新秘境**",
+                                        message);
+                            // V10：重置后**立刻持久化新种子**（否则重启会回到旧绑定 ⇒ "重置无效"）。
+                            persistWorldInstances("重置秘境（V9b）");
+                        } else {
+                            VX_LOG_WARN("传送门菜单（V9b · 重置）被拒绝：%s", resetReason.c_str());
+                        }
+                    } else {
+                        VX_LOG_INFO("传送门菜单（V9）：取消（保持「不自动切换」）");
                     }
                 }
             }
@@ -4005,7 +4248,7 @@ int main(int argc, char** argv) {
             stats.loadedTileCount   = tileCoords.size();
             stats.lastDirtyTileCount = destructionUnits;
             stats.tileBodyCount     = terrainCollision.TileBodyCount();
-            stats.nearbyPortalTargetId = nearbyPortalTargetId;  // V3：走近传送门的提示（空串 = 不显示）
+            stats.nearbyPortalPromptName = nearbyPortalPromptName;  // V3/V9：走近传送门的提示（空串 = 不显示）
             stats.physicsReady      = true;
 
             // T24：渲染开销取自引擎的通用统计；绘制数为**最近一次** RenderFrame（面板早于本帧渲染）。

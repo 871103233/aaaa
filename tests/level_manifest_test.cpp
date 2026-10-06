@@ -99,7 +99,8 @@ TEST(LevelManifest, RepoManifestsLoadAndDescribeWorlds) {
     EXPECT_EQ(b.family, WorldFamily::InstancePremade);
     EXPECT_EQ(b.source, WorldSource::Premade);
     EXPECT_FALSE(b.premadeFile.empty());
-    EXPECT_TRUE(b.persistent);
+    // 2026-10-06 所有者裁定「B 要写在程序里、何时访问都一样」⇒ **共享只读**（改不留）⇒ `persistent = false`。
+    EXPECT_FALSE(b.persistent);
     EXPECT_EQ(b.terrain.tileRadiusX, 8);  // 1 km
     EXPECT_EQ(b.terrain.tileRadiusZ, 8);
     EXPECT_EQ(b.objectsFile, maps / "world_b_objects.toml");

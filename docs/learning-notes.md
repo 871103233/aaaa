@@ -1115,3 +1115,10 @@ Naive Surface Nets 每个 cell **只放一个顶点**。当一个 cell 的实心
 
 **相关**：`docs/game-design.md` §1/§2.4、`docs/tech-plan-v2.0.md`（待收敛项 4 / 7）、`docs/devlog.md` T58 / T79、`engine/render/mesh_renderer.hpp`（显存记账范围）。
 
+### Q35 为什么秘境存档里的 `seed` 要写成**字符串**？
+
+TOML 的整数是**有符号 64 位**（toml++ 存 `int64_t`），而实例种子是 **`u64`** —— `RollInstanceSeed()` 实测产出过 `17925097746213602324`（> `INT64_MAX`）。当整数写会溢出 / 解析失败，故 `seed` 以**十进制字符串**落盘（读侧同时接受整数，兼容手改档）才能**无损往返**。
+
+**一般规则**：任何"无符号 64 位或更大"的量落到 TOML / JSON 时都要先确认其数字类型的位宽与符号 —— TOML 整数 = **有符号 64 位**；JSON 更只有 IEEE 双精度浮点（**> 2⁵³ 起就不精确**）。
+**相关**：[ADR 0030](adr/0030-instance-save-slot.md)（秘境存档槽）、`world/save/world_instance_save.hpp`。
+

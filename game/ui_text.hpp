@@ -112,7 +112,18 @@ enum class UiLabel : int {
     HudCoordinates,           ///< HUD 标题：坐标
     HudCoordinatesFormat,     ///< HUD 坐标数值格式（`X %.1f  Y %.1f  Z %.1f`）
     HudCellFormat,            ///< HUD 所在格格式（`cell (%d, %d, %d)`）
-    PortalPromptFormat,       ///< HUD 传送门提示格式（V3；`Near portal '%s' - press E to travel`；`%s` = 目标世界 id）
+    PortalPromptFormat,       ///< HUD 传送门提示格式（V3/V9；`%s` = 门名或目标世界 id；按 `E` **打开菜单**）
+
+    // ---- 传送门交互菜单（V9；所有者 2026-10-06：走近门按 E 出菜单）----
+    PortalDefaultName,           ///< 缺省门名（配置未给 `portal_name`）：神秘传送门
+    PortalMenuTitle,             ///< 菜单窗口标题：传送门
+    PortalMenuTitleFormat,       ///< 菜单标题格式（`%s → %s`；门名 → 秘境名）
+    PortalMenuEnter,             ///< 动作：进入
+    PortalMenuReset,             ///< 动作：重置秘境（**仅肉鸽秘境**）
+    PortalMenuCancel,            ///< 动作：取消
+    PortalMenuGenerationFormat,  ///< 秘境已生成次数（`第 %u 次生成`）
+    PortalMenuSessionHint,       ///< 说明：已存入存档槽 ⇒ 跨启动仍进入同一个（重置才会换）
+    PortalResetDoneFormat,       ///< 重置完成（`已重置秘境 [%s]：新种子 %llu`）
 
     kCount  ///< 标签总数（必须保持在最后）
 };
@@ -210,7 +221,16 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsEnglish = {
     "Coordinates",
     "X %.1f  Y %.1f  Z %.1f",
     "cell (%d, %d, %d)",
-    "Near portal '%s' - press E to travel",
+    "Near '%s' - press E to open menu",
+    "Mysterious Portal",
+    "Portal",
+    "%s -> %s",
+    "Enter",
+    "Reset realm",
+    "Cancel",
+    "generation %u",
+    "Saved to the save slot: the same realm persists across restarts (reset re-rolls it)",
+    "Realm [%s] reset: new seed %llu",
 };
 
 /// 中文标签表：仅当**成功加载 CJK 字体**时启用（此时不可能缺字）。
@@ -303,7 +323,16 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsChinese = {
     "坐标",
     "X %.1f  Y %.1f  Z %.1f",
     "格 (%d, %d, %d)",
-    "靠近传送门「%s」：按 E 传送",
+    "靠近「%s」：按 E 打开菜单",
+    "神秘传送门",
+    "传送门",
+    "%s → %s",
+    "进入",
+    "重置秘境",
+    "取消",
+    "第 %u 次生成",
+    "已存入存档槽：跨启动仍进入同一个（重置才会换）",
+    "已重置秘境 [%s]：新种子 %llu",
 };
 
 /// 纯函数：判断字符串是否**只含 ASCII 字节**（`cjkFontAvailable = false` 时的硬约束）。

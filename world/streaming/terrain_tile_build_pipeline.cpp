@@ -9,8 +9,10 @@
 namespace vx {
 
 TerrainTileBuildPipeline::TerrainTileBuildPipeline(std::uint64_t worldSeed, TerrainGenerationParams params,
-                                                   std::vector<MapEdit> edits, unsigned workerThreads)
-    : m_edits(std::move(edits)), m_noise(worldSeed, std::move(params)), m_scheduler(workerThreads) {}
+                                                   std::vector<MapEdit> edits, unsigned workerThreads,
+                                                   const ITerrainTileSource* tileSource)
+    : m_edits(std::move(edits)), m_noise(worldSeed, std::move(params)), m_tileSource(tileSource),
+      m_scheduler(workerThreads) {}
 
 TerrainTileBuildPipeline::~TerrainTileBuildPipeline() {
     // 安全停机：先等全部任务结束，再析构 `Job`（否则 worker 可能仍在读被释放的 `request`）。
@@ -32,7 +34,13 @@ void TerrainTileBuildPipeline::Submit(TerrainTileBuildRequest request) {
         if (raw->request.remeshOnly) {
             tile = raw->request.tile;
         } else {
-            tile = GenerateTerrainTileData(m_noise, m_edits, raw->request.coord.x, raw->request.coord.z);
+            // V4：优先用**数据来源**（预制地图）；来源缺该 tile ⇒ 回退程序化生成（与主线程路径同一口径）。
+            // 来源返回 true ⇒ tile 完整可用（含 `maxSurfaceBlocks`）⇒ 不再重复刷新。
+            tile.coord                  = raw->request.coord;
+            const bool filledFromSource = (m_tileSource != nullptr) && m_tileSource->FillTileHeights(tile);
+            if (!filledFromSource) {
+                tile = GenerateTerrainTileData(m_noise, m_edits, raw->request.coord.x, raw->request.coord.z);
+            }
         }
         TerrainTileMesh mesh = BuildTerrainMesh(tile, /*quadFilter=*/nullptr, raw->request.lodLevel);
 

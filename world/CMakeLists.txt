@@ -28,6 +28,8 @@ add_library(voxel_world STATIC
     object/object_layer.cpp
     premade/premade_bake.cpp
     premade/premade_map.cpp
+    premade/premade_terrain_source.cpp
+    save/world_instance_save.cpp
     shell/surface_shell.cpp
     shell/surface_shell_residency.cpp
     streaming/dig_volume_residency.cpp

@@ -4,6 +4,10 @@
 - **日期**：2026-10-05
 - **相关**：ADR [0004](0004-hybrid-layered-world-representation.md) / [0005](0005-config-parsing.md)（TOML 配置）/ [0007](0007-volume-meshing-algorithm.md)（Surface Nets）/ [0008](0008-sizes-precision-budget.md)（尺寸）/ [0023](0023-world-representation-v2-hybrid-shell.md)（世界表示 v2）/ [0024](0024-terrain-streaming-and-lod.md)（流式按块访问）/ [0027](0027-water-representation.md)
 - **来源**：项目所有者 2026-10-05 裁定"采用本地存储的预制地图 + 流式加载"
+- **修订（2026-10-06，所有者裁定「B 要写在程序里，何时访问都一样」）**：决策"预制数据文件**一律不入库**"
+  **改为按尺寸分流** —— **小世界预制（如 B，≈1 km，单文件 ≈1.7 MB）的 `.vxmap` 入库** ⇒ 干净克隆**无需生成步骤**即"谁来、何时进去都一样"；
+  **大世界（10 km 级：24649 tile × 8.25 KB ≈ 200 MB 量级）仍不入库**，继续走 `tools/bake_premade_maps.ps1` + `NOTICE.md` 台账。
+  `.gitignore` 由 `assets/maps/*.vxmap` 改为**按需白名单**（见 [plans/v0.5.md](../plans/v0.5.md) §1.13 的 V5/V9 细则）。
 
 ## 背景
 
@@ -43,7 +47,9 @@
 
 ### 四、入库与发行
 
-- 预制地图**数据文件不入库**（体积大）⇒ 与 `assets/textures/`、`assets/models/` 同口径：`tools/` 提供**生成 / 取回脚本**，`NOTICE.md`（或等价台账）登记来源与校验和，`.gitignore` 排除数据目录；
+- 预制地图**数据文件的入库口径按尺寸分流**（2026-10-06 修订，取代原"一律不入库"）：
+  **小世界预制（如 B）入库**（干净克隆即可玩，满足"写在程序里、何时访问都一样"）；**大世界（如 A）不入库**，
+  与 `assets/textures/`、`assets/models/` 同口径 —— `tools/bake_premade_maps.ps1` 生成、`NOTICE.md` 台账登记来源与校验和；
 - 地图的**可读定义**（种子、范围、群系参数、河流样条）可入库（小体积、可复现）。
 
 ## 备选方案与取舍

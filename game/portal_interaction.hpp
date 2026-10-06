@@ -20,6 +20,12 @@ inline constexpr double kPortalPromptRadius = 4.0;
 struct PortalEntry {
     glm::dvec3  position { 0.0 };  ///< 门的世界位置（底面中心，格）
     std::string targetWorldId;      ///< 走到附近按 E 后要切到的世界 id
+
+    /// **门的显示名**（V3c，配置 `portal_name`；**可空** ⇒ UI 层取缺省「神秘传送门」）。
+    ///
+    /// 命名口径来自所有者（2026-10-06："先用**直白的名字**占用，措辞后续我自己补"）⇒
+    /// 具体措辞由所有者在配置里改，**不在代码里硬编码**。
+    std::string name;
 };
 
 /// **最近门**查询（纯函数，确定性）：返回 `portals` 中**距离 `from` 最近且 ≤ `radius`** 的门；

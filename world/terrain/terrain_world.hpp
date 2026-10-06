@@ -6,6 +6,7 @@
 #include "terrain/material_table.hpp"
 #include "terrain/terrain_mesher.hpp"
 #include "terrain/terrain_tile.hpp"
+#include "terrain/terrain_tile_source.hpp"
 #include "terrain/terrain_types.hpp"
 
 #include <cstddef>
@@ -28,6 +29,13 @@ namespace vx {
 /// 前置条件：`noise` 的生命周期覆盖本调用。纯函数（红线 7）：同输入 ⇒ 逐位同输出。
 [[nodiscard]] TerrainTile GenerateTerrainTileData(const TerrainNoiseGenerator& noise,
                                                   const std::vector<MapEdit>& edits, int tileX, int tileZ);
+
+/// 按 `tile.heights` **重算** `tile.maxSurfaceBlocks` 缓存（无其它副作用）。
+///
+/// **为什么是公开自由函数**：worker（`TerrainTileBuildPipeline`）与主线程（`TerrainWorld`）都要在
+/// "tile 高度刚被填好（生成**或**读预制）之后"刷新这个缓存 —— 两条路径**共用同一份实现**才不会出现
+/// "谁忘了刷新、谁的阴影投射体盒就偏小"这类分叉。
+void RefreshTileMaxSurfaceBlocks(TerrainTile& tile) noexcept;
 
 /// 地表世界：持有已加载 tile 的高度数据与网格，并实现引擎的 `ITerrainQuery` 契约。
 ///
@@ -62,6 +70,14 @@ public:
     /// 过滤器由调用方持有，其**生命周期必须覆盖本对象**；传 `nullptr` 恢复"地表网格全覆盖"的旧行为。
     /// 之所以用接口而非直接持有可挖区域表：保持依赖方向 `dig → terrain`（地表网格化不反向依赖挖掘模块）。
     void SetQuadFilter(const ITerrainQuadFilter* filter) noexcept { m_quadFilter = filter; }
+
+    /// 设置**地表数据来源**（V4 / [ADR 0026](../../docs/adr/0026-premade-map-format-and-bake-tool.md)）：
+    /// `nullptr`（缺省）= 按种子**程序化生成** ⇒ 与引入本能力之前**逐位一致**。
+    ///
+    /// 前置条件：必须在任何 `GenerateTile` / `LoadTile` **之前**调用（只影响后续生成）。
+    /// 生命周期：来源对象必须覆盖本对象（本类只持裸指针、**不拥有**）。
+    /// 来源缺该 tile（`FillTileHeights` 返回 false）⇒ **回退程序化生成**（由来源侧负责告警，不静默失败）。
+    void SetTileSource(const ITerrainTileSource* source) noexcept { m_tileSource = source; }
 
     // ---- 单 tile 生命周期（由流式层调用）----
 
@@ -195,6 +211,9 @@ private:
 
     /// 层间交接过滤器（T8，非拥有；`nullptr` = 地表网格全覆盖）。
     const ITerrainQuadFilter* m_quadFilter = nullptr;
+
+    /// 地表数据来源（V4，非拥有；`nullptr` = 程序化生成，即引入本能力之前的路径）。
+    const ITerrainTileSource* m_tileSource = nullptr;
 
     std::map<TileCoord, TerrainTile>     m_tiles;
     std::map<TileCoord, TerrainTileMesh> m_meshes;

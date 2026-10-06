@@ -38,8 +38,13 @@ constexpr float kObstructionStepBlocks = 0.25F;
              std::pair<int, int> { tileX, tileZ - 1 }, std::pair<int, int> { tileX, tileZ } };
 }
 
-/// 重算并写回 tile 的高度缓存（O(65²)）。只在**生成**与**重网格**时调用，
-/// 因此 `MaxSurfaceHeightBlocks()` 得以从"每帧 O(tile × 顶点)"降为"每帧 O(tile)"。
+}  // namespace
+
+// 重算并写回 tile 的高度缓存（O(65²)）。只在**生成**与**重网格**时调用，
+// 因此 `MaxSurfaceHeightBlocks()` 得以从"每帧 O(tile × 顶点)"降为"每帧 O(tile)"。
+//
+// V4 起公开：worker（`TerrainTileBuildPipeline`）与主线程（`TerrainWorld`）在"高度刚被填好"之后
+// 都要刷新它 —— 无论高度是**生成**来的还是从**预制文件读**来的（两条路径共用本实现 ⇒ 不会分叉）。
 void RefreshTileMaxSurfaceBlocks(TerrainTile& tile) noexcept {
     float maximum = 0.0F;
     for (const Height height : tile.heights) {
@@ -48,8 +53,6 @@ void RefreshTileMaxSurfaceBlocks(TerrainTile& tile) noexcept {
     }
     tile.maxSurfaceBlocks = maximum;
 }
-
-}  // namespace
 
 TerrainTile GenerateTerrainTileData(const TerrainNoiseGenerator& noise, const std::vector<MapEdit>& edits,
                                     int tileX, int tileZ) {
@@ -71,7 +74,17 @@ void TerrainWorld::SetMapPreset(const MapPreset& preset) {
 
 void TerrainWorld::GenerateTile(int tileX, int tileZ) {
     // W7-S3b：生成逻辑抽为自由函数 `GenerateTerrainTileData`（worker 与主线程**共用同一份实现** ⇒ 逐位一致）。
-    m_tiles[TileCoord { tileX, tileZ }] = GenerateTerrainTileData(m_noise, m_mapEdits, tileX, tileZ);
+    // V4（ADR 0026）：若设了**数据来源**（预制地图）则优先读它；来源缺该 tile ⇒ **回退程序化生成**
+    // （来源侧负责一次性告警；这里不静默吞掉，也不假装来源成功）。
+    const TileCoord coord { tileX, tileZ };
+    TerrainTile     tile;
+    tile.coord = coord;
+    // 来源返回 true ⇒ 该 tile **完整可用**（含 `maxSurfaceBlocks`，见 `ITerrainTileSource` 契约）⇒ 不再重复刷新。
+    const bool filledFromSource = (m_tileSource != nullptr) && m_tileSource->FillTileHeights(tile);
+    if (!filledFromSource) {
+        tile = GenerateTerrainTileData(m_noise, m_mapEdits, tileX, tileZ);  // 程序化路径自带缓存刷新
+    }
+    m_tiles[coord] = std::move(tile);
 }
 
 void TerrainWorld::MeshTile(int tileX, int tileZ, int lodLevel) {

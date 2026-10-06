@@ -141,17 +141,20 @@ destructible = false
 # ---------------------------------------------------------------------------
 
 # ---- 两个传送门：出生平台（±64 格压平至 120 格）上，出生点东 / 西两侧 ----
+# `portal_name` = **占位命名**（直白占位，措辞待所有者补，见 world-setting §1.5 / §3）。
 [[placement]]
 type = "portal_gate"
 position = [12.0, 0.0, 0.0]
 yaw_deg = 90.0                  # 门洞面向东西向的走近方向
 target_world = "world_b"
+portal_name = "通往小世界的传送门"
 
 [[placement]]
 type = "portal_gate"
 position = [-12.0, 0.0, 0.0]
 yaw_deg = 90.0
 target_world = "world_c"
+portal_name = "通往秘境的传送门"
 
 # ---- 土堆对照 ----
 [[placement]]

@@ -15,5 +15,8 @@ terrain_preset = "world_b_terrain.toml"
 objects_file   = "world_b_objects.toml"   # V3：本世界的物件 / 传送门放置清单（相对本文件目录）
 
 destruction_enabled     = true   # 破坏策略：部分元素可破坏（范围比 A 大）
-persistent              = true   # 存档策略：按用途持久化（剧情存；存档未开始，先登记）
+# 存档策略（2026-10-06 所有者裁定："B 要写在程序里，何时访问都一样"）：
+#   ⇒ **共享只读**：改（挖 / 炸）一律不留 ⇒ `persistent = false`。
+#   （原为 true = "按用途持久化"，与"谁来都一样"互斥，已按所有者口径改掉。）
+persistent              = false
 randomize_seed_on_entry = false

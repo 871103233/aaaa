@@ -373,6 +373,22 @@ ObjectTable ObjectTable::LoadFromFile(const std::filesystem::path& path) {
                 throw std::runtime_error(path.string() + ": 只有传送门可以给出 target_world（type = [" +
                                          placement.typeId + "] 是普通物件）");
             }
+
+            // V3c：`portal_name`（**仅传送门可给**，可选）—— 门的**显示名**。
+            // 命名口径来自所有者（"先用直白的名字占用，措辞后续我自己补"）⇒ 这里只搬运，不硬编码措辞；
+            // **空串视为未给出**（UI 层取缺省「神秘传送门」）。
+            if (const toml::node* nameNode = entry->get("portal_name"); nameNode != nullptr) {
+                const std::optional<std::string> name = nameNode->value<std::string>();
+                if (!name.has_value()) {
+                    throw std::runtime_error(path.string() + ": [[placement]].portal_name 不是字符串（type = [" +
+                                             placement.typeId + "]）");
+                }
+                placement.portalName = *name;
+            }
+            if (placedType->kind != ObjectAssetKind::Portal && !placement.portalName.empty()) {
+                throw std::runtime_error(path.string() + ": 只有传送门可以给出 portal_name（type = [" +
+                                         placement.typeId + "] 是普通物件）");
+            }
             table.placements.push_back(std::move(placement));
         }
     }

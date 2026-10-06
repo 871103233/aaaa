@@ -138,6 +138,11 @@ LevelManifest LevelManifest::LoadFromFile(const std::filesystem::path& path) {
     if (manifest.source == WorldSource::Procedural && !manifest.premadeFile.empty()) {
         throw std::runtime_error(path.string() + ": source = procedural 时不得给出 [premade_file]（会指向不被读取的文件）");
     }
+    // V4：按**清单所在目录**解析出预制文件的**实际路径**（与 terrain_preset 同口径）。
+    // 这里只解析、**不打开**：预制文件是离线烘焙产物、可能尚未生成；打开与校验在 game 层加载世界时做。
+    if (manifest.source == WorldSource::Premade) {
+        manifest.premadeFilePath = ResolveReference(path, manifest.premadeFile);
+    }
 
     manifest.destructionEnabled   = ReadRequiredBool(document, path, "destruction_enabled");
     manifest.persistent           = ReadRequiredBool(document, path, "persistent");

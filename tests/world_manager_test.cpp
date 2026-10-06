@@ -188,4 +188,119 @@ randomize_seed_on_entry = false
     EXPECT_EQ(manager.Count(), 0U);
 }
 
+// ---- V5：秘境实例账本（`EnsureInstance` / `ResetInstance`；见 docs/plans/v0.5.md §1.13）----
+//
+// 语义（所有者 2026-10-06）：**首次进入 roll 一次种子 ⇒ 反复进入复用 ⇒ 重置才换种子**。
+
+TEST(WorldManager, EnsureInstanceCreatesThenReusesTheSameSeed) {
+#ifdef VOXEL_SOURCE_DIR
+    WorldManager manager;
+    manager.RegisterAll(RepoWorldManifests());
+    std::string reason;
+
+    // 首次 ⇒ 建实例（generation = 0，采用传入种子）。
+    ASSERT_TRUE(manager.EnsureInstance("world_c", 111ULL, reason)) << reason;
+    const vx::WorldInstance* first = manager.FindInstance("world_c");
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(first->seed, 111ULL);
+    EXPECT_EQ(first->generation, 0U);
+    EXPECT_EQ(first->worldId, "world_c");
+
+    // 再次进入（即便传入另一个种子）⇒ **复用**：这正是"反复进入 ⇒ 同一个世界"。
+    ASSERT_TRUE(manager.EnsureInstance("world_c", 999ULL, reason)) << reason;
+    const vx::WorldInstance* again = manager.FindInstance("world_c");
+    ASSERT_NE(again, nullptr);
+    EXPECT_EQ(again->seed, 111ULL);
+    EXPECT_EQ(again->generation, 0U);
+    EXPECT_EQ(manager.InstanceCount(), 1U);
+#else
+    GTEST_SKIP() << "VOXEL_SOURCE_DIR 未定义";
+#endif
+}
+
+TEST(WorldManager, ResetInstanceBumpsGenerationAndReplacesSeed) {
+#ifdef VOXEL_SOURCE_DIR
+    WorldManager manager;
+    manager.RegisterAll(RepoWorldManifests());
+    std::string reason;
+
+    // 没有实例就重置 ⇒ 拒绝（不"凭空重置"）。
+    EXPECT_FALSE(manager.ResetInstance("world_c", 222ULL, reason));
+    EXPECT_FALSE(reason.empty());
+
+    ASSERT_TRUE(manager.EnsureInstance("world_c", 111ULL, reason)) << reason;
+    ASSERT_TRUE(manager.ResetInstance("world_c", 222ULL, reason)) << reason;
+    const vx::WorldInstance* second = manager.FindInstance("world_c");
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(second->seed, 222ULL);
+    EXPECT_EQ(second->generation, 1U);
+
+    ASSERT_TRUE(manager.ResetInstance("world_c", 333ULL, reason)) << reason;
+    const vx::WorldInstance* third = manager.FindInstance("world_c");
+    ASSERT_NE(third, nullptr);
+    EXPECT_EQ(third->seed, 333ULL);
+    EXPECT_EQ(third->generation, 2U);
+#else
+    GTEST_SKIP() << "VOXEL_SOURCE_DIR 未定义";
+#endif
+}
+
+TEST(WorldManager, InstanceLedgerRejectsUnknownAndNonRoguelikeWorlds) {
+#ifdef VOXEL_SOURCE_DIR
+    WorldManager manager;
+    manager.RegisterAll(RepoWorldManifests());
+    std::string reason;
+
+    // 未知 id。
+    EXPECT_FALSE(manager.EnsureInstance("nope", 1ULL, reason));
+    EXPECT_FALSE(reason.empty());
+
+    // A 是 overworld、B 是 instance_premade ⇒ **都不参与秘境实例化**（只有肉鸽才实例化）。
+    EXPECT_FALSE(manager.EnsureInstance("world_a", 1ULL, reason));
+    EXPECT_FALSE(reason.empty());
+    EXPECT_FALSE(manager.EnsureInstance("world_b", 1ULL, reason));
+    EXPECT_FALSE(reason.empty());
+    EXPECT_FALSE(manager.ResetInstance("world_a", 1ULL, reason));
+    EXPECT_FALSE(reason.empty());
+    EXPECT_EQ(manager.InstanceCount(), 0U);
+#else
+    GTEST_SKIP() << "VOXEL_SOURCE_DIR 未定义";
+#endif
+}
+
+// ---- V10：读档装回（`RestoreInstance`；见 docs/plans/v0.5.md §1.13.1）----
+//
+// 与 `EnsureInstance` 的区别：本函数**必须能覆盖**已有绑定（把上次存档装回），而 `EnsureInstance` 绝不覆盖。
+
+TEST(WorldManager, RestoreInstanceWrittenBindingAndOverwritesExisting) {
+#ifdef VOXEL_SOURCE_DIR
+    WorldManager manager;
+    manager.RegisterAll(RepoWorldManifests());
+    std::string reason;
+
+    // 无实例 ⇒ 直接装回（可带 `generation`，而 `EnsureInstance` 只能建 generation = 0）。
+    ASSERT_TRUE(manager.RestoreInstance("world_c", 555ULL, 4U, reason)) << reason;
+    const vx::WorldInstance* instance = manager.FindInstance("world_c");
+    ASSERT_NE(instance, nullptr);
+    EXPECT_EQ(instance->seed, 555ULL);
+    EXPECT_EQ(instance->generation, 4U);
+
+    // 已有 ⇒ **覆盖**（"读档装回"的语义；这也是它不能复用 `EnsureInstance` 的原因）。
+    ASSERT_TRUE(manager.RestoreInstance("world_c", 777ULL, 9U, reason)) << reason;
+    instance = manager.FindInstance("world_c");
+    ASSERT_NE(instance, nullptr);
+    EXPECT_EQ(instance->seed, 777ULL);
+    EXPECT_EQ(instance->generation, 9U);
+    EXPECT_EQ(manager.InstanceCount(), 1U);
+
+    // 非 roguelike / 未知 id ⇒ 拒绝（返回 false + 原因，不静默）。
+    EXPECT_FALSE(manager.RestoreInstance("world_b", 1ULL, 0U, reason));
+    EXPECT_FALSE(reason.empty());
+    EXPECT_FALSE(manager.RestoreInstance("nope", 1ULL, 0U, reason));
+    EXPECT_FALSE(reason.empty());
+#else
+    GTEST_SKIP() << "VOXEL_SOURCE_DIR 未定义";
+#endif
+}
+
 }  // namespace

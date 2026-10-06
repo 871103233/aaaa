@@ -20,6 +20,21 @@ enum class WorldSwitchPhase : std::uint8_t {
     Requested,  ///< 已请求切换，等待装载器**分帧**卸载当前世界后开始装载目标
 };
 
+/// 一个**秘境实例**（V5 / [`plans/v0.5.md`](../../docs/plans/v0.5.md) §1.13）。
+///
+/// 生命周期（所有者 2026-10-06 口径："**C 地图生成后与玩家绑定，可以反复进入，同一个玩家反复进入后是一样的，直到被销毁**"）：
+///   1. **首次进入** ⇒ `EnsureInstance` 由 game 层 roll 一个**实例种子**并记下（`generation = 0`）；
+///   2. **之后的进入** ⇒ **复用**同一实例（种子不变）⇒ **同一个世界**（世界指纹逐位相同，红线 7）；
+///   3. **销毁 / 重置** ⇒ `ResetInstance` 丢弃旧实例、roll 新种子、`generation + 1`。
+///
+/// **注意 `randomize_seed_on_entry` 的语义收紧**（本需求）：它 = "**首次进入时随机生成实例种子**"，
+/// **不是**"每次进入都换种子" —— 后者会让"反复进入一样"不成立。
+struct WorldInstance {
+    std::string   worldId;            ///< 所属世界 id
+    std::uint64_t seed       = 0;     ///< 实例种子（决定该秘境长什么样）
+    std::uint32_t generation = 0;     ///< 第几次生成（0 = 首次；每次重置 +1）
+};
+
 /// **世界切换管理器**（V2a；[`plans/v0.5.md`](../../docs/plans/v0.5.md) §1.7）。
 ///
 /// 本类**只做纯逻辑**：**清单注册表**（`id → LevelManifest`）+ **当前世界记账** + **切换请求状态机**；
@@ -133,12 +148,94 @@ public:
     /// 装载**成功**后确认新世界（未知 id ⇒ 抛 `std::invalid_argument`）。
     void CommitActive(const std::string& id) { SetActive(id); }
 
+    // ---- V5：秘境实例账本（纯逻辑；种子由 game 层提供 ⇒ 本类保持可单测、不碰随机数）----
+
+    /// **确保秘境实例存在**：没有 ⇒ 用 `seed` 建一个（`generation = 0`）；**已有 ⇒ 复用**（不动种子）。
+    ///
+    /// 拒绝（返回 false + `outReason`，不静默）：**未知 id** / 该世界**不是 `instance_roguelike`**。
+    /// 复用语义正是"反复进入 ⇒ 同一个世界"的实现。
+    [[nodiscard]] bool EnsureInstance(const std::string& id, std::uint64_t seed, std::string& outReason) {
+        const LevelManifest* manifest = Find(id);
+        if (manifest == nullptr) {
+            outReason = "未知世界 id [" + id + "]";
+            return false;
+        }
+        if (manifest->family != WorldFamily::InstanceRoguelike) {
+            outReason = "世界 [" + id + "] 不是肉鸽秘境（family=" + std::string(ToString(manifest->family)) +
+                        "）⇒ 不参与秘境实例化";
+            return false;
+        }
+        if (m_instances.find(id) == m_instances.end()) {
+            m_instances.emplace(id, WorldInstance { id, seed, 0U });
+        }
+        outReason.clear();
+        return true;
+    }
+
+    /// **销毁并重生**：丢弃该秘境的实例、以 `seed` 新建、`generation + 1`。
+    ///
+    /// 拒绝：**未知 id** / 非 `instance_roguelike` / **当前没有实例**（须先 `EnsureInstance`，避免"凭空重置"）。
+    [[nodiscard]] bool ResetInstance(const std::string& id, std::uint64_t seed, std::string& outReason) {
+        const LevelManifest* manifest = Find(id);
+        if (manifest == nullptr) {
+            outReason = "未知世界 id [" + id + "]";
+            return false;
+        }
+        if (manifest->family != WorldFamily::InstanceRoguelike) {
+            outReason = "世界 [" + id + "] 不是肉鸽秘境（family=" + std::string(ToString(manifest->family)) +
+                        "）⇒ 不可重置";
+            return false;
+        }
+        const auto found = m_instances.find(id);
+        if (found == m_instances.end()) {
+            outReason = "世界 [" + id + "] 当前没有秘境实例 ⇒ 先进入一次（EnsureInstance）再重置";
+            return false;
+        }
+        found->second = WorldInstance { id, seed, found->second.generation + 1U };
+        outReason.clear();
+        return true;
+    }
+
+    /// 查秘境实例（不存在 ⇒ `nullptr`）。
+    [[nodiscard]] const WorldInstance* FindInstance(const std::string& id) const noexcept {
+        const auto found = m_instances.find(id);
+        return (found == m_instances.end()) ? nullptr : &found->second;
+    }
+
+    /// **读档恢复**（V10）：把存档里的绑定（种子 + `generation`）**原样装回账本** —— 有则覆盖、无则新建。
+    ///
+    /// 与 `EnsureInstance` 的区别（**为什么单独一个入口**）：后者是"运行期首次进入"（无则建、**有则复用**、
+    /// 绝不覆盖已有种子）；本函数只由**启动读档**调用，必须能**覆盖**（把上次的绑定装回）—— 若复用它，
+    /// 就得给 `EnsureInstance` 开一个"覆盖已有种子"的口子，反而让运行期也可能误改种子。
+    ///
+    /// 拒绝（返回 false + `outReason`，不静默）：**未知 id** / 非 `instance_roguelike`。
+    [[nodiscard]] bool RestoreInstance(const std::string& id, std::uint64_t seed, std::uint32_t generation,
+                                       std::string& outReason) {
+        const LevelManifest* manifest = Find(id);
+        if (manifest == nullptr) {
+            outReason = "未知世界 id [" + id + "]";
+            return false;
+        }
+        if (manifest->family != WorldFamily::InstanceRoguelike) {
+            outReason = "世界 [" + id + "] 不是肉鸽秘境（family=" + std::string(ToString(manifest->family)) +
+                        "）⇒ 不参与秘境实例化";
+            return false;
+        }
+        m_instances[id] = WorldInstance { id, seed, generation };
+        outReason.clear();
+        return true;
+    }
+
+    [[nodiscard]] std::size_t InstanceCount() const noexcept { return m_instances.size(); }
+
 private:
     std::vector<std::string>                       m_order;      ///< 注册顺序（确定性）
     std::unordered_map<std::string, LevelManifest> m_manifests;  ///< `id → 清单`
     std::string                                    m_activeId;   ///< 当前世界 id（空 = 未设定）
     std::string                                    m_pendingId;  ///< 待处理的目标 id
     WorldSwitchPhase                               m_phase = WorldSwitchPhase::Idle;
+
+    std::unordered_map<std::string, WorldInstance> m_instances;  ///< 秘境实例账本（V5；`id → 实例`）
 };
 
 }  // namespace vx

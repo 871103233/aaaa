@@ -38,3 +38,10 @@ assets/generated/
 # 资源文件由 `tools/fetch_assets.ps1` 按需取回（全部 CC0）。校验和见 `tools/assets.sha256`（**该文件进仓库**）。
 assets/textures/
 assets/models/
+
+# ---------- 预制地图烘焙产物（**按尺寸分流**）----------
+# 依据 docs/adr/0026 §四（2026-10-06 修订：由"一律不入库"改为**按尺寸分流**）与 docs/plans/v0.5.md §1.13：
+#   · **小世界预制（如 B，≈1.7 MB）入库** ⇒ 干净克隆即可玩、"写在程序里、何时访问都一样"；
+#   · **大世界（10 km 级，≈200 MB）不入库** ⇒ 由 `tools/bake_premade_maps.ps1` 确定性生成（同一输入 ⇒ 逐字节相同）。
+assets/maps/*.vxmap
+!assets/maps/world_b.vxmap

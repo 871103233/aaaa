@@ -6,6 +6,7 @@
 #include "generation/terrain_params.hpp"
 #include "terrain/terrain_mesher.hpp"
 #include "terrain/terrain_tile.hpp"
+#include "terrain/terrain_tile_source.hpp"
 #include "terrain/terrain_types.hpp"
 
 #include <cstddef>
@@ -63,8 +64,12 @@ class TerrainTileBuildPipeline final {
 public:
     /// `workerThreads == 0` ⇒ 自动（硬件并发 − 1）。线程池不可用时**自动回落**为"提交即同步算完"
     /// ——结果不变，只是尖峰回到引入本模块之前的样子（`TaskScheduler` 会 WARN 一次，不静默）。
+    /// `tileSource`（可选、**非拥有**）—— V4（[ADR 0026](../../docs/adr/0026-premade-map-format-and-bake-tool.md)）：
+    /// **非空**时 worker 优先读它取 tile（如预制地图），来源缺该 tile ⇒ **回退程序化生成**；
+    /// `nullptr`（缺省）= 与引入本能力之前**逐位一致**的程序化路径。
+    /// 生命周期：`tileSource` 必须覆盖本对象（worker 会**并发**调用它，故实现须线程安全）。
     TerrainTileBuildPipeline(std::uint64_t worldSeed, TerrainGenerationParams params, std::vector<MapEdit> edits,
-                             unsigned workerThreads = 0);
+                             unsigned workerThreads = 0, const ITerrainTileSource* tileSource = nullptr);
     ~TerrainTileBuildPipeline();
 
     TerrainTileBuildPipeline(const TerrainTileBuildPipeline&) = delete;
@@ -105,6 +110,9 @@ private:
 
     std::vector<MapEdit>    m_edits;    ///< 预设编辑的**副本**（worker 只读；主线程不再改动它）
     TerrainNoiseGenerator   m_noise;    ///< worker 侧自持的生成器（**不共用** `TerrainWorld::m_noise`）
+
+    /// 地表数据来源（V4，非拥有；`nullptr` = 程序化生成）。worker **并发只读** ⇒ 实现须线程安全。
+    const ITerrainTileSource* m_tileSource = nullptr;
 
     TaskScheduler m_scheduler;
 

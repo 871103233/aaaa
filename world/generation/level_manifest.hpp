@@ -48,9 +48,15 @@ struct LevelManifest {
 
     /// `source = premade` 时**必填**（仓库相对路径）；`procedural` 时**必须为空**。
     ///
-    /// **本阶段只校验"非空"**：预制文件的存在性与格式校验发生在**实际加载世界时**（V4）——
-    /// 因为预制文件是**离线烘焙产物**（不入库），此刻可能尚未生成。
+    /// **清单加载时只校验"非空"**：预制文件的存在性与格式校验发生在**实际加载世界时**——
+    /// 因为预制文件是**离线烘焙产物**（不入库），此刻可能尚未生成（由 `tools/bake_premade_maps.ps1` 生成）。
     std::string premadeFile;
+
+    /// `premade_file` 按**清单所在目录**解析出的路径（仅 `source = premade` 时非空；与 `terrain_preset` 同口径）。
+    ///
+    /// V4 起由 `game/main.cpp` 据此**打开并校验**预制容器（存在 / 魔数 / 版本 / 半径与种子与清单一致）；
+    /// 校验失败**即抛**（不静默回退到程序化生成）。
+    std::filesystem::path premadeFilePath;
 
     /// 引用的**地形预设**（`MapPreset`）路径（仓库相对）；必填且必须可加载。
     std::string terrainPresetPath;
@@ -71,7 +77,10 @@ struct LevelManifest {
     /// 该世界是否**持久化**（"存档策略"；存档尚未开始 ⇒ 本阶段只解析 / 校验 / 登记）。
     bool persistent = false;
 
-    /// 每次进入是否**更换种子**（仅 `instance_roguelike` 可开；本阶段只解析 / 校验，V5 消费）。
+    /// **首次进入时随机生成实例种子**（仅 `instance_roguelike` 可开；V5 起消费）。
+    ///
+    /// **语义收紧（2026-10-06）**：**不是**"每次进入都换种子" —— 那会让"反复进入一样"不成立。
+    /// 正确口径见 `game/world_manager.hpp` 的 `WorldInstance`：首次 roll 一次 ⇒ 反复进入**复用** ⇒ **重置**才换。
     bool randomizeSeedOnEntry = false;
 
     /// 由 `terrainPresetPath` 加载的**地形预设**（spawn / seed / 半径 / 编辑的唯一事实来源）。

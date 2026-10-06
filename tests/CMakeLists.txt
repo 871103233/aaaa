@@ -41,7 +41,9 @@ add_executable(voxel_tests
     object_support_test.cpp
     orb_test.cpp
     premade_map_test.cpp
+    premade_terrain_source_test.cpp
     portal_interaction_test.cpp
+    portal_menu_test.cpp
     system_settings_test.cpp
     test_mode_test.cpp
     physics_test.cpp
@@ -67,6 +69,8 @@ add_executable(voxel_tests
     volume_collision_test.cpp
     volume_mesher_test.cpp
     world_bounds_test.cpp
+    world_fingerprint_test.cpp
+    world_instance_save_test.cpp
     world_manager_test.cpp
 )
 
