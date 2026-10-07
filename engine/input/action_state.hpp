@@ -38,6 +38,9 @@ enum class ActionId : std::uint8_t {
     PlacementToggleRotateHold,    ///< V0.11：切换"旋转长按模式"（缺省开；`Z`）
     PlacementToggleNeighborSnap,  ///< V0.11：切换"邻居优先吸附"（缺省开；`X`）
     PlacementToggleGridSnap,      ///< V0.11：切换"世界网格吸附"（缺省开；`B`）
+    PlacementUndo,                ///< V0.11 / I3：撤销上一次编辑层操作（`Ctrl+Z`）
+    PlacementRedo,                ///< V0.11 / I3：重做上一次被撤销的操作（`Ctrl+Y`）
+    PlacementModifierCtrl,        ///< V0.11 / I3：编辑修饰键（`Ctrl`）—— 用于把 `Z` 区分为"撤销（Ctrl+Z）"与"旋转长按开关（Z）"
 
     Count,
 };

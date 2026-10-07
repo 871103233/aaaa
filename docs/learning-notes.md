@@ -505,6 +505,55 @@
 - 易错点或关键取舍：**取值就是"点击 / 长按"的分界** —— 业界参照：Windows 键盘**重复延迟**缺省 ≈ 500 ms（范围 250~1000）、Material / iOS 的长按阈值 ≈ 400~500 ms；而一次**明确点击**通常 **50~150 ms**。取 **0.4 s** = 既留足余量不误触发，又比 OS 的 500 ms 稍早起转。太短（≤0.3s）对"慢点击"有误触发风险，太长（≥0.6s）有等待感。
 - 相关：`game/placement_rotate.hpp`（`PlacementHoldActive`）、`docs/plans/v0.11.md` A3 表 Y6、`docs/learning-notes.md` Q44
 
+### 命令栈（Command Stack / Undo–Redo）
+
+- 一句话定义：把每次可撤销的编辑动作记成一条**可逆记录**压入栈；**撤销** = 取栈顶逐条**反向执行**，**重做** = 再正向执行；**新操作清空重做栈**，栈有**容量上限**。
+- 在本项目里是什么 / 为什么需要：V0.11 / I3 的编辑撤销 / 重做（`world/object/edit_history.hpp` 的 `EditHistory` + `ApplyEditCommand` / `RevertEditCommand`，容量 **64 步**）。业界形态同源：UE5 Editor **Transaction（`FTransaction`）**、Unity **`Undo`**（`Undo.RecordObject`）、Godot **`UndoRedo`**。
+- 易错点或关键取舍：① **命令栈 vs 全量快照** —— 前者内存 O(操作数) 且天然给出"撤销深度"，后者每步复制整个文档（随内容增长）；② **每条命令必须同时够"做"与"撤"** —— 本项目把"改了编辑层哪一处 + 改前 / 改后值"都记进 `EditCommand`（删除还要记"删的是本层条目还是记 `[[remove]]`"与原下标）；③ **副作用要一起可逆** —— 落点 ①/③ 会**改地形**，撤销整座建筑时必须把地形也写回，否则留下"建筑没了、地面还平"的世界不自洽（把逐列改前 / 改后高度记进命令，见 `TerrainColumnEdit`）；④ **保存后清栈** —— 保存即新基线，否则会试图把改动撤到"文件之前"的旧状态。
+- 相关：`world/object/edit_history.hpp`、`tests/edit_history_test.cpp`、`world/dig/terrain_brush.*`、`docs/plans/v0.11.md`（I3）
+
+### gizmo（操纵手柄 / Manipulator）
+
+- 一句话定义：叠加在**选中对象**上的一组**可交互手柄**（平移箭头 / 旋转环 / 缩放手块），**按住并拖动**即改该对象的变换（transform）。
+- 在本项目里是什么 / 为什么需要：V0.11 / I4 + **I4b**（`world/object/gizmo.hpp` + `game/main.cpp`）—— **修改模式**内（`F2` 面板按钮进入；两模式**互斥**）**点击已有物件 ⇒ 选中**，**X 红 / Z 蓝箭头 = 沿轴平移**、**黄环 = 绕 Y 旋转**；**左键按在手柄上 = 拖动**。**摆放模式**内**不显示 gizmo**、左键**无条件 = 放下**。业界形态同源：**UE5 Editor 世界轴 gizmo**、**Unity Move / Rotate Gizmo**、**Godot `Node3D` gizmo**（且均为**"选择/修改"与"放置"分开的工具**）。
+- 易错点或关键取舍：① **手柄拾取要有优先级且取最近**（轴杆与环带重叠处按最近者，否则"想转却平移"）；② **旋转角跨 ±180° 必须归一化**（否则物件瞬间反转一圈）；③ **"摆放"与"修改（选中 / 拖动）"必须分成两种模式**（同一条左键不能既"放下"又"拖动"；用"悬停即选中"会让 gizmo 在摆放时不断弹出并被误触 —— 本项目 I4 初版即此坑，I4b 拆开）；④ 拖动期间**必须屏蔽相机转向**（鼠标位移改给 gizmo），且**世界轴**手柄不随物件朝向旋转；⑤ **手柄伸出物件之外 ⇒ 选中须先"点击确立"**（选中是粘性的，手柄才能点中）；模式切换必须有**可见指示**（本项目 = 屏幕中央十字，白 / 绿区分未选 / 已选）。
+- 相关：`world/object/gizmo.hpp`、`tests/gizmo_test.cpp`、`docs/plans/v0.11.md`（I4）、`docs/learning-notes.md` Q45
+
+### 交互模式（自由活动 / 建造 / 修改；Mode / Tool）
+
+- 一句话定义：把"玩家当前在干什么"显式建模为**互斥的模式（工具）**，每个模式给**同一条输入**（尤其左键）**不同的含义**；模式切换要有**可见指示**。
+- 为什么需要 / 业界同源：**UE5**（视口左键 = 选择，放置靠拖入；gizmo 只出现在选中对象上）、**Unity**（Scene 工具栏 Move·Rotate 与拖预制体放置分开）、
+  **Godot**（拖入放置 vs 点击选择）、**Valheim / Rust**（建造模式与常规分离）⇒ 共同口径 = **"放置"与"选择·修改"必须是不同的工具**，
+  否则同一条左键要同时承担"放下"与"拖动"，必然互相抢输入。
+- 在本项目里是什么：**三种模式**（SKILL《三种模式与输入隔离》，**硬规则**）—— **自由活动**（左键 = 发射**光球**，含按住连发；**默认**）/
+  **建造**（`F2` ⇒ 选类型 ⇒「进入摆放」/ `Enter` / `F3`；左键 = **放下**）/ **修改**（`F2` ⇒「修改模式」；左键 = **点击已有物件选中** + 拖动 gizmo）。
+  实现 = **输入上下文栈 + 动作归属表**（`game/input_context.hpp`；A6 起"按键归谁"由其单一权威判定，见下一条名词）+ `game/debug_overlay.*`（入口与中央指示器）。
+- 易错点或关键取舍：① **光球必须只在自由活动模式**（含**按住连发**；漏掉 `Held` 分支就会出现"修改模式里点一下也射一颗"）；
+  ② **互斥**（不能同时建造 + 修改）；③ **同键冲突要显式让位**（`E` = 旋转 / 传送门交互）；
+  ④ 模式切换**必须可见**（否则"按住左键没反应"会像 BUG）；⑤ **按键矩阵的权威处是 `docs/ui-inventory.md`**（SKILL 只写不可违反的形态）。
+- 相关：`.trae/skills/voxel-engine-dev-standards/SKILL.md`（《三种模式与输入隔离》）、`docs/ui-inventory.md`（按键矩阵）、`docs/game-design.md`（G12）、`game/main.cpp`
+
+### 输入上下文栈与动作归属表（Input Context Stack / Action Ownership Table）
+
+- 一句话定义：把"当前是谁在接管输入"建模成**一条栈**（base + overlay），**每个动作声明它归哪一层**；
+  高优先级层**消费**它要用的动作并**阻断**低优先级；**未被子层 claim 的动作自动穿透到 base**。
+- 为什么需要 / 业界同源：**UE5 Enhanced Input** 的 **Input Mapping Context + Priority**（Push/Pop 上下文，高优先级消费并阻断低优先级）、
+  **Unity Input System** 的 **Action Map `Enable()` / `Disable()`**（互斥集合）、**Godot `InputMap`** + 代码层 gate；
+  以及 3A 通用的**模态 UI 栈**（`Esc` 统一 = 弹栈顶）与**分层穿透**（base 承载移动 / 视角，overlay 只覆写它要用的动作）。
+- 在本项目里是什么：`game/input_context.hpp`（**纯函数**、header-only）——
+  **上下文**（自由活动 base / 建造 / 修改 / 修改-拖动 / 模态）+ **归属表** `OwnerOf(state, action)`
+  （`Free` / `Build` / `Modify` / `Inactive` / `Blocked` / `AlwaysOn` / `PanelInternal`；**默认 = `Free`**，按上下文覆写例外）
+  + **`Esc` 栈顶弹出** `EscPopTarget`；`game/gameplay_input.hpp` 的**抑制**由上下文派生（`Modal` ⇒ 三类全抑制，其余全放行）。
+- 为什么做：原先"按键归谁"**散落 ≥ 5 处**（发射判据的手写布尔、各模式分支逐个 `ConsumePressed` 让位、`Esc` 的 5 级 `if/else`、`!gizmoDragging`、抑制独立布尔）
+  ⇒ 新增模式 / 键要改多处，**A5 已因此漏过一处**（`fireHeld` 少排除 `modifyMode`）。收敛为**一张表**后，这类漏改在**结构上不可能复现**。
+- 易错点或关键取舍：① **单一权威** —— 不得在调用点再写"模式布尔"或逐键让位；
+  ② **"复用"是表里的 `Free`（穿透），不是"恰好没人 gate 它"** —— 移动 / 跳跃 / 冲刺 / 飞行 / 视角三模式同源，且指令**每帧只算一次**；
+  ③ 模态面板**全量阻断玩法**但**放行面板级热键**（`F1` / `F2` / `F5` / `Ctrl+Z`·`Y` / `Z`·`X`·`B` / `Esc`）；
+  **只读叠加层**（`F1` / 常驻 HUD）**不进上下文** ⇒ **不得**抑制玩法输入（V0.9 回归口径）；
+  ④ 与 `MouseCapture`（**物理层**：光标是否锁定）**正交**，**不合并**。
+- 相关：[ADR 0040](adr/0040-input-context-stack-and-action-ownership-table.md)、`game/input_context.hpp`、
+  `.trae/skills/voxel-engine-dev-standards/SKILL.md`（《输入上下文栈与动作归属表》）、`docs/ui-inventory.md`（权威矩阵 ↔ 归属表**逐格一致**）、`tests/input_context_test.cpp`
+
 ---
 
 ## B. 开发流程与工程用语

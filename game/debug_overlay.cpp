@@ -436,6 +436,12 @@ void DebugOverlay::BuildObjectPalette() {
         m_objectPaletteOpen = false;  // 关面板 → 进摆放模式（捕获由 game 层恢复）
     }
     ImGui::EndDisabled();
+    // V0.11 / I4 修订：**修改模式**按钮（不需先选类型 —— 它是"选中已有物件并拖动"的入口）。
+    ImGui::SameLine();
+    if (ImGui::Button(UiText(UiLabel::ObjectPaletteModify, cjk))) {
+        m_paletteRequest    = PaletteRequest { PaletteRequest::Action::EnterModify, std::string {} };
+        m_objectPaletteOpen = false;  // 关面板 → 进修改模式（捕获由 game 层恢复）
+    }
     ImGui::SameLine();
     if (ImGui::Button(UiText(UiLabel::ObjectPaletteSave, cjk))) {
         m_paletteRequest = PaletteRequest { PaletteRequest::Action::Save, std::string {} };
@@ -464,6 +470,22 @@ void DebugOverlay::BuildUI(const DebugStats& stats, SystemPanelContext& panelCon
 
     // V0.5 E3：物件选择器（居中模态二级列表）。同样放在 `!m_visible` 早退**之前**。
     BuildObjectPalette();
+
+    // V0.11 / I4 修订：**修改模式的屏幕中央指示器**（只读叠加；不参与输入抑制、不影响玩法）。
+    // 为什么要它（所有者 2026-10-08）：摆放与"修改（选中并拖动）"是**两种模式**，屏幕上需要一眼看清当前在哪一种。
+    if (m_modifyActive) {
+        ImDrawList*    foreground = ImGui::GetForegroundDrawList();
+        const ImGuiIO& io         = ImGui::GetIO();
+        const ImVec2   center(io.DisplaySize.x * 0.5F, io.DisplaySize.y * 0.5F);
+        const ImU32    color = m_modifyHasSelection ? IM_COL32(120, 230, 120, 220) : IM_COL32(240, 240, 240, 200);
+        const float    arm   = 10.0F;
+        foreground->AddLine(ImVec2(center.x - arm, center.y), ImVec2(center.x + arm, center.y), color, 2.0F);
+        foreground->AddLine(ImVec2(center.x, center.y - arm), ImVec2(center.x, center.y + arm), color, 2.0F);
+        foreground->AddCircle(center, 3.0F, color, 12, 2.0F);
+        const char*  text = UiText(m_modifyHasSelection ? UiLabel::ModifySelectedIndicator : UiLabel::ModifyModeIndicator, cjk);
+        const ImVec2 size = ImGui::CalcTextSize(text);
+        foreground->AddText(ImVec2(center.x - size.x * 0.5F, center.y + arm + 6.0F), color, text);
+    }
 
     // 常驻坐标 HUD（屏幕左上角，只读）：与 F1 面板相互独立，不需要开面板就能看到当前位置。
     if (m_hudVisible) {

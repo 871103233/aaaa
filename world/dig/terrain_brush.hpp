@@ -81,8 +81,27 @@ enum class LevelMode {
 /// 与其它笔刷同约束：只标脏受影响 tile、高度钳制到世界垂直范围；未加载的列按"不存在"跳过。
 /// 为什么需要它（而不是复用圆形笔刷）：圆形覆盖矩形时会**连带压平 footprint 外一圈**（画面出现圆盘），
 /// 与"只改 footprint 内"的可判定判据冲突 ⇒ 业界做法（UE5 Landscape Flatten / Valheim 地基）本就是矩形地基。
+///
+/// `outColumnEdits`（可选，V0.11 / I3）：**逐列**记录本次改动的「列坐标 + 改前 / 改后高度」，
+/// 供"撤销 / 重做"把地形恢复原样（落点 ①/③ 撤销时必须连地形一起还原，见 `TerrainColumnEdit`）。
+/// 传 `nullptr` ⇒ 不记录（与引入前逐位一致）。
 [[nodiscard]] BrushResult ApplyTerrainLevelRect(TerrainWorld& world, float minX, float maxX, float minZ, float maxZ,
-                                                float targetHeightBlocks, LevelMode mode, float falloffBandBlocks);
+                                                float targetHeightBlocks, LevelMode mode, float falloffBandBlocks,
+                                                std::vector<TerrainColumnEdit>* outColumnEdits = nullptr);
+
+/// 撤销 / 重做地形改动时**采用哪一侧的高度**。
+enum class TerrainHeightSide {
+    Before,  ///< 用 `TerrainColumnEdit::before`（撤销）
+    After,   ///< 用 `TerrainColumnEdit::after`（重做）
+};
+
+/// 把一组**列高度改动样本**写回地形（V0.11 / I3）：`side = Before` = 撤销、`After` = 重做。
+///
+/// 与其它笔刷同约束：逐列 `WriteColumnHeight`（复用"写进全部持有该列的 tile"⇒ 共享边界列不裂缝，红线 12）、
+/// 高度钳制到世界垂直范围、未加载的列按"不存在"跳过、只标脏受影响 tile。
+/// 返回的 `BrushResult` 给出实际改动列数与去重升序的脏 tile 集合。
+[[nodiscard]] BrushResult WriteTerrainColumnHeights(TerrainWorld& world, const std::vector<TerrainColumnEdit>& edits,
+                                                    TerrainHeightSide side);
 
 /// 爆破笔刷（T26）：半径 `craterRadiusBlocks` 内下沉、外环隆起，**边界平滑**（无硬台阶）。
 ///

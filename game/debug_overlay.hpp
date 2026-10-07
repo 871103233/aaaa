@@ -59,6 +59,7 @@ struct PaletteRequest {
     enum class Action {
         None,
         EnterPlacement,  ///< 进入摆放模式（`typeId` = 当前选中类型）
+        EnterModify,     ///< V0.11：进入**修改模式**（选中已有物件并拖动调整；不放置）
         Save,            ///< 保存到可编辑层
         Cancel,          ///< 关闭面板，不改变状态
     };
@@ -66,7 +67,6 @@ struct PaletteRequest {
     Action      action = Action::None;
     std::string typeId;  ///< `EnterPlacement` 时的选中类型 id
 };
-
 /// 调试面板的统计快照：由 game 每帧填充，面板**只读**，不回写任何模拟状态（红线 11）。
 struct DebugStats {
     double      frameSeconds      = 0.0;      ///< 上一帧真实时长（秒）
@@ -218,6 +218,13 @@ public:
 
     [[nodiscard]] bool ObjectPaletteOpen() const noexcept { return m_objectPaletteOpen; }
 
+    /// V0.11 / I4 修订：**修改模式**的屏幕中央指示器状态（`game` 层每帧刷新；面板只读绘制）。
+    /// `active` = 处于修改模式；`hasSelection` = 已选中某个物件（指示器换文案 / 换色）。
+    void SetModifyIndicator(bool active, bool hasSelection) noexcept {
+        m_modifyActive       = active;
+        m_modifyHasSelection = hasSelection;
+    }
+
     /// 就地访问面板数据（`main` 读回"当前选中类型"；面板构建时也会改写 `state`）。
     [[nodiscard]] PaletteModel&       MutablePalette() noexcept { return m_palette; }
     [[nodiscard]] const PaletteModel& Palette() const noexcept { return m_palette; }
@@ -313,6 +320,9 @@ private:
 
     /// 本帧是否已调用 `ImGui::NewFrame`（调试面板或系统面板可见时为 true）。
     bool m_frameActive = false;
+    /// V0.11 / I4 修订：修改模式指示器状态（由 `SetModifyIndicator` 每帧刷新）。
+    bool m_modifyActive       = false;
+    bool m_modifyHasSelection = false;
     /// 玩法是否处于相对鼠标（捕获）状态；为 true 时对本帧 ImGui 置 `NoMouse`。
     bool m_gameplayMouseCaptured = false;
 

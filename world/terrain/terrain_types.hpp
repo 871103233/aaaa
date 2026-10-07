@@ -70,6 +70,18 @@ inline constexpr int kMaxTerrainHeightUnits = kMaxTerrainHeightBlocks * kHeightU
 /// 一列的存储高度：1/16 格定点。**不是** `float`（ADR 0008）。
 using Height = std::int16_t;
 
+/// **一列的高度改动样本**（列坐标 + 改前 / 改后高度）。
+///
+/// 用途（V0.11 / I3）：让"改地形"这一动作**可逆** —— 落点模式 ①压平 / ③填充会改高度场，
+/// 撤销该建筑时必须把地形恢复原样，否则会留下"建筑没了、地面还平"的**世界不自洽**
+/// （见 `.trae/skills/voxel-engine-dev-standards/SKILL.md`「世界内一致性」）。
+struct TerrainColumnEdit {
+    int    x      = 0;  ///< 世界列 X
+    int    z      = 0;  ///< 世界列 Z
+    Height before = 0;  ///< 改动前的定点高度
+    Height after  = 0;  ///< 改动后的定点高度
+};
+
 /// 把定点高度换算为「格」。仅用于网格顶点与材质混合；世界定位仍走整数 / `double`（red line 6）。
 [[nodiscard]] constexpr float HeightToBlocks(Height height) noexcept {
     return static_cast<float>(height) / static_cast<float>(kHeightUnitsPerBlock);

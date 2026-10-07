@@ -180,7 +180,8 @@ BrushResult ApplyTerrainLevel(TerrainWorld& world, const BrushPose& brush, float
 }
 
 BrushResult ApplyTerrainLevelRect(TerrainWorld& world, float minX, float maxX, float minZ, float maxZ,
-                                  float targetHeightBlocks, LevelMode mode, float falloffBandBlocks) {
+                                  float targetHeightBlocks, LevelMode mode, float falloffBandBlocks,
+                                  std::vector<TerrainColumnEdit>* outColumnEdits) {
     BrushResult result;
     if (maxX < minX || maxZ < minZ) {
         return result;  // 空矩形
@@ -238,10 +239,33 @@ BrushResult ApplyTerrainLevelRect(TerrainWorld& world, float minX, float maxX, f
             }
 
             world.WriteColumnHeight(x, z, static_cast<Height>(newUnits), result.dirtyTiles);
+            if (outColumnEdits != nullptr) {
+                // V0.11 / I3：记录"改前 / 改后"高度 ⇒ 撤销 / 重做可把地形恢复原样。
+                outColumnEdits->push_back(TerrainColumnEdit { x, z, current, static_cast<Height>(newUnits) });
+            }
             ++result.changedColumns;
         }
     }
 
+    FinalizeDirtyTiles(result);
+    return result;
+}
+
+BrushResult WriteTerrainColumnHeights(TerrainWorld& world, const std::vector<TerrainColumnEdit>& edits,
+                                      TerrainHeightSide side) {
+    BrushResult result;
+    for (const TerrainColumnEdit& edit : edits) {
+        const Height target = (side == TerrainHeightSide::Before) ? edit.before : edit.after;
+        Height       current = 0;
+        if (!world.ReadColumnHeight(edit.x, edit.z, current)) {
+            continue;  // 该列未加载：按不存在处理
+        }
+        if (current == target) {
+            continue;  // 已是目标高度（重复撤销 / 重做）⇒ 不改动、不标脏
+        }
+        world.WriteColumnHeight(edit.x, edit.z, target, result.dirtyTiles);
+        ++result.changedColumns;
+    }
     FinalizeDirtyTiles(result);
     return result;
 }

@@ -161,6 +161,11 @@ enum class UiLabel : int {
     PlacementNeighborSnapFormat,   ///< 邻居优先吸附状态（`%s` = 是 / 否）+ 键位提示
     PlacementGridSnapFormat,       ///< 世界网格吸附状态（`%s` = 是 / 否）+ 键位提示
 
+    // ---- 修改模式（V0.11 / I4 修订；`F2` 面板入口 + 屏幕中央指示器）----
+    ObjectPaletteModify,          ///< 按钮：进入**修改模式**（选中已有物件并拖动调整）
+    ModifyModeIndicator,          ///< 指示器：修改模式（未选中）
+    ModifySelectedIndicator,      ///< 指示器：修改模式（已选中）
+
     kCount  ///< 标签总数（必须保持在最后）
 };
 
@@ -293,6 +298,9 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsEnglish = {
     "Rotate hold-to-turn: %s  [Z]",
     "Snap prefer neighbor: %s  [X]",
     "Snap world grid: %s  [B]",
+    "Modify Mode",
+    "Modify mode: click an object to select  (click empty to deselect, Esc to exit)",
+    "Selected: drag X/Z arrows to move, ring to rotate",
 };
 
 /// 中文标签表：仅当**成功加载 CJK 字体**时启用（此时不可能缺字）。
@@ -421,6 +429,9 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsChinese = {
     "旋转长按模式：%s（按 Z 切换）",
     "邻居优先吸附：%s（按 X 切换）",
     "世界网格吸附：%s（按 B 切换）",
+    "修改模式",
+    "修改模式：点击物体选中（左键点空处取消 · Esc 退出）",
+    "已选中：拖 X/Z 箭头平移 · 拖环旋转",
 };
 
 /// 纯函数：判断字符串是否**只含 ASCII 字节**（`cjkFontAvailable = false` 时的硬约束）。

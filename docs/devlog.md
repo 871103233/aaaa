@@ -6573,6 +6573,278 @@
 - 下一步 / 遗留：**I3 撤销 / 重做**；随后 **I4 gizmo**、**E1/E2 编辑器外壳**；未开工与已知缺口见 `plans/v0.11.md` **§5**。
   **本批未提交（本次将随提交推送）。**
 
+## 2026-10-08  方向裁定：**先做 V0.10 收口 / 验收** + 自动侧基线复验 + 验收运行手册落盘
+
+- 来源（所有者 2026-10-08）："阅读交接包，分析下一步开发方向" ⇒ 我给出四条候选并推荐"续推 V0.11 的 I3 撤销重做"；
+  所有者**选定「先做 V0.10 收口 / 验收」**（先把上一阶段的冻结门禁走完，再回主线）。
+- 范围：**只做 V0.10 的收口准备与自动侧复验**，不改任何代码 / 配置。
+  **不做**：不收口小项 C1~C5（未开工，本轮只列明）；不冻结 V0.10（须所有者验收通过）；
+  不动 V0.11 的 I3/I4/E1/E2（回到主线时再开）。
+- 做了什么：
+  1. **自动侧基线复验**（本机，2026-10-08）：`cmake --build --preset debug` ⇒ **up-to-date（ninja: no work to do）**、**零警告**；
+     `ctest --preset debug` ⇒ **801/801 Passed**（66.35 s）；`check-banned-identifiers.ps1` ⇒ **scanned 237 file(s), 0 violation(s) / PASS**。
+     ⇒ 与 `plans/v0.11.md` 记录的 801 / 237 一致，**自动侧无待修项**。
+  2. **验收运行手册落盘**（[`plans/v0.10.md`](plans/v0.10.md) **新增 §3.1**）：把原散落在 §3「阻塞 / 未决」的 ①~⑧ 人工验收项
+     合成**一次可执行流程** —— 步骤 0 构建命令（VS DevShell + `VCPKG_ROOT` + `--preset debug`，可直接复制）、
+     步骤 1 运行命令（`--world=world_a --manual-test="①~⑧ 的 9 项"`，落实 SKILL §7.7 三处一致）、
+     步骤 2 逐条"看哪里 / 期望什么"表、步骤 3 两项性能数字取证命令、步骤 4 C1~C5 状态；
+     并写明"加载约 28~32 s，须等「地表世界就绪」再操作"这条本阶段踩过的坑。
+  3. **两项性能数字的部分**取证参照：本机既有档 `%APPDATA%\voxel-engine\voxel_game\saves\world_world_a.voxr` =
+     **48817 B**（2026-10-08 01:04）⇒ 已录入 §3.1 作参照（是否重测以所有者当次运行为准）。
+- 为什么：
+  - **先把上一阶段冻结**：V0.10 的自动侧虽已完成，但**阶段冻结须所有者验收通过**（先例 = V0.9；S7 已明确"自动侧完成 ≠ 冻结"）；
+    在它悬着的情况下开新主线会让"世界成立"链上的"能持久"这一环缺少人工确认。
+  - **合成一份手册**：SKILL §7.6 要求每次交付附"可直接复制执行的构建 / 运行命令 + 逐条测试要点"，
+    且 §7.7 要求 `--manual-test` / F1 面板 / 启动日志三处一致；散落条目合成一处后，所有者**不读 devlog** 即可自测。
+- 验证（命令 + 真实结果）：见上"做了什么"第 1 条（构建 up-to-date / 801 全绿 / 门禁 237 文件 0 违规）。
+- 下一步 / 遗留：
+  1. **所有者人工验收**（V0.10 冻结的前置）：按 [`plans/v0.10.md`](plans/v0.10.md) **§3.1** 的步骤 1~4 逐条目视；
+     通过后把该文件标「已完成（冻结）」、同步 `adr/README` §三，并**新建下一阶段计划**。
+  2. **V0.11 主线**（验收后接续）：**I3 撤销 / 重做** → I4 gizmo → E1/E2 编辑器外壳（见 `plans/v0.11.md` §5.1）。
+  3. **C4 / C5 待人工读数**：可借本次验收顺带取证（P99 帧时间 / 室内亮度 A-B）。
+  4. 本批为**纯文档**改动。
+
+## 2026-10-08  V0.10 人工验收（部分）：**⑦ S9 退出自动保存 / ⑧ S10 终端中文编码 通过** + 其余项延后 + 文档补全
+
+- 来源（所有者 2026-10-08）："**⑦⑧验收通过**，补全文档，其他项以后再测"。
+- 范围：**只做验收结论落盘与文档同步**，不改任何代码 / 配置。
+- 做了什么：
+  1. **验收结论落盘**（[`plans/v0.10.md`](plans/v0.10.md)）：
+     - §2 的 **S9 行 / S10 行**状态由「进行中」改为「**已完成（人工验收通过 2026-10-08）**」；
+     - §3「当前进度」增「**人工验收进度（2026-10-08）**」：**⑦（S9）/ ⑧（S10）通过**，**①~⑤、④b、⑥ 以后再测**；
+     - §3.1 验收运行手册的表后增**验收结论**块（同上口径）；并明确「**V0.10 暂不冻结**」（口径：验收通过才冻结）。
+  2. **决策索引同步**（[`adr/README.md`](adr/README.md) §三 v0.10 行）：原"待人工验收 5 项 + 三项观感 / 端到端项 + 两项性能数字未取证"
+     改为"**人工验收（2026-10-08）：⑦⑧ 已通过；①~⑥ 与两项性能数字以后再测 ⇒ 阶段暂不冻结**"。
+  3. **未改**：不冻结 V0.10（仍有 ①~⑥ 与两项性能数字）；不动 `adr/README` 的 ADR 状态列（ADR 有效性未变）；不收口 C1~C5。
+- 为什么：
+  - **⑦⑧ 属 S9 / S10 两条独立修复**（S9 = 物件层退出自动保存 + 未保存计数；S10 = 控制台 UTF-8），二者通过即可各自结案，
+    **不必**等其余项（它们是 S3/S4/S5/S6/S8，与 ⑦⑧ 无依赖）；
+  - **阶段仍不冻结**：V0.10 的阶段级验收维度（洞持久 / 落点 ①③ / 世界定义 / 性能数字）尚未人工确认，
+    按 SKILL「完工留痕」与 V0.9 先例（自动侧完成 ≠ 冻结），如实登记为"部分通过、其余以后再测"。
+- 验证：本次为纯文档改动；自动侧基线见上一批（构建 up-to-date / `ctest` **801/801** / 门禁 **237 文件 0 违规**）。
+- 下一步 / 遗留：
+  1. **需要时再测**：V0.10 的 **①~⑥**（S3/S4 洞与碰撞体持久、S5 落点 ①③、S6 世界定义提示、S8 接管区拒放与幽灵染红）
+     与**两项性能数字**（`.voxr` 大小 / flush 耗时）——流程见 `plans/v0.10.md` §3.1；
+  2. **主线接回 V0.11**：**I3 撤销 / 重做** → I4 gizmo → E1/E2 编辑器外壳（见 `plans/v0.11.md` §5.1）；方向建议见当次回复。
+  3. **C4 / C5**（P99 帧时间 / 室内亮度 A-B）仍待人工读数。
+
+## 2026-10-08  V0.11 / I3 落地：**编辑操作的撤销 / 重做**（命令栈 + 落点 ①/③ 地形一并可逆）
+
+- 来源（所有者 2026-10-08）："续推 V0.11（A）" ⇒ 按 [`plans/v0.11.md`](plans/v0.11.md) §2 的 **I3** 推进（A 组既定顺序：吸附 → 合法性 → **撤销重做** → gizmo）。
+- 范围：编辑层操作的**撤销 / 重做**（放置单件 / 删除单件 / 放置成套建筑 / 删除成套建筑 / 改室内变暗）+
+  **落点 ①压平 / ③填充的地形改动一并可逆**；`Ctrl+Z` / `Ctrl+Y`，容量 **64 步**。
+  **不做**：I4 gizmo、E1/E2 编辑器外壳；不改编辑层 schema / 写盘格式 / `.voxr` 字节布局。
+- **先评价再动手**（已写进 [`plans/v0.11.md`](plans/v0.11.md)）：
+  ① **业界参照（点名）** = **UE5 Editor Transaction（`FTransaction`）** / **Unity `Undo`（`Undo.RecordObject` + 命令栈）** / **Godot `UndoRedo`**
+  —— 共同口径 = **命令栈 + 容量上限 + 新操作清空重做栈**，**采纳**；
+  ② **3A 判据** = 连续 32 次放置全部撤销后**逐字段回到初始**、重做等量前推、撤销后计数正确、撤销"带地基建筑"时**地形一并恢复**；
+  ③ **不降级**（唯一取舍 = 用容量 64 的**命令栈**而非全量快照）。
+- 做了什么：
+  1. **新增** [`world/object/edit_history.hpp`](../world/object/edit_history.hpp)（**纯逻辑、header-only**）：`EditOpKind`（5 种）+
+     `EditDarkeningTarget` + `EditCommand`（**纯数据**的可逆记录：落点 / 原下标 / 改前改后值 / 一并清掉的变暗覆盖 / 地形逐列改前改后高度）+
+     `ApplyEditCommand` / `RevertEditCommand`（**严格互逆**、只改编辑层数据）+ **`EditHistory`**（命令栈：`Record` 清空重做栈 / 容量 64 / `MutableRedoCommand` 回填新实例 id / `CommitUndo` / `CommitRedo` / `Clear`）。
+  2. [`world/terrain/terrain_types.hpp`](../world/terrain/terrain_types.hpp) 新增 **`TerrainColumnEdit`**（列坐标 + 改前 / 改后定点高度）；
+     [`world/dig/terrain_brush.*`](../world/dig/terrain_brush.cpp)：`ApplyTerrainLevelRect` 增可选 **`outColumnEdits`**（逐列记录改动），
+     **新增 `WriteTerrainColumnHeights`**（撤销写 `before` / 重做写 `after`，与其它笔刷同约束：只标脏受影响 tile、未加载列跳过）。
+  3. [`engine/input/action_state.hpp`](../engine/input/action_state.hpp) 新增三个动作：`PlacementUndo`（绑 `Z`）/ `PlacementRedo`（绑 `Y`）/
+     `PlacementModifierCtrl`（绑 `LCTRL` + `RCTRL`）—— `Ctrl` 用于把 `Z` 区分为"撤销"与"旋转长按开关"。
+  4. [`game/main.cpp`](../game/main.cpp)：**三个变更点**（变暗 / 删除 / 放置）都构造 `EditCommand` 并 `editHistory.Record(...)`；
+     删除分流改为**返回下标**（`FindEditLayerPlacementIndex` / `FindEditLayerBuildingIndex`，撤销按原下标回插）；
+     新增**运行期 undo/redo lambda**（数据侧走 `Apply` / `Revert`，运行期侧销毁 / 重建网格 + 碰撞体 + 回写地形）；
+     `Ctrl+Z` / `Ctrl+Y` 接线在**面板级热键**段（**先判 `Ctrl`**，按住时不切旋转长按开关）；**保存成功后 `editHistory.Clear()`**（栈与文件一致）。
+  5. **测试**：新增 [`tests/edit_history_test.cpp`](../tests/edit_history_test.cpp) **14 例** —— 放置 / 删除（本层 vs 记 `[[remove]]`）/
+     放置·删除成套建筑（含**被一并清掉的变暗覆盖回插**）/ 三种变暗落点 / 容量丢最旧 / 清栈 / **混合操作按逆序撤销回初始** /
+     **连续 32 次放置 ⇒ 全部撤销回到初始 ⇒ 全部重做等量前推**。
+- 为什么：
+  - **命令栈而非全量快照**：业界形态（UE5 / Unity / Godot 同源），内存 O(操作数)、天然给出"撤销深度"这个可判定上限；
+    全量快照每步都复制整个编辑层，随内容增长且无法表达"深度"。
+  - **地形必须一并可逆（世界内一致性）**：落点 ①/③ 会改高度场；若撤销整座建筑却不还原地形，会留下"**建筑没了、地面还平**"的**可见不自洽**
+    （SKILL「世界内一致性」明令不得留）⇒ 把逐列"改前 / 改后"高度记进命令，撤销写回 `before`。
+  - **`Ctrl` 另绑一个动作**：`Z` 已是"旋转长按开关"（V0.11 既有能力，不得删除）；用 `Held(Ctrl)` 分流，**按 Ctrl+Z 不会顺带翻开关**。
+  - **保存清栈**：`plans/v0.11.md` I3 判据要求"**保存后栈与文件一致**" —— 保存后当前文件即新基线，栈清空即一致（否则会试图把改动撤到"文件之前"的旧基线）。
+- 验证（命令 + 真实结果）：
+  1. **构建**：VS DevShell → `cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug` ⇒ **815/815 passed**（V0.11 基线 801，**+14**）。
+  3. **门禁**：`check-banned-identifiers.ps1` ⇒ **scanned 239 file(s), 0 violation(s) / PASS**（237 → 239 = 新增 `edit_history.hpp` + `edit_history_test.cpp`）。
+  4. **冒烟**（`--world=world_a --auto-test --autofly=5`，`build/perf/i3_smoke.*.log`）⇒ **无 ERROR**；退出前强制 flush 正常
+     （`提交写盘 27 块` → `强制写盘完成`）；帧尖峰 WARN 属**既有 10km 流式**（`over50=3 / worst 71.3 ms`，与本次改动无关，本次不触发任何 undo/redo）。
+- 下一步 / 遗留（按"缺什么 / 为什么没做 / 切换条件"三项登记）：
+  1. **I3 端到端人工验收**（本环境无法注入键鼠）：摆放 3 件 → `Ctrl+Z` 三次逐件消失 → `Ctrl+Y` 三次逐件回来；
+     放一座 `flatten` 建筑 → `Ctrl+Z` ⇒ **建筑与地面压平一并恢复**；`F5` 保存后再 `Ctrl+Z` ⇒ **无可撤销**（栈已清）。
+  2. **I4 gizmo**：`plans/v0.11.md` §3 的「下一步」（可见平移 / 旋转手柄，仅编辑态显示）。
+  3. **已知取舍（如实登记，非本轮降级）**：撤销 `PlaceObject` 优先按**实例 id** 精确销毁，id 为 0 时回落"类型 + 平面位置 + ε"匹配（与既有删除口径同源）；
+     `SetBuildingDarkening` 每次 `[`/`]` 按键记一条命令（按住连按会产生多条，可多次撤销）。
+
+## 2026-10-08  V0.11 / I4 落地：**gizmo**（选中已有物件 → 拖动手柄改 transform；单件 + 成套建筑）
+
+- 来源（所有者 2026-10-08）："开发下一步" ⇒ 按 [`plans/v0.11.md`](plans/v0.11.md) §2 推进 **I4**（A 组既定顺序：吸附 → 合法性 → 撤销重做 → **gizmo**）。
+  **两处形态由所有者当场裁定**：① gizmo = **B 形态**（附着**已放置的选中物件**，非"待放幽灵"）；② **选中口径 = 准星指向即选中**
+  （沿用 ADR 0036 决策三的"选中态"）；可拖动对象 = **单件 + 成套建筑**。
+- 范围：**选中（准星指向 / 粘性）已有物件 → 拖动手柄改 transform**；平移 **X / Z**、旋转**绕 Y（yaw）**；提交走 I3 撤销栈。
+  **不做**：Y 轴平移（会造出悬空物件，违反 I2 契约）、缩放手柄、多选 / 框选（G6）、顶点 / 插槽吸附。
+- **先评价再动手**（已写进 [`plans/v0.11.md`](plans/v0.11.md)）：① **业界参照（点名）** = **UE5 Editor 世界轴 gizmo** / **Unity Move·Rotate Gizmo** /
+  **Godot `Node3D` gizmo**；② **3A 判据** = 手柄可见（X 红 / Z 蓝 / 环黄）+ 按住拖动改 transform + 松开提交 + `Ctrl+Z` 可撤销 + 退出编辑态不再绘制 + 无 > 3 ms 单帧；
+  ③ **不降级**（两处口径取舍如实登记：Y 轴不做、旋转环取扁平环）。
+- 做了什么：
+  1. **新增** [`world/object/gizmo.hpp`](../world/object/gizmo.hpp)（**纯逻辑、header-only**）：`GizmoHandle`（None / TranslateX / TranslateZ / RotateY）+
+     `GizmoLayout` + `GizmoRay` + **`PickGizmoHandle`**（射线 × 轴杆 AABB / 环带半径，取最近）+ `GizmoAngleDegrees` +
+     **`GizmoYawDeltaDegrees`**（±180° 边界归一化，不跳变）+ `BuildGizmoAxisMesh` / `BuildGizmoRingMesh`（几何，复用 `AppendBoxCentered`）。
+  2. [`world/object/edit_history.hpp`](../world/object/edit_history.hpp) 扩展：`EditOpKind::MoveObject` / `MoveBuilding` + 字段（改前 / 改后、本层就地改 vs
+     "发布清单条目 ⇒ 记删 + 落新"、被一并清掉的变暗覆盖）+ `ApplyEditCommand` / `RevertEditCommand` 的对应分支（**严格互逆**）。
+  3. [`game/main.cpp`](../game/main.cpp)：**粘性选中**（手柄命中优先，其次"准星指向的物件"）；手柄绘制复用 **V0.10/S8 的逐网格 tint**（X 红 / Z 蓝 / 环黄）；
+     **左键按在手柄 = 开始拖动、按在地面 = 放下**（既有摆放不变）；拖动期间**相机不转**（`lookX/lookY` 交给 gizmo）、按屏幕投影把鼠标位移换算成沿轴的世界位移；
+     拖动中只改**渲染位姿**（`SetMeshTransform`，半透明反馈）、**物理体在提交时**重建；松开左键 ⇒ 提交（销毁旧槽 + 新建 + `editHistory.Record`）；
+     非摆放模式 ⇒ 释放手柄网格（不占槽位）。`performUndo` / `performRedo` 增 `MoveObject` / `MoveBuilding` 的运行期分支。
+  4. **测试**：新增 [`tests/gizmo_test.cpp`](../tests/gizmo_test.cpp) **6 例**（轴杆 / 环带 / 未命中 / yaw 边界归一化 / 网格非空）；
+     [`tests/edit_history_test.cpp`](../tests/edit_history_test.cpp) **+4 例**（Move 的"本层就地改"与"基座 ⇒ 记删 + 落新"两分支互逆，含被清掉的变暗覆盖回插）。
+- 为什么：
+  - **选中用"准星指向"而非"点击选中"**（所有者裁定）：复用 ADR 0036 决策三已有的"选中态"概念，**不新增按键 / 不破坏"左键放下"**；
+    但纯"指向即选中"会让**伸到物件之外的手柄**一离开物件就丢选中 ⇒ 实现为**粘性**：只要手柄命中就保持选中。
+  - **只做 X / Z 平移 + 绕 Y 旋转**：物件的 `y` 是**地表高度的函数**（I2 明令拒放悬空）⇒ 给 Y 轴会自相矛盾；`ObjectPlacement` / `ObjectBuilding`
+    也只有 `yawDegrees` 一个朝向自由度。
+  - **拖动中不碰物理**：静态碰撞体没有旋转接口（朝向烘进顶点，见 ADR 0032）⇒ 每帧重建代价大；改为**只在提交时**销毁 + 重建（与摆放 / 删除同量级）。
+  - **移动复用 I3 的撤销栈**：新增 `MoveObject` / `MoveBuilding` 两种命令，**发布清单条目**无法改 ⇒ 记 `[[remove(_building)]]` + 落新（建筑取**新 id** 避免与基座重名），
+    **本层条目**就地改；两条分支都由 `Apply` / `Revert` 覆盖并有单测钉住互逆。
+- 验证（命令 + 真实结果）：
+  1. **构建**：VS DevShell → `cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug` ⇒ **825/825 passed**（I3 基线 815，**+10** = gizmo 6 + edit_history Move 4）。
+  3. **门禁**：`check-banned-identifiers.ps1` ⇒ **scanned 241 file(s), 0 violation(s) / PASS**（239 → 241 = 新增 `gizmo.hpp` + `gizmo_test.cpp`）。
+  4. **冒烟**（`--world=world_a --auto-test --autofly=5`，`build/perf/i4_smoke.*.log`）⇒ **无 ERROR**；退出前强制 flush 正常；
+     网格槽位 **5412**（与之前 5412~5416 同量级 ⇒ 委托给渲染器的池无泄漏）；帧尖峰 WARN 属既有 10km 流式（本次不进入摆放模式 ⇒ 不触发 gizmo）。
+- 下一步 / 遗留（按"缺什么 / 为什么没做 / 切换条件"三项登记）：
+  1. **I4 端到端人工验收**（本环境无法注入键鼠）：`F2` 进摆放模式 → 准星指向一个已放物件 ⇒ **出现 X / Z / 旋转手柄**；
+     左键**按在 X 或 Z 箭头上拖动** ⇒ 物件沿该轴移动、松开落位；按在**旋转环**上左右拖 ⇒ 绕 Y 转；`Ctrl+Z` ⇒ **回原位**、`Ctrl+Y` ⇒ 再前推；
+     移动**成套建筑** ⇒ 整座一起动；退出摆放模式 ⇒ 手柄**消失**。
+  2. **B 组 = 编辑器外壳**（`plans/v0.11.md` §3 的「下一步」）：**E1** `editor/` 独立可执行 + **E2** 编辑器不冻结画面。
+  3. **已知取舍（如实登记，非本轮降级）**：① **无 Y 轴平移**（物件必须贴地）；② 旋转环是**扁平环**（正侧视偏细，观感项）；
+     ③ 提交时**不做重叠校验**（移动落点若与别的物件重叠不会被拒 —— 与"放置"不同，登记为待评估；切换条件 = 需要"移动也不允许重叠"时复用 `FootprintsOverlap2D`）。
+     **本批未提交。**
+
+## 2026-10-08  V0.11 / I4b：**把「摆放」与「修改」拆成两种模式**（`F2` 面板入口 + 屏幕中央指示器 + 点击选中）
+
+- 来源（所有者 2026-10-08）："当前摆放和修改操作逻辑存在冲突，将**修改模式**在 `F2` 面板中单独做一个按钮入口，
+  修改模式时在屏幕中间显示一个**光标指示器**，点击已存在的物体时**选中**进入调整的相关逻辑。**评估合理性，合理则开发**。"
+- **真伪判定 = 确认交互冲突**（I4 引入）：契约 = ADR 0032 决策四"模式内左键 = **放下**"；I4 又定义"左键**按在手柄上 = 拖动**" +
+  "选中 = **准星指向**" ⇒ 摆放时准星扫过既有物件就弹 gizmo、按在手柄上的左键不再放下 ⇒ **"左键 = 放下"不再无条件成立**。
+- **业界标准（点名）**：**UE5**（视口左键 = 选择，放置靠拖入；gizmo 只出现在选中对象上）/ **Unity**（Move·Rotate 与拖预制体放置分开）/
+  **Valheim·Rust**（建造模式与常规分离）⇒ 共同口径 = **"摆放"与"选择·修改"是两种工具（模式）** + 修改模式内**点击选中**。
+  **结论：方案合理、与业界一致 ⇒ 实施**（gizmo 能力代码全保留，只改**触发方式**；I4 尚未人工验收 ⇒ 属设计变更）。
+- 做了什么：
+  1. [`game/ui_text.hpp`](../game/ui_text.hpp)：新增 **3 条标签**（`ObjectPaletteModify` = 「修改模式」/「Modify Mode」、
+     `ModifyModeIndicator`、`ModifySelectedIndicator`；**英文项纯 ASCII** ⇒ 无 CJK 字体时回退不缺字）。
+  2. [`game/debug_overlay.hpp`](../game/debug_overlay.hpp)：`PaletteRequest::Action` 增 **`EnterModify`**；
+     新增 `SetModifyIndicator(active, hasSelection)` + 两个字段（面板只读绘制）。
+  3. [`game/debug_overlay.cpp`](../game/debug_overlay.cpp)：`F2` 面板「进入摆放」旁新增「**修改模式**」按钮（**不需先选类型**）；
+     `BuildUI` 用 **ImGui 前景绘制**屏幕中央指示器（未选中=白十字 / 已选=绿十字 + 文案；**零 GPU 资源**、不参与输入抑制）。
+  4. [`game/main.cpp`](../game/main.cpp)：新增 **`modifyMode`** 状态（与 `placementMode` **互斥**）；消费 `EnterModify`（退摆放 → 进修改 → 恢复捕获）；
+     `Esc` 级联加"先退修改模式"；**摆放分支恢复"左键无条件 = 放下"**（移除 I4 的 gizmo 抢占 / 选中 / 绘制）+ `hideGizmo()`；
+     **新增修改模式分支**（**点击已有物件 ⇒ 选中**、点空处 ⇒ 取消、手柄拖动、右键删除、画 gizmo）；无编辑模式时 `releaseGizmoMeshes()`；
+     每帧刷新指示器。
+- 为什么：
+  - **两模式分离**是业界形态（模式/工具概念），也是唯一能把"左键 = 放下"与"左键 = 拖动"彻底分开的做法；
+  - **点击选中**取代 I4 的"悬停选中"：悬停选中会让 gizmo 在摆放时不断弹出（冲突源），点击选中则**只在需要时**选中；
+  - **指示器**给"当前在哪种模式"一个**一眼可辨**的信号（两种模式左键含义相反，必须有可见反馈）。
+- 验证（命令 + 真实结果）：
+  1. **构建**：VS DevShell → `cmake --build --preset debug` ⇒ **零警告**（首次链接因残留 `voxel_game.exe` 占用而 `LNK1168`，结束进程后重建通过）。
+  2. **测试**：`ctest --preset debug` ⇒ **825/825 passed**（`ui_text` 的"两表等长 / 英文纯 ASCII"断言一并通过）。
+  3. **门禁**：`check-banned-identifiers.ps1` ⇒ **scanned 241 file(s), 0 violation(s) / PASS**。
+  4. **冒烟**（`--world=world_a --auto-test --autofly=5`，`build/perf/modify_smoke.*.log`）⇒ **无 ERROR**；退出前强制 flush 正常；网格槽位稳定。
+- 下一步 / 遗留：
+  1. **人工验收**：`F2` ⇒ 点「**修改模式**」⇒ 屏幕中央出现**白十字** → 准星点某物件 ⇒ **变绿十字 + gizmo**、日志"已选中"；
+     拖 X/Z 箭头平移、拖环旋转、松开提交；`Ctrl+Z` 回原位；点空处取消选中；`Esc` 退出（指示器消失）。
+     再进「**进入摆放**」⇒ 准星扫过物件**不再弹 gizmo**、左键**无条件放下**。
+  2. **B 组编辑器外壳**（`plans/v0.11.md` §3 的「下一步」）：E1 / E2。
+  3. **已知取舍**（同 I4，未变）：无 Y 轴平移、旋转环为扁平环、移动落点不做重叠校验。
+     **本批未提交。**
+
+## 2026-10-08  **模式定义与输入隔离**：自由活动 / 建造 / 修改（**光球 = 自由活动专属**）+ SKILL 补硬规则
+
+- 来源（所有者 2026-10-08）："补充 skill 文档，将模式定义分为**自由活动模式、建造模式、修改模式**；
+  进入修改模式 / 建造模式时要**屏蔽左键的发光球功能**；将三种模式的**按键功能进行隔离区分**，**发光球是自由活动模式专属的功能**。"
+- 范围：① **SKILL 文档**新增硬规则节《三种模式与输入隔离》+ DoD 一条；② **代码**把"光球仅在自由活动模式"落实（**这是 I4b 遗漏的一处**：
+  修改模式此前**仍会发光球**）；③ `ui-inventory.md` 新增**权威"按键 ↔ 模式"矩阵**；④ 同步 `references/gameplay-v0.1.md` / `game-design.md` / `learning-notes.md`。
+  **不做**：不改世界表示 / 破坏分级 / 存档；不删任何模式的功能代码（只改"何时生效"）。
+- 做了什么（**先判真伪**）：所有者说的"要屏蔽"，机制上**确实有漏洞** —— `game/main.cpp` 的发射判据 `fireHeld`
+  当时只排除 `placementMode`（I4b 加 `modifyMode` 时**漏了这一处**）⇒ 修改模式内**按住左键会照常发光球**。判定 = **确认缺陷**（契约 = SKILL 新规则「光球是自由活动专属」/ 既有 ADR 0032"模式内让位"；机制链清楚）。
+  1. [`game/main.cpp`](../game/main.cpp)：`fireHeld` 增 `&& !modifyMode`（**含按住连发**一并屏蔽）；
+     **修改模式分支**增 `(void)input.ConsumePressed(vx::ActionId::Interact)`（`E` 不再触发传送门交互，与建造模式同口径）；
+     `EnterModify` 增 `fireSuppressUntilRelease = true`（与 `enterPlacement` 同口径 —— 抑制"进模式那一帧的这次点击"）。
+  2. [`.trae/skills/voxel-engine-dev-standards/SKILL.md`](../.trae/skills/voxel-engine-dev-standards/SKILL.md)：新增 **《三种模式与输入隔离（硬规则）》**
+     —— 三模式唯一定义表（自由活动 / 建造 / 修改）+ **7 条硬规则**（光球专属 / 互斥 / 按键隔离与同键让位 / 切换可见 / 通用键清单 / 不得删能力 / 权威处指向 `ui-inventory`）+ DoD 增一条勾选项。
+  3. [`docs/ui-inventory.md`](ui-inventory.md)：新增**权威"按键 ↔ 模式"矩阵**（左键 / 右键 / `Q`·`E` / `E` / `T` / `[`·`]` / `F3` / `Esc` / `F2` / `F5` / `Ctrl+Z`·`Ctrl+Y` / `Z`·`X`·`B` / 移动 / `F1`）+ 硬规则摘要。
+  4. [`docs/game-design.md`](game-design.md) / [`docs/learning-notes.md`](learning-notes.md) / [`references/gameplay-v0.1.md`](../.trae/skills/voxel-engine-dev-standards/references/gameplay-v0.1.md)：同步"三模式 + 光球专属"口径。
+- 为什么：
+  - **必须显式写进 SKILL**：模式与"哪条左键干什么"是**跨模块的交互契约**（输入层 / 建造 / 修改 / 战斗都受它约束），
+    只写在代码注释或计划里会随会话丢失 ⇒ 按 SKILL 自身《方案与方向的留档义务》落盘到**规范层**；
+  - **"隔离"要可检查**：每条硬规则都给了**判据**（例：两模式内按住左键不产生光球）+ **实现落点**（`fireHeld`），避免"写了规则没处验"；
+  - **同键冲突显式让位**：`E` 被 3 个功能共用（旋转 / 传送门交互 / 建造旋转）⇒ 规则要求**点名**这种冲突并规定谁让位，而不是靠巧合。
+- 验证（命令 + 真实结果）：
+  1. **构建**：VS DevShell → `cmake --build --preset debug` ⇒ **零警告**（首次链接遇残留 `voxel_game.exe` 占用 `LNK1168`，结束后重建通过）。
+  2. **测试**：`ctest --preset debug` ⇒ **825/825 passed**。
+  3. **门禁**：`check-banned-identifiers.ps1` ⇒ **scanned 241 file(s), 0 violation(s) / PASS**（本次**新增代码在既有文件内** ⇒ 文件数不变）。
+  4. **冒烟**（`--world=world_a --auto-test --autofly=5`，`build/perf/modes_smoke.*.log`）⇒ **0 条 ERROR**；正常退出（累计 40.1 s，稳态 hitch `frames=1039 over33=6 over50=5 worst=70.2 ms`）。
+- 下一步 / 遗留：
+  1. **人工验收**：自由活动模式按住左键 ⇒ **连续发光球**；进「建造模式」按住左键 ⇒ **只放下、不发光球**；进「修改模式」按住左键 ⇒ **只选中 / 拖动、不发光球**；
+     两模式内按 `E` ⇒ **不打开传送门**；`Esc` 逐级退出（修改 → 自由活动 / 建造 → 自由活动）。
+  2. **B 组编辑器外壳**（`plans/v0.11.md` §3 的「下一步」）：E1 / E2。
+     **本批未提交。**
+
+## 2026-10-08  V0.11 / A6：**输入上下文栈与动作归属表**（按键隔离收敛为单一权威；S1~S4 一次落地）
+
+- 来源（所有者 2026-10-08）："当前按键功能是怎么隔离的，要做好**统筹**（不同**面板状态**下、不同**模式状态**下按键功能的隔离），
+  该**复用**的地方也要**复用提高性能**（比如**走动和飞行在三种模式下都是一样的逻辑**），结合**业界规范和 3A 标准**，给出你的方案"⇒
+  随后下令：**写入项目开发 skill 规范** + **一次性完成 S1~S4**。
+- 范围：① 新增 `game/input_context.hpp`（**输入上下文栈 + 动作归属表**，纯函数、header-only）；
+  ② `game/main.cpp` 的**手写模式布尔 / 逐键让位 / `Esc` 五级 `if/else` 链**全部改由归属表与纯函数驱动；
+  ③ `game/gameplay_input.hpp` 的抑制改由上下文派生；④ SKILL 新增《输入上下文栈与动作归属表》硬规则节 + DoD 一条；
+  ⑤ 新建 ADR 0040 + `adr/README` 索引 + `ui-inventory` 互相核对义务 + 交接包同步。
+  **不做**：不改键位绑定（`InputMap::BindKey` 一行不动）、不改世界表示 / 破坏分级 / 存档、不改 `MouseCapture` 捕获状态机、
+  不引入运行期改键位、**不删任何能力代码**。
+- 做了什么（**先判真伪** = **确认架构缺陷**，非功能缺陷）：隔离规则**散落 ≥ 5 处** ——
+  ① `fireHeld` 的手写 `!placementMode && !modifyMode`；② 相机的手写 `!gizmoDragging`；③ 三个模式分支里**逐键** `ConsumePressed` 让位；
+  ④ `Esc` 的 5 级 `if/else` 链；⑤ `suppression` 的独立面板布尔。**A5 已因此漏过一处**（`fireHeld` 少排除 `modifyMode`）。
+  修法（**业界标准优先**）：采纳 **UE5 Enhanced Input 的 Input Mapping Context + Priority** / **Unity Input System 的 Action Map `Enable`/`Disable`** /
+  **Godot `InputMap` + 代码层 gate** / 3A 通用的**模态 UI 栈（`Esc` = pop）+ 分层穿透** ⇒ 形成 `InputContext`（自由活动 base / 建造 / 修改 / 修改-拖动 / 模态）
+  + `OwnerOf(state, action)`（`Free` / `Build` / `Modify` / `Inactive` / `Blocked` / `AlwaysOn` / `PanelInternal`；**默认 `Free`**、按上下文覆写例外）
+  + `EscPopTarget`（栈顶弹出）+ `DecideInputSuppression(ctx)`。落地要点：
+  1. [`game/input_context.hpp`](../game/input_context.hpp)（**新**）：`CurrentContext` / **`OwnerOf`（归属表）** / `EscPopTarget`；**header-only、零分配、无字符串**。
+  2. [`game/main.cpp`](../game/main.cpp)：新增**唯一采集口** `makeInputContext()`；
+     `fireHeld` 改判 `OwnerOf(..., Attack) == Free`；相机改判 `OwnerOf(..., LookX) == Free`；
+     **表驱动让位**（一次遍历消费 `Inactive` / `Blocked` 的动作边沿，取代三个分支里的逐键 `ConsumePressed`）；
+     `Esc` 改 `switch (EscPopTarget(...))`；`F3` 的"面板打开时不生效"改由表判。
+  3. [`game/gameplay_input.hpp`](../game/gameplay_input.hpp)：`DecideInputSuppression(InputContext)`（`Modal` ⇒ 三类全抑制，其余全放行）。
+  4. [`tests/input_context_test.cpp`](../tests/input_context_test.cpp)（**新，15 例**：面板 × 模式 × 动作矩阵 + 两条结构性不变量 + `Esc` 栈序）；
+     [`tests/gameplay_input_test.cpp`](../tests/gameplay_input_test.cpp) 改为按上下文断言（仍 3 例）。
+  5. 文档：[`.trae/skills/voxel-engine-dev-standards/SKILL.md`](../.trae/skills/voxel-engine-dev-standards/SKILL.md) 新增《输入上下文栈与动作归属表》硬规则节（**8 条**）+ DoD 一条；
+     新建 [`docs/adr/0040-*.md`](adr/0040-input-context-stack-and-action-ownership-table.md) + [`adr/README.md`](adr/README.md) 索引；
+     [`ui-inventory.md`](ui-inventory.md) 写明"**归属表 ↔ 权威矩阵逐格一致**"的互相核对义务；[`file-index.md`](file-index.md) / [`learning-notes.md`](learning-notes.md) /
+     [`game-design.md`](game-design.md)（G12）/ [`references/gameplay-v0.1.md`](../.trae/skills/voxel-engine-dev-standards/references/gameplay-v0.1.md) 同步；
+     [`plans/v0.11.md`](plans/v0.11.md) 新增 **A6** 条目与「动手前评价」。
+- 为什么：
+  - **A5 的教训是"结构使然"而非"看走眼"**：新增模式 / 键要改多处，漏一处就**静默出错**。收敛为一张表后，
+    "光球仅自由活动"这类规则由**结构**保证（建造 / 修改上下文里 `Attack` 归 `Build` / `Modify` ⇒ base 的发射路径**拿不到**该动作）。
+  - **"复用"要显式**：移动 / 跳跃 / 冲刺 / 飞行 / 视角是表里的 `Free`（**穿透到 base**），不再依赖"恰好没人 gate 它"；
+    `command` / `aimDirection` 仍**每帧只算一次** ⇒ **性能不退化**（路由 = `O(1)` 查表、编译期常量表）。
+  - **可检查**：归属矩阵进了**单测**（面板 × 模式 × 动作），取代"靠人读 `main.cpp`"；SKILL DoD 增"表 ↔ `ui-inventory` 逐格一致"。
+- 验证（命令 + 真实结果）：
+  1. **构建**：VS DevShell → `cmake --build --preset debug` ⇒ **零错误零警告**（`/W4` + `/WX`）。
+  2. **测试**：`ctest --preset debug` ⇒ **840/840 passed**（A5 基线 825，**+15** = `input_context_test.cpp` 的 15 例）。
+  3. **门禁**：`check-banned-identifiers.ps1` ⇒ **scanned 243 file(s), 0 violation(s) / PASS**（+2 = 新头文件 + 新测试）。
+  4. **冒烟**（`--world=world_a --auto-test --autofly=5`，`build/perf/a6_smoke.out.log` / `.err.log`；按既有口径以 `WM_CLOSE` 正常退出）
+     ⇒ **stdout / stderr 各 0 条 ERROR**；退出前**强制写盘完成**；稳态 hitch 汇总 `frames=3085 over33=9 over50=5 worst_ms=69.5`（**满足密度阈值**）。
+- 行为差异（**如实登记，仅此一处**）：模态面板打开时，玩法动作的边沿**在路由层即被消费** ⇒ 不再泄漏给"仍处于打开状态的修改模式"
+  （原先在修改模式按 `F2` 打开选择器后，点击面板的那一下会顺带在准星处**选中物件** —— 那是既有隐性缺陷，本次顺带修正）。
+  其余交互**逐位不变**。
+- 下一步 / 遗留：
+  1. **人工验收**：自由活动按住左键 ⇒ **连续发光球**；建造 / 修改模式按住左键 ⇒ **不发光球**、`E` **不开传送门**；
+     `Esc` **逐级**退出（修改 / 建造 → 自由活动 → 系统面板）；`F1` / `F2` / `F5` / `Ctrl+Z`·`Ctrl+Y` / `Z`·`X`·`B` 在**面板打开时仍生效**；
+     移动 / 跳跃 / 冲刺 / 飞行在三模式下**一致**。
+  2. **B 组编辑器外壳**（`plans/v0.11.md` §5.1 的 E1 / E2）仍是既定后续。
+  3. 本批**未提交**。
+
+
+
+
 
 
 

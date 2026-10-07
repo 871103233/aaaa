@@ -25,10 +25,13 @@
 #include "generation/level_manifest.hpp"
 #include "generation/map_preset.hpp"
 #include "generation/terrain_params.hpp"
+#include "input_context.hpp"  // V0.11 A6：输入上下文栈 + 动作归属表（按键隔离的单一权威；ADR 0040）
 #include "input/input_map.hpp"
 #include "mouse_capture.hpp"
 #include "object/object_edit_save.hpp"  // V0.5 E3：保存可编辑层
 #include "object/object_layer.hpp"
+#include "object/edit_history.hpp"  // V0.11 I3：编辑操作的撤销 / 重做栈（纯逻辑；ADR 0038 决策四）
+#include "object/gizmo.hpp"         // V0.11 I4：gizmo 手柄（拾取 / 几何；纯逻辑；ADR 0038 决策四）
 #include "object/object_mesh.hpp"
 #include "object/object_placement_rule.hpp"  // V0.6 C5：流式散布（地形感知放置规则）
 #include "object/placement_snap.hpp"         // V0.11 I1/I1c：放置吸附与对齐 + 邻居优先吸附（纯函数；ADR 0038 决策四）
@@ -664,29 +667,43 @@ constexpr const char* kBuildingSetCategoryName = "building_set";
     return templateId;  // 不可达（百万级同名建筑）
 }
 
-/// 从"编辑层新增落点"里按（类型 + 平面位置 + ε）删掉一条；删到返回 true（V0.5 E3 的删除分流）。
-[[nodiscard]] bool EraseEditLayerPlacement(std::vector<vx::ObjectPlacement>& placements, const std::string& typeId,
-                                          float x, float z, float tolerance) {
-    for (auto it = placements.begin(); it != placements.end(); ++it) {
-        if (it->typeId == typeId && std::abs(it->x - x) <= tolerance && std::abs(it->z - z) <= tolerance) {
-            placements.erase(it);
-            return true;
+/// 从"编辑层新增落点"里按（类型 + 平面位置 + ε）找一条；**返回其下标**（`placements.size()` = 未命中）。
+///
+/// V0.11 / I3：撤销 / 重做要知道"删掉的那条在原位置哪儿"（撤销时按原下标回插）⇒ 返回下标而非布尔。
+[[nodiscard]] std::size_t FindEditLayerPlacementIndex(const std::vector<vx::ObjectPlacement>& placements,
+                                                      const std::string& typeId, float x, float z, float tolerance) {
+    for (std::size_t i = 0; i < placements.size(); ++i) {
+        if (placements[i].typeId == typeId && std::abs(placements[i].x - x) <= tolerance &&
+            std::abs(placements[i].z - z) <= tolerance) {
+            return i;
         }
     }
-    return false;
+    return placements.size();  // 未命中（调用方据此走"记一条 [[remove]]"分支）
 }
 
 /// V0.9 / [ADR 0036](../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策四：
-/// 从"编辑层新增成套建筑"里按 **id**（精确匹配）删掉一座；删到返回 true。
-/// 与 `EraseEditLayerPlacement` 的差异：建筑有**唯一 id** ⇒ 不需要"类型 + 平面位置 + ε"的模糊匹配。
-[[nodiscard]] bool EraseEditLayerBuilding(std::vector<vx::ObjectBuilding>& buildings, const std::string& buildingId) {
-    for (auto it = buildings.begin(); it != buildings.end(); ++it) {
-        if (it->id == buildingId) {
-            buildings.erase(it);
-            return true;
+/// 从"编辑层新增成套建筑"里按 **id**（精确匹配）找一座；**返回其下标**（`buildings.size()` = 未命中）。
+/// 与 `FindEditLayerPlacementIndex` 的差异：建筑有**唯一 id** ⇒ 不需要"类型 + 平面位置 + ε"的模糊匹配。
+[[nodiscard]] std::size_t FindEditLayerBuildingIndex(const std::vector<vx::ObjectBuilding>& buildings,
+                                                     const std::string& buildingId) {
+    for (std::size_t i = 0; i < buildings.size(); ++i) {
+        if (buildings[i].id == buildingId) {
+            return i;
         }
     }
-    return false;
+    return buildings.size();
+}
+
+/// V0.11 / I3：编辑操作种类的**日志 token**（纯 ASCII ⇒ 无 CJK 字体时日志也不缺字）。
+[[nodiscard]] const char* EditOpKindToken(vx::EditOpKind kind) noexcept {
+    switch (kind) {
+        case vx::EditOpKind::PlaceObject:          return "place-object";
+        case vx::EditOpKind::RemoveObject:         return "remove-object";
+        case vx::EditOpKind::PlaceBuilding:        return "place-building";
+        case vx::EditOpKind::RemoveBuilding:       return "remove-building";
+        case vx::EditOpKind::SetBuildingDarkening: return "set-darkening";
+    }
+    return "unknown";
 }
 
 /// V0.9 / ADR 0036 决策四：落点模式的**配置 token**（纯 ASCII ⇒ 无 CJK 字体时 HUD 也不缺字）。
@@ -1055,6 +1072,25 @@ constexpr float kPlacementBlockedTintStrength = 0.75F;
 
 /// V0.5 E3：`[[remove]]` 的平面匹配容差（格）—— 与 `ObjectRemoval::tolerance` 的缺省值一致。
 constexpr float kPlacementRemoveTolerance = 0.5F;
+
+// ---------------------------------------------------------------------------
+// V0.11 / I4：gizmo（选中已有物件 → 拖动手柄改 transform）—— 尺度与手感常量
+// ---------------------------------------------------------------------------
+
+/// 平移箭头的长度（格）与粗细（格）。
+constexpr float kGizmoAxisLength    = 2.0F;
+constexpr float kGizmoAxisThickness = 0.07F;
+/// 手柄的**有效拾取半径**（格；略大于视觉粗细 ⇒ 好点中）。
+constexpr float kGizmoHandleRadius = 0.25F;
+/// 旋转环半径与环带宽度（格）。
+constexpr float kGizmoRingRadius = 1.6F;
+constexpr float kGizmoRingBand   = 0.14F;
+/// 旋转灵敏度（度 / 像素）：水平鼠标位移 × 它 = yaw 增量。
+constexpr float kGizmoDegreesPerPixel = 0.35F;
+/// gizmo 手柄的 tint（X 红 / Z 蓝 / 旋转黄）+ 强度。
+constexpr float kGizmoTintStrength = 0.9F;
+/// 拖动期间被移动物件的**半透明**反馈不透明度。
+constexpr float kGizmoDragOpacity = 0.65F;
 
 /// V0.5 E4：物件选择器**预览小图**的自动旋转角速度（弧度 / 秒）。慢转 ⇒ 静止时也能看出立体形状；
 /// 用户的拖动偏移叠加在它之上（见 `PaletteModel::previewYawRadians`）。
@@ -2985,6 +3021,12 @@ int main(int argc, char** argv) {
         input.BindKey(vx::ActionId::PlacementToggleRotateHold, SDL_SCANCODE_Z);      // V0.11：切换"旋转长按模式"
         input.BindKey(vx::ActionId::PlacementToggleNeighborSnap, SDL_SCANCODE_X);    // V0.11：切换"邻居优先吸附"
         input.BindKey(vx::ActionId::PlacementToggleGridSnap, SDL_SCANCODE_B);        // V0.11：切换"世界网格吸附"
+        // V0.11 I3：撤销 / 重做（`Ctrl+Z` / `Ctrl+Y`）。`Ctrl` 另绑一个动作用于把 `Z` 与"旋转长按开关"区分开
+        //（同一 scancode 可绑多个动作；处理时**先看 Ctrl**，见主循环的"面板级热键"段）。
+        input.BindKey(vx::ActionId::PlacementUndo, SDL_SCANCODE_Z);
+        input.BindKey(vx::ActionId::PlacementRedo, SDL_SCANCODE_Y);
+        input.BindKey(vx::ActionId::PlacementModifierCtrl, SDL_SCANCODE_LCTRL);
+        input.BindKey(vx::ActionId::PlacementModifierCtrl, SDL_SCANCODE_RCTRL);
         input.BindMouseButton(vx::ActionId::Attack, SDL_BUTTON_LEFT);   // T27：左键 = 发射光球（摆放模式内 = 放下）
         input.BindMouseAxis(vx::ActionId::LookX, vx::MouseAxis::X);
         input.BindMouseAxis(vx::ActionId::LookY, vx::MouseAxis::Y);
@@ -3925,6 +3967,10 @@ int main(int argc, char** argv) {
         /// ⇒ 出现"地面留下了、建筑没了"的不自洽。这里把物件层也接上"退出 / 切世界自动保存"。
         int editLayerUnsavedOps = 0;
 
+        /// V0.11 / I3：**编辑操作的撤销 / 重做栈**（命令栈；容量 64 ≥ 计划要求的 32）。
+        /// 只记录**本次运行**由玩家做出的编辑层操作；保存成功后清空（栈与文件一致）。
+        vx::EditHistory editHistory;
+
         std::error_code editExistsError;
         const bool      objectsEditExists = std::filesystem::exists(objectsEditPath, editExistsError);
         vx::ObjectTable objects           = objectsPublished;
@@ -4838,6 +4884,10 @@ int main(int argc, char** argv) {
 
         // ---- V0.5 E3：摆放模式状态（跨帧保持；进入新世界即重置；[ADR 0032](../../docs/adr/0032-object-palette-and-placement-mode.md)）----
         bool          placementMode   = false;  ///< 是否处于摆放模式（模式内左键放下 / 右键删除 / Q,E 旋转）
+        /// V0.11 / I4 修订（所有者 2026-10-08）：**修改模式**（与摆放模式**互斥**）——
+        /// 屏幕中央显示指示器；**点击已有物件 ⇒ 选中**（显示 gizmo）；拖动手柄改 transform；**不放置**。
+        /// 为什么单独成模式：把"左键 = 放下"与"左键 = 拖动"分开，消除两者叠加导致的交互冲突。
+        bool          modifyMode      = false;
         float         placementYawDeg = 0.0F;   ///< 预览与放下时的朝向（度）
         /// V0.11（2026-10-08）：`Q`/`E` **连续按住**的秒数（0 = 未按；按下边沿清零）—— 供"长按启动延迟"判定
         /// （`PlacementHoldActive`：须按住 `holdDelaySeconds`（缺省 0.5 s）才**开始**连续转 ⇒ 轻点不漂）。
@@ -4982,6 +5032,7 @@ int main(int argc, char** argv) {
             lastPlaceTypeId   = id;
             lastPlaceYawDeg   = 0.0F;
             placementYawDeg   = 0.0F;
+            modifyMode        = false;  // V0.11 / I4 修订：两种模式**互斥**（进摆放即退修改）
             placementMode     = true;
             previewBlocked    = false;
             previewBlockedByVolume = false;
@@ -5011,6 +5062,7 @@ int main(int argc, char** argv) {
         };
         const auto exitPlacement = [&]() {
             placementMode  = false;
+            modifyMode     = false;  // V0.11 / I4 修订：退摆放模式同时退修改模式（两者互斥）
             placeIsBuilding = false;
             previewBlocked = false;
             previewBlockedByVolume = false;
@@ -5036,6 +5088,7 @@ int main(int argc, char** argv) {
             try {
                 vx::SaveObjectEditLayer(objectsEditPath, editLayerState);
                 editLayerUnsavedOps = 0;  // V0.10 / S9：写盘成功（写的是**全部**增量）⇒ 未保存计数归零
+                editHistory.Clear();      // V0.11 / I3：保存后**栈与文件一致**（撤销 / 重做基于当前文件状态）
                 pickFeedback = "saved";
                 VX_LOG_INFO("可编辑层已保存（E3/V0.9）：%s（类型 %zu、放置 %zu、删除 %zu、散布 %zu；成套建筑 %zu、"
                             "删建筑 %zu、变暗覆盖 %zu）",
@@ -5330,9 +5383,20 @@ int main(int argc, char** argv) {
                 }
             }
             // ② 落到可编辑层：本层新增的建筑改字段；发布清单 / 上一轮来的建筑写 `[[building_darkening]]` 覆盖。
+            // V0.11 / I3：同时构造一条**可逆记录**（改前值 / 落点），使本次改动可撤销 / 重做。
+            vx::EditCommand command;
+            command.kind            = vx::EditOpKind::SetBuildingDarkening;
+            command.buildingId      = buildingId;
+            command.darkeningBefore = interiorDarkening;  // 兜底：未命中任何条目时按全局值
+            command.darkeningAfter  = clamped;
             bool inEditLayer = false;
-            for (vx::ObjectBuilding& building : editLayerState.buildings) {
+            for (std::size_t i = 0; i < editLayerState.buildings.size(); ++i) {
+                vx::ObjectBuilding& building = editLayerState.buildings[i];
                 if (building.id == buildingId) {
+                    command.darkeningBefore    = (building.interiorDarkening >= 0.0F) ? building.interiorDarkening
+                                                                                     : interiorDarkening;
+                    command.darkeningTarget    = vx::EditDarkeningTarget::EditLayerBuilding;
+                    command.darkeningIndex     = i;
                     building.interiorDarkening = clamped;
                     inEditLayer                = true;
                     break;
@@ -5340,20 +5404,27 @@ int main(int argc, char** argv) {
             }
             if (!inEditLayer) {
                 bool updated = false;
-                for (vx::ObjectBuildingDarkening& override : editLayerState.buildingDarkenings) {
+                for (std::size_t i = 0; i < editLayerState.buildingDarkenings.size(); ++i) {
+                    vx::ObjectBuildingDarkening& override = editLayerState.buildingDarkenings[i];
                     if (override.buildingId == buildingId) {
-                        override.darkening = clamped;
-                        updated            = true;
+                        command.darkeningBefore = override.darkening;
+                        command.darkeningTarget = vx::EditDarkeningTarget::ExistingOverride;
+                        command.darkeningIndex  = i;
+                        override.darkening      = clamped;
+                        updated                 = true;
                         break;
                     }
                 }
                 if (!updated) {
+                    command.darkeningTarget = vx::EditDarkeningTarget::NewOverride;
+                    command.darkeningIndex  = editLayerState.buildingDarkenings.size();
                     vx::ObjectBuildingDarkening override;
                     override.buildingId = buildingId;
                     override.darkening  = clamped;
                     editLayerState.buildingDarkenings.push_back(std::move(override));
                 }
             }
+            editHistory.Record(command);
             pickFeedback = "darken " + buildingId;
             ++editLayerUnsavedOps;  // V0.10 / S9：改动落在可编辑层 ⇒ 计一次未保存
             VX_LOG_INFO("摆放模式（V0.9）：建筑 [%s] 的室内变暗 → %.2f（F5 保存后重启仍在）", buildingId.c_str(),
@@ -5374,6 +5445,9 @@ int main(int argc, char** argv) {
             // ---- V0.9：整座建筑 ----
             if (!target->buildingId.empty()) {
                 const std::string buildingId = target->buildingId;
+                vx::EditCommand   command;
+                command.kind       = vx::EditOpKind::RemoveBuilding;
+                command.buildingId = buildingId;
                 std::size_t       removedPieces = 0;
                 for (ObjectSlot& slot : objectSlots) {
                     if (!slot.removed && slot.buildingId == buildingId) {
@@ -5381,20 +5455,37 @@ int main(int argc, char** argv) {
                         ++removedPieces;
                     }
                 }
-                if (!EraseEditLayerBuilding(editLayerState.buildings, buildingId)) {
+                const std::size_t editIndex = FindEditLayerBuildingIndex(editLayerState.buildings, buildingId);
+                if (editIndex < editLayerState.buildings.size()) {
+                    // **本层新增**的建筑 ⇒ 记下定义 + 原下标，直接从本层删掉（撤销时按原下标回插）。
+                    command.building              = editLayerState.buildings[editIndex];
+                    command.buildingFromEditLayer = true;
+                    command.buildingIndex         = editIndex;
+                    editLayerState.buildings.erase(editLayerState.buildings.begin() +
+                                                   static_cast<std::ptrdiff_t>(editIndex));
+                } else {
                     // 发布清单 / 上一轮来的建筑 ⇒ 记一条按 id 的删除项；并清掉它可能的变暗覆盖（避免悬挂）。
-                    vx::ObjectBuildingRemoval removal;
-                    removal.buildingId = buildingId;
-                    editLayerState.buildingRemovals.push_back(std::move(removal));
-                    for (auto it = editLayerState.buildingDarkenings.begin();
-                         it != editLayerState.buildingDarkenings.end();) {
-                        if (it->buildingId == buildingId) {
-                            it = editLayerState.buildingDarkenings.erase(it);
-                        } else {
-                            ++it;
+                    if (const vx::ObjectBuilding* definition = objects.FindBuilding(buildingId);
+                        definition != nullptr) {
+                        command.building = *definition;  // 供撤销时按定义整座重建
+                    }
+                    command.buildingFromEditLayer = false;
+                    command.buildingIndex         = editLayerState.buildingRemovals.size();
+                    vx::ObjectBuildingRemoval entry;
+                    entry.buildingId = buildingId;
+                    editLayerState.buildingRemovals.push_back(std::move(entry));
+                    // 先收集（原下标 + 值），再按下标**降序**删除 ⇒ 撤销时按原下标升序回插。
+                    for (std::size_t i = 0; i < editLayerState.buildingDarkenings.size(); ++i) {
+                        if (editLayerState.buildingDarkenings[i].buildingId == buildingId) {
+                            command.erasedDarkenings.emplace_back(i, editLayerState.buildingDarkenings[i]);
                         }
                     }
+                    for (auto it = command.erasedDarkenings.rbegin(); it != command.erasedDarkenings.rend(); ++it) {
+                        editLayerState.buildingDarkenings.erase(
+                            editLayerState.buildingDarkenings.begin() + static_cast<std::ptrdiff_t>(it->first));
+                    }
                 }
+                editHistory.Record(command);
                 pickFeedback = "deleted building";
                 ++editLayerUnsavedOps;  // V0.10 / S9：删除落在可编辑层 ⇒ 计一次未保存
                 VX_LOG_INFO("摆放模式（V0.9）：**已删除整座建筑** [%s]（%zu 个构件一并释放；F5 保存后重启不再出现）",
@@ -5404,15 +5495,35 @@ int main(int argc, char** argv) {
             const std::string typeId = (target->type != nullptr) ? target->type->id : std::string {};
             const float       x      = static_cast<float>(target->position.x);
             const float       z      = static_cast<float>(target->position.z);
+
+            vx::EditCommand command;
+            command.kind                 = vx::EditOpKind::RemoveObject;
+            command.placement.typeId     = typeId;
+            command.placement.x          = x;
+            command.placement.y          = static_cast<float>(target->position.y);  // 撤销重建时贴回原高度
+            command.placement.z          = z;
+            command.placement.yawDegrees = target->yawDegrees;
+
             DestroyObjectSlot(*target, objectLayer, physics, renderer);
-            if (!EraseEditLayerPlacement(editLayerState.placements, typeId, x, z, kPlacementRemoveTolerance)) {
+            const std::size_t editPlacementIndex =
+                FindEditLayerPlacementIndex(editLayerState.placements, typeId, x, z, kPlacementRemoveTolerance);
+            if (editPlacementIndex < editLayerState.placements.size()) {
+                command.objectFromEditLayer = true;
+                command.objectIndex         = editPlacementIndex;
+                editLayerState.placements.erase(editLayerState.placements.begin() +
+                                                static_cast<std::ptrdiff_t>(editPlacementIndex));
+            } else {
+                command.objectFromEditLayer = false;
+                command.objectIndex         = editLayerState.removals.size();
                 vx::ObjectRemoval removal;
                 removal.typeId    = typeId;
                 removal.x         = x;
                 removal.z         = z;
                 removal.tolerance = kPlacementRemoveTolerance;
+                command.removal   = removal;
                 editLayerState.removals.push_back(std::move(removal));
             }
+            editHistory.Record(command);
             pickFeedback = "deleted";
             ++editLayerUnsavedOps;  // V0.10 / S9：删除落在可编辑层 ⇒ 计一次未保存
             VX_LOG_INFO("摆放模式（E3）：**已删除**物件 [%s] @ (%.2f, %.2f)（F5 保存后重启不再出现；发布清单文件未被改动）",
@@ -5472,6 +5583,10 @@ int main(int argc, char** argv) {
                 placed.yawDegrees          = tmpl->yawDegrees + placementYawDeg;
                 placed.interiorDarkening   = placementDarkening;    // 待放值（具体值；`[`/`]` 可调）
                 placed.landingMode         = placementLandingMode;  // 落点模式（`T` 可切）
+                // V0.11 / I3：构造**可逆记录** —— 落点 ①/③ 会改地形，故把逐列"改前 / 改后"高度也记进命令，
+                // 使"撤销整座建筑"能**连地形一起**恢复（否则会留下"建筑没了、地面还平"的世界不自洽）。
+                vx::EditCommand command;
+                command.kind = vx::EditOpKind::PlaceBuilding;
                 // V0.10 / S5（[ADR 0037](../../docs/adr/0037-world-state-save-v2-and-terrain-persistence.md)）：落点 ①/③ 会**改地形** ——
                 // 按 footprint 把地面改到锚点高度（矩形纯函数，**精确只改 footprint 内**）。改完把脏 tile 送进
                 // **既有延后队列**（重网格 + 上传 + 碰撞重建按帧预算做，**不在渲染帧内同步重网格**，SKILL 第四节）；
@@ -5488,7 +5603,7 @@ int main(int argc, char** argv) {
                                                                                            : vx::LevelMode::Fill;
                         const vx::BrushResult leveled = vx::ApplyTerrainLevelRect(
                             world, fMinX, fMaxX, fMinZ, fMaxZ, previewHit->surfaceY, levelMode,
-                            vx::kBuildingLandingFalloffBlocks);
+                            vx::kBuildingLandingFalloffBlocks, &command.terrainEdits);
                         if (leveled.changedColumns > 0) {
                             editContext.pending.MergeTiles(leveled.dirtyTiles);
                             VX_LOG_INFO("摆放模式（V0.10/S5）：落点 %s —— footprint 平整 %zu 列 ⇒ 入队 %zu 个 tile 的延后工作"
@@ -5500,6 +5615,10 @@ int main(int argc, char** argv) {
                 }
                 expandBuilding(placed, previewHit->surfaceY);       // 与加载期同一条展开路径
                 editLayerState.buildings.push_back(placed);         // 本层增量（F5 保存即持久化）
+                command.building              = placed;             // V0.11 / I3：可逆记录（含 terrainEdits）
+                command.buildingFromEditLayer = true;
+                command.buildingIndex         = editLayerState.buildings.size() - 1;
+                editHistory.Record(command);
                 ++editLayerUnsavedOps;                              // V0.10 / S9：未保存计数
 
                 lastPlaceYawDeg = placementYawDeg;
@@ -5536,6 +5655,12 @@ int main(int argc, char** argv) {
             (void)objectLayer.Get(placedId, instance);
             addObjectSlot(instance);
             editLayerState.placements.push_back(placed);  // 本层增量（F5 保存即持久化）
+            vx::EditCommand command;                      // V0.11 / I3：可逆记录（撤销按 id 精确销毁运行期实例）
+            command.kind            = vx::EditOpKind::PlaceObject;
+            command.placement       = placed;
+            command.objectIndex     = editLayerState.placements.size() - 1;
+            command.runtimeObjectId = placedId;
+            editHistory.Record(command);
             ++editLayerUnsavedOps;                        // V0.10 / S9：未保存计数
 
             lastPlaceYawDeg = placementYawDeg;
@@ -5544,6 +5669,541 @@ int main(int argc, char** argv) {
                         "（本次运行内可见；F5 保存到可编辑层后重启仍在）",
                         placeTypeId.c_str(), placedId, static_cast<double>(placed.x), static_cast<double>(placed.z),
                         static_cast<double>(placed.y), static_cast<double>(placementYawDeg));
+        };
+
+        // ---- V0.11 / I3：撤销 / 重做（运行期侧）----
+        // 数据侧走 `ApplyEditCommand` / `RevertEditCommand`（纯函数、可单测）；这里按**同一条命令**执行运行期动作
+        //（GPU 网格 + 物理碰撞体 + 地形回写）。成本 = 常数级（只涉及单次操作触及的对象 / 列），当帧做。
+        const auto destroySlotsOfBuilding = [&](const std::string& buildingId) {
+            for (ObjectSlot& slot : objectSlots) {
+                if (!slot.removed && slot.buildingId == buildingId) {
+                    DestroyObjectSlot(slot, objectLayer, physics, renderer);
+                }
+            }
+        };
+        const auto rebuildBuilding = [&](const vx::ObjectBuilding& building) {
+            float anchorSurface = 0.0F;
+            if (!world.QueryHeight(building.x, building.z, anchorSurface)) {
+                VX_LOG_WARN("撤销 / 重做（V0.11/I3）：建筑 [%s] 的锚点无地表数据 ⇒ 只恢复编辑层数据（运行期未展开）",
+                            building.id.c_str());
+                return;
+            }
+            expandBuilding(building, anchorSurface);
+        };
+        const auto rebuildObject = [&](const vx::ObjectPlacement& placement) -> std::uint32_t {
+            const std::uint32_t id = objectLayer.Place(objects, placement);
+            vx::ObjectInstance  instance;
+            if (objectLayer.Get(id, instance)) {
+                addObjectSlot(instance);
+            }
+            return id;
+        };
+        const auto destroyObjectById = [&](std::uint32_t id) {
+            if (id == 0) {
+                return;
+            }
+            for (ObjectSlot& slot : objectSlots) {
+                if (!slot.removed && slot.id == id) {
+                    DestroyObjectSlot(slot, objectLayer, physics, renderer);
+                    return;
+                }
+            }
+        };
+        const auto destroyObjectByPlacement = [&](const vx::ObjectPlacement& placement) {
+            for (ObjectSlot& slot : objectSlots) {
+                if (!slot.removed && slot.type != nullptr && slot.type->id == placement.typeId &&
+                    std::abs(static_cast<float>(slot.position.x) - placement.x) <= kPlacementRemoveTolerance &&
+                    std::abs(static_cast<float>(slot.position.z) - placement.z) <= kPlacementRemoveTolerance) {
+                    DestroyObjectSlot(slot, objectLayer, physics, renderer);
+                    return;
+                }
+            }
+        };
+        const auto setBuildingDarkeningRuntime = [&](const std::string& buildingId, float value) {
+            for (ObjectSlot& slot : objectSlots) {
+                if (!slot.removed && slot.buildingId == buildingId) {
+                    slot.enclosure.darkening = value;
+                }
+            }
+        };
+        // 落点 ①/③ 的地形改动：撤销 = 写回 `before`、重做 = 写回 `after`；脏 tile 入既有延后队列（按帧预算重网格）。
+        const auto applyTerrainEdits = [&](const std::vector<vx::TerrainColumnEdit>& edits, vx::TerrainHeightSide side) {
+            if (edits.empty()) {
+                return;
+            }
+            const vx::BrushResult result = vx::WriteTerrainColumnHeights(world, edits, side);
+            if (result.changedColumns > 0) {
+                editContext.pending.MergeTiles(result.dirtyTiles);
+            }
+        };
+
+        const auto performRedo = [&]() {
+            if (!editHistory.CanRedo()) {
+                pickFeedback = "nothing to redo";
+                VX_LOG_INFO("撤销 / 重做（V0.11/I3）：**没有可重做的操作**");
+                return;
+            }
+            vx::EditCommand& command = editHistory.MutableRedoCommand();  // 可写入"重做后新的实例 id"
+            const vx::EditOpKind kind = command.kind;                     // 先存一份（`CommitRedo` 会移走命令 ⇒ 引用失效）
+            switch (command.kind) {
+                case vx::EditOpKind::PlaceObject:
+                    command.runtimeObjectId = rebuildObject(command.placement);
+                    break;
+                case vx::EditOpKind::RemoveObject:
+                    destroyObjectByPlacement(command.placement);
+                    break;
+                case vx::EditOpKind::PlaceBuilding:
+                    rebuildBuilding(command.building);
+                    break;
+                case vx::EditOpKind::RemoveBuilding:
+                    destroySlotsOfBuilding(command.buildingId);
+                    break;
+                case vx::EditOpKind::SetBuildingDarkening:
+                    setBuildingDarkeningRuntime(command.buildingId, command.darkeningAfter);
+                    break;
+                case vx::EditOpKind::MoveObject:
+                    destroyObjectByPlacement(command.moveObjectFrom);
+                    command.runtimeObjectId = rebuildObject(command.moveObjectTo);
+                    break;
+                case vx::EditOpKind::MoveBuilding:
+                    destroySlotsOfBuilding(command.moveBuildingFrom.id);
+                    rebuildBuilding(command.moveBuildingTo);
+                    break;
+            }
+            applyTerrainEdits(command.terrainEdits, vx::TerrainHeightSide::After);
+            vx::ApplyEditCommand(editLayerState, command);
+            editHistory.CommitRedo();
+            ++editLayerUnsavedOps;
+            pickFeedback = "redo";
+            VX_LOG_INFO("撤销 / 重做（V0.11/I3）：**已重做** %s（未保存改动 %d 处）", EditOpKindToken(kind),
+                        editLayerUnsavedOps);
+        };
+        const auto performUndo = [&]() {
+            if (!editHistory.CanUndo()) {
+                pickFeedback = "nothing to undo";
+                VX_LOG_INFO("撤销 / 重做（V0.11/I3）：**没有可撤销的操作**");
+                return;
+            }
+            const vx::EditCommand& command = editHistory.UndoCommand();
+            const vx::EditOpKind   kind    = command.kind;  // 先存一份（`CommitUndo` 会移走命令 ⇒ 引用失效）
+            switch (command.kind) {
+                case vx::EditOpKind::PlaceObject:
+                    if (command.runtimeObjectId != 0) {
+                        destroyObjectById(command.runtimeObjectId);
+                    } else {
+                        destroyObjectByPlacement(command.placement);  // 兜底
+                    }
+                    break;
+                case vx::EditOpKind::RemoveObject:
+                    (void)rebuildObject(command.placement);
+                    break;
+                case vx::EditOpKind::PlaceBuilding:
+                    destroySlotsOfBuilding(command.building.id);
+                    break;
+                case vx::EditOpKind::RemoveBuilding:
+                    rebuildBuilding(command.building);
+                    break;
+                case vx::EditOpKind::SetBuildingDarkening:
+                    setBuildingDarkeningRuntime(command.buildingId, command.darkeningBefore);
+                    break;
+                case vx::EditOpKind::MoveObject:
+                    destroyObjectByPlacement(command.moveObjectTo);
+                    (void)rebuildObject(command.moveObjectFrom);
+                    break;
+                case vx::EditOpKind::MoveBuilding:
+                    destroySlotsOfBuilding(command.moveBuildingTo.id);
+                    rebuildBuilding(command.moveBuildingFrom);
+                    break;
+            }
+            applyTerrainEdits(command.terrainEdits, vx::TerrainHeightSide::Before);
+            vx::RevertEditCommand(editLayerState, command);
+            editHistory.CommitUndo();
+            editLayerUnsavedOps = std::max(0, editLayerUnsavedOps - 1);
+            pickFeedback = "undo";
+            VX_LOG_INFO("撤销 / 重做（V0.11/I3）：**已撤销** %s（未保存改动 %d 处）", EditOpKindToken(kind),
+                        editLayerUnsavedOps);
+        };
+
+        // =====================================================================
+        // V0.11 / I4：gizmo —— "**准星指向即选中**"，拖动手柄改**选中物件**的 transform
+        //   · 平移：仅水平两轴 X / Z（`y` 由地表高度决定 ⇒ 不允许拖出悬空物件）；旋转：绕 Y（yaw）。
+        //   · 左键**按在手柄上 = 拖动**；按在地面 = 放下（既有摆放路径不变）。
+        //   · 提交走 I3 的撤销栈（`MoveObject` / `MoveBuilding`）。
+        // =====================================================================
+        vx::MeshHandle gizmoXHandle {};
+        vx::MeshHandle gizmoZHandle {};
+        vx::MeshHandle gizmoRingHandle {};
+        bool           gizmoMeshesReady = false;
+
+        /// 拖动中被移动的**槽位**：局部偏移（相对锚点、未旋转）+ 自身 yaw（相对锚点）⇒ 每帧按新位姿重算渲染位姿。
+        struct GizmoDragTarget {
+            std::uint32_t slotId = 0;
+            glm::dvec3    localOffset { 0.0 };
+            float         pieceYawDeg = 0.0F;
+        };
+
+        bool                         gizmoDragging = false;
+        vx::GizmoHandle              gizmoDragHandle = vx::GizmoHandle::None;
+        std::uint32_t                gizmoSelectedSlotId = 0;  ///< 粘性选中（0 = 无）
+        std::string                  gizmoDragBuildingId;      ///< 拖动目标建筑（空 = 单件物件）
+        std::string                  gizmoDragTypeId;
+        std::uint32_t                gizmoDragSlotId = 0;
+        double                       gizmoDragAnchorX = 0.0;
+        double                       gizmoDragAnchorY = 0.0;
+        double                       gizmoDragAnchorZ = 0.0;
+        float                        gizmoDragAnchorYaw = 0.0F;
+        double                       gizmoDragDraftX = 0.0;
+        double                       gizmoDragDraftZ = 0.0;
+        float                        gizmoDragDraftYaw = 0.0F;
+        std::vector<GizmoDragTarget> gizmoDragTargets;
+
+        const auto findSlotById = [&](std::uint32_t id) -> ObjectSlot* {
+            if (id == 0) {
+                return nullptr;
+            }
+            for (ObjectSlot& slot : objectSlots) {
+                if (!slot.removed && slot.id == id) {
+                    return &slot;
+                }
+            }
+            return nullptr;
+        };
+
+        const auto ensureGizmoMeshes = [&]() {
+            if (gizmoMeshesReady) {
+                return;
+            }
+            gizmoXHandle = renderer.UploadMesh(vx::BuildGizmoAxisMesh(kGizmoAxisLength, kGizmoAxisThickness),
+                                               glm::dvec3(0.0));
+            gizmoZHandle = renderer.UploadMesh(vx::BuildGizmoAxisMesh(kGizmoAxisLength, kGizmoAxisThickness),
+                                               glm::dvec3(0.0));
+            gizmoRingHandle = renderer.UploadMesh(vx::BuildGizmoRingMesh(kGizmoRingRadius, kGizmoRingBand),
+                                                 glm::dvec3(0.0));
+            gizmoMeshesReady = gizmoXHandle.IsValid() && gizmoZHandle.IsValid() && gizmoRingHandle.IsValid();
+            if (!gizmoMeshesReady) {
+                VX_LOG_WARN("gizmo（V0.11/I4）：手柄网格上传失败 ⇒ 本次运行内不显示 gizmo");
+            }
+        };
+
+        /// 释放 gizmo 手柄网格（离开摆放模式时调用；与 `previewHandle` 同一释放口径，避免占槽位）。
+        const auto releaseGizmoMeshes = [&]() {
+            if (gizmoXHandle.IsValid()) {
+                renderer.ReleaseMesh(gizmoXHandle);
+            }
+            if (gizmoZHandle.IsValid()) {
+                renderer.ReleaseMesh(gizmoZHandle);
+            }
+            if (gizmoRingHandle.IsValid()) {
+                renderer.ReleaseMesh(gizmoRingHandle);
+            }
+            gizmoXHandle      = vx::MeshHandle {};
+            gizmoZHandle      = vx::MeshHandle {};
+            gizmoRingHandle   = vx::MeshHandle {};
+            gizmoMeshesReady  = false;
+            gizmoSelectedSlotId = 0;
+            gizmoDragging     = false;
+        };
+
+        const auto hideGizmo = [&]() {
+            if (gizmoXHandle.IsValid()) {
+                renderer.SetMeshOpacity(gizmoXHandle, 0.0F);
+            }
+            if (gizmoZHandle.IsValid()) {
+                renderer.SetMeshOpacity(gizmoZHandle, 0.0F);
+            }
+            if (gizmoRingHandle.IsValid()) {
+                renderer.SetMeshOpacity(gizmoRingHandle, 0.0F);
+            }
+        };
+
+        /// 画 gizmo（X 红 / Z 蓝 / 旋转黄；**世界轴**，不随物件朝向旋转）。
+        const auto drawGizmo = [&](const glm::dvec3& origin) {
+            ensureGizmoMeshes();
+            if (!gizmoMeshesReady) {
+                return;
+            }
+            const glm::quat identity(1.0F, 0.0F, 0.0F, 0.0F);
+            renderer.SetMeshTransform(gizmoXHandle, origin, identity);
+            renderer.SetMeshTransform(gizmoZHandle, origin,
+                                      glm::angleAxis(glm::radians(-90.0F), glm::vec3(0.0F, 1.0F, 0.0F)));
+            renderer.SetMeshTransform(gizmoRingHandle, origin, identity);
+            renderer.SetMeshOpacity(gizmoXHandle, 1.0F);
+            renderer.SetMeshOpacity(gizmoZHandle, 1.0F);
+            renderer.SetMeshOpacity(gizmoRingHandle, 1.0F);
+            renderer.SetMeshTint(gizmoXHandle, 0.95F, 0.20F, 0.20F, kGizmoTintStrength);
+            renderer.SetMeshTint(gizmoZHandle, 0.25F, 0.45F, 0.95F, kGizmoTintStrength);
+            renderer.SetMeshTint(gizmoRingHandle, 0.95F, 0.85F, 0.20F, kGizmoTintStrength);
+        };
+
+        /// 世界点 → 屏幕像素（`false` = 在相机背后）。
+        const auto projectToScreen = [&](const glm::dvec3& point, glm::vec2& out) -> bool {
+            const vx::CameraView view = camera.Evaluate(1.0, &cameraQuery);
+            const glm::vec4     clip = view.viewProjection *
+                                       glm::vec4(static_cast<float>(point.x), static_cast<float>(point.y),
+                                                 static_cast<float>(point.z), 1.0F);
+            if (clip.w <= 1.0e-6F) {
+                return false;
+            }
+            const glm::vec3 ndc = glm::vec3(clip) / clip.w;
+            out.x = (ndc.x * 0.5F + 0.5F) * static_cast<float>(clientSize.width);
+            out.y = (1.0F - (ndc.y * 0.5F + 0.5F)) * static_cast<float>(clientSize.height);
+            return true;
+        };
+
+        /// 准星射线。
+        const auto gizmoRayFromCrosshair = [&]() {
+            const vx::CameraView view = camera.Evaluate(1.0, &cameraQuery);
+            const glm::vec3     dir  = AimDirection(camera, cameraQuery);
+            vx::GizmoRay        ray;
+            ray.ox = view.eye.x;
+            ray.oy = view.eye.y;
+            ray.oz = view.eye.z;
+            ray.dx = dir.x;
+            ray.dy = dir.y;
+            ray.dz = dir.z;
+            return ray;
+        };
+
+        /// 针对**当前选中**槽位的手柄拾取（粘性选中 ⇒ 手柄伸出物件之外也能点中）。
+        const auto pickGizmoHandleForSelection = [&]() -> vx::GizmoHandle {
+            const ObjectSlot* slot = findSlotById(gizmoSelectedSlotId);
+            if (slot == nullptr) {
+                return vx::GizmoHandle::None;
+            }
+            vx::GizmoLayout layout;
+            layout.x            = slot->position.x;
+            layout.y            = slot->position.y;
+            layout.z            = slot->position.z;
+            layout.axisLength   = kGizmoAxisLength;
+            layout.handleRadius = kGizmoHandleRadius;
+            layout.ringRadius   = kGizmoRingRadius;
+            return vx::PickGizmoHandle(gizmoRayFromCrosshair(), layout, static_cast<double>(kPickMaxDistance));
+        };
+
+        const auto beginGizmoDrag = [&](vx::GizmoHandle handle) {
+            ObjectSlot* selected = findSlotById(gizmoSelectedSlotId);
+            if (selected == nullptr || handle == vx::GizmoHandle::None) {
+                return;
+            }
+            constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
+            gizmoDragging  = true;
+            gizmoDragHandle = handle;
+            gizmoDragTargets.clear();
+            if (!selected->buildingId.empty()) {
+                gizmoDragBuildingId = selected->buildingId;
+                gizmoDragTypeId.clear();
+                const vx::ObjectBuilding* def = objects.FindBuilding(gizmoDragBuildingId);
+                if (def == nullptr) {
+                    gizmoDragging = false;
+                    return;
+                }
+                gizmoDragAnchorX   = def->x;
+                gizmoDragAnchorZ   = def->z;
+                gizmoDragAnchorYaw = def->yawDegrees;
+                float surfaceY = 0.0F;
+                (void)world.QueryHeight(def->x, def->z, surfaceY);
+                gizmoDragAnchorY = surfaceY;
+                for (ObjectSlot& slot : objectSlots) {
+                    if (slot.removed || slot.buildingId != gizmoDragBuildingId) {
+                        continue;
+                    }
+                    GizmoDragTarget target;
+                    target.slotId = slot.id;
+                    // 局部偏移 = 逆旋转（绕 Y，与 `expandBuilding` 同一约定）后的"槽位 − 锚点"。
+                    const double dx = slot.position.x - gizmoDragAnchorX;
+                    const double dz = slot.position.z - gizmoDragAnchorZ;
+                    const double inv = -static_cast<double>(gizmoDragAnchorYaw) * kDegToRad;
+                    const double c = std::cos(inv);
+                    const double s = std::sin(inv);
+                    target.localOffset = glm::dvec3(c * dx - s * dz, slot.position.y - gizmoDragAnchorY,
+                                                    s * dx + c * dz);
+                    target.pieceYawDeg = slot.yawDegrees - gizmoDragAnchorYaw;
+                    gizmoDragTargets.push_back(target);
+                }
+            } else {
+                gizmoDragBuildingId.clear();
+                gizmoDragTypeId    = (selected->type != nullptr) ? selected->type->id : std::string {};
+                gizmoDragAnchorX   = selected->position.x;
+                gizmoDragAnchorY   = selected->position.y;
+                gizmoDragAnchorZ   = selected->position.z;
+                gizmoDragAnchorYaw = selected->yawDegrees;
+                GizmoDragTarget target;
+                target.slotId = selected->id;
+                gizmoDragTargets.push_back(target);
+            }
+            gizmoDragSlotId   = selected->id;
+            gizmoDragDraftX   = gizmoDragAnchorX;
+            gizmoDragDraftZ   = gizmoDragAnchorZ;
+            gizmoDragDraftYaw = gizmoDragAnchorYaw;
+            pickFeedback      = "gizmo drag";
+            VX_LOG_INFO("gizmo（V0.11/I4）：开始拖动 %s（目标 [%s]）—— 松开左键提交",
+                        handle == vx::GizmoHandle::RotateY ? "旋转环" : (handle == vx::GizmoHandle::TranslateX ? "X 轴" : "Z 轴"),
+                        gizmoDragBuildingId.empty() ? gizmoDragTypeId.c_str() : gizmoDragBuildingId.c_str());
+        };
+
+        /// 每帧按**鼠标位移**推进拖动（位移来自 `LookX`/`LookY`；拖动期间相机不转）。
+        const auto updateGizmoDrag = [&](float mouseDx, float mouseDy) {
+            if (!gizmoDragging) {
+                return;
+            }
+            if (gizmoDragHandle == vx::GizmoHandle::TranslateX || gizmoDragHandle == vx::GizmoHandle::TranslateZ) {
+                // 把鼠标位移投到该轴在**屏幕上的方向**上 ⇒ 每像素对应的世界距离 = 1 / 屏幕像素长度。
+                const glm::dvec3 anchor(gizmoDragAnchorX, gizmoDragAnchorY, gizmoDragAnchorZ);
+                const glm::dvec3 axis = (gizmoDragHandle == vx::GizmoHandle::TranslateX) ? glm::dvec3(1.0, 0.0, 0.0)
+                                                                                          : glm::dvec3(0.0, 0.0, 1.0);
+                glm::vec2 screen0;
+                glm::vec2 screen1;
+                if (projectToScreen(anchor, screen0) && projectToScreen(anchor + axis, screen1)) {
+                    const glm::vec2 delta        = screen1 - screen0;
+                    const float     pixelsPerUnit = glm::length(delta);
+                    if (pixelsPerUnit > 1.0e-3F) {
+                        const glm::vec2 direction = delta / pixelsPerUnit;
+                        const float worldDelta = (direction.x * mouseDx + direction.y * mouseDy) / pixelsPerUnit;
+                        if (gizmoDragHandle == vx::GizmoHandle::TranslateX) {
+                            gizmoDragDraftX += static_cast<double>(worldDelta);
+                        } else {
+                            gizmoDragDraftZ += static_cast<double>(worldDelta);
+                        }
+                    }
+                }
+            } else {
+                gizmoDragDraftYaw += mouseDx * kGizmoDegreesPerPixel;
+                gizmoDragDraftYaw = std::fmod(gizmoDragDraftYaw + 360.0F, 360.0F);
+            }
+            // 吸附（与 I1 同口径；开关关 ⇒ 步长 0 = 不吸附）。
+            const double gridStep = placementGridSnap ? static_cast<double>(placementSnap.translateBlocks) : 0.0;
+            gizmoDragDraftX   = vx::SnapToStep(gizmoDragDraftX, gridStep);
+            gizmoDragDraftZ   = vx::SnapToStep(gizmoDragDraftZ, gridStep);
+            gizmoDragDraftYaw = static_cast<float>(
+                vx::SnapYawDegrees(static_cast<double>(gizmoDragDraftYaw), placementSnap.yawDegrees));
+            // 拖动反馈：直接改被移动槽位的**渲染位姿**（物理体在提交时重建 ⇒ 拖动中不动物理）。
+            constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
+            const double yawRad = static_cast<double>(gizmoDragDraftYaw) * kDegToRad;
+            const double cosYaw = std::cos(yawRad);
+            const double sinYaw = std::sin(yawRad);
+            float surfaceY = static_cast<float>(gizmoDragAnchorY);
+            (void)world.QueryHeight(static_cast<float>(gizmoDragDraftX), static_cast<float>(gizmoDragDraftZ),
+                                    surfaceY);
+            for (const GizmoDragTarget& target : gizmoDragTargets) {
+                ObjectSlot* slot = findSlotById(target.slotId);
+                if (slot == nullptr) {
+                    continue;
+                }
+                const glm::dvec3 position(gizmoDragDraftX + (cosYaw * target.localOffset.x + sinYaw * target.localOffset.z),
+                                          static_cast<double>(surfaceY) + target.localOffset.y,
+                                          gizmoDragDraftZ + (-sinYaw * target.localOffset.x + cosYaw * target.localOffset.z));
+                renderer.SetMeshTransform(slot->handle, position,
+                                          glm::angleAxis(glm::radians(gizmoDragDraftYaw + target.pieceYawDeg),
+                                                         glm::vec3(0.0F, 1.0F, 0.0F)));
+                renderer.SetMeshOpacity(slot->handle, kGizmoDragOpacity);
+            }
+        };
+
+        /// 松开左键 ⇒ **提交**（销毁旧槽 + 在新位姿重建 + 记一条可撤销命令）。
+        const auto commitGizmoDrag = [&]() {
+            if (!gizmoDragging) {
+                return;
+            }
+            gizmoDragging = false;
+            const double gridStep = placementGridSnap ? static_cast<double>(placementSnap.translateBlocks) : 0.0;
+            const double newX     = vx::SnapToStep(gizmoDragDraftX, gridStep);
+            const double newZ     = vx::SnapToStep(gizmoDragDraftZ, gridStep);
+            const float  newYaw   = static_cast<float>(
+                vx::SnapYawDegrees(static_cast<double>(gizmoDragDraftYaw), placementSnap.yawDegrees));
+            float newSurfaceY = static_cast<float>(gizmoDragAnchorY);
+            (void)world.QueryHeight(static_cast<float>(newX), static_cast<float>(newZ), newSurfaceY);
+
+            vx::EditCommand command;
+            if (gizmoDragBuildingId.empty()) {
+                command.kind                     = vx::EditOpKind::MoveObject;
+                command.moveObjectFrom.typeId    = gizmoDragTypeId;
+                command.moveObjectFrom.x         = static_cast<float>(gizmoDragAnchorX);
+                command.moveObjectFrom.y         = static_cast<float>(gizmoDragAnchorY);
+                command.moveObjectFrom.z         = static_cast<float>(gizmoDragAnchorZ);
+                command.moveObjectFrom.yawDegrees = gizmoDragAnchorYaw;
+                command.moveObjectTo             = command.moveObjectFrom;
+                command.moveObjectTo.x           = static_cast<float>(newX);
+                command.moveObjectTo.y           = newSurfaceY;
+                command.moveObjectTo.z           = static_cast<float>(newZ);
+                command.moveObjectTo.yawDegrees  = newYaw;
+                const std::size_t editIndex = FindEditLayerPlacementIndex(
+                    editLayerState.placements, gizmoDragTypeId, static_cast<float>(gizmoDragAnchorX),
+                    static_cast<float>(gizmoDragAnchorZ), kPlacementRemoveTolerance);
+                if (editIndex < editLayerState.placements.size()) {
+                    command.moveObjectInEditLayer     = true;
+                    command.moveObjectIndex           = editIndex;
+                    editLayerState.placements[editIndex] = command.moveObjectTo;
+                } else {
+                    command.moveObjectInEditLayer    = false;
+                    command.moveObjectRemoval.typeId = gizmoDragTypeId;
+                    command.moveObjectRemoval.x      = static_cast<float>(gizmoDragAnchorX);
+                    command.moveObjectRemoval.z      = static_cast<float>(gizmoDragAnchorZ);
+                    command.moveObjectRemoval.tolerance = kPlacementRemoveTolerance;
+                    command.moveObjectRemovalIndex   = editLayerState.removals.size();
+                    editLayerState.removals.push_back(command.moveObjectRemoval);
+                    command.moveObjectPlacementIndex = editLayerState.placements.size();
+                    editLayerState.placements.push_back(command.moveObjectTo);
+                }
+                destroyObjectById(gizmoDragSlotId);
+                const std::uint32_t newId = rebuildObject(command.moveObjectTo);
+                gizmoSelectedSlotId       = newId;
+                editHistory.Record(command);
+                ++editLayerUnsavedOps;
+                pickFeedback = "moved";
+                VX_LOG_INFO("gizmo（V0.11/I4）：**已移动** [%s] → (%.2f, %.2f)、朝向 %.1f°（Ctrl+Z 可撤销）",
+                            gizmoDragTypeId.c_str(), newX, newZ, static_cast<double>(newYaw));
+                return;
+            }
+            // ---- 成套建筑 ----
+            const vx::ObjectBuilding* def = objects.FindBuilding(gizmoDragBuildingId);
+            if (def == nullptr) {
+                return;
+            }
+            command.kind                     = vx::EditOpKind::MoveBuilding;
+            command.moveBuildingFrom         = *def;
+            command.moveBuildingTo           = *def;
+            command.moveBuildingTo.x         = static_cast<float>(newX);
+            command.moveBuildingTo.z         = static_cast<float>(newZ);
+            command.moveBuildingTo.yawDegrees = newYaw;
+            const std::size_t editIndex = FindEditLayerBuildingIndex(editLayerState.buildings, gizmoDragBuildingId);
+            if (editIndex < editLayerState.buildings.size()) {
+                command.moveBuildingInEditLayer      = true;
+                command.moveBuildingIndex            = editIndex;
+                editLayerState.buildings[editIndex]  = command.moveBuildingTo;
+            } else {
+                command.moveBuildingInEditLayer  = false;
+                command.moveBuildingTo.id        = MakeUniqueBuildingId(objects, editLayerState, def->id);
+                command.moveBuildingRemovalIndex = editLayerState.buildingRemovals.size();
+                vx::ObjectBuildingRemoval removal;
+                removal.buildingId = def->id;
+                editLayerState.buildingRemovals.push_back(removal);
+                for (std::size_t i = 0; i < editLayerState.buildingDarkenings.size(); ++i) {
+                    if (editLayerState.buildingDarkenings[i].buildingId == def->id) {
+                        command.moveErasedDarkenings.emplace_back(i, editLayerState.buildingDarkenings[i]);
+                    }
+                }
+                for (auto it = command.moveErasedDarkenings.rbegin(); it != command.moveErasedDarkenings.rend(); ++it) {
+                    editLayerState.buildingDarkenings.erase(editLayerState.buildingDarkenings.begin() +
+                                                            static_cast<std::ptrdiff_t>(it->first));
+                }
+                command.moveBuildingPlacementIndex = editLayerState.buildings.size();
+                editLayerState.buildings.push_back(command.moveBuildingTo);
+            }
+            destroySlotsOfBuilding(command.moveBuildingFrom.id);
+            rebuildBuilding(command.moveBuildingTo);
+            // 选中新建筑的第一个构件（id 变了 ⇒ 重新定位）。
+            gizmoSelectedSlotId = 0;
+            for (ObjectSlot& slot : objectSlots) {
+                if (!slot.removed && slot.buildingId == command.moveBuildingTo.id) {
+                    gizmoSelectedSlotId = slot.id;
+                    break;
+                }
+            }
+            editHistory.Record(command);
+            ++editLayerUnsavedOps;
+            pickFeedback = "moved building";
+            VX_LOG_INFO("gizmo（V0.11/I4）：**已移动整座建筑** [%s] → (%.2f, %.2f)、朝向 %.1f°（Ctrl+Z 可撤销）",
+                        command.moveBuildingTo.id.c_str(), newX, newZ, static_cast<double>(newYaw));
         };
 
         while (true) {
@@ -5571,54 +6231,81 @@ int main(int argc, char** argv) {
                 VX_LOG_INFO("鼠标捕获：关（窗口失焦，平台层已自动释放；点击窗口可重新捕获）");
             }
 
-            // T15：Esc 的语义已统一为"开关系统面板"（不再单独承担"释放鼠标"）。
+            // V0.11 / A6：**输入上下文的唯一采集口** —— 由"模式 + 三个模态面板 + gizmo 拖动"组成
+            //（[ADR 0040](../../docs/adr/0040-input-context-stack-and-action-ownership-table.md)）。
+            // 玩法输入抑制 / 动作归属 / `Esc` 栈顶弹出**全部**由它派生（原先三处各判各的，新增模式要改多处）。
+            const auto makeInputContext = [&]() {
+                return vx::InputContextState { placementMode, modifyMode, gizmoDragging, debugOverlay.ObjectPaletteOpen(),
+                                               debugOverlay.PortalMenuOpen(), debugOverlay.SystemPanelOpen() };
+            };
+
+            // T15：Esc 的语义已统一为"**弹输入栈顶**"（不再单独承担"释放鼠标"）。
             // 打开面板 → 释放捕获并记住打开前状态；关闭面板 → 恢复到打开前状态。
             // 与 T14 的捕获状态机共存于 `mouse_capture.hpp`，不是第二套机制。
+            // V0.11 / A6：弹出顺序由 `vx::EscPopTarget` 的**纯函数**给出（物件选择器 → 修改 → 建造 → 传送门菜单 → 系统面板），
+            // 取代原先的 5 级 `if/else` 链 ⇒ 任意"面板 × 模式"组合都弹出正确的一级（且可单测）。
             if (input.ConsumePressed(vx::ActionId::ToggleSystemPanel)) {
-                if (debugOverlay.ObjectPaletteOpen()) {
-                    // V0.5 E3：Esc 先关**物件选择器**（与传送门菜单同一套捕获语义），**不**顺带打开系统面板。
-                    debugOverlay.CloseObjectPalette();
-                    const vx::PanelCaptureTransition transition =
-                        vx::DecidePanelCaptureTransition(/*opening=*/false, captureBeforePanel);
-                    if (transition.captureRequested) {
-                        mouseCaptured = window.SetRelativeMouseMode(true);
+                switch (vx::EscPopTarget(makeInputContext())) {
+                    case vx::EscTarget::CloseObjectPalette: {
+                        // V0.5 E3：Esc 先关**物件选择器**（与传送门菜单同一套捕获语义），**不**顺带打开系统面板。
+                        debugOverlay.CloseObjectPalette();
+                        const vx::PanelCaptureTransition transition =
+                            vx::DecidePanelCaptureTransition(/*opening=*/false, captureBeforePanel);
+                        if (transition.captureRequested) {
+                            mouseCaptured = window.SetRelativeMouseMode(true);
+                        }
+                        jumpRequested = false;
+                        VX_LOG_INFO("物件选择器（E3）：关闭（Esc）；鼠标捕获：%s",
+                                    mouseCaptured ? "开（已恢复打开前状态）" : "关");
+                        break;
                     }
-                    jumpRequested = false;
-                    VX_LOG_INFO("物件选择器（E3）：关闭（Esc）；鼠标捕获：%s",
-                                mouseCaptured ? "开（已恢复打开前状态）" : "关");
-                } else if (placementMode) {
-                    // V0.5 E3：摆放模式内 `Esc` **先退模式**（**不**打开系统面板；模式外行为与从前逐位一致）。
-                    exitPlacement();
-                    jumpRequested = false;
-                } else if (debugOverlay.PortalMenuOpen()) {
-                    // V9：Esc 先关**传送门菜单**（与系统面板同一套捕获语义），**不**顺带打开系统面板。
-                    debugOverlay.ClosePortalMenu();
-                    const vx::PanelCaptureTransition transition =
-                        vx::DecidePanelCaptureTransition(/*opening=*/false, captureBeforePanel);
-                    if (transition.captureRequested) {
-                        mouseCaptured = window.SetRelativeMouseMode(true);
+                    case vx::EscTarget::ExitModify: {
+                        // V0.11 / I4 修订：修改模式内 `Esc` **先退模式**（不打开系统面板）。
+                        modifyMode          = false;
+                        gizmoSelectedSlotId = 0;
+                        jumpRequested       = false;
+                        VX_LOG_INFO("修改模式（V0.11/I4）：退出（Esc）");
+                        break;
                     }
-                    jumpRequested = false;
-                    VX_LOG_INFO("传送门菜单（V9）：关闭（Esc）；鼠标捕获：%s",
-                                mouseCaptured ? "开（已恢复打开前状态）" : "关");
-                } else {
-                    const bool opening = !debugOverlay.SystemPanelOpen();
-                    debugOverlay.ToggleSystemPanel();
-                    const vx::PanelCaptureTransition transition =
-                        vx::DecidePanelCaptureTransition(opening, opening ? mouseCaptured : captureBeforePanel);
-                    if (transition.rememberCaptureState) {
-                        captureBeforePanel = mouseCaptured;
+                    case vx::EscTarget::ExitBuild: {
+                        // V0.5 E3：摆放模式内 `Esc` **先退模式**（**不**打开系统面板；模式外行为与从前逐位一致）。
+                        exitPlacement();
+                        jumpRequested = false;
+                        break;
                     }
-                    if (transition.releaseRequested) {
-                        (void)window.SetRelativeMouseMode(false);
-                        mouseCaptured = false;
+                    case vx::EscTarget::ClosePortalMenu: {
+                        // V9：Esc 先关**传送门菜单**（与系统面板同一套捕获语义），**不**顺带打开系统面板。
+                        debugOverlay.ClosePortalMenu();
+                        const vx::PanelCaptureTransition transition =
+                            vx::DecidePanelCaptureTransition(/*opening=*/false, captureBeforePanel);
+                        if (transition.captureRequested) {
+                            mouseCaptured = window.SetRelativeMouseMode(true);
+                        }
+                        jumpRequested = false;
+                        VX_LOG_INFO("传送门菜单（V9）：关闭（Esc）；鼠标捕获：%s",
+                                    mouseCaptured ? "开（已恢复打开前状态）" : "关");
+                        break;
                     }
-                    if (transition.captureRequested) {
-                        mouseCaptured = window.SetRelativeMouseMode(true);
+                    case vx::EscTarget::ToggleSystemPanel: {
+                        const bool opening = !debugOverlay.SystemPanelOpen();
+                        debugOverlay.ToggleSystemPanel();
+                        const vx::PanelCaptureTransition transition =
+                            vx::DecidePanelCaptureTransition(opening, opening ? mouseCaptured : captureBeforePanel);
+                        if (transition.rememberCaptureState) {
+                            captureBeforePanel = mouseCaptured;
+                        }
+                        if (transition.releaseRequested) {
+                            (void)window.SetRelativeMouseMode(false);
+                            mouseCaptured = false;
+                        }
+                        if (transition.captureRequested) {
+                            mouseCaptured = window.SetRelativeMouseMode(true);
+                        }
+                        jumpRequested = false;  // 面板开关不应遗留锁存的跳跃请求
+                        VX_LOG_INFO("系统面板：%s；鼠标捕获：%s", opening ? "打开（置于屏幕中央）" : "关闭",
+                                    mouseCaptured ? "开（已恢复打开前状态）" : "关（光标可见，可点击窗口重新捕获）");
+                        break;
                     }
-                    jumpRequested = false;  // 面板开关不应遗留锁存的跳跃请求
-                    VX_LOG_INFO("系统面板：%s；鼠标捕获：%s", opening ? "打开（置于屏幕中央）" : "关闭",
-                                mouseCaptured ? "开（已恢复打开前状态）" : "关（光标可见，可点击窗口重新捕获）");
                 }
             }
 
@@ -5630,18 +6317,30 @@ int main(int argc, char** argv) {
             debugOverlay.BeginFrame();
             double uiMs = uiTimer.EndMs();
 
-            // T15：玩法输入抑制——**只在模态面板（系统面板 / 传送门菜单 / 物件选择器）打开时**抑制，
-            // 决策为纯函数（见 `gameplay_input.hpp`）。
-            // V0.9 缺陷修复：**不再采信 ImGui 的 `WantCaptureMouse|Keyboard`** —— 只读叠加层（常驻 HUD /
+            // T15：玩法输入抑制 —— 决策为纯函数（见 `gameplay_input.hpp`）。
+            // V0.11 / A6：抑制**不再由"面板布尔"直接给**，而是由**输入上下文**派生（抑制 / 归属 / `Esc` 弹出三者同源）。
+            // V0.9 缺陷修复：**不采信 ImGui 的 `WantCaptureMouse|Keyboard`** —— 只读叠加层（常驻 HUD /
             // **F1 调试面板**）可见 / 被悬停 / 获得键盘焦点时 ImGui 也会报告它们，据此抑制会导致
-            // "开着 F1 无法移动 / 转视角"。只读叠加层不提供操作项 ⇒ 不得抢玩法输入。
-            const vx::InputSuppression suppression = vx::DecideInputSuppression(debugOverlay.AnyBlockingPanelOpen());
+            // "开着 F1 无法移动 / 转视角"。只读叠加层不提供操作项、也不进 `InputContextState` ⇒ 不得抢玩法输入。
+            const vx::InputContextState inputContext = makeInputContext();
+            const vx::InputContext      inputContextTop = vx::CurrentContext(inputContext);
+            const vx::InputSuppression  suppression = vx::DecideInputSuppression(inputContextTop);
 
-            // T14 捕获状态机（仅在**任一面板关闭**时）：未捕获时的点击用于重新捕获，状态机把它标记为
+            // V0.11 / A6：**表驱动让位** —— 消费所有"当前上下文内无效果（`Inactive`）/ 被模态阻断（`Blocked`）"的动作边沿。
+            // 取代原先散落在各模式分支里的逐键 `ConsumePressed(...)`（防残余边沿 / 防同键误触发，如 `E`）。
+            // **附带修正**：模态面板打开时，玩法动作的边沿在**边沿层**即被吞掉 ⇒ 不再泄漏给"仍处于打开状态的修改模式"。
+            for (std::size_t actionIndex = 0; actionIndex < vx::kActionCount; ++actionIndex) {
+                const vx::InputOwner owner = vx::OwnerOf(inputContext, static_cast<vx::ActionId>(actionIndex));
+                if (owner == vx::InputOwner::Inactive || owner == vx::InputOwner::Blocked) {
+                    (void)input.ConsumePressed(static_cast<vx::ActionId>(actionIndex));
+                }
+            }
+
+            // T14 捕获状态机（仅在**无模态面板**时）：未捕获时的点击用于重新捕获，状态机把它标记为
             // "已被捕获消费"，随后消费掉鼠标左键边沿，使这次点击绝不会落到发射上。
             // 面板（系统面板 / V9 传送门菜单）打开时整体跳过：此时点击属于面板控件，绝不能触发重捕获。
             // 该顺序由单测钉死。
-            if (!debugOverlay.AnyBlockingPanelOpen()) {
+            if (inputContextTop != vx::InputContext::Modal) {
                 const bool anyClickEdge = input.Pressed(vx::ActionId::Attack);
                 // `escapePressed` 恒为 false：Esc 已改由上面的系统面板消费（T15 统一语义）。
                 const vx::MouseCaptureDecision captureDecision =
@@ -5662,7 +6361,11 @@ int main(int argc, char** argv) {
             // T14/T15：未捕获、或 ImGui 正在接管鼠标（拖滑块 / 悬停面板）时丢弃位移、不转视角。
             const float lookX = input.ConsumeValue(vx::ActionId::LookX);
             const float lookY = input.ConsumeValue(vx::ActionId::LookY);
-            if (mouseCaptured && !suppression.cameraLook) {
+            // V0.11 / I4：**gizmo 拖动期间相机不转** —— 位移改由 `updateGizmoDrag` 消费（见摆放模式段）。
+            // V0.11 / A6：该判定改由**归属表**给出（`ModifyDrag` 上下文中 `LookX` 归 `Modify`）——
+            // 取代原先手写的 `!gizmoDragging`，与"键归谁"的其余判定同源。
+            const bool lookOwnedByBase = vx::OwnerOf(inputContext, vx::ActionId::LookX) == vx::InputOwner::Free;
+            if (mouseCaptured && !suppression.cameraLook && lookOwnedByBase) {
                 camera.AddYaw(-lookX * kLookSensitivity);
                 camera.AddPitch(-lookY * kLookSensitivity);
             }
@@ -5687,10 +6390,26 @@ int main(int argc, char** argv) {
             // V0.11（SKILL《运行期可修改优先》）：摆放控制开关**运行期可按键切换**。
             // **不**按 `suppression.keyboardGameplay` 门控 —— 它们是**面板级热键**（用户正是在 `F2` 选择器里看它们的状态）；
             // 若门控，就会出现"在 `F2` 面板里按了没反应"（所有者 2026-10-07 实测缺陷）。
+            //
+            // V0.11 / I3：`Ctrl+Z` / `Ctrl+Y` = **撤销 / 重做**（编辑层操作）。`Z` 同时绑定了"旋转长按开关"
+            // ⇒ **先判 `Ctrl`**：按住 `Ctrl` 时 `Z` 只当撤销，**不**切开关（否则"按 Ctrl+Z 撤销"会顺带把开关翻掉）。
+            const bool editModifierHeld = input.Held(vx::ActionId::PlacementModifierCtrl);
+            if (editModifierHeld) {
+                if (input.ConsumePressed(vx::ActionId::PlacementUndo)) {
+                    performUndo();
+                }
+                if (input.ConsumePressed(vx::ActionId::PlacementRedo)) {
+                    performRedo();
+                }
+            }
             if (input.ConsumePressed(vx::ActionId::PlacementToggleRotateHold)) {
-                placementRotateHold = !placementRotateHold;
-                VX_LOG_INFO("摆放控制（V0.11）：旋转长按模式 → %s（按 Z 切换；关 = 只点按一步）",
-                            placementRotateHold ? "开" : "关");
+                if (editModifierHeld) {
+                    // `Ctrl+Z`：本次边沿归"撤销"，**不**切换旋转长按开关（`Z` 的共同 scancode）。
+                } else {
+                    placementRotateHold = !placementRotateHold;
+                    VX_LOG_INFO("摆放控制（V0.11）：旋转长按模式 → %s（按 Z 切换；关 = 只点按一步）",
+                                placementRotateHold ? "开" : "关");
+                }
             }
             if (input.ConsumePressed(vx::ActionId::PlacementToggleNeighborSnap)) {
                 placementNeighborSnap = !placementNeighborSnap;
@@ -5709,9 +6428,13 @@ int main(int argc, char** argv) {
             if (!input.Held(vx::ActionId::Attack)) {
                 fireSuppressUntilRelease = false;  // 松开左键即解除"捕获点击"抑制
             }
-            // **模式内让位**（ADR 0032 决策四）：摆放模式里左键是"放下"，不再发射光球；模式外逐位不变。
+            // **光球是「自由活动模式」专属**（[ADR 0039](../../docs/adr/0039-three-interaction-modes-and-input-isolation.md) + SKILL「三种模式与输入隔离」硬规则 1）——
+            // 建造（左键 = 放下）与修改（左键 = 选中 / 拖动）模式内**一律不发射光球**（含按住连发）；退出模式后逐位恢复。
+            // V0.11 / A6：判定改由**归属表**给出 —— 建造 / 修改上下文里 `Attack` 归 `Build` / `Modify`，
+            // 自由活动（base）**拿不到**该动作 ⇒ A5 那类"漏写 `!modifyMode`"在**结构上不可能复现**。
             const bool fireHeld = mouseCaptured && !suppression.mouseAction && !fireSuppressUntilRelease &&
-                                  !placementMode && input.Held(vx::ActionId::Attack);
+                                  vx::OwnerOf(inputContext, vx::ActionId::Attack) == vx::InputOwner::Free &&
+                                  input.Held(vx::ActionId::Attack);
             // 瞄准方向每帧算一次（相机视线；见 `AimDirection` 的说明），供本帧全部固定步复用。
             const glm::vec3 aimDirection = fireHeld ? AimDirection(camera, cameraQuery) : glm::vec3(0.0F);
 
@@ -5730,6 +6453,19 @@ int main(int argc, char** argv) {
                     if (paletteRequest.action == vx::PaletteRequest::Action::EnterPlacement) {
                         // 面板在按钮点击时已关闭；`enterPlacement` 负责恢复捕获（回到打开前的状态）。
                         enterPlacement(paletteRequest.typeId);
+                    } else if (paletteRequest.action == vx::PaletteRequest::Action::EnterModify) {
+                        // V0.11 / I4 修订：**修改模式**（与摆放互斥）—— 恢复捕获（供准星指向 / 拖动）。
+                        exitPlacement();
+                        modifyMode          = true;
+                        gizmoSelectedSlotId = 0;
+                        const vx::PanelCaptureTransition transition =
+                            vx::DecidePanelCaptureTransition(/*opening=*/false, captureBeforePanel);
+                        if (transition.captureRequested) {
+                            mouseCaptured = window.SetRelativeMouseMode(true);
+                        }
+                        // 抑制"进模式那一帧的这次点击"（与 `enterPlacement` 同口径）：否则关面板恢复捕获后会立刻射出一颗光球。
+                        fireSuppressUntilRelease = true;
+                        VX_LOG_INFO("修改模式（V0.11/I4）：**进入** —— 准星点击已有物件选中并拖动手柄调整；`Esc` 退出");
                     } else if (paletteRequest.action == vx::PaletteRequest::Action::Save) {
                         // 面板保持打开 ⇒ 不恢复捕获（仍释放，供继续点控件）。
                         // V0.10 / S9：与 F5 同口径 —— 没有未保存改动时不写盘（避免空写），给出可见反馈。
@@ -5851,8 +6587,8 @@ int main(int argc, char** argv) {
             }
 
             if (placementMode) {
-                // 模式内让位：`E` 同时绑定了传送门交互 ⇒ 这里先消费掉，避免"旋转的同时触发开门"。
-                (void)input.ConsumePressed(vx::ActionId::Interact);
+                // V0.11 / A6：模式内让位（`E` 让位于"旋转"，**不触发传送门交互**）已由**归属表 + 表驱动让位循环**
+                // 统一处理（见上方"表驱动让位"段），此处不再逐键手写 `ConsumePressed`。
                 // V0.11 I1b：`Q` / `E` —— **点按 = 一步、长按 = 连续转**（步长 / 速率可配置；`Shift` 仍 = 90° 一步）。
                 vx::PlacementRotateSettings frameRotate = placementRotate;
                 if (!placementRotateHold) {
@@ -5944,6 +6680,8 @@ int main(int argc, char** argv) {
                     }
                 }
 
+                // V0.11 / I4 修订（所有者 2026-10-08）：摆放模式**恢复"左键无条件 = 放下"**；
+                // gizmo（选中 / 拖动）**只在修改模式**出现 ⇒ 摆放与修改不再互相抢左键。
                 updatePlacementPreview();
                 if (attackPressedEdge) {
                     placeObjectAtPreview();
@@ -5951,16 +6689,65 @@ int main(int argc, char** argv) {
                 if (input.ConsumePressed(vx::ActionId::PlacementRemove)) {
                     deleteObjectUnderCrosshair();
                 }
-            } else {
-                // 非摆放模式：这些键的边沿照常消费（不留残余），但不产生任何效果。
-                (void)input.ConsumePressed(vx::ActionId::PlacementLandingMode);
-                (void)input.ConsumePressed(vx::ActionId::PlacementDarkenDown);
-                (void)input.ConsumePressed(vx::ActionId::PlacementDarkenUp);
+                hideGizmo();  // 本模式不显示 gizmo（若刚从修改模式切来，清掉上一帧的残留）
+            } else if (modifyMode) {
+                // V0.11 / I4 修订：**修改模式** —— 点击已有物件选中 + 拖动手柄改 transform；**不放置、不发光球**。
+                // V0.11 / A6：模式内让位（`E` **不触发**传送门交互；摆放专有键 `T` / `[` / `]` 消费但**不生效**）
+                // 已由**归属表 + 表驱动让位循环**统一处理（见上方），此处不再逐键手写。
                 hoveredBuildingId.clear();
+
+                const vx::GizmoHandle handleHover = pickGizmoHandleForSelection();
+                if (gizmoDragging) {
+                    updateGizmoDrag(lookX, lookY);  // 位移改由 gizmo 消费（相机本帧不转，见上方）
+                    float dragSurfaceY = static_cast<float>(gizmoDragAnchorY);
+                    (void)world.QueryHeight(static_cast<float>(gizmoDragDraftX), static_cast<float>(gizmoDragDraftZ),
+                                            dragSurfaceY);
+                    drawGizmo(glm::dvec3(gizmoDragDraftX, dragSurfaceY, gizmoDragDraftZ));
+                    if (!input.Held(vx::ActionId::Attack)) {
+                        commitGizmoDrag();  // 松开左键 ⇒ 提交
+                    }
+                } else {
+                    if (attackPressedEdge) {
+                        if (handleHover != vx::GizmoHandle::None) {
+                            beginGizmoDrag(handleHover);  // 左键**按在手柄上 = 拖动**
+                        } else if (ObjectSlot* hovered = pickObjectUnderCrosshair(); hovered != nullptr) {
+                            gizmoSelectedSlotId = hovered->id;  // **点击已有物件 ⇒ 选中**
+                            pickFeedback        = "selected";
+                            VX_LOG_INFO("修改模式（V0.11/I4）：**已选中** [%s]（拖 X/Z 箭头平移 · 拖环旋转；"
+                                        "左键点空处取消 · Esc 退出）",
+                                        (hovered->type != nullptr) ? hovered->type->id.c_str() : "object");
+                        } else {
+                            gizmoSelectedSlotId = 0;  // 点击空处 ⇒ 取消选中
+                        }
+                    }
+                    if (input.ConsumePressed(vx::ActionId::PlacementRemove)) {
+                        deleteObjectUnderCrosshair();  // 右键删除仍可用（与摆放模式同口径）
+                    }
+                    if (const ObjectSlot* selected = findSlotById(gizmoSelectedSlotId); selected != nullptr) {
+                        drawGizmo(selected->position);
+                    } else {
+                        hideGizmo();
+                    }
+                }
+            } else {
+                // 非摆放 / 非修改模式：摆放专有键（`T` / `[` / `]`）的边沿照常消费（不留残余）但不产生效果
+                // —— V0.11 / A6：已由**归属表 + 表驱动让位循环**统一处理（见上方），此处不再逐键手写。
+                hoveredBuildingId.clear();
+                if (gizmoDragging) {
+                    commitGizmoDrag();  // 兜底：拖动中被强制退出（如切世界 / 退模式）⇒ 提交，不留半途状态
+                }
+                gizmoSelectedSlotId = 0;
+                hideGizmo();
+                releaseGizmoMeshes();  // 无编辑模式 ⇒ 释放手柄网格（避免占渲染器网格槽位；进入时按需重建）
             }
 
+            // V0.11 / I4 修订：刷新**修改模式的屏幕中央指示器**（`hasSelection` 决定配色 / 文案）。
+            debugOverlay.SetModifyIndicator(modifyMode, findSlotById(gizmoSelectedSlotId) != nullptr);
+
             // `F3` 重复上次：面板打开时**不生效**（避免与面板控件抢输入；边沿照常消费）。
-            if (debugOverlay.AnyBlockingPanelOpen()) {
+            // V0.11 / A6：`F3`（重复上次）在**模态面板打开时不生效** —— 由**归属表**给出（`Modal ⇒ Blocked`）。
+            // 此处按**当前**面板状态重取上下文（同帧前面可能刚按 `F2` 打开选择器），与原先 `AnyBlockingPanelOpen()` 同口径。
+            if (vx::OwnerOf(makeInputContext(), vx::ActionId::PlacementRepeatLast) != vx::InputOwner::Free) {
                 (void)input.ConsumePressed(vx::ActionId::PlacementRepeatLast);
             } else if (input.ConsumePressed(vx::ActionId::PlacementRepeatLast)) {
                 const std::string repeatTypeId = lastPlaceTypeId;

@@ -25,12 +25,15 @@ add_executable(voxel_tests
     dig_volume_test.cpp
     dig_volume_residency_test.cpp
     dig_volume_save_test.cpp
+    edit_history_test.cpp
     environment_test.cpp
     fixed_step_test.cpp
     frame_limiter_test.cpp
     frustum_test.cpp
     gameplay_input_test.cpp
+    gizmo_test.cpp
     ground_pick_test.cpp
+    input_context_test.cpp
     input_map_test.cpp
     instance_batch_test.cpp
     landform_test.cpp
