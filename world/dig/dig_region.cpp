@@ -1,5 +1,6 @@
 #include "dig/dig_region.hpp"
 
+#include "save/world_save.hpp"  // Fnv1a64Builder（世界定义内容哈希）
 #include "terrain/terrain_types.hpp"
 
 #include <algorithm>
@@ -267,6 +268,30 @@ bool DigRegionTable::SkipQuad(const TerrainQuad& quad) const {
         }
     }
     return true;
+}
+
+std::uint64_t DigRegionContentHash(const DigRegionTable& table) noexcept {
+    Fnv1a64Builder builder;
+    builder.Bytes("DGRG", 4);  // 域标签（与地形参数内容哈希区分，避免跨类型碰撞）
+
+    builder.I32(table.BandDownBlocks());
+    builder.I32(table.BandUpBlocks());
+    builder.U32(static_cast<std::uint32_t>(table.Regions().size()));
+    for (const DigRegion& region : table.Regions()) {
+        // 名称带**长度前缀**（否则 ("ab","c") 与 ("a","bc") 编码后无法区分）。
+        builder.U32(static_cast<std::uint32_t>(region.name.size()));
+        builder.Bytes(region.name.data(), region.name.size());
+        builder.Bool(region.diggable);
+        builder.I32(region.priority);
+        builder.I32(region.blockMin.x);
+        builder.I32(region.blockMin.y);
+        builder.I32(region.blockMin.z);
+        builder.I32(region.blockMax.x);
+        builder.I32(region.blockMax.y);
+        builder.I32(region.blockMax.z);
+    }
+    // 注意：**不含 `schema_version`** —— 它是存档头部的独立字段（`digRegionSchemaVersion`）。
+    return builder.Value();
 }
 
 }  // namespace vx

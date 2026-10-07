@@ -38,6 +38,7 @@
 #include "out_of_bounds.hpp"
 #include "physics/physics_world.hpp"
 #include "platform/command_line.hpp"
+#include "platform/console.hpp"
 #include "platform/settings.hpp"
 #include "platform/window.hpp"
 #include "portal_interaction.hpp"
@@ -604,7 +605,8 @@ constexpr const char* kBuildingSetCategoryName = "building_set";
 /// **追加一个合成的「成套建筑」类别**（`kBuildingSetCategoryName`），其二级项 = `table.buildings` 的 id
 /// （按文件顺序 ⇒ 确定性）。它**不在** `ObjectType::category` 值域里（那是类型表的字段）；
 /// 由于解析期已强制"建筑 id 与类型 id 不重名"，游戏层按"先查类型、再查建筑"即可**无歧义**解析。
-[[nodiscard]] vx::PaletteModel BuildPaletteModelFrom(const vx::ObjectTable& table, const std::string& currentId) {
+[[nodiscard]] vx::PaletteModel BuildPaletteModelFrom(const vx::ObjectTable& table, const std::string& currentId,
+                                                     int unsavedChanges = 0) {
     vx::PaletteModel                       model;
     const std::vector<vx::PaletteCategory> categories = vx::BuildPalette(table);
     std::size_t                            selectedCategory = 0;
@@ -638,6 +640,7 @@ constexpr const char* kBuildingSetCategoryName = "building_set";
     }
     model.state.categoryIndex = selectedCategory;
     model.state.typeIndex     = selectedType;
+    model.unsavedChanges      = unsavedChanges;  // V0.10 / S9：面板显示"未保存改动 N 处"
     return model;
 }
 
@@ -698,6 +701,24 @@ constexpr const char* kBuildingSetCategoryName = "building_set";
             return "unspecified";
     }
     return "unspecified";
+}
+
+/// V0.10 / S5：落点模式的**显示名**（走 `ui_text` 标签缝 ⇒ 载到 CJK 字体显示中文、否则回退纯 ASCII）。
+/// 只用于 **F1 面板 / HUD 横幅**；**配置 token 与日志仍用 `LandingModeToken`**（配置口径不变）。
+[[nodiscard]] const char* LandingModeLabel(vx::ObjectBuildingLandingMode mode, bool cjk) noexcept {
+    switch (mode) {
+        case vx::ObjectBuildingLandingMode::Sink:
+            return vx::UiText(vx::UiLabel::LandingModeSink, cjk);
+        case vx::ObjectBuildingLandingMode::FlatOnly:
+            return vx::UiText(vx::UiLabel::LandingModeFlatOnly, cjk);
+        case vx::ObjectBuildingLandingMode::Flatten:
+            return vx::UiText(vx::UiLabel::LandingModeFlatten, cjk);
+        case vx::ObjectBuildingLandingMode::Fill:
+            return vx::UiText(vx::UiLabel::LandingModeFill, cjk);
+        case vx::ObjectBuildingLandingMode::Unspecified:
+            break;  // 不是可交互模式（初值即缺省模式）⇒ 走 ASCII token 兜底
+    }
+    return LandingModeToken(mode);
 }
 
 /// W7-S3b：地表 **LOD 分环**（[ADR 0024](../../docs/adr/0024-terrain-streaming-and-lod.md) 决策二）。
@@ -1020,6 +1041,13 @@ constexpr float kPlacementRotateStepDeg = 15.0F;
 /// V0.5 E3：幽灵预览的不透明度（抖动淡出）—— `SetMeshOpacity` 保持**不透明管线**、不引入 alpha 混合
 /// ⇒ 不破坏深度排序（`ADR 0032` 决策三）。
 constexpr float kPlacementPreviewOpacity = 0.5F;
+
+/// V0.10 / S8：幽灵预览在"**不可放置**"时的 **tint**（逐网格染色；见 `MeshRenderer::SetMeshTint`）。
+/// 用途 = 与"可放置"的常态预览一眼区分；不引入描边 / 图标通道（所有者 2026-10-07 裁定）。
+constexpr float kPlacementBlockedTintR        = 1.0F;
+constexpr float kPlacementBlockedTintG        = 0.15F;
+constexpr float kPlacementBlockedTintB        = 0.10F;
+constexpr float kPlacementBlockedTintStrength = 0.75F;
 
 /// V0.5 E3：`[[remove]]` 的平面匹配容差（格）—— 与 `ObjectRemoval::tolerance` 的缺省值一致。
 constexpr float kPlacementRemoveTolerance = 0.5F;
@@ -2311,6 +2339,15 @@ struct LoadingScreen {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // V0.10 / S10：**第一条语句**就把控制台输出代码页设为 UTF-8 —— 日志字符串是 UTF-8（编译期 `/utf-8`），
+    // 而 Windows 控制台默认按本地 ANSI 代码页（简体中文 = 936）解码 ⇒ 终端里中文变乱码（看似繁体）。
+    // 必须早于**任何**日志（含下面 `CommandLineArgumentsUtf8` 的失败日志），故放在最前。
+    const unsigned int consoleCodePage = vx::EnableUtf8ConsoleOutput();
+    // 把**实际生效值**写进日志（而不是宣称成功）：65001 = UTF-8；0 = 没有附加控制台（如从 GUI 启动）。
+    VX_LOG_INFO("控制台输出代码页 = %u（UTF-8 = 65001；0 = 无附加控制台）⇒ 终端中文日志应可正常显示"
+                "（重定向到文件不受影响，仍为 UTF-8）",
+                consoleCodePage);
+
     // T85：以 **UTF-8** 取回启动参数（Windows 经宽字符命令行还原，见 `platform/command_line.*`），
     // 解析测试模式（自动 / 人工 + 人工验收项）；**开关参数（`--` 前缀）绝不能当成位置参数**。
     const std::vector<std::string> arguments = vx::CommandLineArgumentsUtf8(argc, argv);
@@ -3164,15 +3201,18 @@ int main(int argc, char** argv) {
         WorldStatePersistence worldState;
         worldState.enabled = worldSaveEnabled;
         worldState.path    = WorldStateSavePath(worldSaveId);
+        // S6（[ADR 0037](../../docs/adr/0037-world-state-save-v2-and-terrain-persistence.md) 决策六）：世界定义一致性 ——
+        // 地形生成参数**内容哈希** + 可挖区域表（`schema_version` + **内容哈希**）。两个都是纯函数、确定性。
+        const std::uint64_t currentGeneratorVersion = vx::TerrainParamsContentHash(terrainParams);
+        const std::uint64_t currentDigRegionHash    = vx::DigRegionContentHash(digRegions);
         {
             vx::WorldSaveHeader header;
-            // S6（未开工）：`generatorVersion`（地形参数内容哈希）/ `digRegionContentHash` 暂写 0 —— 不假装已校验。
-            header.generatorVersion       = 0;
+            header.generatorVersion       = currentGeneratorVersion;  // 参与地形生成的参数（不含 climate）
             header.tileRadiusX            = preset.tileRadiusX;
             header.tileRadiusZ            = preset.tileRadiusZ;
             header.worldSeed              = static_cast<std::int64_t>(preset.seed);
-            header.digRegionSchemaVersion = 0;
-            header.digRegionContentHash   = 0;
+            header.digRegionSchemaVersion = digRegions.SchemaVersion();
+            header.digRegionContentHash   = currentDigRegionHash;
             worldState.state.SetHeader(header);
         }
         if (worldState.enabled) {
@@ -3186,19 +3226,41 @@ int main(int argc, char** argv) {
             bool                     found       = false;
             const vx::WorldStateSave loaded      = vx::WorldStateSave::LoadFromFile(worldState.path, found);
             const vx::WorldSaveHeader& loadedHeader = loaded.Header();
-            const bool               matches =
+            // 世界身份（种子 / 半径）与**地形生成参数**不匹配 ⇒ **拒绝应用该档**（差量相对旧生成基线，套用会产生错位地形）。
+            const bool worldMatches =
                 found && loadedHeader.worldSeed == static_cast<std::int64_t>(preset.seed) &&
                 loadedHeader.tileRadiusX == preset.tileRadiusX && loadedHeader.tileRadiusZ == preset.tileRadiusZ;
+            const bool generatorMatches = found && loadedHeader.generatorVersion == currentGeneratorVersion;
             if (!found) {
                 VX_LOG_INFO("世界状态存档（V0.10 / ADR 0037）：世界 [%s] 无既有档（%s）⇒ 本次从零开始",
                             worldSaveId.c_str(), worldState.path.string().c_str());
-            } else if (!matches) {
+            } else if (!worldMatches) {
                 VX_LOG_WARN("世界状态存档（V0.10）：档 %s 与当前世界定义**不匹配**（档内 种子 %lld / 半径 [%d, %d]；"
                             "当前 种子 %llu / 半径 [%d, %d]）⇒ **忽略该档**（不静默误读；秘境被重置过？）",
                             worldState.path.string().c_str(), static_cast<long long>(loadedHeader.worldSeed),
                             loadedHeader.tileRadiusX, loadedHeader.tileRadiusZ,
                             static_cast<unsigned long long>(preset.seed), preset.tileRadiusX, preset.tileRadiusZ);
+            } else if (!generatorMatches) {
+                // S6 决策（所有者 2026-10-07）：生成参数变了 ⇒ 旧差值不再对应新基线 ⇒ **拒绝应用**（不静默迁移）。
+                VX_LOG_WARN("世界状态存档（V0.10/S6）：档 %s 的**地形生成参数已变**（档内 generatorVersion=%016llX；"
+                            "当前=%016llX）⇒ **拒绝应用该档**（差量相对旧生成基线，套用会得到错位地形；"
+                            "ADR 0037 决策六禁止静默迁移）。本世界的改动仍在档里、未被删除 —— 还原 terrain.toml 即可读回。",
+                            worldState.path.string().c_str(),
+                            static_cast<unsigned long long>(loadedHeader.generatorVersion),
+                            static_cast<unsigned long long>(currentGeneratorVersion));
             } else {
+                // S6 决策（所有者 2026-10-07）：**区域表**不匹配 ⇒ **仅提示、继续应用**（区域增删一般安全）。
+                if (loadedHeader.digRegionSchemaVersion != digRegions.SchemaVersion()) {
+                    VX_LOG_WARN("世界状态存档（V0.10/S6）：可挖区域表 schema_version 不一致（档内 %d；当前 %d）"
+                                "⇒ 仅提示，继续应用（不静默忽略）。",
+                                static_cast<int>(loadedHeader.digRegionSchemaVersion), digRegions.SchemaVersion());
+                }
+                if (loadedHeader.digRegionContentHash != currentDigRegionHash) {
+                    VX_LOG_WARN("世界状态存档（V0.10/S6）：可挖区域表**内容已变**（档内哈希 %016llX；当前 %016llX）"
+                                "⇒ 仅提示，继续应用（区域增删一般安全；若出现异常请对照 dig_regions.toml）。",
+                                static_cast<unsigned long long>(loadedHeader.digRegionContentHash),
+                                static_cast<unsigned long long>(currentDigRegionHash));
+                }
                 worldState.state = loaded;
                 worldState.BeginVolumeApplies();  // 体积块差量：登记为"待叠加"（块就位后才叠加）
                 const std::size_t volumeBlocks = worldState.pendingVolumeBlocks.size();
@@ -3730,6 +3792,11 @@ int main(int argc, char** argv) {
         // 保存时**原样写回** `objects_edit_file`（ADR 0032 决策六）：只写增量，发布清单保持**只读**。
         vx::ObjectTable editLayerState;
         editLayerState.destructibleEnabled = objectsPublished.destructibleEnabled;
+        /// V0.10 / S9：**可编辑层未保存改动数**（摆放 / 删除 / 变暗 各计 1；写盘成功即归零）。
+        /// 用途：① F2 面板与 HUD 的"未保存改动 N 处"；② **退出 / 切换世界时自动保存**的判据（`> 0` 才写）。
+        /// 为什么需要（所有者 2026-10-07 实测反馈）：V0.10 起**地形改动退出即自动落盘**，而**物件摆放仍需手动 F5**
+        /// ⇒ 出现"地面留下了、建筑没了"的不自洽。这里把物件层也接上"退出 / 切世界自动保存"。
+        int editLayerUnsavedOps = 0;
 
         std::error_code editExistsError;
         const bool      objectsEditExists = std::filesystem::exists(objectsEditPath, editExistsError);
@@ -4642,8 +4709,11 @@ int main(int argc, char** argv) {
         float         placementDarkening = interiorDarkening;
         /// 建筑摆放的**落点模式**（`T` 循环；初值 = 缺省 ② 向下半埋）。
         vx::ObjectBuildingLandingMode placementLandingMode = vx::kDefaultBuildingLandingMode;
-        /// 本帧预览是否**被落点模式拒绝**（④ 落地必须平整 且不满足）⇒ 不可放下。
+        /// 本帧预览是否**被落点模式拒绝**（④ 落地必须平整 且不满足 / ①③ 落在体积接管区）⇒ 不可放下。
+        /// **被拒时幽灵仍显示**（染红），见 `updatePlacementPreview`。
         bool          previewBlocked = false;
+        /// 本帧预览被拒的**原因**是否为"地表由可挖体积绘制"（V0.10 / S8；用于给出可解释的提示文案）。
+        bool          previewBlockedByVolume = false;
         /// 准星指向的**已有建筑** id（**选中态**；空串 = 没指向建筑）。
         std::string   hoveredBuildingId;
         float         hoveredBuildingDarkening = 0.0F;
@@ -4709,6 +4779,38 @@ int main(int argc, char** argv) {
             return have && (highest - lowest) <= vx::kBuildingFlatToleranceBlocks;
         };
 
+        /// V0.10 / S8：footprint 覆盖到的地表是否**由可挖体积绘制**（所有者称"黄色区域"）——
+        /// 判据与 `ResidentQuadFilter::SkipQuad` **同源**：某列的地表**所在体积块常驻**
+        /// ⇒ 该处地表四边形已被跳过、表面由体积网格承载 ⇒ 此时改高度场**画面上不可见**，
+        /// 且会在接管边界留下破洞（①/③ 落点必须拒放此处；体积平整登记为后续阶段目标）。
+        ///
+        /// 采样 = footprint AABB 上 **5×5 规则网格**（确定性，红线 7；与 ④ 的平整判据同一采样口径）；
+        /// 任一样本命中即视为"触及接管区"。成本为**常数级**（≤ 25 次 `QueryHeight` + 哈希查）。
+        const auto buildingFootprintTouchesVolumeTakeover = [&](const vx::ObjectBuilding& building) -> bool {
+            float minX = 0.0F, maxX = 0.0F, minZ = 0.0F, maxZ = 0.0F;
+            if (!vx::ComputeBuildingFootprintXZ(building, objects, minX, maxX, minZ, maxZ)) {
+                return false;  // 无占地 ⇒ 本判据不成立（其余判据照旧）
+            }
+            constexpr int kSamples = 5;
+            for (int ix = 0; ix < kSamples; ++ix) {
+                for (int iz = 0; iz < kSamples; ++iz) {
+                    const float x = minX + (maxX - minX) * static_cast<float>(ix) / static_cast<float>(kSamples - 1);
+                    const float z = minZ + (maxZ - minZ) * static_cast<float>(iz) / static_cast<float>(kSamples - 1);
+                    float       height = 0.0F;
+                    if (!world.QueryHeight(x, z, height)) {
+                        continue;  // 无地形数据 ⇒ 本样本不参与（其余判据负责拦）
+                    }
+                    const vx::BlockCoord block =
+                        BlockOfWorldPoint(static_cast<int>(std::floor(x)), static_cast<int>(std::floor(height)),
+                                          static_cast<int>(std::floor(z)));
+                    if (editContext.volumeSlots.Contains(block)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+
         const auto enterPlacement = [&](const std::string& id) {
             // V0.9 / ADR 0036 决策四：单位可能是**单件类型**（`objects.Find`）或**成套建筑**（`objects.FindBuilding`）。
             // 解析期已强制"建筑 id 与类型 id 不重名" ⇒ 这里的"先查类型、再查建筑"**无歧义**。
@@ -4730,6 +4832,7 @@ int main(int argc, char** argv) {
             placementYawDeg   = 0.0F;
             placementMode     = true;
             previewBlocked    = false;
+            previewBlockedByVolume = false;
             if (placeIsBuilding) {
                 // V0.9：建筑摆放的**待放值**初值 = 模板自身的 `interior_darkening`（未给 ⇒ 全局值）。
                 placementDarkening =
@@ -4753,6 +4856,7 @@ int main(int argc, char** argv) {
             placementMode  = false;
             placeIsBuilding = false;
             previewBlocked = false;
+            previewBlockedByVolume = false;
             previewHit.reset();
             hoveredBuildingId.clear();
             if (previewHandle.IsValid()) {
@@ -4765,6 +4869,7 @@ int main(int argc, char** argv) {
         const auto saveEditLayer = [&]() {
             try {
                 vx::SaveObjectEditLayer(objectsEditPath, editLayerState);
+                editLayerUnsavedOps = 0;  // V0.10 / S9：写盘成功（写的是**全部**增量）⇒ 未保存计数归零
                 pickFeedback = "saved";
                 VX_LOG_INFO("可编辑层已保存（E3/V0.9）：%s（类型 %zu、放置 %zu、删除 %zu、散布 %zu；成套建筑 %zu、"
                             "删建筑 %zu、变暗覆盖 %zu）",
@@ -4778,7 +4883,7 @@ int main(int argc, char** argv) {
         };
 
         /// 幽灵预览（模式内每帧一次）：准星 → 地表射线 ⇒ **同源几何**半透明网格的位姿 / 不透明度。
-        /// 成本为**常数级**（一次射线 + 一次 64 B 位姿推送），不随世界总量增长；**不建碰撞体、不进物件槽表**
+        /// 成本为**常数级**（一次射线 + 一次 96 B 位姿推送），不随世界总量增长；**不建碰撞体、不进物件槽表**
         /// （不参与剔除 / 支撑 / 破坏；ADR 0032 决策七）。
         const auto updatePlacementPreview = [&]() {
             const vx::ObjectType*     type     = objects.Find(placeTypeId);
@@ -4786,6 +4891,7 @@ int main(int argc, char** argv) {
             if (building == nullptr && (type == nullptr || type->kind == vx::ObjectAssetKind::Portal)) {
                 previewHit.reset();
                 previewBlocked = false;
+                previewBlockedByVolume = false;
                 return;
             }
             if (previewTypeId != placeTypeId || !previewHandle.IsValid()) {
@@ -4809,18 +4915,33 @@ int main(int argc, char** argv) {
                                                return world.QueryHeight(x, z, outHeight);
                                            });
             previewBlocked = false;
+            previewBlockedByVolume = false;
             if (!previewHit.has_value() || !previewHandle.IsValid()) {
                 return;
             }
             float anchorY = previewHit->surfaceY;
             float yawDeg  = placementYawDeg;
             if (building != nullptr) {
-                // V0.9 / ADR 0036 决策四：落点模式 ④ —— footprint 不平 ⇒ **拒绝**（不显示可放的预览）。
+                // 候选落点 = **十字准星指向的位置** + 目标朝向。V0.10 缺陷修复：模板 `building` 的 `x/z` 是
+                // 作者配置的固定锚点，拿它判会导致"无论在什么地面上都按那个固定点"（在平地上也永远拒绝）。
+                vx::ObjectBuilding candidate = *building;
+                candidate.x              = previewHit->x;
+                candidate.z              = previewHit->z;
+                candidate.yawDegrees     = building->yawDegrees + placementYawDeg;
+                // V0.9 / ADR 0036 决策四：落点模式 ④ —— footprint 不平 ⇒ **不可放**。
+                // V0.10 / S8：被拒时**仍显示幽灵**（下方染红），不再整块隐藏（所有者 2026-10-07 要求）。
                 if (placementLandingMode == vx::ObjectBuildingLandingMode::FlatOnly &&
-                    !buildingFootprintIsFlat(*building)) {
+                    !buildingFootprintIsFlat(candidate)) {
                     previewBlocked = true;
-                    previewHit.reset();
-                    return;
+                }
+                // V0.10 / S8：①/③ 会**改高度场**；若 footprint 覆盖的地表**由可挖体积绘制**（"黄色区域"），
+                // 改高度场画面上不可见、且会在接管边界留下**破洞** ⇒ **拒放**（所有者 2026-10-07 裁定
+                // "先拒放，体积平整登记为后续"）。判据与 `ResidentQuadFilter::SkipQuad` 同源。
+                if ((placementLandingMode == vx::ObjectBuildingLandingMode::Flatten ||
+                     placementLandingMode == vx::ObjectBuildingLandingMode::Fill) &&
+                    buildingFootprintTouchesVolumeTakeover(candidate)) {
+                    previewBlocked = true;
+                    previewBlockedByVolume = true;
                 }
                 // ② 向下半埋：整体下沉（层高相对偏移不变）；其余模式（`Unspecified` / `FlatOnly`）不下沉。
                 if (placementLandingMode == vx::ObjectBuildingLandingMode::Sink) {
@@ -4833,7 +4954,15 @@ int main(int argc, char** argv) {
                                     static_cast<double>(previewHit->z));
             const glm::quat rotation = glm::angleAxis(glm::radians(yawDeg), glm::vec3(0.0F, 1.0F, 0.0F));
             renderer.SetMeshTransform(previewHandle, origin, rotation);
+            // V0.10 / S8：幽灵**始终显示**（W6e 的抖动淡出保持不透明管线）；**不可放置 ⇒ 逐网格 tint 染红**，
+            // 可放置 ⇒ 复位为"不变"（强度 0）。tint 从未被其它路径设置，故复位不会影响其它网格。
             renderer.SetMeshOpacity(previewHandle, kPlacementPreviewOpacity);
+            if (previewBlocked) {
+                renderer.SetMeshTint(previewHandle, kPlacementBlockedTintR, kPlacementBlockedTintG,
+                                     kPlacementBlockedTintB, kPlacementBlockedTintStrength);
+            } else {
+                renderer.SetMeshTint(previewHandle, 0.0F, 0.0F, 0.0F, 0.0F);
+            }
         };
 
         /// V0.9：准星指向的**最近物件槽**（删除与**选中态调参**共用；`nullptr` = 没指向）。
@@ -4890,6 +5019,7 @@ int main(int argc, char** argv) {
                 }
             }
             pickFeedback = "darken " + buildingId;
+            ++editLayerUnsavedOps;  // V0.10 / S9：改动落在可编辑层 ⇒ 计一次未保存
             VX_LOG_INFO("摆放模式（V0.9）：建筑 [%s] 的室内变暗 → %.2f（F5 保存后重启仍在）", buildingId.c_str(),
                         static_cast<double>(clamped));
         };
@@ -4930,6 +5060,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 pickFeedback = "deleted building";
+                ++editLayerUnsavedOps;  // V0.10 / S9：删除落在可编辑层 ⇒ 计一次未保存
                 VX_LOG_INFO("摆放模式（V0.9）：**已删除整座建筑** [%s]（%zu 个构件一并释放；F5 保存后重启不再出现）",
                             buildingId.c_str(), removedPieces);
                 return;
@@ -4947,6 +5078,7 @@ int main(int argc, char** argv) {
                 editLayerState.removals.push_back(std::move(removal));
             }
             pickFeedback = "deleted";
+            ++editLayerUnsavedOps;  // V0.10 / S9：删除落在可编辑层 ⇒ 计一次未保存
             VX_LOG_INFO("摆放模式（E3）：**已删除**物件 [%s] @ (%.2f, %.2f)（F5 保存后重启不再出现；发布清单文件未被改动）",
                         typeId.c_str(), static_cast<double>(x), static_cast<double>(z));
         };
@@ -4969,10 +5101,20 @@ int main(int argc, char** argv) {
                     return;
                 }
                 if (previewBlocked) {
-                    pickFeedback = "flat-only rejected";
-                    VX_LOG_WARN("摆放模式（V0.9）：落点模式 flat_only —— footprint 高差 > %.2f 格 ⇒ **本次未放下**"
-                                "（T 切到 sink 可强制放下）",
-                                static_cast<double>(vx::kBuildingFlatToleranceBlocks));
+                    if (previewBlockedByVolume) {
+                        pickFeedback = "surface is dig volume";
+                        VX_LOG_WARN("摆放模式（V0.10/S8）：当前落点模式 %s 需要改**高度场**，但 footprint 覆盖的地表"
+                                    "**由可挖体积绘制**（体积接管区）⇒ 本次未放下（改高度场在此不可见且会在接管边界"
+                                    "留破洞；体积平整已登记为后续目标）。请移出接管区，或改用 %s / %s",
+                                    LandingModeToken(placementLandingMode),
+                                    LandingModeToken(vx::ObjectBuildingLandingMode::Sink),
+                                    LandingModeToken(vx::ObjectBuildingLandingMode::FlatOnly));
+                    } else {
+                        pickFeedback = "flat-only rejected";
+                        VX_LOG_WARN("摆放模式（V0.9）：落点模式 flat_only —— footprint 高差 > %.2f 格 ⇒ **本次未放下**"
+                                    "（T 切到 sink 可强制放下）",
+                                    static_cast<double>(vx::kBuildingFlatToleranceBlocks));
+                    }
                     return;
                 }
                 if (!previewHit.has_value()) {
@@ -4988,8 +5130,35 @@ int main(int argc, char** argv) {
                 placed.yawDegrees          = tmpl->yawDegrees + placementYawDeg;
                 placed.interiorDarkening   = placementDarkening;    // 待放值（具体值；`[`/`]` 可调）
                 placed.landingMode         = placementLandingMode;  // 落点模式（`T` 可切）
+                // V0.10 / S5（[ADR 0037](../../docs/adr/0037-world-state-save-v2-and-terrain-persistence.md)）：落点 ①/③ 会**改地形** ——
+                // 按 footprint 把地面改到锚点高度（矩形纯函数，**精确只改 footprint 内**）。改完把脏 tile 送进
+                // **既有延后队列**（重网格 + 上传 + 碰撞重建按帧预算做，**不在渲染帧内同步重网格**，SKILL 第四节）；
+                // 改的是高度场脏列 ⇒ 天然经 S2/S4 **落盘 / 读档**（这正是放行 ①/③ 的前提）。
+                if (placed.landingMode == vx::ObjectBuildingLandingMode::Flatten ||
+                    placed.landingMode == vx::ObjectBuildingLandingMode::Fill) {
+                    float fMinX = 0.0F;
+                    float fMaxX = 0.0F;
+                    float fMinZ = 0.0F;
+                    float fMaxZ = 0.0F;
+                    if (vx::ComputeBuildingFootprintXZ(placed, objects, fMinX, fMaxX, fMinZ, fMaxZ)) {
+                        const vx::LevelMode levelMode =
+                            (placed.landingMode == vx::ObjectBuildingLandingMode::Flatten) ? vx::LevelMode::Both
+                                                                                           : vx::LevelMode::Fill;
+                        const vx::BrushResult leveled = vx::ApplyTerrainLevelRect(
+                            world, fMinX, fMaxX, fMinZ, fMaxZ, previewHit->surfaceY, levelMode,
+                            vx::kBuildingLandingFalloffBlocks);
+                        if (leveled.changedColumns > 0) {
+                            editContext.pending.MergeTiles(leveled.dirtyTiles);
+                            VX_LOG_INFO("摆放模式（V0.10/S5）：落点 %s —— footprint 平整 %zu 列 ⇒ 入队 %zu 个 tile 的延后工作"
+                                        "（重网格 + 碰撞体；改动随存档保留）",
+                                        LandingModeToken(placed.landingMode), leveled.changedColumns,
+                                        leveled.dirtyTiles.size());
+                        }
+                    }
+                }
                 expandBuilding(placed, previewHit->surfaceY);       // 与加载期同一条展开路径
                 editLayerState.buildings.push_back(placed);         // 本层增量（F5 保存即持久化）
+                ++editLayerUnsavedOps;                              // V0.10 / S9：未保存计数
 
                 lastPlaceYawDeg = placementYawDeg;
                 pickFeedback    = "placed building";
@@ -5018,6 +5187,7 @@ int main(int argc, char** argv) {
             (void)objectLayer.Get(placedId, instance);
             addObjectSlot(instance);
             editLayerState.placements.push_back(placed);  // 本层增量（F5 保存即持久化）
+            ++editLayerUnsavedOps;                        // V0.10 / S9：未保存计数
 
             lastPlaceYawDeg = placementYawDeg;
             pickFeedback    = "placed";
@@ -5193,7 +5363,14 @@ int main(int argc, char** argv) {
                         // 面板在按钮点击时已关闭；`enterPlacement` 负责恢复捕获（回到打开前的状态）。
                         enterPlacement(paletteRequest.typeId);
                     } else if (paletteRequest.action == vx::PaletteRequest::Action::Save) {
-                        saveEditLayer();  // 面板保持打开 ⇒ 不恢复捕获（仍释放，供继续点控件）
+                        // 面板保持打开 ⇒ 不恢复捕获（仍释放，供继续点控件）。
+                        // V0.10 / S9：与 F5 同口径 —— 没有未保存改动时不写盘（避免空写），给出可见反馈。
+                        if (editLayerUnsavedOps > 0) {
+                            saveEditLayer();
+                        } else {
+                            pickFeedback = "nothing to save";
+                            VX_LOG_INFO("可编辑层保存（面板「保存全部」）：**没有未保存的改动** ⇒ 未写盘");
+                        }
                     } else {
                         // Cancel：面板已关闭 ⇒ 恢复打开前的捕获状态。
                         const vx::PanelCaptureTransition transition =
@@ -5242,7 +5419,7 @@ int main(int argc, char** argv) {
                     if (placementMode) {
                         exitPlacement();  // 模式内按 F2 ⇒ 先退模式，再开选择器（换类型）
                     }
-                    debugOverlay.OpenObjectPalette(BuildPaletteModelFrom(objects, placeTypeId));
+                    debugOverlay.OpenObjectPalette(BuildPaletteModelFrom(objects, placeTypeId, editLayerUnsavedOps));
                     captureBeforePanel = mouseCaptured;
                     (void)window.SetRelativeMouseMode(false);
                     mouseCaptured = false;
@@ -5257,6 +5434,7 @@ int main(int argc, char** argv) {
             // 成本 = 面数级（Kenney 低模数十~数百面）⇒ 与"面板打开"这一用户动作绑定，不进入玩法热路径。
             if (debugOverlay.ObjectPaletteOpen()) {
                 vx::PaletteModel& palette = debugOverlay.MutablePalette();
+                palette.unsavedChanges    = editLayerUnsavedOps;  // V0.10 / S9：未保存计数随操作实时刷新
                 std::string       selectedTypeId;
                 if (palette.state.categoryIndex < palette.typeIdsByCategory.size()) {
                     const std::vector<std::string>& typeIds = palette.typeIdsByCategory[palette.state.categoryIndex];
@@ -5298,12 +5476,24 @@ int main(int argc, char** argv) {
                 placementYawDeg = std::fmod(placementYawDeg + 360.0F, 360.0F);  // 归一化到 [0, 360)
 
                 // V0.9 / ADR 0036 决策四：`T` 循环**落点模式**（仅在摆成套建筑时生效；单件摆放时边沿照常消费）。
+                // V0.10 / S5：`flatten` / `fill` 放行后，循环扩为 4 种（Sink → FlatOnly → Flatten → Fill → Sink）。
                 if (input.ConsumePressed(vx::ActionId::PlacementLandingMode)) {
                     if (placeIsBuilding) {
-                        placementLandingMode = (placementLandingMode == vx::ObjectBuildingLandingMode::Sink)
-                                                   ? vx::ObjectBuildingLandingMode::FlatOnly
-                                                   : vx::ObjectBuildingLandingMode::Sink;
-                        VX_LOG_INFO("摆放模式（V0.9）：落点模式 → %s", LandingModeToken(placementLandingMode));
+                        switch (placementLandingMode) {
+                            case vx::ObjectBuildingLandingMode::Sink:
+                                placementLandingMode = vx::ObjectBuildingLandingMode::FlatOnly;
+                                break;
+                            case vx::ObjectBuildingLandingMode::FlatOnly:
+                                placementLandingMode = vx::ObjectBuildingLandingMode::Flatten;
+                                break;
+                            case vx::ObjectBuildingLandingMode::Flatten:
+                                placementLandingMode = vx::ObjectBuildingLandingMode::Fill;
+                                break;
+                            default:
+                                placementLandingMode = vx::ObjectBuildingLandingMode::Sink;
+                                break;
+                        }
+                        VX_LOG_INFO("摆放模式（V0.10/S5）：落点模式 → %s", LandingModeToken(placementLandingMode));
                     }
                 }
                 // V0.9 / ADR 0036 决策三：**选中态** —— 准星指向的已有建筑（`[`/`]` 改的就是它）。
@@ -5348,29 +5538,35 @@ int main(int argc, char** argv) {
                 hoveredBuildingId.clear();
             }
 
-            // `F3` 重复上次 / `F5` 保存：面板打开时**不生效**（避免与面板控件抢输入；边沿照常消费）。
+            // `F3` 重复上次：面板打开时**不生效**（避免与面板控件抢输入；边沿照常消费）。
             if (debugOverlay.AnyBlockingPanelOpen()) {
                 (void)input.ConsumePressed(vx::ActionId::PlacementRepeatLast);
-                (void)input.ConsumePressed(vx::ActionId::PlacementSave);
-            } else {
-                if (input.ConsumePressed(vx::ActionId::PlacementRepeatLast)) {
-                    const std::string repeatTypeId = lastPlaceTypeId;
-                    const float       repeatYawDeg = lastPlaceYawDeg;
-                    if (repeatTypeId.empty()) {
-                        pickFeedback = "no last type";
-                        VX_LOG_WARN("摆放模式（E3）：`F3` 还没有「上次」可重复（先按 F2 选一个模型并放下）");
-                    } else {
-                        enterPlacement(repeatTypeId);
-                        if (placementMode) {
-                            placementYawDeg = repeatYawDeg;  // 重复"上次"的类型**与朝向**
-                            lastPlaceYawDeg = repeatYawDeg;
-                            VX_LOG_INFO("摆放模式（E3）：`F3` 重复上次 —— 类型 [%s]、朝向 %.1f°",
-                                        repeatTypeId.c_str(), static_cast<double>(repeatYawDeg));
-                        }
+            } else if (input.ConsumePressed(vx::ActionId::PlacementRepeatLast)) {
+                const std::string repeatTypeId = lastPlaceTypeId;
+                const float       repeatYawDeg = lastPlaceYawDeg;
+                if (repeatTypeId.empty()) {
+                    pickFeedback = "no last type";
+                    VX_LOG_WARN("摆放模式（E3）：`F3` 还没有「上次」可重复（先按 F2 选一个模型并放下）");
+                } else {
+                    enterPlacement(repeatTypeId);
+                    if (placementMode) {
+                        placementYawDeg = repeatYawDeg;  // 重复"上次"的类型**与朝向**
+                        lastPlaceYawDeg = repeatYawDeg;
+                        VX_LOG_INFO("摆放模式（E3）：`F3` 重复上次 —— 类型 [%s]、朝向 %.1f°",
+                                    repeatTypeId.c_str(), static_cast<double>(repeatYawDeg));
                     }
                 }
-                if (input.ConsumePressed(vx::ActionId::PlacementSave)) {
+            }
+            // `F5` 保存（V0.10 / S9）：**面板打开时也生效** —— 此前它被静默吞掉（设计上让位面板控件），
+            // 玩家会以为"已经存了"（所有者 2026-10-07 实测反馈的诱因之一）。`F5` 不与 ImGui 控件冲突，
+            // 故不再让位；保存的是**全部**可编辑层增量（口径与面板「保存全部到可编辑层」按钮一致）。
+            // 没有未保存改动时**不写盘**（避免空写 / 每次按键都触碰文件 mtime），改为给出可见反馈。
+            if (input.ConsumePressed(vx::ActionId::PlacementSave)) {
+                if (editLayerUnsavedOps > 0) {
                     saveEditLayer();
+                } else {
+                    pickFeedback = "nothing to save";
+                    VX_LOG_INFO("可编辑层保存（F5）：**没有未保存的改动** ⇒ 未写盘");
                 }
             }
 
@@ -6569,10 +6765,14 @@ int main(int argc, char** argv) {
             stats.nearbyPortalPromptName = nearbyPortalPromptName;  // V3/V9：走近传送门的提示（空串 = 不显示）
             stats.placementTypeId        = placeTypeId;             // V0.5 E2：坐标拾取辅助当前类型（空串 = 不显示）
             stats.lastPickFeedback       = pickFeedback;            // V0.5 E2：最近一次拾取反馈（空串 = 不显示）
+            stats.editLayerUnsaved       = editLayerUnsavedOps;     // V0.10 / S9：未保存改动数（HUD 一行）
             stats.placementModeActive    = placementMode;           // V0.5 E3：摆放模式横幅（true ⇒ HUD 显示键位提示）
             // V0.9 / ADR 0036：成套建筑摆放横幅 + **选中态**横幅（动态文本恒为纯 ASCII ⇒ 无 CJK 字体也不缺字）。
+            // V0.10 / S5：落点模式改显**中文显示名**（走 `ui_text` 标签缝；无 CJK 字体时自动回退纯 ASCII）。
             stats.placementBuildingMode = placementMode && placeIsBuilding;
-            stats.placementLandingMode  = stats.placementBuildingMode ? LandingModeToken(placementLandingMode) : "";
+            stats.placementLandingMode  = stats.placementBuildingMode
+                                              ? LandingModeLabel(placementLandingMode, debugOverlay.UsesCjkLabels())
+                                              : "";
             stats.placementDarkeningValue = placementDarkening;
             stats.placementSelectedBuilding  = placementMode ? hoveredBuildingId : std::string {};
             stats.placementSelectedDarkening = hoveredBuildingDarkening;
@@ -6787,6 +6987,17 @@ int main(int argc, char** argv) {
         // 这里**允许阻塞**（帧循环已结束 ⇒ 不存在"冻结画面"）；正常路径下上一帧提交的异步写盘已完成。
         worldState.Flush(world, digVolumes, sessionClock.ElapsedSeconds(),
                          quitRequested ? "退出前强制 flush" : "切世界前强制 flush", /*blocking*/ true);
+
+        // V0.10 / S9：**物件可编辑层**同样在退出 / 切世界前自动落盘（所有者 2026-10-07 实测反馈）。
+        // 为什么需要：上面的地形 / 体积改动会随 `.voxr` 自动保留，而物件摆放此前**只能手动 F5** ⇒
+        // 出现"地面被压平了、建筑却没了"的不自洽。`> 0` 才写（没有改动就不触碰文件）。
+        // 此处帧循环已结束 ⇒ 允许阻塞（与上一条 flush 同口径，不存在"冻结画面"）。
+        if (editLayerUnsavedOps > 0) {
+            const int unsavedOps = editLayerUnsavedOps;  // `saveEditLayer` 成功后会归零 ⇒ 先留一份用于日志
+            saveEditLayer();
+            VX_LOG_INFO("可编辑层（V0.10/S9）：%s前检测到 %d 处未保存的物件改动 ⇒ **已自动写盘**（无需 F5）",
+                        quitRequested ? "退出" : "切世界", unsavedOps);
+        }
 
         for (vx::MeshHandle& handle : tileHandles) {
             if (handle.IsValid()) { renderer.ReleaseMesh(handle); }

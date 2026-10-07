@@ -33,7 +33,8 @@ layout(set = 0, binding = 0, std430) readonly buffer LightMatrixBuffer {
 
 layout(set = 1, binding = 0, std140) uniform MeshTransformBlock {
     mat4 modelToRender;  // 局部坐标 → 渲染原点相对坐标（std140：mat4 = 4 个 vec4）
-    vec4 meshParams;     // W6e：与 mesh.vert 同布局（x = 逐网格不透明度；阴影通道不使用，仅为块布局一致）
+    vec4 meshParams;  // W6e：与 mesh.vert 同布局（x = 逐网格不透明度；阴影通道不使用，仅为块布局一致）
+    vec4 meshTint;    // V0.10：与 mesh.vert 同布局（阴影通道不使用，仅为 uniform 块尺寸一致）
 } meshTransform;
 
 void main() {

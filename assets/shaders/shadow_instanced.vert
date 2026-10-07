@@ -27,7 +27,8 @@ layout(set = 0, binding = 1, std430) readonly buffer InstanceBuffer {
 
 layout(set = 1, binding = 0, std140) uniform MeshTransformBlock {
     mat4 modelToRender;  // 未使用（矩阵来自实例缓冲）
-    vec4 meshParams;     // 与 mesh.vert 同布局（阴影通道不使用）
+    vec4 meshParams;  // 与 mesh.vert 同布局（阴影通道不使用）
+    vec4 meshTint;    // V0.10：与 mesh.vert 同布局（阴影通道不使用，仅为 uniform 块尺寸一致）
 } meshTransform;
 
 void main() {

@@ -50,10 +50,12 @@ struct BrushResult {
 /// 曲线风格与 `world/terrain/material_blender.cpp` 的 `SmoothStep` 一致；不读全局、不分配。
 [[nodiscard]] float BrushFalloff(float distance, float radius, float band) noexcept;
 
-/// 平整笔刷的方向：`Fill` 只把低于目标处抬高（填平）；`Shave` 只把高于目标处削低（削平）。
+/// 平整笔刷的方向：`Fill` 只把低于目标处抬高（填平）；`Shave` 只把高于目标处削低（削平）；
+/// `Both` 双向收敛到目标（压平）。`Both` 由 V0.10 / S5 的 footprint 矩形平整使用。
 enum class LevelMode {
-    Fill,
-    Shave,
+    Fill,   ///< 只抬升低于目标处（填平）
+    Shave,  ///< 只削低高于目标处（削平）
+    Both,   ///< 双向收敛到目标（压平）—— V0.10 / S5 新增
 };
 
 /// 平整笔刷（T26）：半径 `brush.radius` 内每列高度向 `targetHeightBlocks` 收敛。
@@ -67,6 +69,20 @@ enum class LevelMode {
 /// 与 `ApplyTerrainBrush` 同约束：只改动圆盘内的列、**只标脏受影响 tile**、高度钳制到世界垂直范围。
 [[nodiscard]] BrushResult ApplyTerrainLevel(TerrainWorld& world, const BrushPose& brush, float targetHeightBlocks,
                                             float maxStepBlocks, float falloffBand, LevelMode mode);
+
+/// 平整笔刷（**footprint 矩形**版，V0.10 / S5；[ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策四 /
+/// [ADR 0037](../../docs/adr/0037-world-state-save-v2-and-terrain-persistence.md)）：把 XZ 矩形 `[minX, maxX] × [minZ, maxZ]`
+/// 覆盖的列高度**精确收敛**到 `targetHeightBlocks`（**矩形内无衰减、无步长上限** —— 地基必须一步平）。
+///
+/// `falloffBandBlocks` = **边缘过渡带宽度**（格，`0` = 无过渡带）：矩形**外**该宽度内的列按到矩形的距离
+/// 用 smoothstep 把"目标高度"**平滑过渡**回原地形。**必须 > 0 才能避免近垂直硬台阶** ——
+/// 地表是单面网格（背面剔除），硬台阶在斜坡上会露出"看穿"的破口（[ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md) §八本来即要求"边界平滑收敛"）。
+/// `mode`：`Fill` 只抬升低于目标处、`Shave` 只削低高于目标处、`Both` 双向收敛（压平）。
+/// 与其它笔刷同约束：只标脏受影响 tile、高度钳制到世界垂直范围；未加载的列按"不存在"跳过。
+/// 为什么需要它（而不是复用圆形笔刷）：圆形覆盖矩形时会**连带压平 footprint 外一圈**（画面出现圆盘），
+/// 与"只改 footprint 内"的可判定判据冲突 ⇒ 业界做法（UE5 Landscape Flatten / Valheim 地基）本就是矩形地基。
+[[nodiscard]] BrushResult ApplyTerrainLevelRect(TerrainWorld& world, float minX, float maxX, float minZ, float maxZ,
+                                                float targetHeightBlocks, LevelMode mode, float falloffBandBlocks);
 
 /// 爆破笔刷（T26）：半径 `craterRadiusBlocks` 内下沉、外环隆起，**边界平滑**（无硬台阶）。
 ///

@@ -103,4 +103,12 @@ private:
     int                     m_bandUp   = 0;  ///< 地表以上可挖高度（格）；0 = 不裁剪（旧口径）
 };
 
+/// **可挖区域表的内容哈希**（世界定义一致性；[ADR 0037](../../docs/adr/0037-world-state-save-v2-and-terrain-persistence.md) 决策六）。
+///
+/// 口径 = 区域的**语义内容**：逐区域（按 `Regions()` 的 `(priority 升序, 文件顺序)` —— 该顺序本身有意义）编码
+/// `name`（**长度前缀**）/ `diggable` / `priority` / 块包围盒 `blockMin` / `blockMax`，外加竖向带宽 `band_down` / `band_up`。
+/// **`schema_version` 不在此哈希内**（它是存档头部的独立字段 `digRegionSchemaVersion`）。
+/// **纯函数、确定性**：逐字段规范编码（不 hash 结构体裸字节）；同输入必得同值（红线 7）。
+[[nodiscard]] std::uint64_t DigRegionContentHash(const DigRegionTable& table) noexcept;
+
 }  // namespace vx

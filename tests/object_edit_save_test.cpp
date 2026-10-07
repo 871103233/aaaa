@@ -297,6 +297,24 @@ TEST(ObjectEditSave, RoundTripsBuildingsRemovalsAndDarkening) {
     EXPECT_FLOAT_EQ(readBack.buildingDarkenings[0].darkening, 0.20F);
 }
 
+/// V0.10 / S5：会改地形的落点模式（`flatten` / `fill`）也能**往返** —— 写进可编辑层 ⇒ 重启后模式仍在
+/// （V0.9 起这两种模式被拒绝，`LandingModeToString` 已就绪；S5 放行后必须往返一致）。
+TEST(ObjectEditSave, RoundTripsTerrainModifyingLandingModes) {
+    const ObjectTable base = MakeKitBase();
+    for (const std::pair<const char*, ObjectBuildingLandingMode> entry :
+         { std::make_pair("flatten", ObjectBuildingLandingMode::Flatten),
+           std::make_pair("fill", ObjectBuildingLandingMode::Fill) }) {
+        const TempPath file(std::string("voxel_edit_save_landing_") + entry.first + ".toml");
+        ObjectTable    layer           = MakeBuildingEditLayer();
+        layer.buildings[0].landingMode = entry.second;
+
+        SaveObjectEditLayer(file.path(), layer);
+        const ObjectTable readBack = ObjectTable::LoadOverlayFromFile(file.path(), base);
+        ASSERT_EQ(readBack.buildings.size(), 1U);
+        EXPECT_EQ(readBack.buildings[0].landingMode, entry.second);
+    }
+}
+
 TEST(ObjectEditSave, MergeAppliesBuildingRemovalAndDarkening) {
     const TempPath file("voxel_edit_save_buildings_merge.toml");
     const ObjectTable base  = MakeKitBase();

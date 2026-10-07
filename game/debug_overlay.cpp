@@ -199,6 +199,10 @@ void DebugOverlay::BuildHud(const DebugStats& stats) {
     if (!stats.lastPickFeedback.empty()) {
         ImGui::Text(UiText(UiLabel::PlacementPickedFormat, cjk), stats.lastPickFeedback.c_str());
     }
+    // V0.10 / S9：**未保存改动数**（`> 0` 才显示）—— 摆放 / 删除后若尚未写盘，退出前也能一眼看到。
+    if (stats.editLayerUnsaved > 0) {
+        ImGui::Text(UiText(UiLabel::EditLayerUnsavedFormat, cjk), stats.editLayerUnsaved);
+    }
 
     // V0.5 E3：摆放模式横幅 —— 模式内**显式**告知键位（模式内左键/Esc/E 让位，见 ADR 0032）。
     // V0.9 / ADR 0036：成套建筑摆放走**另一条**横幅（多出 落点模式 / 变暗值 两项）。
@@ -394,6 +398,11 @@ void DebugOverlay::BuildObjectPalette() {
     }
 
     ImGui::Separator();
+    // V0.10 / S9：**未保存改动数**（`0` = 不占一行）—— 让"还没写盘"在选择器里**可见**，
+    // 与下方「保存全部到可编辑层」按钮构成明确的"存什么 / 还有多少没存"。
+    if (palette.unsavedChanges > 0) {
+        ImGui::Text(UiText(UiLabel::ObjectPaletteUnsavedFormat, cjk), palette.unsavedChanges);
+    }
     ImGui::BeginDisabled(selectedTypeId.empty());
     if (ImGui::Button(UiText(UiLabel::ObjectPaletteEnter, cjk))) {
         m_paletteRequest    = PaletteRequest { PaletteRequest::Action::EnterPlacement, selectedTypeId };

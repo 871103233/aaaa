@@ -21,6 +21,7 @@
 
 #include <zstd.h>
 
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <stdexcept>
@@ -149,15 +150,50 @@ void ReadRange(std::ifstream& stream, std::uint64_t offset, std::size_t size, st
 // ---------------------------------------------------------------------------
 
 std::uint64_t Fnv1a64(const void* data, std::size_t size) noexcept {
-    constexpr std::uint64_t kOffsetBasis = 1469598103934665603ULL;
-    constexpr std::uint64_t kPrime       = 1099511628211ULL;
-    std::uint64_t           hash         = kOffsetBasis;
-    const auto*             bytes        = static_cast<const std::uint8_t*>(data);
+    std::uint64_t   hash  = kFnv1a64OffsetBasis;
+    const auto*     bytes = static_cast<const std::uint8_t*>(data);
     for (std::size_t index = 0; index < size; ++index) {
         hash ^= static_cast<std::uint64_t>(bytes[index]);
-        hash *= kPrime;
+        hash *= kFnv1a64Prime;
     }
     return hash;
+}
+
+// ---- Fnv1a64Builder（增量版；逐字段固定宽度小端编码，避开结构体填充字节）----
+
+void Fnv1a64Builder::Bytes(const void* data, std::size_t size) noexcept {
+    const auto* bytes = static_cast<const std::uint8_t*>(data);
+    for (std::size_t index = 0; index < size; ++index) {
+        U8(bytes[index]);
+    }
+}
+
+void Fnv1a64Builder::U8(std::uint8_t value) noexcept {
+    m_value ^= static_cast<std::uint64_t>(value);
+    m_value *= kFnv1a64Prime;
+}
+
+void Fnv1a64Builder::U32(std::uint32_t value) noexcept {
+    for (int shift = 0; shift < 32; shift += 8) {
+        U8(static_cast<std::uint8_t>((value >> static_cast<unsigned>(shift)) & 0xFFU));
+    }
+}
+
+void Fnv1a64Builder::U64(std::uint64_t value) noexcept {
+    for (int shift = 0; shift < 64; shift += 8) {
+        U8(static_cast<std::uint8_t>((value >> static_cast<unsigned>(shift)) & 0xFFULL));
+    }
+}
+
+void Fnv1a64Builder::I32(std::int32_t value) noexcept {
+    U32(static_cast<std::uint32_t>(value));  // 二进制补码：与 static_cast 逐位等价
+}
+
+void Fnv1a64Builder::F32(float value) noexcept {
+    std::uint32_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value), "float 必须是 4 字节");
+    std::memcpy(&bits, &value, sizeof(bits));
+    U32(bits);
 }
 
 std::vector<std::uint8_t> EncodeHeightDirtyTile(const std::vector<HeightDirtyEntry>& entries) {

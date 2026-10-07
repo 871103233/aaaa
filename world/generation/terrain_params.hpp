@@ -143,6 +143,14 @@ struct TerrainGenerationParams {
     [[nodiscard]] static TerrainGenerationParams LoadFromFile(const std::filesystem::path& path);
 };
 
+/// **地形生成参数的内容哈希**（世界定义一致性；[ADR 0037](../../docs/adr/0037-world-state-save-v2-and-terrain-persistence.md) 决策六）。
+///
+/// 口径：决定"**未改动的地形数据重建后是否仍与原档一致**"。因此**只覆盖参与地形生成的字段** ——
+/// 三层噪声（频率 / 幅度）、`heightOffsetBlocks`、`variationFrequency`、地貌分区全部字段、悬垂 / 洞穴 / 河流；
+/// **排除 `climate`**（其注释明示"**不参与任何地形生成**"、只供内容放置判据）⇒ **改气候不会误判为生成不一致**。
+/// **纯函数、确定性**：逐字段规范编码（**不** hash 结构体裸字节 —— 有填充字节 ⇒ 不确定）；同输入必得同值（红线 7）。
+[[nodiscard]] std::uint64_t TerrainParamsContentHash(const TerrainGenerationParams& params) noexcept;
+
 /// 按掩罩值判类（用于统计 / 内容，纯函数）。
 /// 判据：`m < hillsStart + blend/2` ⇒ 平原；`m < mountainsStart + blend/2` ⇒ 丘陵；否则山川。
 [[nodiscard]] LandformKind ClassifyLandform(float mask, const TerrainLandformParams& params) noexcept;

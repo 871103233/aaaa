@@ -5993,6 +5993,351 @@
   5. **C4 / C5 仍需所有者实测读数**（P99 帧时间 / 室内亮度 A-B）。
   本批**未提交**。
 
+## 2026-10-07  V0.10 S5 落地：**落点模式 ①/③ 放行**（压平 / 填充建筑地基）
+
+- 来源（所有者 2026-10-07）："阅读交接包，分析下一步开发方向" ⇒ 我给出三条候选并推荐"收口 V0.10 主线（S5→S6→S7）"；
+  所有者选定该方向，并裁定 **S5 的"压平 / 填充"用矩形纯函数（只改 footprint 内）**、收口小项 C1~C5 暂不做。
+- 范围：放行 `landing_mode = "flatten"` / `"fill"`，并在**摆放成套建筑时**按 footprint 把地形改到锚点高度；
+  走**既有**脏 tile → 延后重网格 → 碰撞重扫。**不做**：收口小项 C1~C5；缺省落点仍为 **② 向下半埋**（ADR 0037 决策八未改判）；
+  不做"嵌入地形（离线裁地形 + 留通道）"；**作者配置**的建筑（发布清单里直接写 `flatten`/`fill`）**加载期不重复压平**
+  （其地形由 `.voxr` 差量恢复；纯作者固定建筑用 ①③ 的情形登记为遗留）。
+- **先评价再动手（SKILL 硬规则，已写进 `plans/v0.10.md` §2 之后的「S5 动手前评价」）**：① **业界参照（点名）** =
+  **UE5 Landscape** 的 *Flatten* 工具 + **Landscape Edit Layer**、**Valheim / Rust / 7 Days to Die** 的建筑地基
+  （按 footprint 压平 / 填平地面使地基贴合）、**Unity Terrain `SetHeights`** 区域写入；② **3A 判据** = footprint 内高差 ≤ 0.05 格、
+  建筑与地面**无缝无穿模**、**改完即持久**、**footprint 之外逐列不变**；③ **不降级** —— 唯一取舍 = 平整形状取**矩形纯函数**
+  而非复用圆形笔刷（圆形会连带动到 footprint 外一圈 ⇒ 画面出现圆盘）；**已由所有者选定矩形**。
+- 做了什么：
+  1. **新增 footprint 矩形平整纯函数** [`ApplyTerrainLevelRect`](world/dig/terrain_brush.cpp)（`world/dig/terrain_brush.*`）：
+     把 XZ 矩形 `[minX,maxX]×[minZ,maxZ]` 覆盖的列**精确**收敛到目标高度（**无衰减、无步长上限** —— 地基必须一步平）；
+     `LevelMode` 新增 **`Both`**（双向压平），`Fill` 只抬升低于目标处、`Shave` 只削低高于目标处；与其它笔刷同约束
+     （**只改矩形内**、只标脏受影响 tile、高度钳制到世界垂直范围、未加载列跳过）。
+  2. **放行解析** [`ParseLandingMode`](world/object/object_layer.cpp)：`flatten` / `fill` 由"解析即抛"改为返回对应枚举；错误文案同步；
+     头注释（[`object_layer.hpp`](world/object/object_layer.hpp)）与 `kDefaultBuildingLandingMode` 注释口径更新（枚举本就保留、能力不删）。
+  3. **`game/main.cpp` 接线**：① 预览态对 `flatten`/`fill` **不拒绝**、不下沉（锚点 = 命中点地表高度）；
+     ② 放置提交时**先改地形**（`ComputeBuildingFootprintXZ` 求 footprint → `ApplyTerrainLevelRect`（`flatten`=`Both` / `fill`=`Fill`，
+     目标 = `previewHit->surfaceY`）→ 把脏 tile 并进**既有** `editContext.pending` 延后队列（重网格 + 上传 + 碰撞重建按帧预算做））
+     → 再 `expandBuilding`。③ `T` 循环**扩为 4 模式**（sink → flat_only → flatten → fill → sink）。
+  4. **测试**：`tests/object_kit_test.cpp` 的"flatten/fill 解析即抛"用例改为 **`ParsesAllLandingModes`（4 值均可解析）**；
+     `tests/terrain_brush_test.cpp` 增 **3 例**（`Both` 双向压平且**矩形外逐列不变** / `Fill` 只抬升 + `Shave` 只削低 / 空矩形与未加载列 no-op）；
+     `tests/object_edit_save_test.cpp` 增 **1 例**（`flatten` / `fill` 写进可编辑层后**往返一致**）。
+- 为什么：
+  - **贵的那一步不是改高度，而是重网格 + 碰撞重建**：footprint 改高度是**常数级**（一栋 4×4 小屋 ≈ 16 列，远 < 3 ms）⇒ 当帧做；
+    真正的开销走**既有** `PendingDestruction` 延后队列分帧做闭（SKILL 第四节「所有重活都必须离开渲染帧」）。
+  - **持久化零新增**：改的就是高度场脏列 ⇒ 卸载前采集 / 退出前强制 flush 已由 S4 覆盖 ⇒ **重启后地面仍平**；
+    这正是 ADR 0037 解除 ADR 0035 决策五、放行 ①/③ 的前提。
+  - **矩形而非圆形**：圆形覆盖矩形会**连带压平 footprint 外一圈**（画面出现圆盘），与"只改 footprint 内"的可判定判据冲突；
+    业界做法（UE5 Flatten / Valheim 地基）本就是矩形地基。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`Launch-VsDevShell.ps1` → `cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug` ⇒ **767/767 passed**（S3 基线 764；矩形平整 +3、编辑层往返 +1、移除旧"不放行"用例 −1）。
+  3. **门禁**：`check-banned-identifiers.ps1` ⇒ **scanned 228 file(s), 0 violation(s) / PASS**。
+  4. **冒烟**（`--world=world_a --auto-test`，~30 s，`build/v010_s5_smoke.log`）：读档行按预期打出（`无既有档 ⇒ 从零开始` +
+     `写盘通道 = worker 异步`）；**stderr 空、无 ERROR** —— 既有编辑层里的 `sink` / `flat_only` 建筑**正常加载**（证明放行未破坏既有配置）。
+- 下一步 / 遗留（缺口，按"缺什么 / 为什么没做 / 切换条件"三项登记）：
+  1. **S6 = 世界定义一致性**：缺 = `generatorVersion`（地形参数内容哈希）/ `digRegionContentHash`（区域表内容哈希）两个纯函数 +
+     读档不匹配提示（当前写 0 占位、只按种子 / 半径校验）；为什么 = 属独立一步；切换条件 = **下一步立即开工**。
+  2. **S7 = 验收 + 留痕**：缺 = 阶段级 `ctest` + 门禁 + 文档收口；切换条件 = S6 完成后。
+  3. **S5 的端到端人工验收未做**：为什么 = 本环境无法向前台窗口注入鼠标 / 键盘（无法进摆放模式、按 `T`、左键放下）；
+     切换条件 = **所有者按 `plans/v0.10.md` §3 的 S5 条目目视**（自动侧已由 4 例单测覆盖矩形语义 + 既有编辑层加载冒烟）。
+  4. **作者配置的建筑加载期不以 ①/③ 改地形**：缺 = 发布清单里直接写 `flatten`/`fill` 的固定建筑在加载期不压平；
+     为什么 = S5 的范围明确是"**摆放时**"改地形，玩家摆放的改动由 `.voxr` 差量持久；作者固定建筑用 ①③ 的需求尚未出现；
+     切换条件 = 出现"作者用 flatten 建固定建筑"的需求时，在加载路径复用同一 `ApplyTerrainLevelRect`（须保证在 tile 差量叠加之后）。
+  5. **C4 / C5 仍需所有者实测读数**（P99 帧时间 / 室内亮度 A-B）。
+  本批**未提交**。
+
+## 2026-10-07  V0.10 S6 落地：**世界定义一致性**（`generatorVersion` / `digRegionContentHash` 真值 + 读档校验）
+
+- 来源（所有者 2026-10-07）："开发下一步" ⇒ 按 `plans/v0.10.md` §3 的「下一步」推进 **S6**（世界定义哈希：S1 时两个字段写 0 占位）。
+  一处**用户可见的行为分歧**先问并获裁定：**生成参数不匹配 ⇒ 拒绝应用该档**；**区域表不匹配 ⇒ 仅提示、继续应用**。
+- 范围：新增两个**确定性内容哈希纯函数**（地形生成参数 / 可挖区域表）+ 写入 `.voxr` 头部 + 读档校验。
+  **不做**：不写迁移（当前无旧档）；不把区域标记写进存档（只记哈希）；**不动冻结字节布局**（头部字段 S1 时已存在）。
+- **先评价再动手（已写进 `plans/v0.10.md` 的「S6 动手前评价」）**：① **业界参照（点名）** = **Minecraft** `level.dat` 的
+  `DataVersion` / 生成器版本（不匹配时明确提示、不静默套用）、**Unity `TerrainData` / 资产内容哈希**（改动检测 / 提示重烘焙）、
+  **Unreal World Partition 的关卡版本校验**；② **判据** = 哈希稳定（同输入同值、改参与字段即变）、生成参数不匹配 ⇒ 拒绝应用、
+  区域表不匹配 ⇒ 仅提示；③ **不降级**。
+- 做了什么：
+  1. **共用哈希设施**（[`world_save.hpp`](world/save/world_save.hpp) / `.cpp`）：新增 `Fnv1a64Builder`（**增量版 FNV-1a 64**）+
+     公开常量 `kFnv1a64OffsetBasis` / `kFnv1a64Prime`（`Fnv1a64` 改为复用它们）。**为什么需要 builder**：
+     结构体有**填充字节**、内容不确定 ⇒ 把结构体裸字节喂 hash **不稳定**；builder 只编码**显式字段**、每字段固定宽度**小端**。
+  2. [`TerrainParamsContentHash`](world/generation/terrain_params.hpp)（`world/generation/terrain_params.*`）：域标签 `"TPRM"` +
+     三层噪声 freq/amp + `heightOffsetBlocks` + `variationFrequency` + 地貌分区全部字段 + 悬垂 / 洞穴 / 河流；
+     **排除 `climate`**（其注释明示"不参与任何地形生成"）⇒ 改气候**不会**误判为生成不一致。
+  3. [`DigRegionContentHash`](world/dig/dig_region.hpp)（`world/dig/dig_region.*`）：域标签 `"DGRG"` + 竖向带宽 +
+     逐区域（按 `(priority 升序, 文件顺序)`）`name`（**长度前缀**）/ `diggable` / `priority` / 块包围盒；
+     **不含 `schema_version`**（它是头部独立字段 `digRegionSchemaVersion`）。
+  4. **接线**（`game/main.cpp`）：写头部时填**真值**（`generatorVersion` = 参数哈希；`digRegionSchemaVersion` = 表版本；
+     `digRegionContentHash` = 表哈希）；读档时校验 —— **种子 / 半径或生成参数不匹配 ⇒ 拒绝应用该档**（WARN，档**不删除**）、
+     **区域表 `schema_version` / 内容哈希不匹配 ⇒ 仅 WARN、继续应用**。
+  5. **测试**：新增 [`tests/world_definition_hash_test.cpp`](tests/world_definition_hash_test.cpp) **5 例** —— 参数哈希确定性 +
+     非空 / 参数哈希对生成字段敏感 / **只改 `climate` 哈希不变**（关键语义）/ 区域哈希确定性与敏感（包围盒 / diggable / priority / 带宽 / 名称）/
+     名称长度前缀无歧义（`("ab","c") ≠ ("a","bc")`）；`tests/CMakeLists.txt` 登记新文件。
+- 为什么：
+  - **排除 `climate` 是必须的**：所有者裁定"生成参数不匹配 ⇒ **拒绝应用**"，若把 climate 计入，**只调气候就会丢弃玩家地形改动**（误伤）。
+  - **`generatorVersion` 拒绝、区域表仅提示（分流）**：地形差值是**相对生成高度**的，生成基线一变、套用即产生错位地形 ⇒ 拒绝；
+    区域表变更多为增删区域（越界块由 `ApplyBlockSave` 对非常驻块返回 false 自然跳过）⇒ 继续应用安全。
+  - **不 hash 裸字节**：结构体填充字节不确定 ⇒ 哈希不稳定（会随机误判"生成不一致"）。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`Launch-VsDevShell.ps1` → `cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug` ⇒ **772/772 passed**（S5 基线 767，**+5**）。
+  3. **门禁**：`check-banned-identifiers.ps1` ⇒ **scanned 229 file(s), 0 violation(s) / PASS**（228 → 229）。
+  4. **冒烟**（`--world=world_a --auto-test`，~20 s，`build/v010_s6_smoke.log`）：读档行按预期打出（`无既有档 ⇒ 从零开始` +
+     `写盘通道 = worker 异步`）；**stderr 空、无 ERROR / 无 WARN**。
+- 下一步 / 遗留（缺口，按"缺什么 / 为什么没做 / 切换条件"三项登记）：
+  1. **S7 = 验收 + 留痕**：缺 = 阶段级验收（`ctest` / 门禁 / 文档收口）；切换条件 = **下一步立即开工**。
+  2. **S6 的"不匹配提示 / 拒绝"路径未经端到端人工验收**：为什么 = 本环境无法在两次运行之间改动 `assets/config/*.toml` 并观察前台日志的读档分支
+     （自动侧已由 5 例哈希单测 + 代码路径覆盖）；切换条件 = **所有者按 `plans/v0.10.md` §3 的 S6 条目目视**
+     （改 terrain.toml ⇒ 拒绝；改 dig_regions.toml ⇒ 仅提示；改 `[climate]` ⇒ 不提示）。
+  3. **旧档（S6 之前产出、`generatorVersion` 写下 0）会被拒绝**：为什么 = 格式冻结后不静默迁移（ADR 0037 决策六）；
+     实际无影响（当前存档目录无既有档 —— 首次写入即为真值）；切换条件 = 若出现此类旧档，按 ADR 0037 决策六补迁移函数 + 迁移测试。
+  4. **C4 / C5 仍需所有者实测读数**（P99 帧时间 / 室内亮度 A-B）。
+  本批**未提交**。
+
+## 2026-10-07  V0.10 S7 落地：**阶段验收 + 留痕**（自动侧收口；阶段冻结待所有者验收）
+
+- 来源（所有者 2026-10-07）："开发下一步" ⇒ 按 `plans/v0.10.md` §3 的「下一步」推进 **S7**（阶段验收 + 文档留痕；不改代码）。
+- 范围：**只做验收与文档收口**，不动任何代码 / 配置。**不做**：不收口小项 C1~C5（未开工）。
+- 做了什么：
+  1. **终稿 [plans/v0.10.md](docs/plans/v0.10.md) 的 §2 / §3 / §4**：S1~S7 全部标「已完成」；
+     §2 S7 状态 = **已完成（自动侧）**；§3「进行中」= 无、「下一步」= **所有者人工验收 → 通过后冻结 V0.10 并开新阶段**；
+     §4 阶段验收对照表逐行终稿（确定性行升为**已达成**）。
+  2. **诚实登记两项"未取证"**（§4 表后）：① **`.voxr` 文件实测大小**、② **flush 实测耗时数字** —— 二者都需**真实脏档**，
+     而本环境**无法向前台窗口注入输入**（跑不出有差量的档）⇒ 随人工验收一并取证；**不得当作"已达成"**。
+  3. **阶段状态口径**：**自动侧完成 ≠ 阶段冻结** —— 冻结须**所有者验收通过**（先例 = V0.9）。故本文件**不**标「已完成（冻结）」，留待验收后处理。
+  4. **同步**：`adr/README` §三（v0.10 行）+ §五（持久化缺口行：仅剩 S7 → 现登记为"阶段待验收"）、
+     `engine-capabilities.md` 的「存档 / 读档」行、[ADR 0037](docs/adr/0037-world-state-save-v2-and-terrain-persistence.md) 的落地记录（S5/S6 + 阶段完成）。
+- 为什么：
+  - **不自动冻结阶段**：SKILL 的完工留痕要求"缺失必须落盘"；把"自动侧完成"当成"阶段完成"会掩盖**尚未人工验收**的事实，
+    且与 V0.9 的冻结口径不一致。
+  - **两项数字必须如实标"未取证"**：文件大小 / flush 耗时是性能记账（SKILL §四），**未实测不得声称已达成**。
+- 验证（命令 + 真实结果；与 S6 同一批次）：
+  1. **构建**：`cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug` ⇒ **772/772 passed**。
+  3. **门禁**：`check-banned-identifiers.ps1` ⇒ **scanned 229 file(s), 0 violation(s) / PASS**。
+- 下一步 / 遗留（缺口，按"缺什么 / 为什么没做 / 切换条件"三项登记）：
+  1. **所有者人工验收（本阶段收口的前置）**：缺 = 下列 5 项的目视确认 —— ① 挖洞 → 重启 ⇒ 洞与碰撞体都在；② 挖过的块走远再回 ⇒ 洞仍在；
+     ③ `--world-save=off` 对照（洞重启即消失）；④ `T` 到 `flatten` 在斜坡放建筑 ⇒ 地面被压平贴地、重启仍在；
+     ⑤ 改 `terrain.toml` ⇒ 拒绝读档、改 `dig_regions.toml` ⇒ 仅提示、只改 `[climate]` ⇒ 不提示。
+     为什么 = 本环境无法注入键鼠 / 无法在两次运行间改配置并观察前台日志；切换条件 = **所有者按 `plans/v0.10.md` §3 逐条目视**。
+  2. **两项性能数字未取证**（`.voxr` 文件大小 / flush 耗时）：见上「做了什么」第 2 条；切换条件 = 人工验收产生真实脏档时一并读日志。
+  3. **阶段冻结 + 开新阶段**：缺 = 验收通过后把 `plans/v0.10.md` 标「已完成（冻结）」并更新 `adr/README` §三、新建下一阶段计划；
+     切换条件 = 上面 1、2 项通过后。
+  4. **收口小项 C1~C5 未开工**：缺 = ADR 0034 两个缺口（逐物件网格未移除 / 实例化逐级联阴影过滤）、器物破坏状态切换、
+     4 旋钮调优 + P99 读数（**待人工**）、室内亮度 A-B（**待人工**）；为什么 = 所有者 2026-10-07 选定"只推存档主线"；
+     切换条件 = 下一阶段或专门的收口批次。
+  本批**未提交**。
+
+## 2026-10-07  V0.10 收口期：「挖洞重启未保存」**真伪判定（结论：非缺陷）** + 落点模式面板**中文化**
+
+- 来源（所有者 2026-10-07）：①"挖洞重启后发现没有保存，帮我确认是否是 bug"；②"面板中 T 循环的四个选项采用中文表示"。
+- **一、缺陷真伪判定 —— 判定：不是"保存 / 读档"缺陷**（数据链路**端到端已用运行期证据验证**）。依据（契约 + 机制 + 证据）：
+  - **契约**：[ADR 0037](docs/adr/0037-world-state-save-v2-and-terrain-persistence.md) 判据①（往返一致）/ ④（版本纪律）；
+    `references/save-and-serialization.md` §2（只存脏数据）/ §9（卸载前落盘）。
+  - **机制链（用户那次会话）**：光球命中 **(10.5, 120.0, 8.1)**（**在可挖区域内** ⇒ 三维挖除）⇒ 入队 1 个块 ⇒
+    系统面板「退出游戏」⇒ **退出前强制 flush：提交写盘 1 块 → 强制写盘完成**。
+  - **文件证据**：`saves\world_world_a.voxr` **663 B**、`chunkCount = 1`、`flags = 2`（含脏体积块）；
+    索引项 `kind=2 coord=(0,3,0) raw=32772`（= 1 + 3 pad + 32³）⇒ **改动确实落盘**。
+  - **读档证据（本次压测）**：`--world=world_a --auto-test`（**等"地表世界就绪"后再关窗**）⇒ 日志
+    `已读档 … 1 个脏单元（高度场 0 + 体积 1）` → **首帧** `常驻命中 coord=(0,3,0)` → `本帧叠加 1 个存档体积块`（待叠加剩 0）。
+  - **为什么会以为"没保存"（最可能）**：A 世界（10.4 km：4489 tile + 441 体积块 + 271 物件）**加载约 28~32 s**；
+    早先的验证运行**都在加载阶段就被关闭**（日志尾部 `加载期收到退出请求（…阶段）`）⇒ 那一轮**根本没进主循环**。
+    在加载完成前判断 / 提前关窗，会看到"什么都没变"。
+    **待所有者确认**：重启后是否**等到世界真正出现**（日志 `地表世界就绪`）再查看那个洞；洞在出生点附近 **(10.5, ~120, 8.1)**。
+  - **诊断手法留痕（环境限制）**：本环境验证"重启后是否恢复"必须 **(a)** 重定向 stdout + **(b)** 等 `地表世界就绪` 再
+    `CloseMainWindow` —— **强杀会丢 CRT 输出缓冲**，日志会"看起来缺行"，曾据此误判。
+- **二、落点模式显示名中文化**（`T` 循环 4 选项）：
+  - 做了什么：`game/ui_text.hpp` 新增 **4 个标签**（`LandingModeSink/FlatOnly/Flatten/Fill`）+ 中英两表各 4 项；
+    `game/main.cpp` 新增 **`LandingModeLabel(mode, cjk)`**（走标签缝：有 CJK 字体 ⇒ 中文，否则回退纯 ASCII 显示名）；
+    F1 面板 / HUD 横幅改用它（`stats.placementLandingMode`）。**配置 token 与日志仍用 `LandingModeToken`**（口径不变）。
+  - 为什么这样做（而不是直接塞中文字面量）：SKILL 六.10「控件标签即行为契约」+ `ui_text` 标签缝 ——
+    无 CJK 字体时**不得出现缺字 `?`**（8 项 `ui_text` 测试会逐项把关）。
+- 验证（命令 + 真实结果）：构建 **0 警告**；`ctest` **772/772**；门禁 **229 文件 0 违规**。
+- 下一步 / 遗留：本批是**收口期的修正 / 小改**，不改变 V0.10 的验收清单（见 S7 条目：人工验收 5 项 + 两项性能数字未取证）；
+  **本批未提交**。
+
+## 2026-10-07  V0.10 缺陷修复：**`flat_only` 幽灵不显示** + **`flatten` 斜坡"看穿/破口"**（加边缘过渡带）
+
+- 来源（所有者 2026-10-07 实测反馈）：①"无论我在什么地面上，落点必须平整的模式不显示模型"；②"压平地形模式会使地图出现破口 bug"。
+  逐条**先判真伪**（契约 + 机制），再动手；②的修法（改地形范围）**事前提问获裁定**："加过渡带（默认 3 格）"。
+- **缺陷 ①（确认是缺陷）**：
+  - **契约**：④「落地必须平整」= footprint 内高差 ≤ `kBuildingFlatToleranceBlocks`(0.5) 才允许放置（[ADR 0036](docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策四）。
+  - **机制**：`game/main.cpp` 的预览把判据传成 `*building`（**模板自身**）⇒ 用的是模板配置里的**固定锚点 `x/z`**，与准星指向无关
+    ⇒ 无论站在哪都在同一个点判定（该点不平 / 无地形 ⇒ 永远拒绝）。被拒分支只 `return`、不更新幽灵位姿/透明度 ⇒ 幽灵停在上一处有效位姿（或不可见）。
+  - **修法**：按**十字准星命中的候选落点**（目标 x/z + 目标朝向）重算 footprint 再判定；被拒时显式 `SetMeshOpacity(.., 0)` 隐藏幽灵（状态确定）。
+- **缺陷 ②（确认是缺陷，且违背既定契约）**：
+  - **契约**：[ADR 0037](docs/adr/0037-world-state-save-v2-and-terrain-persistence.md) §八（承接 ADR 0036 §八）原文即写"**边界平滑收敛**"；
+    我的实现是**无衰减硬边** —— 违背契约。
+  - **机制**：斜坡上 footprint 一侧被抬/削数格 ⇒ 边缘形成**近垂直台阶**；地表是**单面网格**、主通道管线 `CULLMODE_BACK`
+    （[`mesh_renderer.cpp`](engine/render/mesh_renderer.cpp) L645/L680）⇒ 从背面看被剔除/近乎不可见 ⇒ **看穿到地形内部**（= 破口）。
+    **已排除"网格器丢面"**：唯一的丢面条件是体积接管过滤器（`ApplyQuadFilterToMesh`），只在**可挖区域内**生效；所有者报告的位置在**区域外**。
+  - **修法（所有者裁定"加过渡带（默认 3 格）"）**：`ApplyTerrainLevelRect` 增 **`falloffBandBlocks`** 参数 ——
+    **矩形内精确**收敛到目标（地基仍一步平）；**矩形外 `band` 内**按到矩形的距离用 smoothstep 把目标高度**平滑过渡回原地形**；
+    `band == 0` ⇒ 矩形外一律不动（旧"精确矩形"语义，供单测对照）。落点调用传 `kBuildingLandingFalloffBlocks = 3` 格。
+    业界参照：**UE5 Landscape** 的 *Flatten* falloff、**Valheim** 地面平整的过渡。
+- 做了什么：
+  1. [`game/main.cpp`](game/main.cpp) 预览的平整判据改用**候选落点**；被拒时隐藏幽灵。
+  2. [`world/dig/terrain_brush.*`](world/dig/terrain_brush.cpp)：`ApplyTerrainLevelRect` 增 `falloffBandBlocks`（smoothstep 过渡；`0` = 旧语义）。
+  3. [`world/object/object_layer.hpp`](world/object/object_layer.hpp)：新增 `kBuildingLandingFalloffBlocks = 3.0F`（含"为什么必须有它"的说明）。
+  4. 测试：旧 3 例 `TerrainBrushLevelRect` 显式传 `0`（锁定"精确矩形"语义）；**新增 1 例 `FalloffBandSmoothsEdgeAndLeavesOutsideUntouched`**
+     （矩形内精确 / 带内单调介于目标与原状之间 / 带外逐列不变 / 边缘台阶显著减小）。
+  5. 文档：[ADR 0037 §八](docs/adr/0037-world-state-save-v2-and-terrain-persistence.md) 补"边缘过渡带是必须的"落地注；
+     [`plans/v0.10.md`](docs/plans/v0.10.md) 的 S5 评价 + §3 记录两处修复 + 待人工验收补 ④b。
+- 验证（命令 + 真实结果）：构建 **0 警告**；`ctest` **773/773**（+1）；门禁 **229 文件 0 违规**。
+- 下一步 / 遗留：
+  1. **两项修复的端到端人工验收**：④b（`flat_only` 在平地显示幽灵；`flatten` 斜坡边缘平滑、不再看穿）—— 本环境无法注入键鼠。
+  2. `flat_only` 在**自然斜坡**上仍会按设计拒绝（容差 0.5 格）—— 若希望放宽，改 `kBuildingFlatToleranceBlocks`（须所有者定值）。
+  3. 两项性能数字（`.voxr` 大小 / flush 耗时）与 S7 的人工验收项**仍未取证**。
+  **本批未提交**。
+
+---
+
+## 2026-10-07  V0.10 / S8：落点 ①/③ 拒放体积接管区 + 幽灵"始终显示 + 不可放置染红"（实测反馈第二批）
+
+- 做了什么：
+  1. **诊断（先判真伪）**：所有者报告三件事 —— ① ①/③ 在"黄色区域"（可挖体积绘制处）无效果、② `flat_only` 在任何地面都不显示幽灵、
+     ③ ①/③ 在区域交界处出现破洞。判为**确认缺陷（同根）**：`ApplyTerrainLevelRect` **只改高度场**，
+     而接管区内地表四边形已被 [`ResidentQuadFilter`](game/main.cpp) 跳过、表面由体积网格绘制 ⇒ 改高度场**画面上不可见**；
+     交界处两套表面错开 ⇒ 露破洞。幽灵问题 = 预览在不可放时 `SetMeshOpacity(.., 0.0F)` **整块隐藏**。
+  2. [`game/main.cpp`](game/main.cpp)：新增 `buildingFootprintTouchesVolumeTakeover`（footprint AABB 5×5 采样，
+     判据与 `ResidentQuadFilter::SkipQuad` **同源**：`BlockOfWorldPoint(column, floor(surfaceY), column) ∈ volumeSlots`）
+     ⇒ 落点 ①/③ **拒放**（**预览**与**提交**两处生效）；预览改为**始终显示幽灵**，被拒时 `SetMeshTint` **染红**（`kPlacementBlockedTint*`），
+     可放时复位为"不变"；`previewBlockedByVolume` 区分提示文案（`pickFeedback` + 可解释 WARN）。
+  3. [`engine/render/mesh_renderer.hpp`](engine/render/mesh_renderer.hpp) / [`.cpp`](engine/render/mesh_renderer.cpp)：新增**逐网格 tint**
+     能力 —— `MeshTransformUniform` 增 `vec4 meshTint`（推送 80 → **96 字节**，去重键含它）、`MeshResources::tint[4]`、
+     `SetMeshTint(handle, r, g, b, strength)`（`strength` 钳到 [0,1]）；`DrawMeshes` 与**实例化路径**都写 tint 并进去重键。
+  4. 着色器（六个共享 `MeshTransformBlock` 者全部同步布局）：`mesh.vert` / `mesh_instanced.vert` / `mesh_skinned.vert` 加
+     `vec4 meshTint` + `layout(location=6) out vec4 v_meshTint`；`mesh.frag` 加对应 `in` 并在输出前
+     `finalColor = mix(finalColor, v_meshTint.rgb, clamp(v_meshTint.a, 0.0, 1.0))`；三个 `shadow*.vert` 仅声明（保持块尺寸一致）。
+     **强度 0（默认）⇒ `mix` 退化为原色、逐位不变**。
+  5. 文档：[ADR 0037 §八](docs/adr/0037-world-state-save-v2-and-terrain-persistence.md) 补 S8 裁定注；
+     [`plans/v0.10.md`](docs/plans/v0.10.md) 增 S8 条目 + 「S8 动手前评价」+ §3 进度 + ⑥ 人工验收 + 未决（体积平整）；
+     [`engine-capabilities.md`](docs/engine-capabilities.md) 补 tint 能力、刷新型落点口径、新增「**体积平整：未开始**」行；
+     [`adr/README.md`](docs/adr/README.md) §五.1 登记体积平整缺口；[`ui-inventory.md`](docs/ui-inventory.md) 更新准星预览与 `T` 的行为契约。
+- 为什么：
+  1. **业界标准优先**（先评价再动手）：**Valheim / Rust / 7 Days to Die** 的"放置合法性预览"在放不下时**仍显示虚影并变红**（不隐藏）；
+     **UE5 Landscape** 的 *Flatten* 只作用于 Landscape（高度场），对非高度场拥有的表面**不提供该编辑**。⇒ 本项目取
+     "**预览始终可见 + 不可放显红 + 拒绝落在非高度场拥有的表面上**"，与所有者裁定一致。
+  2. **降级（已获所有者 2026-10-07 事前确认）**：本阶段**只拒放**，不实现"体积平整"（需对 `int8` 密度场做平面切割，
+     属新系统 / 性能风险、须开 ADR）；提示取 **tint 染色**而非描边 / 图标（后者是纯增强，SKILL §五）。
+     二者均已在回复中与本文档登记"降到什么程度 / 为什么 / 何时补回"。
+- 验证（命令 + 真实结果）：构建 `Launch-VsDevShell.ps1` → `cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4 /WX`，含 7 个 shader 双格式重编）；
+  `ctest --preset debug` ⇒ **773/773 passed**（无新增用例 —— 见下）；门禁 `check-banned-identifiers.ps1` ⇒ **229 文件 0 违规**；
+  冒烟（`build\perf\s8_smoke.*.log`：`--world=world_a --auto-test --autofly=8`）⇒ **无 ERROR**、世界就绪、退出前强制 flush 正常
+  （`世界状态存档 … 提交写盘 22 块`、`退出前强制写盘完成`）。
+- 下一步 / 遗留：
+  1. **⑥ 端到端人工验收**（本环境无法注入键鼠 / 无 GPU 交互路径）：`flat_only` 幽灵常显且不可放变红；①/③ 在接管区拒放且
+     交界处不再破洞；普通地形上 ①/③ 与 S5 一致（见 [`plans/v0.10.md`](docs/plans/v0.10.md) §3「待人工验收（S8）」）。
+  2. **无新增自动化测试的原因**：该判据与提示位于 `game/main.cpp` 的交互 / GPU 预览路径，测试环境无窗口与 GPU ⇒
+     按 SKILL「无法自动化时写明人工验收步骤」处理；渲染能力 `SetMeshTint` 亦属 GPU 路径（`mesh.frag` 的 `mix` 有强度 0 的逐位不变保证）。
+  3. **体积平整未做**（登记为后续阶段明确目标；切换条件 = 需要"在洞穴地表上平整地基"时）。
+  **本批未提交**（与 V0.10 的 S5/S6/S7 同批）。
+
+---
+
+## 2026-10-07  V0.10 / S9：物件可编辑层"退出即自动保存" + 未保存计数 + 修「面板打开时 F5 被吞」
+
+- 做了什么：
+  1. **诊断（先判真伪）**：所有者报告"重启后摆放的东西不见了"。判为 **不是写盘坏了，但构成必须修的世界不自洽** ——
+     摆放只在 `F5` / 面板按钮时整层写盘（ADR 0032 决策三/六，设计使然）；实测佐证：`world_a_objects.edit.toml`
+     有 21 座 `spawn_hut#N`（18:55 写）、存档 `.voxr` 为 20:28、冒烟日志 `成套建筑：22 座`（发布清单 1 + 编辑层 21）
+     ⇒ 读写链路完好，**最后一次会话没触发保存**。但 V0.10 起**地形改动退出即自动落盘**、**物件摆放仍需手动 F5**
+     ⇒ 重启后"地面留下了、建筑没了"；诱因是 `F5` 在 `F2` 面板打开时**被静默吞掉**（无任何反馈）。
+  2. [`game/main.cpp`](game/main.cpp)：新增 `editLayerUnsavedOps`（摆放 / 删除 / 变暗各 +1）；`saveEditLayer` 成功即归零；
+     **退出 / 切世界前**（世界状态强制 flush 的**同一点**、帧循环结束之后 ⇒ 允许阻塞）若 `> 0` 则**自动写盘**并记录日志；
+     `F5` 改为**面板打开时也生效**、无未保存改动时**不写盘**并给可见反馈；面板「保存」动作同样加该守卫。
+  3. [`game/debug_overlay.hpp`](game/debug_overlay.hpp) / [`.cpp`](game/debug_overlay.cpp)：`PaletteModel::unsavedChanges` +
+     `DebugStats::editLayerUnsaved`；HUD 与 `F2` 面板各加一行「未保存改动 N 处」（`0` 时不占行）；面板按钮改名「保存全部到可编辑层」。
+  4. [`game/ui_text.hpp`](game/ui_text.hpp)：新增 2 条标签（`EditLayerUnsavedFormat` / `ObjectPaletteUnsavedFormat`，中英各一）
+     + 改名 `ObjectPaletteSave`（走标签缝，英文项纯 ASCII）。
+  5. 文档：[ADR 0032](docs/adr/0032-object-palette-and-placement-mode.md) 追加「落地回填（V0.10 / S9 —— 保存时机修订）」；
+     [`plans/v0.10.md`](docs/plans/v0.10.md) 增 S9 条目 + 「S9 动手前评价」+ §3 进度 + ⑦ 人工验收；
+     [`ui-inventory.md`](docs/ui-inventory.md) 更新 `F5` / 面板按钮 / 未保存计数的行为契约与"当前限制"。
+- 为什么：
+  1. **业界标准优先**（先评价再动手）：Minecraft（`level.dat` / 区块周期与退出保存）、Valheim（周期 + 退出保存，
+     玩家无需按键）、Rust（周期 + 退出保存）⇒ 采纳"**玩家操作即持久化，退出 / 周期自动落盘**"；
+     项目内先例 = V0.10 自己的 `.voxr` 退出前强制 flush（**同一条退出路径、同一调用点**）。
+  2. **降级**：无。F5 / 面板按钮作为"立即保存"**保留**（不删既有能力，符合 SKILL 第五节）。
+  3. **世界内一致性**：真实世界 = "动过的东西按同一规则留存"，修掉了地形 / 物件两套留存规则的不对称。
+- 验证（命令 + 真实结果）：构建 `Launch-VsDevShell.ps1` → `cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4 /WX`）；
+  `ctest --preset debug` ⇒ **773/773 passed**（含 `ui_text` 的标签缝门禁：两张表与枚举等长、英文纯 ASCII、中文确有中文）；
+  门禁 `check-banned-identifiers.ps1` ⇒ **229 文件 0 违规**；
+  冒烟（`--world=world_a --auto-test --autofly=6`）⇒ **无 ERROR**；**未保存改动 = 0 ⇒ `assets/maps/world_a_objects.edit.toml`
+  的 mtime 逐秒不变（18:55:04 → 18:55:04）** ⇒ 判据④"无改动不空写"成立。
+- 下一步 / 遗留：
+  1. **⑦ 端到端人工验收**（"未保存改动 > 0 ⇒ 退出自动写盘"这条**必须真实摆放**才能触发；本环境无法注入键鼠）：
+     摆 3 座不按 F5 → 退出 → 重启 ⇒ 3 座都在，日志有"退出前检测到 3 处未保存的物件改动 ⇒ **已自动写盘**"
+     （见 [`plans/v0.10.md`](docs/plans/v0.10.md) §3「待人工验收（S9）」）。
+  2. 写盘 / 读回链路本身已有既有单测（`object_edit_save_test.cpp` 的 `RoundTripsBuildingsRemovalsAndDarkening` 等）
+     与本机既有存档（21 座建筑可正确加载）佐证。
+  **本批未提交**（与 V0.10 的 S5~S8 同批）。
+
+---
+
+## 2026-10-07  V0.10 / S10：修复终端中文日志乱码（启动即把控制台输出代码页设为 UTF-8）
+
+- 做了什么：
+  1. **诊断（先判真伪）**：所有者报告"终端日志看不懂，不知是繁体还是乱码"。判为**确认缺陷**：
+     日志字符串是 **UTF-8 字节**（根 `CMakeLists.txt` 已开 `/utf-8`，已核对），而 Windows 控制台默认按**本地 ANSI 代码页**
+     （简体中文系统 = **936 / GBK**）解码 ⇒ UTF-8 字节被当 GBK 解释，输出**看似繁体字的乱码**（正是所有者的描述）；
+     `game/main.cpp` 中**没有任何设置控制台代码页的调用**。**反证**：重定向到文件时中文完全正确 ⇒ 字节没问题，只有"控制台解码"这一环错。
+  2. **新增** [`engine/platform/console.hpp`](engine/platform/console.hpp) + [`.cpp`](engine/platform/console.cpp)：
+     `EnableUtf8ConsoleOutput()` —— Windows 调 `SetConsoleOutputCP(CP_UTF8)` + `SetConsoleCP(CP_UTF8)`，并**回读 `GetConsoleOutputCP()` 作为返回值**
+     （`0` = 无附加控制台）；非 Windows 返回 `0`（终端本身即 UTF-8）。与既有 `command_line.cpp` 同口径
+     （`WIN32_LEAN_AND_MEAN` + `NOMINMAX` + `<windows.h>` **只在平台层**）。
+  3. [`engine/CMakeLists.txt`](engine/CMakeLists.txt)：登记 `platform/console.cpp`。
+  4. [`game/main.cpp`](game/main.cpp)：在 `main` 的**第一条语句**调用（早于任何日志，含 `CommandLineArgumentsUtf8` 的失败日志），
+     并把**真实生效代码页**写进首行日志（`65001` = UTF-8 / `0` = 无附加控制台）—— 让"是否真的设上了"**可判定**，而不是一句声明。
+  5. 文档：`plans/v0.10.md` 增 S10 条目 + 「S10 动手前评价」+ §3 进度 + ⑧ 人工验收；
+     `engine-capabilities.md` 增"控制台输出编码"能力行；`file-index.md` 的 `engine/platform/` 条目补注。
+- 为什么：
+  1. **业界标准优先**（先评价再动手）：CMake / Git / Rust `cargo` 等跨平台 CLI 在 Windows 上的通行做法 = **启动即设控制台 CP 为 UTF-8**
+     （等价 `chcp 65001`）；**Python PEP 528** 把 Windows 控制台读写编码改为 UTF-8；Windows 官方 API 即 `SetConsoleOutputCP`。**采纳**，**不降级**。
+  2. **分层**：按 SKILL §2（`platform → engine core → world → game`），Win32 只在平台层出现，由最上层 `game/main.cpp` 调用 ⇒ 无逆向依赖。
+  3. **不影响重定向**：写文件 / 管道仍是原始 UTF-8 字节（该设置只改"控制台如何解码"）。
+- 验证（命令 + 真实结果）：
+  - **复现 + 修复的对照实验**：先 `chcp 936`（复现乱码条件），再启动 `voxel_game.exe` ⇒ 首行日志回读
+    **`[   0.000] [INFO ] 控制台输出代码页 = 65001（UTF-8 = 65001；0 = 无附加控制台）…`**
+    ⇒ 在起始 936 的控制台上，进程确实把输出代码页改成了 65001（**修复生效**，而非"本来就没问题"）。
+  - 构建 `cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4 /WX`）；
+  - `ctest --preset debug` ⇒ **773/773 passed**；门禁 `check-banned-identifiers.ps1` ⇒ **231 文件 0 违规**（+2 = 新增的 `console.hpp/cpp`）。
+- 下一步 / 遗留：
+  1. **⑧ 人工验收**：在所有者自己的终端里**不重定向**直接运行 ⇒ 中文日志应为**可读简体中文**、首行回读 `65001`
+     （见 [`plans/v0.10.md`](docs/plans/v0.10.md) §3）。本环境无法目视终端渲染，故该"观感"项按 SKILL §七.4 标注为**待人工目视验收**。
+  **本批未提交**（与 V0.10 的 S5~S9 同批）。
+
+---
+
+## 2026-10-07  交接包整理（V0.10 / S8~S10 收口）+ 发现一处新缺口
+
+- 做了什么：把所有者实测反馈的三批修复（S8 体积接管区拒放 / 幽灵染红、S9 物件层退出自动保存 + 未保存计数、
+  S10 终端日志 UTF-8）**回填进六份交接包**，并对全仓库做一次"口径漂移 + 陈旧陈述"清理：
+  1. `docs/plans/v0.10.md`：S8/S9/S10 条目 + 三份「动手前评价」+ §3 进度 + ⑥⑦⑧ 人工验收 + 「阻塞 / 未决」；
+     并把 §3 的"进行中"改为 **S1~S10 自动侧全部完成**。
+  2. `docs/devlog.md`：本批三条追加（S8 / S9 / S10）+ 本条。
+  3. `docs/adr/README.md`：ADR 0032 行补「**2026-10-07 局部修订**（保存时机：退出 / 切世界自动写盘、`F5` 面板内生效、未保存计数）」；
+     §三 的 v0.10 行更新为 S1~S10 + 最新数字（`ctest` 773、门禁 231 文件）；§五.3 增两条缺口。
+  4. `docs/engine-capabilities.md`：新增「**控制台输出编码设为 UTF-8**」能力行；「地形笔刷 / 体积平整」行按 S8 更新。
+  5. `docs/ui-inventory.md`：`F5` / 面板按钮 / 未保存计数 / 幽灵染红的**名义承诺与当前限制**。
+  6. `docs/file-index.md`：`engine/platform/` 条目补"命令行（UTF-8 取回）与控制台编码"。
+  7. `docs/learning-notes.md`：新增 **Q43**（"程序输出是正常中文，为什么终端里像繁体乱码？"）。
+  8. `docs/game-design.md`：修正**陈旧陈述**（原写"世界改动（挖洞 / 塌落 / 物件）未持久化" —— V0.10 起已解除），
+     并登记 C 世界"退出即丢"的门控未接。
+  9. **新缺口（交接时发现，已登记未修）**：`LevelManifest::persistent` **仍未被消费** —— `game/main.cpp`
+     只在启动日志打印是 / 否，**没有用它门控 `.voxr` 落盘** ⇒ 声明 `persistent = false` 的 **C / 肉鸽秘境也会被落盘**，
+     与 `game-design.md` 的"退出即丢"口径不一致。已登记到 `plans/v0.10.md` §3「阻塞 / 未决」、`adr/README` §五.3、
+     `game-design.md`（A/B/C 表 + 秘境实例末条），并把 `world/generation/level_manifest.hpp` 的**陈旧字段注释**
+     改为现状 + 指向登记处（SKILL 同步清单第 9 条：源码注释复述结论须一并改）。
+- 为什么：① 交接包的价值在于"接手者只读这几份就能开工"，任何**只存在于对话里的结论**换会话即丢失（SKILL 会话边界）；
+  ② 三批修复改了**渲染能力 / 存档时机 / 平台行为**，对应内容基线文档必须同批更新（SKILL 六.5「改动即同步」）；
+  ③ 发现的新缺口按 SKILL「完工留痕」登记三要素（缺什么 / 为什么现在没做 / 切换条件），**不在本次顺手改**
+     （它属**存档策略口径**，须所有者裁定，且会改变 C 的可见行为）。
+- 验证：构建 `cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4 /WX`）；
+  `ctest --preset debug` ⇒ **773/773 passed**；门禁 `check-banned-identifiers.ps1` ⇒ **231 文件 0 违规**。
+- 下一步 / 遗留：
+  1. **待所有者裁定**：`LevelManifest::persistent` 是否门控 `.voxr` 落盘（口径见 `plans/v0.10.md` §3「阻塞 / 未决」）。
+  2. 人工验收项：S3/S4 / S5（④b）/ S6 / S8（⑥）/ S9（⑦）/ S10（⑧），以及两项性能数字（`.voxr` 大小 / flush 耗时）。
+  **本批已提交**（见同日的提交）。
+
+
 
 
 

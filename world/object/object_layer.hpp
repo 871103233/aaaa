@@ -210,15 +210,15 @@ struct ObjectBuildingPiece {
 /// **成套建筑的落点处理模式**（V0.9，配置 `landing_mode`；[ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策四）。
 ///
 /// 口径：**逐建筑记录、随保存落进可编辑层**；`Unspecified` = 与 V0.8 逐位一致（保证"模式外逐位不变"）。
-/// **本阶段只实现 `Sink` / `FlatOnly`**（两者**不改地形**）；`Flatten` / `Fill` 会改地形 ⇒
-/// 与 [ADR 0035](../../docs/adr/0035-modular-building-kit-and-enterable-spaces.md) 决策五冲突、且地形改动无持久化
-/// ⇒ **不放行**：枚举保留、解析遇到即抛（能力不删，见 ADR 0036 §五）。
+/// 四种模式**均已放行**：`Sink` / `FlatOnly` **不改地形**；`Flatten` / `Fill` 会改地形，
+/// 由 V0.10 / S5 起实现（[ADR 0037](../../docs/adr/0037-world-state-save-v2-and-terrain-persistence.md) 解除 ADR 0035 决策五，
+/// 且地形改动**有持久化** ⇒ 在**摆放时**按 footprint 改地形，改动随 `.voxr` 落盘）。
 enum class ObjectBuildingLandingMode : std::uint8_t {
     Unspecified,  ///< 未给出 ⇒ 锚点 = 地表高度（V0.8 行为：不下沉、不校验）
     Sink,         ///< ② 向下半埋：整体下沉 `kBuildingSinkBlocks`（层高相对偏移不变）
     FlatOnly,     ///< ④ 落地必须平整：footprint 内高差 ≤ `kBuildingFlatToleranceBlocks` 才允许放置
-    Flatten,      ///< ① 顺手压平地形（**不放行**：会改地形）
-    Fill,         ///< ③ 悬空处填充（**不放行**：会改地形）
+    Flatten,      ///< ① 顺手压平地形：footprint 内**双向**收敛到锚点高度（V0.10 / S5 实现）
+    Fill,         ///< ③ 悬空处填充：只抬升 footprint 内低于锚点高度处（V0.10 / S5 实现）
 };
 
 /// 落点模式 **② 向下半埋**的下沉量（格）。
@@ -227,8 +227,20 @@ inline constexpr float kBuildingSinkBlocks = 0.5F;
 /// 落点模式 **④ 落地必须平整** 的 footprint 内**允许高差**（格）。
 inline constexpr float kBuildingFlatToleranceBlocks = 0.5F;
 
+/// 落点模式 **① 压平 / ③ 填充地形** 改地形时的**边缘过渡带宽度**（格）。
+///
+/// 语义：footprint **内**精确压平 / 填充到锚点高度；footprint **外**该宽度内用 smoothstep
+/// 把地形**平滑过渡回原样**（距离越远改动越小、外缘归零）。
+///
+/// **为什么必须有它（V0.10 缺陷修复，2026-10-07）**：`0`（无过渡带的硬边）会在斜坡上留下**近垂直台阶** ——
+/// 地表是**单面网格**（主通道 `CULLMODE_BACK`），这类台阶在画面里会露出"看穿"的破口。
+/// 这与 [ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md) §八
+/// 原本就写明的"**边界平滑收敛**"一致；业界做法（UE5 Landscape 的 *Flatten* falloff、Valheim 地面平整）同为边缘平滑过渡。
+inline constexpr float kBuildingLandingFalloffBlocks = 3.0F;
+
 /// **交互摆放时的缺省落点模式**（V0.9 / ADR 0036 决策四）：**② 向下半埋**（**暂定，待所有者确认**）。
-/// 为什么取它：① 不改地形（不冲突 ADR 0035 决策五）；② 永不拒绝放置（摆放工具不应"点了没反应"）。
+/// 为什么取它：① 不改地形（最保守，不产生持久化副作用）；② 永不拒绝放置（摆放工具不应"点了没反应"）。
+/// V0.10 / S5 已放行 ①/③，但**缺省仍不改为 ①/③**（ADR 0037 决策八未改判）。
 inline constexpr ObjectBuildingLandingMode kDefaultBuildingLandingMode = ObjectBuildingLandingMode::Sink;
 
 /// **一座成套建筑**（V0.8，配置 `[[building]]`；[ADR 0035](../../docs/adr/0035-modular-building-kit-and-enterable-spaces.md) 决策三）。

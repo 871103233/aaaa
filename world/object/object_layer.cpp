@@ -156,10 +156,11 @@ constexpr double kPiOver180 = 3.14159265358979323846 / 180.0;
                              "]（可选：floor / wall / wall_door / roof）");
 }
 
-/// 解析 `landing_mode`（V0.9；`[[building]]` 可选；[ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策四）。
+/// 解析 `landing_mode`（V0.9 起；`[[building]]` 可选；[ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策四）。
 ///
-/// **① `flatten` / ③ `fill` 不放行**：它们会**改地形** ⇒ 与 ADR 0035 决策五（首期只放地形之上、不裁地形）冲突，
-/// 且地形改动**没有持久化**（重启即丢）⇒ 解析期**明确报错**（不静默回退；枚举保留、能力不删）。
+/// **V0.10 / S5 起放行 ① `flatten` / ③ `fill`**：[ADR 0037](../../docs/adr/0037-world-state-save-v2-and-terrain-persistence.md)
+/// 已解除 ADR 0035 决策五（首期只放地形之上、不裁地形），且**地形改动有持久化**（走 `.voxr` 的脏列通路）
+/// ⇒ 这两个"会改地形"的落点模式不再报错，由 `game/main.cpp` 在**摆放时**按 footprint 改地形。
 [[nodiscard]] ObjectBuildingLandingMode ParseLandingMode(const std::string& text, const std::filesystem::path& path) {
     if (text == "sink") {
         return ObjectBuildingLandingMode::Sink;
@@ -167,13 +168,14 @@ constexpr double kPiOver180 = 3.14159265358979323846 / 180.0;
     if (text == "flat_only") {
         return ObjectBuildingLandingMode::FlatOnly;
     }
-    if (text == "flatten" || text == "fill") {
-        throw std::runtime_error(path.string() + ": [[building]].landing_mode [" + text +
-                                 "] **本阶段不放行**（会改动地形；与 ADR 0035 决策五冲突，且地形改动无持久化）"
-                                 "—— 见 ADR 0036 §五；请改用 sink（向下半埋）或 flat_only（落地必须平整）");
+    if (text == "flatten") {
+        return ObjectBuildingLandingMode::Flatten;
+    }
+    if (text == "fill") {
+        return ObjectBuildingLandingMode::Fill;
     }
     throw std::runtime_error(path.string() + ": 未知的落点模式 landing_mode [" + text +
-                             "]（本阶段可选：sink / flat_only）");
+                             "]（可选：sink / flat_only / flatten / fill）");
 }
 
 /// 物件类型的查找器（用于"落点引用的类型是否存在"这类校验）。
@@ -598,7 +600,7 @@ void ParseBuildings(const toml::table& root, const std::filesystem::path& path, 
         }
 
         // V0.9 / ADR 0036 决策四：`landing_mode`（**可选**，缺省 `Unspecified` = V0.8 行为）。
-        // `flatten` / `fill` **不放行** ⇒ 解析期抛（见 `ParseLandingMode`）。
+        // V0.10 / S5 起 `flatten` / `fill` 也放行（见 `ParseLandingMode`）；改地形的动作在**摆放时**由 `game/` 执行。
         if (const toml::node* landingNode = entry->get("landing_mode"); landingNode != nullptr) {
             const std::optional<std::string> landing = landingNode->value<std::string>();
             if (!landing.has_value()) {

@@ -38,7 +38,9 @@ layout(set = 0, binding = 1, std430) readonly buffer InstanceBuffer {
 
 layout(set = 1, binding = 0, std140) uniform MeshTransformBlock {
     mat4 modelToRender;  // 未使用（矩阵来自实例缓冲）；保留以复用同一块布局与推送路径
-    vec4 meshParams;     // x = 逐批不透明度（1 = 不透明；< 1 = 片元 Bayer 抖动淡出），yzw 预留
+    vec4 meshParams;  // x = 逐批不透明度（1 = 不透明；< 1 = 片元 Bayer 抖动淡出），yzw 预留
+    // V0.10：逐**批** tint（与 `mesh.vert` 同布局；强度 0 = 不变）。
+    vec4 meshTint;
 } meshTransform;
 
 layout(location = 0) out vec3 v_relativePosition;
@@ -48,6 +50,8 @@ layout(location = 3) out float v_fade;
 // V0.8 室内变暗：逐实例围合体代理（`flat`：整实例同值，不做插值）。片元据此判定"是否室内"。
 layout(location = 4) flat out vec4 v_enclosureA;
 layout(location = 5) flat out vec4 v_enclosureB;
+// V0.10：逐**批** tint（与 mesh.vert 同位置；强度 0 = 不变）。
+layout(location = 6) out vec4 v_meshTint;
 
 void main() {
     const InstanceRecord record = instances.records[gl_InstanceIndex];
@@ -61,4 +65,5 @@ void main() {
     v_fade              = meshTransform.meshParams.x;
     v_enclosureA        = record.enclosureA;
     v_enclosureB        = record.enclosureB;
+    v_meshTint          = meshTransform.meshTint;
 }

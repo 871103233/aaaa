@@ -1557,6 +1557,21 @@ void MeshRenderer::SetMeshOpacity(MeshHandle handle, float opacity) noexcept {
     resources.opacity = std::clamp(opacity, 0.0F, 1.0F);
 }
 
+void MeshRenderer::SetMeshTint(MeshHandle handle, float red, float green, float blue, float strength) noexcept {
+    if (!handle.IsValid() || handle.id > m_meshes.size()) {
+        return;
+    }
+    MeshResources& resources = m_meshes[handle.id - 1];
+    if (resources.vertexBuffer == nullptr) {
+        return;
+    }
+    // 强度钳到 [0,1]（0 = 不变）；颜色原样保留（强度为 0 时不影响结果）。
+    resources.tint[0] = red;
+    resources.tint[1] = green;
+    resources.tint[2] = blue;
+    resources.tint[3] = std::clamp(strength, 0.0F, 1.0F);
+}
+
 void MeshRenderer::SetMeshLodMorph(MeshHandle handle, float morphStep, float startDistance,
                                    float endDistance) noexcept {
     if (!handle.IsValid() || handle.id > m_meshes.size()) {
@@ -2220,7 +2235,7 @@ void MeshRenderer::DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURender
         }
 
         // 逐网格模型变换（T41 起；T33 由 `vec4` 偏移泛化为 `mat4`；W6e 增不透明度）：把**网格局部坐标**
-        // 变成渲染相对坐标。每帧对每个网格只是一次 80 字节的 `SDL_PushGPUVertexUniformData`（**不是**上传，
+        // 变成渲染相对坐标。每帧对每个网格只是一次 96 字节的 `SDL_PushGPUVertexUniformData`（**不是**上传，
         // 不创建 / 不拷贝 GPU 缓冲），且 uniform 对**后续**绘制持续生效 ⇒ 与自发光同一套去重。
         // 为什么用矩阵而不是"偏移 + 旋转分开传"：倒塌中的刚体**位置与姿态都在变**，
         // 而局部顶点完全不变 ⇒ 一次推送即可，CPU 无需重烘焙上万顶点（T33）。
@@ -2238,6 +2253,9 @@ void MeshRenderer::DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURender
             transform.meshParams[1] = resources.morphStep;
             transform.meshParams[2] = resources.morphStartDistance;
             transform.meshParams[3] = resources.morphEndDistance;
+            // V0.10：逐网格 tint（摆放模式"不可放置"红色提示）。强度 0（默认）⇒ 与原值逐位一致，
+            // 但仍必须进去重键，否则"只改 tint"的网格会被误判为未变而不推送。
+            transform.meshTint = glm::vec4(resources.tint[0], resources.tint[1], resources.tint[2], resources.tint[3]);
             const float* matrix  = &transform.modelToRender[0][0];
             bool         changed = !transformState.pushed || transformState.opacity != transform.meshParams[0] ||
                                    transformState.morphStep != transform.meshParams[1] ||
@@ -2245,6 +2263,9 @@ void MeshRenderer::DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURender
                                    transformState.morphEndDistance != transform.meshParams[3];
             for (int element = 0; element < 16 && !changed; ++element) {
                 changed = transformState.matrix[element] != matrix[element];
+            }
+            for (int channel = 0; channel < 4 && !changed; ++channel) {
+                changed = transformState.tint[channel] != resources.tint[channel];
             }
             if (changed) {
                 SDL_PushGPUVertexUniformData(commandBuffer, 0, &transform, static_cast<Uint32>(sizeof(transform)));
@@ -2255,6 +2276,9 @@ void MeshRenderer::DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURender
                 transformState.morphEndDistance   = transform.meshParams[3];
                 for (int element = 0; element < 16; ++element) {
                     transformState.matrix[element] = matrix[element];
+                }
+                for (int channel = 0; channel < 4; ++channel) {
+                    transformState.tint[channel] = resources.tint[channel];
                 }
             }
         }
@@ -2339,6 +2363,8 @@ void MeshRenderer::DrawInstancedBatches(SDL_GPUCommandBuffer* commandBuffer, SDL
         {
             MeshTransformUniform transform;  // 缺省 = 单位矩阵（平移分量已由实例缓冲给出）+ 不透明
             transform.meshParams[0] = resources.opacity;
+            // V0.10：逐**批** tint（与 `DrawMeshes` 同义；实例着色器读同一个 `MeshTransformBlock`）。
+            transform.meshTint = glm::vec4(resources.tint[0], resources.tint[1], resources.tint[2], resources.tint[3]);
             const float* matrix = &transform.modelToRender[0][0];
             bool changed = !transformState.pushed || transformState.opacity != transform.meshParams[0] ||
                            transformState.morphStep != transform.meshParams[1] ||
@@ -2346,6 +2372,9 @@ void MeshRenderer::DrawInstancedBatches(SDL_GPUCommandBuffer* commandBuffer, SDL
                            transformState.morphEndDistance != transform.meshParams[3];
             for (int element = 0; element < 16 && !changed; ++element) {
                 changed = transformState.matrix[element] != matrix[element];
+            }
+            for (int channel = 0; channel < 4 && !changed; ++channel) {
+                changed = transformState.tint[channel] != resources.tint[channel];
             }
             if (changed) {
                 SDL_PushGPUVertexUniformData(commandBuffer, 0, &transform, static_cast<Uint32>(sizeof(transform)));
@@ -2356,6 +2385,9 @@ void MeshRenderer::DrawInstancedBatches(SDL_GPUCommandBuffer* commandBuffer, SDL
                 transformState.morphEndDistance   = transform.meshParams[3];
                 for (int element = 0; element < 16; ++element) {
                     transformState.matrix[element] = matrix[element];
+                }
+                for (int channel = 0; channel < 4; ++channel) {
+                    transformState.tint[channel] = resources.tint[channel];
                 }
             }
         }

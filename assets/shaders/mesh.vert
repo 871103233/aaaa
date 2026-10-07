@@ -45,6 +45,9 @@ layout(set = 1, binding = 0, std140) uniform MeshTransformBlock {
     // W6e/W7-S3b：x = 逐网格不透明度（1 = 不透明；< 1 = 片元 Bayer 抖动淡出）；
     // y = morphStep（> 0 启用 CDLOD 顶点过渡；= 父级网格步长）；z / w = morph 起 / 止距离（格）。
     vec4 meshParams;
+    // V0.10：逐网格 **tint**（rgb = 目标色、a = 强度 ∈ [0,1]；强度 0 = 不变 ⇒ 与从前逐位一致）。
+    // 用途 = 摆放模式的"不可放置"红色提示（`MeshRenderer::SetMeshTint`）。
+    vec4 meshTint;
 } meshTransform;
 
 layout(location = 0) out vec3 v_relativePosition;
@@ -57,6 +60,8 @@ layout(location = 3) out float v_fade;
 // 位置必须与 `mesh_instanced.vert` 一致（两者共用 `mesh.frag`）。
 layout(location = 4) flat out vec4 v_enclosureA;
 layout(location = 5) flat out vec4 v_enclosureB;
+// V0.10：逐网格 tint（rgb = 目标色、a = 强度；摆放模式"不可放置"红色提示用；强度 0 = 不变）。
+layout(location = 6) out vec4 v_meshTint;
 
 void main() {
     // 网格局部坐标 → 渲染原点相对坐标（片元据此 + 渲染原点还原世界坐标）。
@@ -92,4 +97,5 @@ void main() {
     // V0.8：地表 / 非实例化物件**没有**围合体代理 ⇒ 启用位 0 ⇒ 片元不做室内变暗（逐位退回旧行为）。
     v_enclosureA       = vec4(0.0);
     v_enclosureB       = vec4(0.0);
+    v_meshTint         = meshTransform.meshTint;
 }

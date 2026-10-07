@@ -115,10 +115,16 @@ struct CameraUniform {
 ///   - `y` = **morphStep**（> 0 启用 CDLOD 顶点过渡；= **父级网格步长**，即 `2 × 当前步长`；0 = 不启用）；
 ///   - `z` = **morph 起距离**（格）、`w` = **morph 止距离**（格）——均按顶点到 LOD 原点的 Chebyshev 距离计。
 ///
-/// std140 下 `mat4` = 4 个 `vec4`（64 字节）+ `vec4`（16 字节）= 80 字节，无隐式填充（扩展语义不改布局）。
+/// `meshTint`（V0.10）：逐网格 **tint**。`rgb` = 目标颜色、`a` = **强度** ∈ [0,1]
+/// （0 = 不变，逐位退回旧行为；片元 `mix(finalColor, rgb, a)`）。用途 = 摆放模式"**不可放置**"的红色提示
+/// （见 `SetMeshTint`）。**必须与六个共享 `MeshTransformBlock` 的着色器保持同一布局**（三个主通道顶点着色器 +
+/// 三个阴影顶点着色器；阴影通道声明但不使用，只为块尺寸一致）。
+///
+/// std140 下 `mat4` = 4 个 `vec4`（64 字节）+ `vec4` × 2（32 字节）= 96 字节，无隐式填充。
 struct MeshTransformUniform {
     glm::mat4 modelToRender { 1.0F };
     glm::vec4 meshParams { 1.0F, 0.0F, 0.0F, 0.0F };
+    glm::vec4 meshTint { 0.0F, 0.0F, 0.0F, 0.0F };
 };
 
 /// 网格资源的 GPU 句柄。`id == 0` 表示无效句柄。
@@ -393,6 +399,13 @@ public:
     /// 无效句柄为无操作；值被钳到 [0,1]。下一次 `RenderFrame` 生效。
     void SetMeshOpacity(MeshHandle handle, float opacity) noexcept;
 
+    /// 设置一个网格的 **tint**（V0.10）：`rgb` = 目标颜色、`strength` ∈ [0,1] = 混合强度
+    /// （0 = 不变，逐位退回旧行为）。片元按 `mix(finalColor, rgb, strength)` 着色。
+    ///
+    /// 用途：摆放模式"**不可放置**"的**红色提示**（幽灵预览整体染红），**不引入**新的后处理 / 描边通道。
+    /// 无效句柄为无操作；`strength` 被钳到 [0,1]。下一次 `RenderFrame` 生效。
+    void SetMeshTint(MeshHandle handle, float red, float green, float blue, float strength) noexcept;
+
     /// 设置一个网格的 **LOD morph 参数**（W7-S3b / [ADR 0024](../../docs/adr/0024-terrain-streaming-and-lod.md)）：
     /// CDLOD 顶点过渡，让相邻 LOD 环在边界处几何逐位一致、消除接缝。
     ///
@@ -569,6 +582,11 @@ private:
         float morphStartDistance = 0.0F;
         float morphEndDistance = 0.0F;
 
+        /// 该网格的 **tint**（V0.10；默认全 0 ⇒ 强度 0 = 不变，逐位退回旧行为）。
+        /// `[0..2]` = 目标颜色 rgb、`[3]` = 强度 ∈ [0,1]。`SetMeshTint` 写入，
+        /// `DrawMeshes` 经 `MeshTransformUniform::meshTint` 传给顶点着色器 → 片元 `mix` 染色。
+        float tint[4] = { 0.0F, 0.0F, 0.0F, 0.0F };
+
         /// 是否为**水面**网格（W6 / [ADR 0027](../../docs/adr/0027-water-representation.md)）：
         /// 走独立的水面管线（`water.frag` 的 flow 着色 + alpha 混合 + 不剔除），在主通道**最后**绘制，
         /// 且**不投影阴影**。见 `UploadMesh` 的 `water` 参数与 `DrawMeshes` 的 `waterPass`。
@@ -690,6 +708,8 @@ private:
         float morphStep = 0.0F;
         float morphStartDistance = 0.0F;
         float morphEndDistance = 0.0F;
+        /// V0.10：逐网格 tint（`[0..2]` = rgb、`[3]` = 强度；缺省全 0 ⇒ 与从前逐位一致）。
+        float tint[4] = { 0.0F, 0.0F, 0.0F, 0.0F };
     };
 
     void DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURenderPass* pass, const MeshHandle* meshes,

@@ -37,7 +37,9 @@ layout(set = 0, binding = 1, std430) readonly buffer BoneBuffer {
 
 layout(set = 1, binding = 0, std140) uniform MeshTransformBlock {
     mat4 modelToRender;  // 局部坐标 → 渲染原点相对坐标（std140：mat4 = 4 个 vec4）
-    vec4 meshParams;     // W6e：x = 逐网格不透明度（1 = 不透明；< 1 = 片元 Bayer 抖动淡出），yzw 预留
+    vec4 meshParams;  // W6e：x = 逐网格不透明度（1 = 不透明；< 1 = 片元 Bayer 抖动淡出），yzw 预留
+    // V0.10：逐网格 tint（与 `mesh.vert` 同布局；强度 0 = 不变）。
+    vec4 meshTint;
 } meshTransform;
 
 layout(location = 0) out vec3 v_relativePosition;
@@ -50,6 +52,8 @@ layout(location = 3) out float v_fade;
 // 位置必须与 mesh.vert / mesh_instanced.vert 一致（三者共用 mesh.frag）。
 layout(location = 4) flat out vec4 v_enclosureA;
 layout(location = 5) flat out vec4 v_enclosureB;
+// V0.10：蒙皮网格 tint（与 mesh.vert 同位置；强度 0 = 不变）。
+layout(location = 6) out vec4 v_meshTint;
 
 void main() {
     // 线性混合蒙皮：权重已在 CPU 侧归一化，直接加权求和。
@@ -73,4 +77,5 @@ void main() {
     // V0.8：蒙皮网格无围合体代理 ⇒ 启用位 0（片元不做室内变暗，逐位退回旧行为）。
     v_enclosureA       = vec4(0.0);
     v_enclosureB       = vec4(0.0);
+    v_meshTint         = meshTransform.meshTint;
 }

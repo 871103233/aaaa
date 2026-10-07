@@ -81,6 +81,7 @@ add_executable(voxel_tests
     volume_collision_test.cpp
     volume_mesher_test.cpp
     world_bounds_test.cpp
+    world_definition_hash_test.cpp
     world_fingerprint_test.cpp
     world_instance_save_test.cpp
     world_manager_test.cpp

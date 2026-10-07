@@ -5,6 +5,8 @@
 
 #include "generation/terrain_params.hpp"
 
+#include "save/world_save.hpp"  // Fnv1a64Builder（世界定义内容哈希）
+
 #include <toml++/toml.hpp>
 
 #include <algorithm>
@@ -281,6 +283,62 @@ TerrainGenerationParams TerrainGenerationParams::LoadFromFile(const std::filesys
     }
 
     return params;
+}
+
+std::uint64_t TerrainParamsContentHash(const TerrainGenerationParams& params) noexcept {
+    Fnv1a64Builder builder;
+    builder.Bytes("TPRM", 4);  // 域标签（与区域表内容哈希区分，避免跨类型碰撞）
+
+    builder.F32(params.baseFrequency);
+    builder.F32(params.detailFrequency);
+    builder.F32(params.roughFrequency);
+    builder.F32(params.baseAmplitude);
+    builder.F32(params.detailAmplitude);
+    builder.F32(params.roughAmplitude);
+    builder.F32(params.heightOffsetBlocks);
+    builder.F32(params.variationFrequency);
+
+    const TerrainLandformParams& landform = params.landform;
+    builder.Bool(landform.enabled);
+    builder.F32(landform.frequency);
+    builder.F32(landform.hillsStart);
+    builder.F32(landform.mountainsStart);
+    builder.F32(landform.blend);
+    builder.F32(landform.plainsAmplitudeScale);
+    builder.F32(landform.hillsAmplitudeScale);
+    builder.F32(landform.mountainsAmplitudeScale);
+    builder.F32(landform.plainsOffsetBlocks);
+    builder.F32(landform.hillsOffsetBlocks);
+    builder.F32(landform.mountainsOffsetBlocks);
+    builder.U64(landform.seedChannel);
+
+    const TerrainOverhangParams& overhang = params.overhang;
+    builder.F32(overhang.frequency);
+    builder.F32(overhang.amplitudeBlocks);
+    builder.U64(overhang.seedChannel);
+
+    const TerrainCaveParams& caves = params.caves;
+    builder.Bool(caves.enabled);
+    builder.F32(caves.frequency);
+    builder.F32(caves.tunnelRadius);
+    builder.F32(caves.carveStrengthBlocks);
+    builder.F32(caves.depthFadeBlocks);
+    builder.U64(caves.seedChannel);
+
+    const TerrainRiverParams& river = params.river;
+    builder.Bool(river.enabled);
+    builder.F32(river.stepBlocks);
+    builder.I32(river.maxNodes);
+    builder.F32(river.channelDepthBlocks);
+    builder.F32(river.channelHalfWidthBlocks);
+    builder.F32(river.bankHalfWidthBlocks);
+    builder.F32(river.waterDepthBlocks);
+    builder.F32(river.jitterRadians);
+    builder.F32(river.jitterFrequency);
+    builder.U64(river.seedChannel);
+
+    // 注意：**不含 `climate`** —— 它不参与任何地形生成（只供内容放置判据），见头文件注释。
+    return builder.Value();
 }
 
 }  // namespace vx

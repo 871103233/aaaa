@@ -179,6 +179,73 @@ BrushResult ApplyTerrainLevel(TerrainWorld& world, const BrushPose& brush, float
     return result;
 }
 
+BrushResult ApplyTerrainLevelRect(TerrainWorld& world, float minX, float maxX, float minZ, float maxZ,
+                                  float targetHeightBlocks, LevelMode mode, float falloffBandBlocks) {
+    BrushResult result;
+    if (maxX < minX || maxZ < minZ) {
+        return result;  // 空矩形
+    }
+
+    // 目标高度换算为定点单位并钳制到世界垂直范围（与其它笔刷口径一致）。
+    const int targetUnits = std::clamp(
+        static_cast<int>(std::lround(static_cast<double>(targetHeightBlocks) * kHeightUnitsPerBlock)),
+        kMinTerrainHeightUnits, kMaxTerrainHeightUnits);
+
+    const float band = std::max(0.0F, falloffBandBlocks);
+    // 作用域 = 矩形**外扩过渡带**（带内按距离把目标高度平滑过渡回原地形；`band == 0` ⇒ 只有矩形内）。
+    const int x0 = static_cast<int>(std::floor(static_cast<double>(minX - band)));
+    const int x1 = static_cast<int>(std::ceil(static_cast<double>(maxX + band)));
+    const int z0 = static_cast<int>(std::floor(static_cast<double>(minZ - band)));
+    const int z1 = static_cast<int>(std::ceil(static_cast<double>(maxZ + band)));
+
+    for (int z = z0; z <= z1; ++z) {
+        for (int x = x0; x <= x1; ++x) {
+            Height current = 0;
+            if (!world.ReadColumnHeight(x, z, current)) {
+                continue;  // 该列未加载：按不存在处理
+            }
+
+            // 到矩形的距离（矩形内 = 0）⇒ 权重：矩形内 1、过渡带外缘 0（smoothstep 平滑，避免硬台阶）。
+            const float px = static_cast<float>(x);
+            const float pz = static_cast<float>(z);
+            const float dx = std::max(std::max(minX - px, 0.0F), px - maxX);
+            const float dz = std::max(std::max(minZ - pz, 0.0F), pz - maxZ);
+            const float distance = std::sqrt(dx * dx + dz * dz);
+            // 权重：矩形内（distance == 0）恒为 1；矩形外 `band` 由 1 平滑降到 0；`band == 0` ⇒ 矩形外一律不动。
+            float weight = 1.0F;
+            if (distance > 0.0F) {
+                weight = (band > 0.0F) ? (1.0F - SmoothStep(0.0F, band, distance)) : 0.0F;
+            }
+            if (weight <= 0.0F) {
+                continue;  // 过渡带之外：一律不动
+            }
+
+            // 目标 = 原地形与目标高度的插值（矩形内 weight == 1 ⇒ 精确落在目标上）。
+            const float wanted =
+                static_cast<float>(current) + (static_cast<float>(targetUnits) - static_cast<float>(current)) * weight;
+            const int   newUnits = std::clamp(static_cast<int>(std::lround(wanted)), kMinTerrainHeightUnits,
+                                              kMaxTerrainHeightUnits);
+
+            // 单向模式：Fill 只抬升低于目标处、Shave 只削低高于目标处（另一侧不动）；Both 双向。
+            if (mode == LevelMode::Fill && newUnits <= static_cast<int>(current)) {
+                continue;
+            }
+            if (mode == LevelMode::Shave && newUnits >= static_cast<int>(current)) {
+                continue;
+            }
+            if (newUnits == static_cast<int>(current)) {
+                continue;
+            }
+
+            world.WriteColumnHeight(x, z, static_cast<Height>(newUnits), result.dirtyTiles);
+            ++result.changedColumns;
+        }
+    }
+
+    FinalizeDirtyTiles(result);
+    return result;
+}
+
 BrushResult ApplyTerrainCrater(TerrainWorld& world, const BrushPose& brush, float depthBlocks, float rimBlocks,
                                float craterRadiusBlocks, float falloffBand) {
     BrushResult result;

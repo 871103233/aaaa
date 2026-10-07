@@ -93,6 +93,8 @@ layout(location = 3) in float v_fade;
 // 逐**实例**围合体代理（`flat`，与两个顶点着色器同位置）。`v_enclosureB.w = 0` ⇒ 未启用（地表 / 室外物件）。
 layout(location = 4) flat in vec4 v_enclosureA;  // xy = 围合体中心 XZ，zw = 半尺寸 XZ（世界坐标）
 layout(location = 5) flat in vec4 v_enclosureB;  // x = 屋檐下沿绝对高度，y = **逐建筑变暗覆盖**（< 0 = 用全局），w = 启用位（1/0）
+// V0.10：逐网格 tint（rgb = 目标色、a = 强度；摆放模式"不可放置"红色提示；强度 0 = 不变 ⇒ 逐位退回旧行为）。
+layout(location = 6) in vec4 v_meshTint;
 
 layout(location = 0) out vec4 o_color;
 
@@ -705,6 +707,9 @@ void main() {
             discard;
         }
     }
+
+    // V0.10：逐网格 **tint**（摆放模式的"不可放置"红色提示）。强度 0（默认）⇒ `mix` 退化为原色、逐位不变。
+    finalColor = mix(finalColor, v_meshTint.rgb, clamp(v_meshTint.a, 0.0, 1.0));
 
     o_color = vec4(finalColor, 1.0);
 }

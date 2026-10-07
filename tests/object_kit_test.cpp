@@ -579,13 +579,16 @@ TEST(ObjectKitDarkening, InvalidInteriorDarkeningThrows) {
     }
 }
 
-// --------------------------- V0.9：落点 4 模式（ADR 0036 决策四~五）---------------------------
+// --------------------------- V0.9：落点 4 模式（ADR 0036 决策四~五；V0.10 / S5 全部放行）---------------------------
 
-/// `landing_mode = "sink"` / `"flat_only"` 可解析（两者**不改地形** ⇒ 放行）。
-TEST(ObjectKitLanding, ParsesSinkAndFlatOnly) {
+/// `landing_mode` **四种取值均已放行**（V0.10 / S5：`flatten` / `fill` 也放行 —— 它们会改地形，
+/// 但改地形的动作在**摆放时**由 `game/` 实现，解析期不再报错；见 ADR 0037）。
+TEST(ObjectKitLanding, ParsesAllLandingModes) {
     for (const std::pair<const char*, vx::ObjectBuildingLandingMode> entry :
          { std::make_pair("sink", vx::ObjectBuildingLandingMode::Sink),
-           std::make_pair("flat_only", vx::ObjectBuildingLandingMode::FlatOnly) }) {
+           std::make_pair("flat_only", vx::ObjectBuildingLandingMode::FlatOnly),
+           std::make_pair("flatten", vx::ObjectBuildingLandingMode::Flatten),
+           std::make_pair("fill", vx::ObjectBuildingLandingMode::Fill) }) {
         std::string content = kBuildingBase;
         const std::string anchor = "id = \"hut\"\n";
         content.insert(content.find(anchor) + anchor.size(),
@@ -593,18 +596,6 @@ TEST(ObjectKitLanding, ParsesSinkAndFlatOnly) {
         const TempToml    file("vx_kit_building_landing.toml", content);
         const ObjectTable table = ObjectTable::LoadFromFile(file.path());
         EXPECT_EQ(table.buildings[0].landingMode, entry.second);
-    }
-}
-
-/// `landing_mode = "flatten"` / `"fill"` **本阶段不放行**（会改地形 ⇒ 解析即抛；能力不删）。
-TEST(ObjectKitLanding, RejectsTerrainModifyingModes) {
-    for (const char* value : { "flatten", "fill" }) {
-        std::string content = kBuildingBase;
-        const std::string anchor = "id = \"hut\"\n";
-        content.insert(content.find(anchor) + anchor.size(),
-                       std::string("landing_mode = \"") + value + "\"\n");
-        const TempToml file("vx_kit_building_landing_bad.toml", content);
-        ExpectLoadThrows(file.path());
     }
 }
 

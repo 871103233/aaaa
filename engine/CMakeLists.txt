@@ -19,6 +19,7 @@ add_library(voxel_engine STATIC
     input/input_map.cpp
     physics/physics_world.cpp
     platform/command_line.cpp
+    platform/console.cpp
     platform/settings.cpp
     platform/window.cpp
     render/camera.cpp

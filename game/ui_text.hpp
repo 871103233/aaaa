@@ -129,13 +129,15 @@ enum class UiLabel : int {
     // ---- 坐标拾取辅助（V0.5 E2；HUD 一行）----
     PlacementHintFormat,         ///< HUD 摆放辅助提示（`摆放（F2）：当前类型「%s」……`；`%s` = 类型 id（纯 ASCII））
     PlacementPickedFormat,       ///< HUD 最近一次摆放 / 删除反馈（`上次摆放：%s`；`%s` 恒为纯 ASCII）
+    EditLayerUnsavedFormat,      ///< HUD 未保存改动计数（V0.10 / S9；`未保存改动：%d 处（F5 或面板保存）`）
 
     // ---- 物件选择器与摆放模式（V0.5 E3；见 ADR 0032）----
     ObjectPaletteTitle,           ///< 面板标题
     ObjectPaletteCategoryHeader,  ///< 一级列标题：仓库（类别）
     ObjectPaletteTypeHeader,      ///< 二级列标题：模型
     ObjectPaletteEnter,           ///< 按钮：进入摆放模式
-    ObjectPaletteSave,            ///< 按钮：保存到可编辑层
+    ObjectPaletteSave,            ///< 按钮：保存**全部**改动到可编辑层（V0.10 / S9：明示"全部"）
+    ObjectPaletteUnsavedFormat,   ///< 面板：未保存改动计数（V0.10 / S9；`未保存改动：%d 处`）
     ObjectPaletteCancel,          ///< 按钮：取消
     PlacementModeHintFormat,      ///< 摆放模式横幅（`%s` = 当前类型 id）
     PlacementSaveFailedFormat,    ///< 保存失败（`%s` = 原因）
@@ -144,8 +146,14 @@ enum class UiLabel : int {
     ObjectPalettePreviewEmpty,    ///< V0.5 E4 预览不可用（该类型几何为空）
 
     // ---- 成套建筑摆放 / 室内变暗调参（V0.9；ADR 0036）----
-    PlacementBuildingHintFormat,   ///< 建筑摆放模式横幅（`%s` = 建筑 id（纯 ASCII）、`%s` = 落点模式 token（纯 ASCII）、`%.2f` = 待放变暗值）
+    PlacementBuildingHintFormat,   ///< 建筑摆放模式横幅（`%s` = 建筑 id（纯 ASCII）、`%s` = 落点模式**显示名**、`%.2f` = 待放变暗值）
     PlacementSelectedHintFormat,   ///< 选中态横幅（`%s` = 被指向的建筑 id、`%.2f` = 该建筑当前的室内变暗值）
+
+    // ---- 落点模式显示名（V0.10 / S5；`T` 循环的 4 个选项）----
+    LandingModeSink,      ///< 落点模式 ② 向下半埋
+    LandingModeFlatOnly,  ///< 落点模式 ④ 落地必须平整
+    LandingModeFlatten,   ///< 落点模式 ① 压平地形
+    LandingModeFill,      ///< 落点模式 ③ 填充地形
 
     kCount  ///< 标签总数（必须保持在最后）
 };
@@ -256,11 +264,13 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsEnglish = {
     "Realm [%s] reset: new seed %llu",
     "Place (F2): type '%s' - press F2 to open the object palette",
     "Last place: %s",
+    "Unsaved changes: %d (F5 or the palette Save button writes them)",
     "Object palette (F2)",
     "Warehouse (category)",
     "Model",
     "Enter placement mode",
-    "Save to edit layer",
+    "Save all to edit layer",
+    "Unsaved changes: %d",
     "Cancel",
     "PLACEMENT MODE: '%s'  |  Q/E rotate  |  LMB place  |  RMB delete  |  F5 save  |  Esc exit",
     "Save failed: %s",
@@ -269,6 +279,10 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsEnglish = {
     "no preview (empty geometry)",
     "PLACE BUILDING: '%s'  landing=%s  interior-darkening=%.2f  |  Q/E rotate  |  LMB place  |  RMB delete  |  T landing mode  |  [ ] darkening  |  F5 save  |  Esc exit",
     "SELECTED BUILDING '%s'  interior-darkening=%.2f  ([ ] to adjust, F5 to save)",
+    "sink (half-buried)",
+    "flat ground only",
+    "flatten terrain",
+    "fill terrain",
 };
 
 /// 中文标签表：仅当**成功加载 CJK 字体**时启用（此时不可能缺字）。
@@ -374,11 +388,13 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsChinese = {
     "已重置秘境 [%s]：新种子 %llu",
     "摆放（F2）：当前类型「%s」—— 按 F2 打开物件选择器",
     "上次摆放：%s",
+    "未保存改动：%d 处（F5 或面板「保存全部」写盘）",
     "物件选择器（F2）",
     "仓库（类别）",
     "模型",
     "进入摆放模式",
-    "保存到可编辑层",
+    "保存全部到可编辑层",
+    "未保存改动：%d 处",
     "取消",
     "摆放模式：「%s」  |  Q/E 旋转  |  左键放下  |  右键删除  |  F5 保存  |  Esc 退出",
     "保存失败：%s",
@@ -387,6 +403,10 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsChinese = {
     "无预览（该类型几何为空）",
     "摆放建筑：「%s」  落点=%s  室内变暗=%.2f  |  Q/E 旋转  |  左键放下  |  右键删除  |  T 落点模式  |  [ ] 变暗  |  F5 保存  |  Esc 退出",
     "选中建筑「%s」  室内变暗=%.2f（[ ] 调整，F5 保存）",
+    "向下半埋",
+    "落地必须平整",
+    "压平地形",
+    "填充地形",
 };
 
 /// 纯函数：判断字符串是否**只含 ASCII 字节**（`cjkFontAvailable = false` 时的硬约束）。

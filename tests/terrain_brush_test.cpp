@@ -21,6 +21,7 @@ namespace {
 using vx::ApplyTerrainBrush;
 using vx::ApplyTerrainCrater;
 using vx::ApplyTerrainLevel;
+using vx::ApplyTerrainLevelRect;
 using vx::BrushFalloff;
 using vx::BrushPose;
 using vx::BrushResult;
@@ -477,6 +478,157 @@ TEST(TerrainBrushLevels, CraterClampsAtVerticalLimits) {
         }
     }
     (void)result;
+}
+
+// ============================================================
+// V0.10 / S5：footprint 矩形平整（精确"只改矩形内"、一步到位）
+// ============================================================
+
+namespace {
+constexpr int kRectX0 = 10;
+constexpr int kRectX1 = 25;
+constexpr int kRectZ0 = 12;
+constexpr int kRectZ1 = 27;
+[[nodiscard]] bool InsideRect(int x, int z) noexcept {
+    return x >= kRectX0 && x <= kRectX1 && z >= kRectZ0 && z <= kRectZ1;
+}
+}  // namespace
+
+/// `Both` ⇒ 矩形内**双向**收敛到目标（一步到位、无衰减），且**矩形外逐列不变**。
+TEST(TerrainBrushLevelRect, FlattensRectExactAndLeavesOutsideUntouched) {
+    TerrainWorld world(0x5EED0007ULL, TerrainMaterialTable::Default());
+    world.LoadTile(0, 0);
+    std::vector<TileCoord> scratch;
+
+    // 铺一片高低不一的地：矩形内刻意起伏，矩形外固定哨兵高度（用于验证"矩形外不动"）。
+    const float target = 120.0F;
+    for (int z = 0; z <= 40; ++z) {
+        for (int x = 0; x <= 40; ++x) {
+            const float h = InsideRect(x, z) ? (target - 5.0F + static_cast<float>((x * 7 + z * 3) % 11)) : 90.0F;
+            world.WriteColumnHeight(x, z, static_cast<Height>(std::lround(h * kHeightUnitsPerBlock)), scratch);
+        }
+    }
+
+    const BrushResult result = ApplyTerrainLevelRect(world, static_cast<float>(kRectX0), static_cast<float>(kRectX1),
+                                                     static_cast<float>(kRectZ0), static_cast<float>(kRectZ1), target,
+                                                     LevelMode::Both, /*falloffBandBlocks=*/0.0F);
+    EXPECT_GT(result.changedColumns, 0U);
+    ASSERT_EQ(result.dirtyTiles.size(), 1U);
+    EXPECT_EQ(result.dirtyTiles.front(), (TileCoord { 0, 0 }));
+
+    for (int z = 0; z <= 40; ++z) {
+        for (int x = 0; x <= 40; ++x) {
+            Height h = 0;
+            ASSERT_TRUE(world.ReadColumnHeight(x, z, h));
+            const float expected = InsideRect(x, z) ? target : 90.0F;
+            EXPECT_FLOAT_EQ(HeightToBlocks(h), expected) << "(x=" << x << ",z=" << z << ")";
+        }
+    }
+}
+
+/// `Fill` 只抬升低于目标处、`Shave` 只削低高于目标处（矩形版单向语义）。
+TEST(TerrainBrushLevelRect, FillRaisesOnlyAndShaveLowersOnly) {
+    TerrainWorld world(0x5EED0008ULL, TerrainMaterialTable::Default());
+    world.LoadTile(0, 0);
+    std::vector<TileCoord> scratch;
+
+    const float target = 100.0F;
+    // x 偶数列低于目标（95），x 奇数列高于目标（105）。
+    for (int z = 0; z <= 8; ++z) {
+        for (int x = 0; x <= 8; ++x) {
+            const float h = ((x % 2) == 0) ? 95.0F : 105.0F;
+            world.WriteColumnHeight(x, z, static_cast<Height>(std::lround(h * kHeightUnitsPerBlock)), scratch);
+        }
+    }
+
+    const BrushResult filled = ApplyTerrainLevelRect(world, 0.0F, 8.0F, 0.0F, 8.0F, target, LevelMode::Fill, 0.0F);
+    EXPECT_GT(filled.changedColumns, 0U);
+    for (int z = 0; z <= 8; ++z) {
+        for (int x = 0; x <= 8; ++x) {
+            Height h = 0;
+            ASSERT_TRUE(world.ReadColumnHeight(x, z, h));
+            EXPECT_FLOAT_EQ(HeightToBlocks(h), ((x % 2) == 0) ? target : 105.0F)
+                << "Fill 只抬升低处、不动高处 (x=" << x << ")";
+        }
+    }
+
+    const BrushResult shaved = ApplyTerrainLevelRect(world, 0.0F, 8.0F, 0.0F, 8.0F, target, LevelMode::Shave, 0.0F);
+    EXPECT_GT(shaved.changedColumns, 0U);
+    for (int z = 0; z <= 8; ++z) {
+        for (int x = 0; x <= 8; ++x) {
+            Height h = 0;
+            ASSERT_TRUE(world.ReadColumnHeight(x, z, h));
+            // Shave 后：原先 95 的（低于目标，Fill 已抬到目标）保持目标；原先 105 的被削到目标。
+            EXPECT_FLOAT_EQ(HeightToBlocks(h), target) << "Shave 只削高处、不动低处 (x=" << x << ")";
+        }
+    }
+}
+
+/// 空矩形 / 覆盖到**未加载 tile** 的矩形 ⇒ 无改动、无脏 tile（不猜）。
+TEST(TerrainBrushLevelRect, EmptyRectAndUnloadedColumnsAreNoOps) {
+    TerrainWorld world(0x5EED0009ULL, TerrainMaterialTable::Default());
+    world.LoadTile(0, 0);
+
+    const BrushResult empty = ApplyTerrainLevelRect(world, 10.0F, 5.0F, 0.0F, 5.0F, 120.0F, LevelMode::Both, 0.0F);
+    EXPECT_EQ(empty.changedColumns, 0U);
+    EXPECT_TRUE(empty.dirtyTiles.empty());
+
+    // tile(1,0) 未加载（列 x ∈ [64,128)）⇒ 矩形整体落空。
+    const BrushResult unloaded = ApplyTerrainLevelRect(world, 70.0F, 90.0F, 0.0F, 20.0F, 120.0F, LevelMode::Both, 0.0F);
+    EXPECT_EQ(unloaded.changedColumns, 0U);
+}
+
+/// V0.10 缺陷修复：**边缘过渡带** —— 矩形内仍精确压平；矩形外 `band` 内按距离平滑过渡回原地形；
+/// 过渡带之外（含恰在外缘）**逐列不变**；过渡带把"硬台阶"显著减小（消除近垂直面 ⇒ 不再"看穿"）。
+TEST(TerrainBrushLevelRect, FalloffBandSmoothsEdgeAndLeavesOutsideUntouched) {
+    TerrainWorld world(0x5EED000AULL, TerrainMaterialTable::Default());
+    world.LoadTile(0, 0);
+    std::vector<TileCoord> scratch;
+
+    // 斜坡：h(x) = 100 + 2x（沿 +X 均匀升高；z 方向恒定），使"压平到锚点高度"必然产生台阶。
+    for (int z = 0; z <= 40; ++z) {
+        for (int x = 0; x <= 40; ++x) {
+            world.WriteColumnHeight(x, z, static_cast<Height>((100 + 2 * x) * kHeightUnitsPerBlock), scratch);
+        }
+    }
+    auto readBlocks = [&](int x, int z) {
+        Height h = 0;
+        const bool ok = world.ReadColumnHeight(x, z, h);
+        EXPECT_TRUE(ok);
+        return HeightToBlocks(h);
+    };
+
+    constexpr int   kX0 = 10;
+    constexpr int   kX1 = 20;
+    constexpr float kTarget = 120.0F;  // = 斜坡在 x = 10 处的高度
+    constexpr float kBand   = 3.0F;
+
+    const BrushResult result =
+        ApplyTerrainLevelRect(world, static_cast<float>(kX0), static_cast<float>(kX1), 0.0F, 20.0F, kTarget,
+                              LevelMode::Both, kBand);
+    EXPECT_GT(result.changedColumns, 0U);
+
+    // 矩形内：精确落在目标（无衰减）。
+    for (int z = 0; z <= 20; ++z) {
+        for (int x = kX0; x <= kX1; ++x) {
+            EXPECT_FLOAT_EQ(readBlocks(x, z), kTarget) << "(x=" << x << ") 矩形内应精确压平";
+        }
+    }
+    // 过渡带外（恰在外缘 x = kX1 + 3 及更远）：逐列不变（= 原斜坡）。
+    EXPECT_FLOAT_EQ(readBlocks(kX1 + 3, 5), 100.0F + 2.0F * static_cast<float>(kX1 + 3));
+    EXPECT_FLOAT_EQ(readBlocks(kX1 + 8, 5), 100.0F + 2.0F * static_cast<float>(kX1 + 8));
+    // 过渡带内：介于"目标"与"原斜坡"之间（单调过渡，不是硬台阶）。
+    const float origAtEdge = 100.0F + 2.0F * static_cast<float>(kX1 + 1);  // x = 21 的原高度 = 142
+    const float smoothed   = readBlocks(kX1 + 1, 5);
+    EXPECT_GT(smoothed, kTarget) << "过渡带内应仍高于目标（未一步到位）";
+    EXPECT_LT(smoothed, origAtEdge) << "过渡带内应已被拉向目标";
+    // 硬边对照：`band = 0` 时 x=20→21 的台阶 = 142 - 120 = 22 格；带过渡带后应显著更小。
+    const float stepWithBand = smoothed - readBlocks(kX1, 5);
+    EXPECT_LT(stepWithBand, origAtEdge - kTarget) << "过渡带应显著减小边缘台阶";
+    // 反方向（x 递减）也要平滑：x = 9 处（带内）介于目标与原斜坡之间。
+    const float smoothedLow = readBlocks(kX0 - 1, 5);           // x = 9，原高度 118
+    EXPECT_LT(smoothedLow, kTarget);
+    EXPECT_GT(smoothedLow, 100.0F + 2.0F * static_cast<float>(kX0 - 1));
 }
 
 // ============================================================

@@ -84,7 +84,7 @@ voxel-engine/
 | `engine/core/` | 主循环装配、固定步长累加器、单调计时、统一日志接口 | 可依赖 `engine/platform` 与第三方 | 不放渲染与世界逻辑 |
 | `engine/input/` | 输入动作状态层：按键 / 鼠标 → 动作，每帧采样一次 | 可依赖 `engine/platform` | 上层只消费动作；**本层之外不得读 SDL 事件队列** |
 | `engine/physics/` | Jolt 薄封装：生命周期、固定步长推进、通用高度场 / 角色胶囊 / 动态凸包刚体（**公共头不含 Jolt 类型**；`ActivateBody` = T46 唤醒保留残骸；`RayCastDynamic` = T48 只查动态刚体的线段查询，命中点落在**真实凸包表面**并回报句柄；`ConvexHullDesc::rotation` = T50 按当前姿态原地重建刚体用） | 可依赖 `engine/core` 与第三方 | 不放地形专有类型；世界坐标进出须显式转换并注明精度（见待收敛项 7） |
-| `engine/platform/` | 平台抽象：窗口、输入、计时、文件 IO | 可依赖第三方（SDL3） | 不放渲染与游戏逻辑 |
+| `engine/platform/` | 平台抽象：窗口、输入、计时、文件 IO、**命令行（UTF-8 取回）与控制台编码**（V0.10 / S10：启动时把控制台输出代码页设为 UTF-8，否则中文日志在 Windows 终端乱码） | 可依赖第三方（SDL3） | 不放渲染与游戏逻辑 |
 | `engine/render/` | 渲染封装（RHI 薄层） | 可依赖 `engine/platform` | 不把具体图形 API 语义泄漏到上层 |
 | `engine/CMakeLists.txt` | 聚合 `engine/` 源文件为 `voxel_engine` 静态库 | — | 新增源文件须在此登记 |
 

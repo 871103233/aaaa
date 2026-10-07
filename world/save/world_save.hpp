@@ -167,4 +167,29 @@ struct VolumeDirtyPayload {
 /// `size == 0` 时返回偏移基值（`data` 可为 `nullptr`）。
 [[nodiscard]] std::uint64_t Fnv1a64(const void* data, std::size_t size) noexcept;
 
+/// FNV-1a 64 的参数（公开常量，供 `Fnv1a64` 与 `Fnv1a64Builder` 共用）。
+inline constexpr std::uint64_t kFnv1a64OffsetBasis = 1469598103934665603ULL;
+inline constexpr std::uint64_t kFnv1a64Prime       = 1099511628211ULL;
+
+/// `Fnv1a64` 的**增量版**（世界定义内容哈希用）：逐字段喂入，最后取 `Value()`。
+///
+/// 为什么需要它（而不是把结构体裸字节喂给 `Fnv1a64`）：C++ 结构体有**填充字节**、其内容不确定
+/// ⇒ 裸 hash **不稳定**（同输入可能得不同值）。本类只编码**显式字段**，每字段按**固定宽度小端**写入
+/// ⇒ 同输入必得同值（红线 7）。**纯函数式用法**：构造 → 若干 `Feed*` → `Value()`。
+class Fnv1a64Builder {
+public:
+    void Bytes(const void* data, std::size_t size) noexcept;  ///< 原样追加（字符串等；`size == 0` 合法）
+    void U8(std::uint8_t value) noexcept;
+    void U32(std::uint32_t value) noexcept;
+    void U64(std::uint64_t value) noexcept;
+    void I32(std::int32_t value) noexcept;  ///< 二进制补码 ⇒ 与 `static_cast<u32>` 逐位等价
+    void F32(float value) noexcept;         ///< 以 IEEE-754 位模式编码（同值 ⇒ 同位模式）
+    void Bool(bool value) noexcept { U8(value ? 1U : 0U); }
+
+    [[nodiscard]] std::uint64_t Value() const noexcept { return m_value; }
+
+private:
+    std::uint64_t m_value = kFnv1a64OffsetBasis;
+};
+
 }  // namespace vx

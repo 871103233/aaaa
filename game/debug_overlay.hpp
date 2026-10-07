@@ -37,6 +37,9 @@ struct PaletteModel {
     /// V0.5 E4：预览的**用户拖动朝向偏移**（弧度）。面板在拖动时累加；game 层把它叠加到自动旋转角上。
     /// 归零 = 只看自动旋转。
     float previewYawRadians = 0.0F;
+
+    /// V0.10 / S9：**可编辑层**未保存改动数（game 层每帧刷新）⇒ 面板显示 `ObjectPaletteUnsavedFormat`。
+    int unsavedChanges = 0;
 };
 
 /// 选择器上"用户做了什么"（每帧最多取走一次；见 `TakePaletteRequest`）。
@@ -107,7 +110,7 @@ struct DebugStats {
     // ---- V0.9（[ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md)）：成套建筑摆放 ----
     /// 摆放模式是否在摆**成套建筑**（true ⇒ HUD 用 `PlacementBuildingHintFormat`）。
     bool          placementBuildingMode = false;
-    /// 当前落点模式的**配置 token**（纯 ASCII：`sink` / `flat_only`；非建筑模式为空串）。
+    /// 当前落点模式的**配置 token**（纯 ASCII：`sink` / `flat_only` / `flatten` / `fill`；非建筑模式为空串）。
     std::string   placementLandingMode;
     /// 建筑摆放模式下的**待放室内变暗值**（`[` / `]` 调整）。
     float         placementDarkeningValue = 0.0F;
@@ -115,6 +118,10 @@ struct DebugStats {
     std::string   placementSelectedBuilding;
     /// 被指向建筑当前的**有效**室内变暗值（`-1`（用全局值）时显示全局值）。
     float         placementSelectedDarkening = 0.0F;
+
+    /// V0.10 / S9：**可编辑层**自上次成功写盘以来的**未保存改动数**（摆放 / 删除 / 变暗 各计 1）。
+    /// `> 0` ⇒ HUD 一行 `EditLayerUnsavedFormat`（让"还没保存"在游戏内**可见**，不依赖控制台）。
+    int           editLayerUnsaved = 0;
 };
 
 /// 极简 ImGui 调试面板（T9）。基于 imgui 的 **SDL3 平台后端 + SDL3_gpu 渲染后端**。
