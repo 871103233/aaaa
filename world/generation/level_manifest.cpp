@@ -149,11 +149,10 @@ LevelManifest LevelManifest::LoadFromFile(const std::filesystem::path& path) {
     manifest.randomizeSeedOnEntry = ReadRequiredBool(document, path, "randomize_seed_on_entry");
 
     // 族 × 策略的一致性（可判定，且不会误伤当前内容）。
+    // 注（2026-10-07 所有者裁定）：**不再要求** `instance_roguelike` 必须 `persistent = false` ——
+    // 肉鸽（C）的**内容退出要保存**，**丢弃时机 = 主动「重置」换种子**（见 `level_manifest.hpp` 的 `persistent` 注释）。
     if (manifest.randomizeSeedOnEntry && manifest.family != WorldFamily::InstanceRoguelike) {
         throw std::runtime_error(path.string() + ": [randomize_seed_on_entry] 只对 instance_roguelike 有意义");
-    }
-    if (manifest.family == WorldFamily::InstanceRoguelike && manifest.persistent) {
-        throw std::runtime_error(path.string() + ": instance_roguelike 必须 persistent = false（退出即丢）");
     }
 
     manifest.terrainPresetPath = ReadString(document, path, "terrain_preset");

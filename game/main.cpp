@@ -21,6 +21,7 @@
 #include "destruction_queue.hpp"
 #include "gameplay_input.hpp"
 #include "ground_pick.hpp"  // E2：坐标拾取辅助（准星射线求地表交点，纯函数）
+#include "placement_rotate.hpp"  // V0.11 I1b：摆放旋转手感（点按一步 / 长按连续转，纯函数）
 #include "generation/level_manifest.hpp"
 #include "generation/map_preset.hpp"
 #include "generation/terrain_params.hpp"
@@ -30,6 +31,8 @@
 #include "object/object_layer.hpp"
 #include "object/object_mesh.hpp"
 #include "object/object_placement_rule.hpp"  // V0.6 C5：流式散布（地形感知放置规则）
+#include "object/placement_snap.hpp"         // V0.11 I1/I1c：放置吸附与对齐 + 邻居优先吸附（纯函数；ADR 0038 决策四）
+#include "object/placement_validation.hpp"   // V0.11 I2：重叠合法性（2D 有向矩形 SAT，纯函数）
 #include "object/object_scatter.hpp"  // V8：程序化散布（纯函数）
 #include "object/object_support.hpp"
 #include "object/terrain_sampling.hpp"  // V0.6 C5：地形采样（坡度 / 高度 / 地貌）
@@ -1036,7 +1039,8 @@ constexpr float kPickMaxDistance  = 256.0F;  ///< 最大拾取距离（格）—
 constexpr float kPickStepDistance = 0.5F;    ///< 射线步进距离（格）
 
 /// V0.5 E3：摆放模式里 `Q`/`E` 每次旋转的步进（度）；按住 `Shift` 时吸附到 90°（`ADR 0032`）。
-constexpr float kPlacementRotateStepDeg = 15.0F;
+/// V0.11（2026-10-08）：**缺省 15 → 1**（所有者要求"整步 1° 便于精细调整"）。
+constexpr float kPlacementRotateStepDeg = 1.0F;
 
 /// V0.5 E3：幽灵预览的不透明度（抖动淡出）—— `SetMeshOpacity` 保持**不透明管线**、不引入 alpha 混合
 /// ⇒ 不破坏深度排序（`ADR 0032` 决策三）。
@@ -1305,6 +1309,13 @@ struct ObjectSlot {
     /// **V0.9：来源建筑 id**（[ADR 0036](../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策四）。
     /// 空串 = 非成套建筑构件（单件 `[[placement]]` / 散布 / 动态）。右键删除与选中态调参**按整座**处理。
     std::string                  buildingId;
+
+    /// **V0.11**：**底面足迹**半尺寸（由 `localMesh` 的顶点 AABB 得出，取**真实几何**而非"模数盒"）。
+    /// 用途 = 放置合法性（重叠）/ 邻居吸附。`0` = 网格为空（调用方回落到 `type->halfExtent`）。
+    /// 为什么不用 `type->halfExtent`：kit 墙的几何是"占满模数格的**中间薄板**"（约 4.0 × 0.3），
+    /// 模数盒（4×4）会让薄轴方向**多占 ≈3.7 格** ⇒ **过度拒绝**（所有者 2026-10-07 实测）。
+    float                        footprintHalfX = 0.0F;
+    float                        footprintHalfZ = 0.0F;
 };
 
 /// 支撑探测的**下探深度**（格）：探测点取"底面中心 − 该深度"。小于它 ⇒ 视为脚下已是空的。
@@ -2431,6 +2442,111 @@ int main(int argc, char** argv) {
         }
     }
 
+    // V0.11 I1（[ADR 0038](../../docs/adr/0038-construction-editor-and-runtime-separation.md) 决策四"吸附"）：
+    // `--placement-snap=<格>` 平移吸附步长（缺省 1.0；`0` / `off` = 关闭）；`--placement-yaw-snap=<度>` 旋转吸附步长
+    // （**缺省 1.0**；`0` / `off` = 关闭）。关闭 ⇒ **落点 / 朝向与引入前逐位一致**（A/B 对照）。
+    // 为什么用启动参数（与 `plans/v0.11.md` 初稿的"写进 objects.toml"不同，已在计划 / devlog 说明变更原因）：
+    //   `objects.toml` 是**每世界一份**的物件清单（`objects_file`）⇒ 放进去会变成"每世界一套编辑手感"；
+    //   而吸附是**编辑工具**的全局口径，与既有 `--interior-darkening` / `--occlusion` 同口径、便于对照。
+    vx::PlacementSnapSettings placementSnap;
+    for (const std::string& argument : arguments) {
+        constexpr const char* kSnapPrefix = "--placement-snap=";
+        if (argument.rfind(kSnapPrefix, 0) == 0) {
+            const std::string value = argument.substr(std::char_traits<char>::length(kSnapPrefix));
+            if (value == "off" || value == "false") {
+                placementSnap.translateBlocks = 0.0;
+            } else {
+                try {
+                    placementSnap.translateBlocks = std::stod(value);
+                } catch (const std::exception&) {
+                    VX_LOG_WARN("`--placement-snap` 取值非法 ⇒ 保持缺省 %.2f 格", placementSnap.translateBlocks);
+                }
+            }
+            continue;
+        }
+        constexpr const char* kYawSnapPrefix = "--placement-yaw-snap=";
+        if (argument.rfind(kYawSnapPrefix, 0) == 0) {
+            const std::string value = argument.substr(std::char_traits<char>::length(kYawSnapPrefix));
+            if (value == "off" || value == "false") {
+                placementSnap.yawDegrees = 0.0;
+            } else {
+                try {
+                    placementSnap.yawDegrees = std::stod(value);
+                } catch (const std::exception&) {
+                    VX_LOG_WARN("`--placement-yaw-snap` 取值非法 ⇒ 保持缺省 %.2f 度", placementSnap.yawDegrees);
+                }
+            }
+            continue;
+        }
+        // V0.11 I1c：**邻居优先吸附**的搜索半径（格）；`0` / `off` = 关闭邻居吸附（恒走世界网格）。
+        constexpr const char* kNeighborPrefix = "--placement-neighbor-radius=";
+        if (argument.rfind(kNeighborPrefix, 0) == 0) {
+            const std::string value = argument.substr(std::char_traits<char>::length(kNeighborPrefix));
+            if (value == "off" || value == "false") {
+                placementSnap.neighborRadiusBlocks = 0.0;
+            } else {
+                try {
+                    placementSnap.neighborRadiusBlocks = std::stod(value);
+                } catch (const std::exception&) {
+                    VX_LOG_WARN("`--placement-neighbor-radius` 取值非法 ⇒ 保持缺省 %.2f 格",
+                                placementSnap.neighborRadiusBlocks);
+                }
+            }
+        }
+    }
+
+    // V0.11 I1b（[ADR 0038](../../docs/adr/0038-construction-editor-and-runtime-separation.md) 决策四"旋转"）：
+    // **点按 = 一步**（`--placement-rotate-step=<度>`，缺省 `kPlacementRotateStepDeg` = **1°**）、
+    // **长按 = 连续转**（`--placement-rotate-rate=<度/秒>`，缺省 **90**；`0` / `off` = 关闭长按）。
+    vx::PlacementRotateSettings placementRotate;
+    placementRotate.stepDegrees = static_cast<double>(kPlacementRotateStepDeg);
+    for (const std::string& argument : arguments) {
+        constexpr const char* kRotateStepPrefix = "--placement-rotate-step=";
+        if (argument.rfind(kRotateStepPrefix, 0) == 0) {
+            const std::string value = argument.substr(std::char_traits<char>::length(kRotateStepPrefix));
+            try {
+                placementRotate.stepDegrees = std::stod(value);
+            } catch (const std::exception&) {
+                VX_LOG_WARN("`--placement-rotate-step` 取值非法 ⇒ 保持缺省 %.2f 度", placementRotate.stepDegrees);
+            }
+            continue;
+        }
+        constexpr const char* kRotateRatePrefix = "--placement-rotate-rate=";
+        if (argument.rfind(kRotateRatePrefix, 0) == 0) {
+            const std::string value = argument.substr(std::char_traits<char>::length(kRotateRatePrefix));
+            if (value == "off" || value == "false") {
+                placementRotate.rateDegPerSec = 0.0;
+            } else {
+                try {
+                    placementRotate.rateDegPerSec = std::stod(value);
+                } catch (const std::exception&) {
+                    VX_LOG_WARN("`--placement-rotate-rate` 取值非法 ⇒ 保持缺省 %.2f 度/秒",
+                                placementRotate.rateDegPerSec);
+                }
+            }
+            continue;
+        }
+        // V0.11（2026-10-08）：**长按启动延迟**（秒）—— 按住超过该时长才**开始**连续转（轻点恰好一步、不漂）。
+        constexpr const char* kHoldDelayPrefix = "--placement-hold-delay=";
+        if (argument.rfind(kHoldDelayPrefix, 0) == 0) {
+            const std::string value = argument.substr(std::char_traits<char>::length(kHoldDelayPrefix));
+            try {
+                placementRotate.holdDelaySeconds = std::stod(value);
+            } catch (const std::exception&) {
+                VX_LOG_WARN("`--placement-hold-delay` 取值非法 ⇒ 保持缺省 %.2f 秒",
+                            placementRotate.holdDelaySeconds);
+            }
+        }
+    }
+
+    // V0.11（SKILL「运行期可修改优先」）：三个摆放开关**可在运行期按键切换**（缺省均**开**），
+    // 状态显示在**其所属界面** = `F2` 物件选择器（摆放功能相关 ⇒ 不放 F1 调试面板；见 SKILL 界面归属规则）：
+    //   `Z` = 旋转长按模式（关 ⇒ 只点按一步）；`X` = 邻居优先吸附（关 ⇒ 恒走世界网格）；
+    //   `B` = 世界网格吸附（关 ⇒ 落点不吸附到网格，**完全自由**）。
+    bool placementRotateHold   = true;
+    bool placementNeighborSnap = true;
+    bool placementGridSnap     = true;
+
     // V0.7 H3：`--object-collision-radius=<格>` —— 静态物件**物理体**的半径裁剪（缺省 `kObjectCollisionRadiusBlocks`；
     // `0` = **关闭裁剪**，回到"每体常驻"的旧行为）。用于 H3 的 A/B 实测（`plans/v0.7.md` §4）。
     double objectCollisionRadiusBlocks = kObjectCollisionRadiusBlocks;
@@ -2866,6 +2982,9 @@ int main(int argc, char** argv) {
         input.BindKey(vx::ActionId::PlacementLandingMode, SDL_SCANCODE_T);        // V0.9：成套建筑落点模式循环
         input.BindKey(vx::ActionId::PlacementDarkenDown, SDL_SCANCODE_LEFTBRACKET);   // V0.9：室内变暗 −
         input.BindKey(vx::ActionId::PlacementDarkenUp, SDL_SCANCODE_RIGHTBRACKET);    // V0.9：室内变暗 +
+        input.BindKey(vx::ActionId::PlacementToggleRotateHold, SDL_SCANCODE_Z);      // V0.11：切换"旋转长按模式"
+        input.BindKey(vx::ActionId::PlacementToggleNeighborSnap, SDL_SCANCODE_X);    // V0.11：切换"邻居优先吸附"
+        input.BindKey(vx::ActionId::PlacementToggleGridSnap, SDL_SCANCODE_B);        // V0.11：切换"世界网格吸附"
         input.BindMouseButton(vx::ActionId::Attack, SDL_BUTTON_LEFT);   // T27：左键 = 发射光球（摆放模式内 = 放下）
         input.BindMouseAxis(vx::ActionId::LookX, vx::MouseAxis::X);
         input.BindMouseAxis(vx::ActionId::LookY, vx::MouseAxis::Y);
@@ -3102,6 +3221,11 @@ int main(int argc, char** argv) {
             presetSourceLabel = "清单 " + worldManager.ActiveId();
             roundManifest     = &worldManager.Active();
         }
+        // V0.11 / D1：**该世界是否持久化** —— 消费 `LevelManifest::persistent`（此前只打印，见 `level_manifest.hpp`）。
+        // 口径：A=true（改动保留）/ B=false（**共享只读 ⇒ 改不留**，"何时访问都一样"）/
+        //       C=true（**改动退出即保存，丢弃时机 = 主动「重置」换种子**；所有者 2026-10-07 裁定，"退出即丢"口径作废）。
+        // 走 `--map=`（无清单）时按 true（与既有行为逐位一致）；`--world-save=off` 仍是**总开关**（一律不落盘）。
+        const bool worldPersistent = (roundManifest == nullptr) || roundManifest->persistent;
 
         // ---- V5（[plans/v0.5.md](../docs/plans/v0.5.md) §1.13）：肉鸽秘境的**实例种子** ----
         // 口径（所有者 2026-10-06）：**首次进入 roll 一次 ⇒ 之后反复进入复用 ⇒ 重置（V9 菜单）才换**。
@@ -3199,7 +3323,7 @@ int main(int argc, char** argv) {
         const std::string worldSaveId =
             (roundManifest != nullptr) ? roundManifest->id : std::filesystem::path(mapFile).stem().string();
         WorldStatePersistence worldState;
-        worldState.enabled = worldSaveEnabled;
+        worldState.enabled = worldSaveEnabled && worldPersistent;  // V0.11 / D1：清单门控（B 共享只读 ⇒ 不落盘）
         worldState.path    = WorldStateSavePath(worldSaveId);
         // S6（[ADR 0037](../../docs/adr/0037-world-state-save-v2-and-terrain-persistence.md) 决策六）：世界定义一致性 ——
         // 地形生成参数**内容哈希** + 可挖区域表（`schema_version` + **内容哈希**）。两个都是纯函数、确定性。
@@ -3275,6 +3399,9 @@ int main(int argc, char** argv) {
                         worldState.flusher->HasWorkers() ? "worker 异步（主线程只提交快照 + 收包）"
                                                          : "**线程池不可用 ⇒ 同步写盘**",
                         WorldStatePersistence::kFlushIntervalSeconds);
+        } else if (!worldPersistent) {
+            VX_LOG_INFO("世界状态存档（V0.11/D1）：世界 [%s] 声明 `persistent = false`（**共享只读 ⇒ 改动不留**）"
+                        "⇒ **不读档、不写盘**", worldSaveId.c_str());
         } else {
             VX_LOG_INFO("世界状态存档（V0.10）：**已由 `--world-save=off` 关闭** ⇒ 不读档、不写盘"
                         "（行为与 V0.9 逐位一致）");
@@ -3974,6 +4101,21 @@ int main(int argc, char** argv) {
             slot.localMesh  = localMesh;
             slot.position   = origin;
             slot.yawDegrees = instance.yawDegrees;
+            // V0.11：底面足迹 = **真实几何**的局部（未旋转）AABB ⇒ 供放置合法性 / 邻居吸附（见 `ObjectSlot::footprintHalfX`）。
+            if (!localMesh.vertices.empty()) {
+                float minX = localMesh.vertices.front().position[0];
+                float maxX = minX;
+                float minZ = localMesh.vertices.front().position[2];
+                float maxZ = minZ;
+                for (const vx::MeshVertex& vertex : localMesh.vertices) {
+                    minX = std::min(minX, vertex.position[0]);
+                    maxX = std::max(maxX, vertex.position[0]);
+                    minZ = std::min(minZ, vertex.position[2]);
+                    maxZ = std::max(maxZ, vertex.position[2]);
+                }
+                slot.footprintHalfX = 0.5F * (maxX - minX);
+                slot.footprintHalfZ = 0.5F * (maxZ - minZ);
+            }
             // 剔除包围盒取**旋转后**的几何（它才是世界里的真实形状；渲染侧施加同一旋转）。
             slot.bounds = BoundsOfVertices(colliderMesh.vertices, origin);
             slot.handle = renderer.UploadMesh(localMesh, origin);
@@ -4697,6 +4839,10 @@ int main(int argc, char** argv) {
         // ---- V0.5 E3：摆放模式状态（跨帧保持；进入新世界即重置；[ADR 0032](../../docs/adr/0032-object-palette-and-placement-mode.md)）----
         bool          placementMode   = false;  ///< 是否处于摆放模式（模式内左键放下 / 右键删除 / Q,E 旋转）
         float         placementYawDeg = 0.0F;   ///< 预览与放下时的朝向（度）
+        /// V0.11（2026-10-08）：`Q`/`E` **连续按住**的秒数（0 = 未按；按下边沿清零）—— 供"长按启动延迟"判定
+        /// （`PlacementHoldActive`：须按住 `holdDelaySeconds`（缺省 0.5 s）才**开始**连续转 ⇒ 轻点不漂）。
+        double        placementRotateLeftHeldSeconds  = 0.0;
+        double        placementRotateRightHeldSeconds = 0.0;
         std::string   lastPlaceTypeId;          ///< `F3` 重复上次**实际放下**的类型（空 = 还没放过）
         float         lastPlaceYawDeg = 0.0F;   ///< `F3` 重复上次**实际放下**的朝向（度）
         vx::MeshHandle previewHandle {};        ///< 幽灵预览的 GPU 网格（仅模式内有效）
@@ -4714,6 +4860,12 @@ int main(int argc, char** argv) {
         bool          previewBlocked = false;
         /// 本帧预览被拒的**原因**是否为"地表由可挖体积绘制"（V0.10 / S8；用于给出可解释的提示文案）。
         bool          previewBlockedByVolume = false;
+        /// V0.11 / I2：被拒原因 —— 与已有物件**足迹重叠**。
+        bool          previewBlockedByOverlap = false;
+        /// V0.11 / I2：被拒原因 —— 底面 5 探测点**全部无支撑**（悬空）。
+        bool          previewBlockedByFloating = false;
+        /// V0.11 / I2：上一次已打日志的"重叠挡住者"类型 id（只在变化时打 ⇒ 不刷屏）。
+        std::string   loggedOverlapBlocker;
         /// 准星指向的**已有建筑** id（**选中态**；空串 = 没指向建筑）。
         std::string   hoveredBuildingId;
         float         hoveredBuildingDarkening = 0.0F;
@@ -4851,12 +5003,19 @@ int main(int argc, char** argv) {
                 VX_LOG_INFO("摆放模式（E3）：进入，类型 [%s]（Q/E 旋转、左键放下、右键删除、F3 重复、F5 保存、Esc 退出）",
                             id.c_str());
             }
+            // V0.11 I1b/I1c：把**本次生效的吸附与旋转口径**打进日志（可判定；各项都可用启动参数关闭做 A/B 对照）。
+            VX_LOG_INFO("摆放模式（V0.11）：吸附 —— 世界网格 %.2f 格 / 邻居半径 %.2f 格（0=关）/ 朝向 %.2f 度；"
+                        "旋转 —— 点按 %.2f 度 / 长按 %.2f 度每秒（0=关）",
+                        placementSnap.translateBlocks, placementSnap.neighborRadiusBlocks, placementSnap.yawDegrees,
+                        placementRotate.stepDegrees, placementRotate.rateDegPerSec);
         };
         const auto exitPlacement = [&]() {
             placementMode  = false;
             placeIsBuilding = false;
             previewBlocked = false;
             previewBlockedByVolume = false;
+            previewBlockedByOverlap = false;
+            previewBlockedByFloating = false;
             previewHit.reset();
             hoveredBuildingId.clear();
             if (previewHandle.IsValid()) {
@@ -4867,6 +5026,13 @@ int main(int argc, char** argv) {
             VX_LOG_INFO("摆放模式（E3/V0.9）：退出");
         };
         const auto saveEditLayer = [&]() {
+            // V0.11 / D1：清单门控（**所有入口点统一生效**：F5 / 面板按钮 / 退出自动保存）。
+            // `persistent = false` 的世界（B / 共享只读）**改不留** ⇒ 拒绝写盘并给出可见反馈（不静默）。
+            if (!worldPersistent) {
+                pickFeedback = "read-only world";
+                VX_LOG_WARN("可编辑层（V0.11/D1）：本世界声明 `persistent = false`（共享只读 ⇒ 改动不留）⇒ **不写盘**");
+                return;
+            }
             try {
                 vx::SaveObjectEditLayer(objectsEditPath, editLayerState);
                 editLayerUnsavedOps = 0;  // V0.10 / S9：写盘成功（写的是**全部**增量）⇒ 未保存计数归零
@@ -4882,6 +5048,74 @@ int main(int argc, char** argv) {
             }
         };
 
+        /// V0.11：**单位 id → 局部足迹**（半尺寸 + 中心偏移，**局部帧**；由**真实几何** AABB 得出）。
+        /// 按 id 缓存（每帧只查表）。`type` 与成套建筑都在 `objects` 表内 ⇒ 一个入口覆盖二者。
+        struct LocalFootprint {
+            double halfX   = 0.0;
+            double halfZ   = 0.0;
+            double offsetX = 0.0;
+            double offsetZ = 0.0;
+        };
+        std::map<std::string, LocalFootprint> localFootprintCache;
+        const auto localFootprintOf = [&](const std::string& id) -> LocalFootprint {
+            const auto cached = localFootprintCache.find(id);
+            if (cached != localFootprintCache.end()) {
+                return cached->second;
+            }
+            vx::MeshData          mesh;
+            const vx::ObjectType* type = objects.Find(id);
+            if (type != nullptr) {
+                mesh = buildLocalMesh(*type);
+            } else {
+                const vx::ObjectBuilding* building = objects.FindBuilding(id);
+                if (building != nullptr) {
+                    mesh = buildBuildingLocalMesh(*building);
+                }
+            }
+            LocalFootprint footprint;
+            if (!mesh.vertices.empty()) {
+                double minX = mesh.vertices.front().position[0];
+                double maxX = minX;
+                double minZ = mesh.vertices.front().position[2];
+                double maxZ = minZ;
+                for (const vx::MeshVertex& vertex : mesh.vertices) {
+                    minX = std::min(minX, static_cast<double>(vertex.position[0]));
+                    maxX = std::max(maxX, static_cast<double>(vertex.position[0]));
+                    minZ = std::min(minZ, static_cast<double>(vertex.position[2]));
+                    maxZ = std::max(maxZ, static_cast<double>(vertex.position[2]));
+                }
+                footprint.halfX   = 0.5 * (maxX - minX);
+                footprint.halfZ   = 0.5 * (maxZ - minZ);
+                footprint.offsetX = 0.5 * (minX + maxX);
+                footprint.offsetZ = 0.5 * (minZ + maxZ);
+            }
+            return localFootprintCache.emplace(id, footprint).first->second;
+        };
+
+        /// V0.11 I1c / I2：把"现存可放物件"投影成**底面足迹**（**邻居优先吸附**与**重叠检测**共用）。
+        /// 建筑构件本身也是物件槽（`buildingId` 非空）⇒ 天然覆盖"建筑展开件"；已移除 / 非物件跳过。
+        const auto collectPlacementFootprints = [&]() {
+            std::vector<vx::PlacementFootprint> out;
+            out.reserve(objectSlots.size());
+            for (const ObjectSlot& slot : objectSlots) {
+                if (slot.removed || slot.type == nullptr) {
+                    continue;
+                }
+                vx::PlacementFootprint footprint;
+                footprint.x          = slot.position.x;
+                footprint.z          = slot.position.z;
+                // V0.11 缺陷修复：优先用**真实几何**足迹（`makeObjectSlot` 里由网格 AABB 算好）；
+                // 网格为空时才回落到"模数盒"（`type->halfExtent`）。
+                footprint.halfX      = (slot.footprintHalfX > 0.0F) ? static_cast<double>(slot.footprintHalfX)
+                                                                    : static_cast<double>(slot.type->halfExtentX);
+                footprint.halfZ      = (slot.footprintHalfZ > 0.0F) ? static_cast<double>(slot.footprintHalfZ)
+                                                                    : static_cast<double>(slot.type->halfExtentZ);
+                footprint.yawDegrees = static_cast<double>(slot.yawDegrees);
+                out.push_back(footprint);
+            }
+            return out;
+        };
+
         /// 幽灵预览（模式内每帧一次）：准星 → 地表射线 ⇒ **同源几何**半透明网格的位姿 / 不透明度。
         /// 成本为**常数级**（一次射线 + 一次 96 B 位姿推送），不随世界总量增长；**不建碰撞体、不进物件槽表**
         /// （不参与剔除 / 支撑 / 破坏；ADR 0032 决策七）。
@@ -4892,6 +5126,8 @@ int main(int argc, char** argv) {
                 previewHit.reset();
                 previewBlocked = false;
                 previewBlockedByVolume = false;
+                previewBlockedByOverlap = false;
+                previewBlockedByFloating = false;
                 return;
             }
             if (previewTypeId != placeTypeId || !previewHandle.IsValid()) {
@@ -4914,8 +5150,44 @@ int main(int argc, char** argv) {
                                            [&](float x, float z, float& outHeight) {
                                                return world.QueryHeight(x, z, outHeight);
                                            });
+            // V0.11 I1c（[ADR 0038](../../docs/adr/0038-construction-editor-and-runtime-separation.md) 决策四"吸附"）：
+            // **邻居优先吸附** —— 先找最近邻居并把落点**贴到它最近的面**；**找不到才退回世界网格**（缺省 0.25 格）。
+            // 吸附后**按吸附列重采样地表高度**（否则按"未吸附列"的高度贴地 ⇒ 斜坡上悬空 / 陷地）。
+            // 两段都可关闭：`--placement-neighbor-radius=0` / `--placement-snap=0` ⇒ 逐位退回引入前。
+            // V0.11 缺陷修复（第二次；所有者 2026-10-07："离得近但理论上可以放的地方还是放不了"）：
+            // 候选足迹改取**真实几何** AABB（**局部帧**：半尺寸 + 中心偏移）—— 之前用 `type->halfExtent`（"模数盒"），
+            // 而 kit 墙的几何只是"占满模数格的**中间薄板**"（≈4.0 × 0.3）⇒ 薄轴方向**多占 ≈3.7 格** ⇒ **过度拒绝**。
+            // 总朝向 = 摆放朝向（+ 建筑自身朝向）；中心偏移在下面按总朝向旋转到世界。
+            const LocalFootprint selfLocal = localFootprintOf(placeTypeId);
+            const double         selfHalfX = selfLocal.halfX;
+            const double         selfHalfZ = selfLocal.halfZ;
+            const double         selfYawDegrees =
+                static_cast<double>(placementYawDeg) + ((building != nullptr) ? building->yawDegrees : 0.0F);
+            // V0.11 运行期开关：`X` 关闭"邻居优先吸附" ⇒ 不贴邻居；`B` 关闭"世界网格吸附" ⇒ 落点完全自由。
+            const double neighborRadius = placementNeighborSnap ? placementSnap.neighborRadiusBlocks : 0.0;
+            const double gridStep       = placementGridSnap ? placementSnap.translateBlocks : 0.0;
+            if (previewHit.has_value() && (gridStep > 0.0 || neighborRadius > 0.0)) {
+                const std::vector<vx::PlacementFootprint> neighbors = collectPlacementFootprints();
+                double                                     snapX     = previewHit->x;
+                double                                     snapZ     = previewHit->z;
+                const bool snappedToNeighbor = vx::SnapPlacementToNeighbor(
+                    previewHit->x, previewHit->z, selfHalfX, selfHalfZ, neighbors, neighborRadius, gridStep, snapX,
+                    snapZ);
+                if (!snappedToNeighbor && gridStep > 0.0) {
+                    snapX = vx::SnapToStep(previewHit->x, gridStep);
+                    snapZ = vx::SnapToStep(previewHit->z, gridStep);
+                }
+                previewHit->x = static_cast<float>(snapX);
+                previewHit->z = static_cast<float>(snapZ);
+                float snappedSurfaceY = 0.0F;
+                if (world.QueryHeight(previewHit->x, previewHit->z, snappedSurfaceY)) {
+                    previewHit->surfaceY = snappedSurfaceY;  // 吸附后仍**贴地**（落点吸附语义）
+                }
+            }
             previewBlocked = false;
             previewBlockedByVolume = false;
+            previewBlockedByOverlap = false;
+            previewBlockedByFloating = false;
             if (!previewHit.has_value() || !previewHandle.IsValid()) {
                 return;
             }
@@ -4949,6 +5221,70 @@ int main(int argc, char** argv) {
                 }
                 // 建筑渲染位姿的 yaw = **模板自身朝向 + 用户旋转**（与最终展开逐字同源）。
                 yawDeg += building->yawDegrees;
+            }
+            // V0.11 / I2：**合法性检测**（预览侧）—— ① 与现存足迹**重叠**；② 底面 5 探测点**全部无支撑**（悬空）。
+            // 判据与提交侧共用同一批纯函数 / 探测点 ⇒ 预览与提交一致（不会"看着能放、点了不放"）。
+            {
+                // 局部中心偏移按**总朝向**旋转到世界（局部 → 世界：x' = c·lx + s·lz、z' = −s·lx + c·lz）。
+                constexpr double kDegreesToRadians = 3.14159265358979323846 / 180.0;
+                const double selfYawRadians = selfYawDegrees * kDegreesToRadians;
+                const double selfCosYaw     = std::cos(selfYawRadians);
+                const double selfSinYaw     = std::sin(selfYawRadians);
+                vx::PlacementFootprint candidate;
+                candidate.x          = previewHit->x + selfCosYaw * selfLocal.offsetX + selfSinYaw * selfLocal.offsetZ;
+                candidate.z          = previewHit->z - selfSinYaw * selfLocal.offsetX + selfCosYaw * selfLocal.offsetZ;
+                candidate.halfX      = selfHalfX;
+                candidate.halfZ      = selfHalfZ;
+                candidate.yawDegrees = selfYawDegrees;
+                // 重叠判据：直接遍历**物件槽**（而非只拿足迹）⇒ 顺带记录"**谁挡住了**"，给出可解释日志
+                // （所有者 2026-10-07 反馈"看着有地方却放不下"；没有归因就只能靠猜）。
+                const char* overlapBlockerTypeId = nullptr;
+                for (const ObjectSlot& slot : objectSlots) {
+                    if (slot.removed || slot.type == nullptr) {
+                        continue;
+                    }
+                    vx::PlacementFootprint other;
+                    other.x          = slot.position.x;
+                    other.z          = slot.position.z;
+                    other.halfX      = (slot.footprintHalfX > 0.0F) ? static_cast<double>(slot.footprintHalfX)
+                                                                    : static_cast<double>(slot.type->halfExtentX);
+                    other.halfZ      = (slot.footprintHalfZ > 0.0F) ? static_cast<double>(slot.footprintHalfZ)
+                                                                    : static_cast<double>(slot.type->halfExtentZ);
+                    other.yawDegrees = static_cast<double>(slot.yawDegrees);
+                    if (vx::FootprintsOverlap2D(candidate, other)) {
+                        previewBlocked          = true;
+                        previewBlockedByOverlap = true;
+                        overlapBlockerTypeId    = slot.type->id.c_str();
+                        break;
+                    }
+                }
+                // 只在"挡住者变化"时打一条（避免每帧刷屏）。
+                if (previewBlockedByOverlap && overlapBlockerTypeId != nullptr &&
+                    loggedOverlapBlocker != overlapBlockerTypeId) {
+                    loggedOverlapBlocker = overlapBlockerTypeId;
+                    VX_LOG_INFO("摆放模式（V0.11/I2）：当前落点与 [%s] 的占地**重叠** ⇒ 不可放"
+                                "（移开一点 / 换朝向；`X` 可关掉邻居吸附）",
+                                overlapBlockerTypeId);
+                } else if (!previewBlockedByOverlap) {
+                    loggedOverlapBlocker.clear();
+                }
+                const auto probes = vx::ObjectSupportProbes(static_cast<float>(selfHalfX),
+                                                            static_cast<float>(selfHalfZ),
+                                                            static_cast<float>(selfYawDegrees));
+                bool supported = false;
+                for (const vx::ObjectProbeOffset& probe : probes) {
+                    float groundY = 0.0F;
+                    if (world.QueryHeight(static_cast<float>(candidate.x) + probe.x,
+                                          static_cast<float>(candidate.z) + probe.z, groundY) &&
+                        static_cast<double>(groundY) >= static_cast<double>(anchorY) - kObjectSupportProbeDepth) {
+                        supported = true;
+                        break;
+                    }
+                }
+                if (!supported) {
+                    previewBlocked           = true;
+                    previewBlockedByFloating = true;
+                }
             }
             const glm::dvec3 origin(static_cast<double>(previewHit->x), static_cast<double>(anchorY),
                                     static_cast<double>(previewHit->z));
@@ -5101,7 +5437,13 @@ int main(int argc, char** argv) {
                     return;
                 }
                 if (previewBlocked) {
-                    if (previewBlockedByVolume) {
+                    if (previewBlockedByOverlap) {
+                        pickFeedback = "overlap";
+                        VX_LOG_WARN("摆放模式（V0.11/I2）：候选足迹与**已有物件重叠** ⇒ 本次未放下（挪开一点或换朝向）。");
+                    } else if (previewBlockedByFloating) {
+                        pickFeedback = "unsupported ground";
+                        VX_LOG_WARN("摆放模式（V0.11/I2）：底面 5 探测点**全部无支撑**（悬空）⇒ 本次未放下。");
+                    } else if (previewBlockedByVolume) {
                         pickFeedback = "surface is dig volume";
                         VX_LOG_WARN("摆放模式（V0.10/S8）：当前落点模式 %s 需要改**高度场**，但 footprint 覆盖的地表"
                                     "**由可挖体积绘制**（体积接管区）⇒ 本次未放下（改高度场在此不可见且会在接管边界"
@@ -5168,6 +5510,13 @@ int main(int argc, char** argv) {
                             static_cast<double>(placed.z), static_cast<double>(previewHit->surfaceY),
                             static_cast<double>(placementYawDeg), LandingModeToken(placementLandingMode),
                             static_cast<double>(placementDarkening), placed.pieces.size());
+                return;
+            }
+            // V0.11 / I2：**提交侧**同样拦截（与预览侧共用同一批判据）—— 重叠 / 悬空 ⇒ 不放下。
+            if (previewBlocked) {
+                pickFeedback = previewBlockedByOverlap ? "overlap" : "unsupported ground";
+                VX_LOG_WARN("摆放模式（V0.11/I2）：%s ⇒ 本次未放下",
+                            previewBlockedByOverlap ? "与已有物件重叠" : "底面 5 探测点全部无支撑（悬空）");
                 return;
             }
             if (!previewHit.has_value()) {
@@ -5335,6 +5684,25 @@ int main(int argc, char** argv) {
                             flying ? "开（无重力，Space 上升 / 左Ctrl 下降）" : "关（恢复重力与碰撞）");
             }
 
+            // V0.11（SKILL《运行期可修改优先》）：摆放控制开关**运行期可按键切换**。
+            // **不**按 `suppression.keyboardGameplay` 门控 —— 它们是**面板级热键**（用户正是在 `F2` 选择器里看它们的状态）；
+            // 若门控，就会出现"在 `F2` 面板里按了没反应"（所有者 2026-10-07 实测缺陷）。
+            if (input.ConsumePressed(vx::ActionId::PlacementToggleRotateHold)) {
+                placementRotateHold = !placementRotateHold;
+                VX_LOG_INFO("摆放控制（V0.11）：旋转长按模式 → %s（按 Z 切换；关 = 只点按一步）",
+                            placementRotateHold ? "开" : "关");
+            }
+            if (input.ConsumePressed(vx::ActionId::PlacementToggleNeighborSnap)) {
+                placementNeighborSnap = !placementNeighborSnap;
+                VX_LOG_INFO("摆放控制（V0.11）：邻居优先吸附 → %s（按 X 切换；关 = 不贴邻居）",
+                            placementNeighborSnap ? "开" : "关");
+            }
+            if (input.ConsumePressed(vx::ActionId::PlacementToggleGridSnap)) {
+                placementGridSnap = !placementGridSnap;
+                VX_LOG_INFO("摆放控制（V0.11）：世界网格吸附 → %s（按 B 切换；关 = 落点完全自由）",
+                            placementGridSnap ? "开" : "关");
+            }
+
             // T27：发射意图在**帧边界**采样一次（按住 = 连发，由固定步内的冷却控制射速）。
             // 这里仍消费"本帧按下"边沿，避免边沿残留到下一帧被重复消费；边沿另供摆放模式"左键放下"使用。
             const bool attackPressedEdge = input.ConsumePressed(vx::ActionId::Attack);
@@ -5435,6 +5803,10 @@ int main(int argc, char** argv) {
             if (debugOverlay.ObjectPaletteOpen()) {
                 vx::PaletteModel& palette = debugOverlay.MutablePalette();
                 palette.unsavedChanges    = editLayerUnsavedOps;  // V0.10 / S9：未保存计数随操作实时刷新
+                // V0.11：摆放开关状态（面板显示当前值 + 键位；改在运行期按键）。
+                palette.rotateHoldEnabled   = placementRotateHold;
+                palette.neighborSnapEnabled = placementNeighborSnap;
+                palette.gridSnapEnabled     = placementGridSnap;
                 std::string       selectedTypeId;
                 if (palette.state.categoryIndex < palette.typeIdsByCategory.size()) {
                     const std::vector<std::string>& typeIds = palette.typeIdsByCategory[palette.state.categoryIndex];
@@ -5449,14 +5821,30 @@ int main(int argc, char** argv) {
                     if (type != nullptr) {
                         palettePreviewMesh      = buildLocalMesh(*type);
                         palettePreviewMeshReady = !palettePreviewMesh.vertices.empty();
+                    } else {
+                        // V0.11 缺陷修复（所有者 2026-10-07）：**成套建筑**（合成类别 `building_set` 的条目）
+                        // 此前**永远无预览** —— 因为上面只查**单件类型表**（`objects.Find`），建筑 id 必落空。
+                        // 回落到"整座合并几何"（与摆放 / 幽灵**同源** `buildBuildingLocalMesh`）。
+                        const vx::ObjectBuilding* building = objects.FindBuilding(selectedTypeId);
+                        if (building != nullptr) {
+                            palettePreviewMesh      = buildBuildingLocalMesh(*building);
+                            palettePreviewMeshReady = !palettePreviewMesh.vertices.empty();
+                        }
                     }
                 }
                 if (palettePreviewMeshReady) {
-                    palettePreviewSpinSeconds += static_cast<float>(frameDeltaSeconds);
+                    // V0.11（所有者 2026-10-08）：**鼠标拖动预览时暂停自动旋转**，松开后恢复。
+                    // 拖动偏移（yaw / pitch）由面板累加；松开时面板已把偏移归零 ⇒ 这里只剩自动旋转的**原角度**。
+                    if (!palette.previewDragging) {
+                        palettePreviewSpinSeconds += static_cast<float>(frameDeltaSeconds);
+                    }
                     const float yaw =
                         kPalettePreviewSpinRadiansPerSecond * palettePreviewSpinSeconds + palette.previewYawRadians;
-                    palette.previewTriangles =
-                        vx::BuildObjectPreview(palettePreviewMesh, yaw, vx::kObjectPreviewPitchRadians);
+                    // 上下拖动叠加到固定俯仰角上（限幅由面板负责；这里再夹一次防越界翻面）。
+                    constexpr float kMaxPreviewPitch = 1.45F;
+                    const float pitch = std::clamp(vx::kObjectPreviewPitchRadians + palette.previewPitchRadians,
+                                                   -kMaxPreviewPitch, kMaxPreviewPitch);
+                    palette.previewTriangles = vx::BuildObjectPreview(palettePreviewMesh, yaw, pitch);
                 } else {
                     palette.previewTriangles.clear();
                 }
@@ -5465,15 +5853,48 @@ int main(int argc, char** argv) {
             if (placementMode) {
                 // 模式内让位：`E` 同时绑定了传送门交互 ⇒ 这里先消费掉，避免"旋转的同时触发开门"。
                 (void)input.ConsumePressed(vx::ActionId::Interact);
-                // `Q` / `E` 旋转（步进 15°；按住 `Shift` 吸附 90°）。
-                const float rotateStep = input.Held(vx::ActionId::Sprint) ? 90.0F : kPlacementRotateStepDeg;
-                if (input.ConsumePressed(vx::ActionId::PlacementRotateLeft)) {
-                    placementYawDeg -= rotateStep;
+                // V0.11 I1b：`Q` / `E` —— **点按 = 一步、长按 = 连续转**（步长 / 速率可配置；`Shift` 仍 = 90° 一步）。
+                vx::PlacementRotateSettings frameRotate = placementRotate;
+                if (!placementRotateHold) {
+                    frameRotate.rateDegPerSec = 0.0;  // V0.11 运行期开关：关 ⇒ 只点按一步
                 }
-                if (input.ConsumePressed(vx::ActionId::PlacementRotateRight)) {
-                    placementYawDeg += rotateStep;
+                if (input.Held(vx::ActionId::Sprint)) {
+                    frameRotate.stepDegrees = 90.0;  // 既有口径：`Shift` = 粗步长（90°）
                 }
-                placementYawDeg = std::fmod(placementYawDeg + 360.0F, 360.0F);  // 归一化到 [0, 360)
+                const bool rotatePressedLeft  = input.ConsumePressed(vx::ActionId::PlacementRotateLeft);
+                const bool rotatePressedRight = input.ConsumePressed(vx::ActionId::PlacementRotateRight);
+                const bool rotateHeldLeft     = input.Held(vx::ActionId::PlacementRotateLeft);
+                const bool rotateHeldRight    = input.Held(vx::ActionId::PlacementRotateRight);
+                // V0.11（2026-10-08）：累计"已连续按住"的秒数（按下边沿清零、松开清零）—— 供**长按启动延迟**判定。
+                placementRotateLeftHeldSeconds =
+                    rotateHeldLeft
+                        ? (rotatePressedLeft ? 0.0 : placementRotateLeftHeldSeconds + frameDeltaSeconds)
+                        : 0.0;
+                placementRotateRightHeldSeconds =
+                    rotateHeldRight
+                        ? (rotatePressedRight ? 0.0 : placementRotateRightHeldSeconds + frameDeltaSeconds)
+                        : 0.0;
+                // **长按启动延迟**（缺省 0.5 s）：须连续按住这么久才**开始**连续转 ⇒ **轻点恰好一步、不漂**（所有者 2026-10-08）。
+                const bool rotateHoldActiveLeft =
+                    vx::PlacementHoldActive(rotateHeldLeft, placementRotateLeftHeldSeconds, frameRotate);
+                const bool rotateHoldActiveRight =
+                    vx::PlacementHoldActive(rotateHeldRight, placementRotateRightHeldSeconds, frameRotate);
+                const double rotateDelta = vx::PlacementRotationDeltaDegrees(
+                    rotatePressedLeft, rotateHoldActiveLeft, rotatePressedRight, rotateHoldActiveRight,
+                    frameDeltaSeconds, frameRotate);
+                placementYawDeg = static_cast<float>(static_cast<double>(placementYawDeg) + rotateDelta);
+                placementYawDeg = std::fmod(placementYawDeg + 360.0F, 360.0F);  // 先归一化到 [0, 360)
+                // V0.11 I1：旋转吸附到 `placementSnap.yawDegrees` 的整数倍（步长 <= 0 ⇒ 仅归一化，逐位退回引入前）。
+                // V0.11 缺陷修复（所有者 2026-10-08："长按还是没反应、只能单点"）：**长按连续转时不再逐帧吸附** ——
+                // 原实现**每帧**都把角度吸附到 15° 的整数倍，而连续转每帧只走 `rate × dt`（缺省 180°/s × 1/60 ≈ 3°）
+                // < 半个吸附步长（7.5°）⇒ 每帧都被四舍五入**回原角度** ⇒ 长按看起来"完全没反应"（点按恰好一步仍正常）。
+                // 现口径：**点按（离散步）仍吸附**；**长按连续转用原始角度累加（平滑）**；**松开后再吸附一次**（松手归到整步）。
+                const bool continuousRotation =
+                    !(rotatePressedLeft || rotatePressedRight) && (rotateHoldActiveLeft || rotateHoldActiveRight);
+                if (!continuousRotation) {
+                    placementYawDeg = static_cast<float>(
+                        vx::SnapYawDegrees(static_cast<double>(placementYawDeg), placementSnap.yawDegrees));
+                }
 
                 // V0.9 / ADR 0036 决策四：`T` 循环**落点模式**（仅在摆成套建筑时生效；单件摆放时边沿照常消费）。
                 // V0.10 / S5：`flatten` / `fill` 放行后，循环扩为 4 种（Sink → FlatOnly → Flatten → Fill → Sink）。
@@ -6992,11 +7413,15 @@ int main(int argc, char** argv) {
         // 为什么需要：上面的地形 / 体积改动会随 `.voxr` 自动保留，而物件摆放此前**只能手动 F5** ⇒
         // 出现"地面被压平了、建筑却没了"的不自洽。`> 0` 才写（没有改动就不触碰文件）。
         // 此处帧循环已结束 ⇒ 允许阻塞（与上一条 flush 同口径，不存在"冻结画面"）。
-        if (editLayerUnsavedOps > 0) {
+        if (editLayerUnsavedOps > 0 && worldPersistent) {
             const int unsavedOps = editLayerUnsavedOps;  // `saveEditLayer` 成功后会归零 ⇒ 先留一份用于日志
             saveEditLayer();
             VX_LOG_INFO("可编辑层（V0.10/S9）：%s前检测到 %d 处未保存的物件改动 ⇒ **已自动写盘**（无需 F5）",
                         quitRequested ? "退出" : "切世界", unsavedOps);
+        } else if (editLayerUnsavedOps > 0) {
+            // V0.11 / D1：非持久世界（B / 共享只读）⇒ 改动**按设计丢弃**（此时不得打印"已自动写盘"）。
+            VX_LOG_INFO("可编辑层（V0.11/D1）：本世界 `persistent = false`（共享只读）⇒ %d 处改动**按设计丢弃**（不写盘）",
+                        editLayerUnsavedOps);
         }
 
         for (vx::MeshHandle& handle : tileHandles) {

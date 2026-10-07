@@ -57,6 +57,9 @@ add_executable(voxel_tests
     system_settings_test.cpp
     test_mode_test.cpp
     physics_test.cpp
+    placement_rotate_test.cpp
+    placement_snap_test.cpp
+    placement_validation_test.cpp
     render_camera_test.cpp
     render_stats_test.cpp
     river_test.cpp

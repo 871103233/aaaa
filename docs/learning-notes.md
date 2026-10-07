@@ -484,6 +484,27 @@
 - 相关：`world/save/world_save.*`（`Fnv1a64` / `Fnv1a64Builder`）、`world/generation/terrain_params.*`、`world/dig/dig_region.*`、
   [ADR 0037](adr/0037-world-state-save-v2-and-terrain-persistence.md) 决策六、`references/save-and-serialization.md` §5
 
+### 分离轴定理（SAT，Separating Axis Theorem）与"放置合法性"的 2D 重叠检测
+
+- 一句话定义：判定两个**凸多边形是否相交**的经典算法 —— 若能找到**一条轴**使两者在该轴上的**投影区间不重叠**，则它们**分离**（不相交）；只有在**所有候选轴**上都重叠，才判"相交"。
+- 在本项目里是什么 / 为什么需要：V0.11 / I2 的**放置合法性** —— 把物件底面当作**有向矩形**（中心 + 半尺寸 + 绕 Y 朝向），两矩形取各自 2 条轴共 **4 条候选轴**逐条投影比较（`FootprintsOverlap2D`，纯函数、可单测）。同形态：UE5 *Place Actors* 的"碰撞即红"、Cities: Skylines 的"不可建造地块"判据。
+- 易错点或关键取舍：① **"相切"必须判为不重叠**（间隙 = 0 不算重叠）—— 用 `>= ra + rb - epsilon` 而非 `>`，否则"贴着邻居放"会被**误拒**；② 候选轴要用**各自矩形的局部轴**（有朝向时的正确做法），**不能**只用世界 X/Z 轴；③ epsilon 只用于吸收浮点误差（本项目 `1e-6`），不能大到掩盖真实重叠。
+- 相关：`world/object/placement_validation.hpp`、`tests/placement_validation_test.cpp`、[ADR 0038](adr/0038-construction-editor-and-runtime-separation.md) 决策四
+
+### 邻居优先吸附 / 世界网格吸附（Neighbor & Grid Snapping）
+
+- 一句话定义：摆放时把落点**量化**到参照物上 —— 优先**贴合最近的已有构件**（贴其最近的那一面），找不到邻居时才退回**世界网格**的整数倍。
+- 在本项目里是什么 / 为什么需要：V0.11 / I1c 的吸附口径（`SnapPlacementToNeighbor` + `SnapToStep`）。同形态：UE5 **Socket / Vertex snapping**、**Valheim 建造吸附（贴相邻构件）**、Unity ProGrids / ProBuilder。
+- 易错点或关键取舍：① "贴邻居"**只改位置、不改朝向**（朝向仍由 `Q`/`E` 决定；朝向对齐已登记为**后续可选**）；② 吸附后**必须按吸附列重采样地表高度**，否则斜坡上会悬空 / 陷地；③ **"旋转离散步"与"旋转吸附步"必须一致** —— 若离散步（点按一步）比吸附步小，小步长点按会被吸附**回整步**（本项目踩过：1° 点按被吸附回 15° ⇒ 看起来"点按没反应"）。
+- 相关：`world/object/placement_snap.hpp`、`game/main.cpp` 摆放模式接线、`tests/placement_snap_test.cpp`
+
+### 长按启动延迟 / 按键重复延迟（Hold Delay / Key-repeat Delay）
+
+- 一句话定义：**点按**与**长按**之间的一段"静默期" —— 按住超过该时长才**开始**连续动作（连续转 / 连续滚动）；短于它时只按"点按"处理。
+- 在本项目里是什么 / 为什么需要：V0.11 的旋转手感（`PlacementRotateSettings::holdDelaySeconds`，缺省 **0.4 s**，`--placement-hold-delay=` 可调）。**不做就有可感知残缺**：没有延迟时，一次稍慢的点击也会在"点按那一步"之外**再叠加** `速率 × 按住时长` 的一小段连续转（**单击被污染**）。
+- 易错点或关键取舍：**取值就是"点击 / 长按"的分界** —— 业界参照：Windows 键盘**重复延迟**缺省 ≈ 500 ms（范围 250~1000）、Material / iOS 的长按阈值 ≈ 400~500 ms；而一次**明确点击**通常 **50~150 ms**。取 **0.4 s** = 既留足余量不误触发，又比 OS 的 500 ms 稍早起转。太短（≤0.3s）对"慢点击"有误触发风险，太长（≥0.6s）有等待感。
+- 相关：`game/placement_rotate.hpp`（`PlacementHoldActive`）、`docs/plans/v0.11.md` A3 表 Y6、`docs/learning-notes.md` Q44
+
 ---
 
 ## B. 开发流程与工程用语
@@ -1339,6 +1360,17 @@ UTF-8 的三字节汉字被按 GBK 两字节切分，就解出一串"像繁体"�
 - 该设置**只改"控制台如何解码"**，写文件 / 管道时仍是原始 UTF-8 字节；
 - 无附加控制台时 `GetConsoleOutputCP()` 返回 **0**（不是失败，是"没有控制台"）⇒ 静默忽略即可。
 **相关**：`engine/platform/console.hpp`、`engine/platform/command_line.hpp`（同类问题：`argv` 按 ANSI 解码会把中文变 `?`，故改走宽字符命令行）、`docs/devlog.md` 2026-10-07 的 S10 条目。
+
+### Q44 长按连续转为什么还要加一个"启动延迟"？（V0.11）
+
+**问题**：长按 `Q`/`E` 连续转，为什么不在按下的当帧就开始按速率转，而要等 0.4 s？
+
+**原因**：连续转的增量是 `速率 × 帧时长`，而**点按**只走"恰好一步"。若**没有**延迟，那么**任何按住**（哪怕只按了 0.1 s）都会在"点按那一步"之外**再叠加一小段连续转** ⇒ 用户想"点一下转一格"，结果总会多转一点点，且多转多少取决于按了多久（**单击被污染**）。
+加一段**启动延迟**后：**< 延迟 = 纯点按**（恰好一步）、**≥ 延迟 = 连续转**，两种意图彻底分开。
+
+**取值依据**：一次**明确点击**通常 **50~150 ms**；OS 键盘**重复延迟**缺省 ≈ 500 ms；UI **长按**阈值 ≈ 400~500 ms。取 **0.4 s** 兼顾"不误触发"与"不显滞后"。**可配置**：`--placement-hold-delay=<秒>`（`0` = 按住即连续转）。
+
+**相关**：`game/placement_rotate.hpp` 的 `PlacementHoldActive` / `holdDelaySeconds`、`tests/placement_rotate_test.cpp` 的 `HoldDelayGate` / `QuickTapDoesNotDrift`、`docs/plans/v0.11.md` A3 表 Y6。
 
 
 

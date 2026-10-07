@@ -35,6 +35,9 @@ enum class ActionId : std::uint8_t {
     PlacementLandingMode, ///< 摆放模式：循环切换成套建筑的**落点模式**（V0.9；`T`；仅建筑摆放）
     PlacementDarkenDown,  ///< 摆放模式：室内变暗 −0.05（V0.9；`[`；预览态调待放值 / 选中态调已有建筑）
     PlacementDarkenUp,    ///< 摆放模式：室内变暗 +0.05（V0.9；`]`；同上）
+    PlacementToggleRotateHold,    ///< V0.11：切换"旋转长按模式"（缺省开；`Z`）
+    PlacementToggleNeighborSnap,  ///< V0.11：切换"邻居优先吸附"（缺省开；`X`）
+    PlacementToggleGridSnap,      ///< V0.11：切换"世界网格吸附"（缺省开；`B`）
 
     Count,
 };

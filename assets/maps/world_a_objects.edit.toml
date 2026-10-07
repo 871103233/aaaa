@@ -1,18 +1,2254 @@
-# 可编辑层：**手工摆放静态资产**的落点（阶段 V0.5 的 E1）。
-#
-# 与发布清单（world_a_objects.toml）**分开存、叠加读**：本文件在发布清单之后加载，
-# 其 `[[type]]` / `[[placement]]` / `[[scatter]]` **按文件顺序追加**（确定性，红线 7）。
-# 规则（非法即抛）：① 类型 id 不得与发布清单重复；② `destructible_enabled` 必须与发布清单一致。
-#
-# 用法：进入该世界（`--world=world_a`），走到想摆放的位置、对准地面按 `F2`
-# —— 日志会给出**可直接粘贴**的 `[[placement]]` 片段（含类型 / 坐标 / 朝向），粘到本文件末尾即可。
-# 想换放置类型：启动参数 `--place-type=<type id>`（缺省 = 该世界类型表首项）。
-#
-# 示例（取消注释即可）：
-# [[placement]]
-# type = "tree_default"
-# position = [12.0, 0.0, 8.0]
-# yaw_deg = 90.0
-
-schema_version = 1
+# 物件可编辑层（V0.5 E3 由游戏保存生成；**覆盖式写入 ⇒ 注释不会保留**）
+# 加载顺序 = 发布清单（只读）→ 应用 [[remove]] → 追加 [[placement]] → [[scatter]]。
+building_darkening = []
 destructible_enabled = true
+placement = []
+remove_building = []
+scatter = []
+schema_version = 1
+type = []
+
+[[building]]
+id = 'spawn_hut#1'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 78.0819091796875, 0.0, -14.445304870605469 ]
+yaw_deg = 285.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#2'
+interior_darkening = 0.44999998807907104
+landing_mode = 'flat_only'
+position = [ 68.70154571533203, 0.0, -4.652509689331055 ]
+yaw_deg = 285.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#3'
+interior_darkening = 0.44999998807907104
+landing_mode = 'flat_only'
+position = [ 120.13733673095703, 0.0, 75.7193832397461 ]
+yaw_deg = 285.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#4'
+interior_darkening = 0.44999998807907104
+landing_mode = 'flat_only'
+position = [ 184.10775756835938, 0.0, 184.5429229736328 ]
+yaw_deg = 285.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#5'
+interior_darkening = 0.44999998807907104
+landing_mode = 'flat_only'
+position = [ 181.03390502929688, 0.0, 184.90928649902344 ]
+yaw_deg = 285.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#6'
+interior_darkening = 0.44999998807907104
+landing_mode = 'flat_only'
+position = [ 181.38951110839844, 0.0, 184.72198486328125 ]
+yaw_deg = 285.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#7'
+interior_darkening = 0.44999998807907104
+landing_mode = 'flat_only'
+position = [ 115.96430969238281, 0.0, 330.1234130859375 ]
+yaw_deg = 285.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#8'
+interior_darkening = 0.44999998807907104
+landing_mode = 'flat_only'
+position = [ 29.828956604003906, 0.0, 93.33816528320312 ]
+yaw_deg = 285.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#9'
+interior_darkening = 0.44999998807907104
+landing_mode = 'flat_only'
+position = [ 30.77204132080078, 0.0, 94.37144470214844 ]
+yaw_deg = 285.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#10'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 89.25484466552734, 0.0, 127.38361358642578 ]
+yaw_deg = 285.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#11'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 13.064478874206543, 0.0, 119.53013610839844 ]
+yaw_deg = 285.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#12'
+interior_darkening = 0.44999998807907104
+landing_mode = 'flat_only'
+position = [ 16.107379913330078, 0.0, 123.96427154541016 ]
+yaw_deg = 285.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#13'
+interior_darkening = 0.44999998807907104
+landing_mode = 'flat_only'
+position = [ 21.48064422607422, 0.0, 125.49342346191406 ]
+yaw_deg = 285.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#14'
+interior_darkening = 0.44999998807907104
+landing_mode = 'flat_only'
+position = [ 30.99079704284668, 0.0, 50.76331329345703 ]
+yaw_deg = 210.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#15'
+interior_darkening = 0.44999998807907104
+landing_mode = 'flat_only'
+position = [ 43.98556137084961, 0.0, 50.5981559753418 ]
+yaw_deg = 210.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#16'
+interior_darkening = 0.44999998807907104
+landing_mode = 'flat_only'
+position = [ 18.295948028564453, 0.0, 14.525016784667969 ]
+yaw_deg = 210.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#17'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -4.593820571899414, 0.0, 74.06707763671875 ]
+yaw_deg = 210.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#18'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -10.30278205871582, 0.0, 83.95851135253906 ]
+yaw_deg = 210.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#19'
+interior_darkening = 0.20000000298023224
+landing_mode = 'sink'
+position = [ 7.025573253631592, 0.0, 102.75272369384766 ]
+yaw_deg = 210.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#20'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 94.31913757324219, 0.0, 74.1072998046875 ]
+yaw_deg = 210.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#21'
+interior_darkening = 0.3499998450279236
+landing_mode = 'sink'
+position = [ 9.352096557617188, 0.0, 108.10944366455078 ]
+yaw_deg = 210.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#22'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -2.686539649963379, 0.0, 2.786836624145508 ]
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#23'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -2.0079870223999023, 0.0, -1.5577402114868164 ]
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#24'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -1.4424041509628296, 0.0, -5.264841079711914 ]
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#25'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -0.18201684951782227, 0.0, -9.356790542602539 ]
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#26'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 22.35242462158203, 0.0, -17.65639305114746 ]
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#27'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 52.26676559448242, 0.0, 13.249044418334961 ]
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#28'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 55.020023345947266, 0.0, 20.17585563659668 ]
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#29'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 51.005680084228516, 0.0, 23.259824752807617 ]
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#30'
+interior_darkening = 0.44999998807907104
+landing_mode = 'fill'
+position = [ 187.0, 0.0, 124.0 ]
+yaw_deg = 60.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#31'
+interior_darkening = 0.44999998807907104
+landing_mode = 'fill'
+position = [ 197.0, 0.0, 132.0 ]
+yaw_deg = 60.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#32'
+interior_darkening = 0.44999998807907104
+landing_mode = 'fill'
+position = [ 265.0, 0.0, 118.0 ]
+yaw_deg = 60.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#33'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -146.0, 0.0, 10.25 ]
+yaw_deg = 60.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#34'
+interior_darkening = 0.44999998807907104
+landing_mode = 'fill'
+position = [ -92.5, 0.0, -19.5 ]
+yaw_deg = 60.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#35'
+interior_darkening = 0.44999998807907104
+landing_mode = 'fill'
+position = [ -70.0, 0.0, -18.5 ]
+yaw_deg = 60.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#36'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -94.25, 0.0, -5.25 ]
+yaw_deg = 60.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#37'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -84.25, 0.0, 13.0 ]
+yaw_deg = 60.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#38'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -36.75, 0.0, 6.25 ]
+yaw_deg = 60.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#39'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -44.0, 0.0, 12.25 ]
+yaw_deg = 60.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#40'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -46.0, 0.0, 0.75 ]
+yaw_deg = 60.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#30#1'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -40.25, 0.0, -11.75 ]
+yaw_deg = 60.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#30#2'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -27.5, 0.0, -25.25 ]
+yaw_deg = 60.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#30#3'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -26.5, 0.0, -35.75 ]
+yaw_deg = 60.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#40#1'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -71.5, 0.0, -2.0 ]
+yaw_deg = 135.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#40#2'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -59.25, 0.0, 67.0 ]
+yaw_deg = 135.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#40#3'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 10.5, 0.0, 28.25 ]
+yaw_deg = 300.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#26#1'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 23.25, 0.0, -3.5 ]
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#26#2'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 23.5, 0.0, -7.800000190734863 ]
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#26#3'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 27.549999237060547, 0.0, -3.5 ]
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#26#4'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 27.799999237060547, 0.0, -7.800000190734863 ]
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#26#5'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 41.5, 0.0, -1.25 ]
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#26#6'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 41.25, 0.0, 3.0500001907348633 ]
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#26#7'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 32.5, 0.0, 12.25 ]
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#26#8'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 36.79999923706055, 0.0, 11.75 ]
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#26#10'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 27.700000762939453, 0.0, 22.75 ]
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#26#9'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 27.700000762939453, 0.0, 27.049999237060547 ]
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#26#11'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 27.75, 0.0, 31.5 ]
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#26#12'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 45.25, 0.0, 29.75 ]
+yaw_deg = 345.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#4#1'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -5.75, 0.0, 43.25 ]
+yaw_deg = 285.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#26#11#1'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -4.637077808380127, 0.0, 47.403480529785156 ]
+yaw_deg = 15.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#26#11#2'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 0.75, 0.0, 36.0 ]
+yaw_deg = 15.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#26#11#3'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 5.032890796661377, 0.0, 35.37004089355469 ]
+yaw_deg = 15.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#26#11#4'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 9.186371803283691, 0.0, 34.257118225097656 ]
+yaw_deg = 15.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#26#11#5'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 13.339852333068848, 0.0, 33.144195556640625 ]
+yaw_deg = 15.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#26#11#6'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ 240.0, 0.0, 224.75 ]
+yaw_deg = 15.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#2#1'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -7.0, 0.0, 16.75 ]
+yaw_deg = 495.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#2#2'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -8.25, 0.0, 7.5 ]
+yaw_deg = 495.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[building]]
+id = 'spawn_hut#2#3'
+interior_darkening = 0.44999998807907104
+landing_mode = 'sink'
+position = [ -14.25, 0.0, 4.75 ]
+yaw_deg = 420.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.0, 0.0 ]
+    type = 'kit_floor'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, -2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ 0.0, 0.30000001192092896, 2.0 ]
+    type = 'kit_wall'
+
+    [[building.pieces]]
+    offset = [ -2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 2.0, 0.30000001192092896, 0.0 ]
+    type = 'kit_wall_door'
+    yaw_deg = 90.0
+
+    [[building.pieces]]
+    offset = [ 0.0, 3.299999952316284, 0.0 ]
+    type = 'kit_roof'
+
+[[remove]]
+position = [ 18.612485885620117, -25.966419219970703 ]
+tolerance = 0.5
+type = 'tree_oak'
+
+[[remove]]
+position = [ 16.5469970703125, -42.882694244384766 ]
+tolerance = 0.5
+type = 'bush'
+
+[[remove]]
+position = [ 18.210540771484375, -48.51999282836914 ]
+tolerance = 0.5
+type = 'boulder'
+
+[[remove]]
+position = [ 17.71709442138672, -43.4859619140625 ]
+tolerance = 0.5
+type = 'boulder'

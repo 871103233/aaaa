@@ -155,6 +155,12 @@ enum class UiLabel : int {
     LandingModeFlatten,   ///< 落点模式 ① 压平地形
     LandingModeFill,      ///< 落点模式 ③ 填充地形
 
+    // ---- 摆放控制（V0.11；**运行期可改**的开关 + 键位提示，见 SKILL「运行期可修改优先」）----
+    SectionPlacementControls,      ///< 分区：摆放控制（运行期可改）
+    PlacementRotateHoldFormat,     ///< 旋转长按模式状态（`%s` = 是 / 否）+ 键位提示
+    PlacementNeighborSnapFormat,   ///< 邻居优先吸附状态（`%s` = 是 / 否）+ 键位提示
+    PlacementGridSnapFormat,       ///< 世界网格吸附状态（`%s` = 是 / 否）+ 键位提示
+
     kCount  ///< 标签总数（必须保持在最后）
 };
 
@@ -275,7 +281,7 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsEnglish = {
     "PLACEMENT MODE: '%s'  |  Q/E rotate  |  LMB place  |  RMB delete  |  F5 save  |  Esc exit",
     "Save failed: %s",
     "Preview",
-    "spins automatically - drag to turn",
+    "spins automatically - drag (any direction) to rotate; release resets & resumes",
     "no preview (empty geometry)",
     "PLACE BUILDING: '%s'  landing=%s  interior-darkening=%.2f  |  Q/E rotate  |  LMB place  |  RMB delete  |  T landing mode  |  [ ] darkening  |  F5 save  |  Esc exit",
     "SELECTED BUILDING '%s'  interior-darkening=%.2f  ([ ] to adjust, F5 to save)",
@@ -283,6 +289,10 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsEnglish = {
     "flat ground only",
     "flatten terrain",
     "fill terrain",
+    "Placement (runtime toggles; keys apply live)",
+    "Rotate hold-to-turn: %s  [Z]",
+    "Snap prefer neighbor: %s  [X]",
+    "Snap world grid: %s  [B]",
 };
 
 /// 中文标签表：仅当**成功加载 CJK 字体**时启用（此时不可能缺字）。
@@ -399,7 +409,7 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsChinese = {
     "摆放模式：「%s」  |  Q/E 旋转  |  左键放下  |  右键删除  |  F5 保存  |  Esc 退出",
     "保存失败：%s",
     "预览",
-    "自动旋转 · 拖动可转向",
+    "自动旋转 · 上下左右拖动可旋转 · 松开归位并恢复自转",
     "无预览（该类型几何为空）",
     "摆放建筑：「%s」  落点=%s  室内变暗=%.2f  |  Q/E 旋转  |  左键放下  |  右键删除  |  T 落点模式  |  [ ] 变暗  |  F5 保存  |  Esc 退出",
     "选中建筑「%s」  室内变暗=%.2f（[ ] 调整，F5 保存）",
@@ -407,6 +417,10 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsChinese = {
     "落地必须平整",
     "压平地形",
     "填充地形",
+    "摆放控制（运行期可改；按下面的键切换）",
+    "旋转长按模式：%s（按 Z 切换）",
+    "邻居优先吸附：%s（按 X 切换）",
+    "世界网格吸附：%s（按 B 切换）",
 };
 
 /// 纯函数：判断字符串是否**只含 ASCII 字节**（`cjkFontAvailable = false` 时的硬约束）。

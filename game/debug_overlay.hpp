@@ -38,8 +38,20 @@ struct PaletteModel {
     /// 归零 = 只看自动旋转。
     float previewYawRadians = 0.0F;
 
+    /// V0.11：预览的**用户拖动俯仰偏移**（弧度；上下拖）。限幅 ±≈83°；松开归零。
+    float previewPitchRadians = 0.0F;
+
+    /// V0.11：预览**是否正在被拖动**。`true` ⇒ game 层**暂停自动旋转**；松开 ⇒ 偏移归零并恢复自动旋转。
+    bool previewDragging = false;
+
     /// V0.10 / S9：**可编辑层**未保存改动数（game 层每帧刷新）⇒ 面板显示 `ObjectPaletteUnsavedFormat`。
     int unsavedChanges = 0;
+
+    /// V0.11（SKILL《运行期可修改优先》）：三个**摆放开关**的当前状态（game 层每帧刷新）。
+    /// 显示在**其所属界面** = 物件选择器（摆放功能相关）；**改**在运行期用键位（面板只读，同"无效控件"红线）。
+    bool rotateHoldEnabled   = true;  ///< 旋转长按模式（`Z` 切换）
+    bool neighborSnapEnabled = true;  ///< 邻居优先吸附（`X` 切换）
+    bool gridSnapEnabled     = true;  ///< 世界网格吸附（`B` 切换）
 };
 
 /// 选择器上"用户做了什么"（每帧最多取走一次；见 `TakePaletteRequest`）。

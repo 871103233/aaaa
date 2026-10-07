@@ -4,8 +4,9 @@
 # `randomize_seed_on_entry = true` ⇒ **首次进入时随机生成"秘境实例种子"**（V5 消费）；
 #   之后**反复进入复用该种子**（⇒ 同一个世界），直到被**重置 / 销毁**（V9 菜单的「重置」）。
 #   ⚠️ 语义收紧（2026-10-06 所有者裁定）：**不是**"每次进入都换种子"——那会让"反复进入一样"不成立。
-# `persistent = false` ⇒ 退出即丢（roguelike 的既定口径，见 ADR 0028 §一的世界族表）。
-#   ⚠️ 因此当前"与玩家绑定"**仅在本会话内成立**；跨启动保持 = 第二批 V10（存档槽），见 plans/v0.5.md §1.13。
+# `persistent = true` ⇒ **退出即保存**（世界状态随 `.voxr` 落盘、物件随可编辑层落盘）。
+#   **丢弃时机 = 玩家主动「重置」**（V9 菜单，换种子 ⇒ 旧档因**种子不匹配**被忽略，见 ADR 0037 决策六的校验路径）
+#   或未来其他重置时机。**2026-10-07 所有者裁定**：肉鸽地图的**内容退出要保存**，丢弃时机为主动重置。
 
 schema_version = 1
 id   = "world_c"
@@ -17,5 +18,5 @@ terrain_preset = "world_c_terrain.toml"
 objects_file   = "world_c_objects.toml"   # V3：本世界的物件 / 传送门放置清单（相对本文件目录）
 
 destruction_enabled     = true   # 破坏策略：可破坏范围最大
-persistent              = false  # 退出即丢
+persistent              = true   # 退出即保存；丢弃 = 主动重置（换种子）
 randomize_seed_on_entry = true

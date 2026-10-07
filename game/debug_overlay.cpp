@@ -328,8 +328,13 @@ void DebugOverlay::BuildObjectPalette() {
         const std::vector<std::string>& typeIds = palette.typeIdsByCategory[palette.state.categoryIndex];
         for (std::size_t index = 0; index < typeIds.size(); ++index) {
             const bool selected = (index == palette.state.typeIndex);
-            if (ImGui::Selectable(typeIds[index].c_str(), selected)) {
+            // V0.11：**双击**模型名 ⇒ 直接进入摆放模式（与「进入摆放」按钮等效；所有者 2026-10-07 要求）。
+            if (ImGui::Selectable(typeIds[index].c_str(), selected, ImGuiSelectableFlags_AllowDoubleClick)) {
                 palette.state.typeIndex = index;
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                    m_paletteRequest    = PaletteRequest { PaletteRequest::Action::EnterPlacement, typeIds[index] };
+                    m_objectPaletteOpen = false;  // 关面板 → 进摆放模式（捕获由 game 层恢复）
+                }
             }
             if (selected) {
                 ImGui::SetItemDefaultFocus();
@@ -350,16 +355,28 @@ void DebugOverlay::BuildObjectPalette() {
         const ImVec2 previewOrigin = ImGui::GetCursorScreenPos();
         ImGui::InvisibleButton("##palette_preview", previewSize);
         if (ImGui::IsItemActive()) {
-            // 拖动改朝向（累加到 game 层给的自动旋转角之上）；**回绕到 [−π, π]** ⇒ 长时间拖动不会让角度无界增长
-            // （`cos/sin` 在极大角度上会丢精度）。
+            // V0.11：**上下左右都能转**（左右 = yaw、上下 = pitch）；拖动期间**暂停自动旋转**
+            // （game 层据 `previewDragging` 不再推进自动角）。
             constexpr float kPi    = 3.14159265358979323846F;
             constexpr float kTwoPi = 6.28318530717958647692F;
             palette.previewYawRadians += ImGui::GetIO().MouseDelta.x * kPalettePreviewDragRadiansPerPixel;
+            // 回绕到 [−π, π] ⇒ 长时间拖动不会让角度无界增长（`cos/sin` 在极大角度上会丢精度）。
             if (palette.previewYawRadians > kPi) {
                 palette.previewYawRadians -= kTwoPi;
             } else if (palette.previewYawRadians < -kPi) {
                 palette.previewYawRadians += kTwoPi;
             }
+            // 俯仰**限幅**（±≈83°）⇒ 不会翻过头。
+            constexpr float kMaxPitch   = 1.45F;
+            palette.previewPitchRadians = std::clamp(
+                palette.previewPitchRadians + ImGui::GetIO().MouseDelta.y * kPalettePreviewDragRadiansPerPixel,
+                -kMaxPitch, kMaxPitch);
+            palette.previewDragging = true;
+        } else if (palette.previewDragging) {
+            // V0.11：**松开 ⇒ 回到初始角度**（拖动偏移归零）并**恢复自动旋转**（所有者 2026-10-07 要求）。
+            palette.previewYawRadians   = 0.0F;
+            palette.previewPitchRadians = 0.0F;
+            palette.previewDragging     = false;
         }
         ImGui::TextDisabled("%s", UiText(UiLabel::ObjectPalettePreviewHint, cjk));
 
@@ -398,6 +415,16 @@ void DebugOverlay::BuildObjectPalette() {
     }
 
     ImGui::Separator();
+    // V0.11（SKILL《运行期可修改优先》）：**摆放控制** —— 状态 + 键位显示。
+    // 放在**其所属界面**（摆放功能的物件选择器），**不**塞进 F1 调试面板（见 SKILL「界面归属」）。
+    // 本面板只读：**改**在运行期按键（`Z` / `X` / `B`），符合"界面上不存在点了没反应的无效控件"。
+    ImGui::SeparatorText(UiText(UiLabel::SectionPlacementControls, cjk));
+    ImGui::Text(UiText(UiLabel::PlacementRotateHoldFormat, cjk),
+                UiText(palette.rotateHoldEnabled ? UiLabel::ValueYes : UiLabel::ValueNo, cjk));
+    ImGui::Text(UiText(UiLabel::PlacementNeighborSnapFormat, cjk),
+                UiText(palette.neighborSnapEnabled ? UiLabel::ValueYes : UiLabel::ValueNo, cjk));
+    ImGui::Text(UiText(UiLabel::PlacementGridSnapFormat, cjk),
+                UiText(palette.gridSnapEnabled ? UiLabel::ValueYes : UiLabel::ValueNo, cjk));
     // V0.10 / S9：**未保存改动数**（`0` = 不占一行）—— 让"还没写盘"在选择器里**可见**，
     // 与下方「保存全部到可编辑层」按钮构成明确的"存什么 / 还有多少没存"。
     if (palette.unsavedChanges > 0) {

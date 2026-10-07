@@ -105,13 +105,14 @@ TEST(LevelManifest, RepoManifestsLoadAndDescribeWorlds) {
     EXPECT_EQ(b.terrain.tileRadiusZ, 8);
     EXPECT_EQ(b.objectsFile, maps / "world_b_objects.toml");
 
-    // ---- C：随机小世界（1×1 km；roguelike；每次换种子；不持久化）----
+    // ---- C：随机小世界（1×1 km；roguelike；首次进入换种子；**改动退出即保存**）----
     const LevelManifest c = LevelManifest::LoadFromFile(maps / "world_c.toml");
     EXPECT_EQ(c.id, "world_c");
     EXPECT_EQ(c.family, WorldFamily::InstanceRoguelike);
     EXPECT_EQ(c.source, WorldSource::Procedural);
     EXPECT_TRUE(c.randomizeSeedOnEntry);
-    EXPECT_FALSE(c.persistent);
+    // 2026-10-07 所有者裁定：肉鸽（C）的**内容退出要保存**，**丢弃时机 = 主动「重置」换种子**（"退出即丢"口径作废）⇒ `persistent = true`。
+    EXPECT_TRUE(c.persistent);
     EXPECT_EQ(c.terrain.tileRadiusX, 8);  // 1 km
     EXPECT_EQ(c.terrain.tileRadiusZ, 8);
     EXPECT_EQ(c.objectsFile, maps / "world_c_objects.toml");
@@ -316,7 +317,7 @@ randomize_seed_on_entry = true
     ExpectThrows(dir.Path("world.toml"));
 }
 
-TEST(LevelManifest, RoguelikePersistentThrows) {
+TEST(LevelManifest, RoguelikeMayBePersistent) {
     const TempDir dir("vx_level_manifest_rogue_persistent");
     dir.Write("terrain_ok.toml", kTerrainOk);
     dir.Write("world.toml", R"(
@@ -330,7 +331,10 @@ destruction_enabled = true
 persistent = true
 randomize_seed_on_entry = true
 )");
-    ExpectThrows(dir.Path("world.toml"));
+    // 2026-10-07 所有者裁定：肉鸽（C）**内容退出要保存**（丢弃时机 = 主动重置）⇒ **允许** persistent = true（不再抛）。
+    const LevelManifest manifest = LevelManifest::LoadFromFile(dir.Path("world.toml"));
+    EXPECT_TRUE(manifest.persistent);
+    EXPECT_TRUE(manifest.randomizeSeedOnEntry);
 }
 
 TEST(LevelManifest, MissingPolicyBoolThrows) {
