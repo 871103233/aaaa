@@ -2,6 +2,7 @@
 
 #include "dig/dig_region.hpp"
 #include "dig/volume_mesher.hpp"
+#include "save/world_save.hpp"  // `VolumeDirtyPayload`：存档载荷与本类的内存表示**同源**（ADR 0037 决策二）
 
 #include <glm/vec3.hpp>
 
@@ -327,6 +328,27 @@ public:
     /// 块不存在 ⇒ false。
     [[nodiscard]] bool IsBlockDirty(const BlockCoord& coord) const noexcept;
 
+    // ---- V0.10 S3：存档差量（`.voxr` 的 `VolumeDirtyBlock`；[ADR 0037](../../docs/adr/0037-world-state-save-v2-and-terrain-persistence.md) 决策二 / 三 / 四）----
+
+    /// 导出该块的存档载荷（**只读**）。块不存在 ⇒ 返回 `false`（未常驻 ⇒ 不能凭空重算，
+    /// 差量应在**卸载前**采集）。
+    ///
+    /// `density` = 该块**拥有的** `32³` 采样（局部 `[0, kVolumeBlockSize)`）。**为什么不含边界层**：
+    /// 采样数组是 `33³`、相邻块**重叠一格**（A 的局部 32 == B 的局部 0，同一个世界采样）⇒ 每块只导出自有那一格，
+    /// 每个世界采样在档里便**恰好出现一次**（与地表脏列的"只导出本 tile 拥有的列"同一口径）。
+    /// `material` = 该块**已写入**的体素材质（懒分配 ⇒ 从未写过则 `materialPresent = false`，
+    /// 读回后仍走"回落列派生"的零内存路径）。
+    [[nodiscard]] bool ExportBlockSave(const BlockCoord& coord, VolumeDirtyPayload& out) const;
+
+    /// 读档：把一块的存档载荷写回（**块必须已常驻**；顺序 = 生成 → 叠加，ADR 0037 决策三禁止颠倒）。
+    ///
+    /// 写回后**重算共享边界层**（局部索引 `== kVolumeBlockSize` 的采样）—— 本块**与已常驻的邻块**一起算：
+    /// 边界层的真值由"**拥有**该采样的块"给出（`SampleDensity` 已实现"常驻 ⇒ 读块数据 /
+    /// 非常驻 ⇒ 回退高度场推导"）⇒ 结果**不依赖恢复顺序**，只依赖"邻块有没有常驻"。
+    /// 不这么做的话，先恢复的那块会留着按"邻块尚未恢复"算出的边界值 ⇒ 接缝处等值面错一格。
+    /// 返回是否有实际改动（调用方据此决定要不要重网格）。
+    bool ApplyBlockSave(const BlockCoord& coord, const VolumeDirtyPayload& payload);
+
     /// 当前**常驻**的块坐标（**升序**；供常驻调度器做集合差）。
     [[nodiscard]] std::vector<BlockCoord> ResidentBlocks() const;
 
@@ -440,9 +462,12 @@ private:
 
     /// 初始化**单个**块的密度数组（分步初始化的第一轮：只填密度、不网格化）。
     void FillBlockDensity(const BlockCoord& coord);
-
     /// 网格化**单个**已填充密度的块，并同步填充分类（分步初始化的第二轮）。
     void MeshBlock(const BlockCoord& coord);
+
+    /// 重算**共享边界层**（见 `ApplyBlockSave`）：`coord` 自身 + 其 6 个**已常驻**邻块的
+    /// `局部索引 == kVolumeBlockSize` 采样。返回是否有实际改动。
+    bool SyncBlockBoundaryLayers(const BlockCoord& coord);
 
     /// 地表高度（格）：优先查**足迹缓存**，未命中时回落到 `TerrainWorld::QueryHeight`。
     [[nodiscard]] bool SurfaceHeight(double x, double z, float& outHeight) const noexcept;

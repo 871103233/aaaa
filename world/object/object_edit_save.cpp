@@ -94,6 +94,77 @@ namespace {
     return entry;
 }
 
+/// `ObjectBuildingLandingMode` → 配置串（与 `ParseLandingMode` 的取值**必须一致**；不一致 ⇒ 写出的文件读不回）。
+/// `Unspecified` 不写出（缺省即 V0.8 行为）。
+[[nodiscard]] const char* LandingModeToString(ObjectBuildingLandingMode mode) noexcept {
+    switch (mode) {
+        case ObjectBuildingLandingMode::Sink:
+            return "sink";
+        case ObjectBuildingLandingMode::FlatOnly:
+            return "flat_only";
+        case ObjectBuildingLandingMode::Flatten:
+            return "flatten";
+        case ObjectBuildingLandingMode::Fill:
+            return "fill";
+        case ObjectBuildingLandingMode::Unspecified:
+            return "unspecified";
+    }
+    return "unspecified";
+}
+
+/// 序列化一座成套建筑（V0.9 / [ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策四）。
+///
+/// 只写**非缺省**字段：`yaw_deg`（0 不写）、`interior_darkening`（`-1` 不写 ⇒ 用全局值）、
+/// `landing_mode`（`Unspecified` 不写 ⇒ V0.8 行为）⇒ 读回 `LoadOverlayFromFile` 逐字段一致。
+[[nodiscard]] toml::table SerializeBuilding(const ObjectBuilding& building) {
+    toml::table entry;
+    (void)entry.insert_or_assign("id", building.id);
+    toml::array position;
+    position.push_back(static_cast<double>(building.x));
+    position.push_back(0.0);  // 锚点 y 由地表解算 ⇒ 文件里恒写 0（与解析口径一致，解析期忽略 y）
+    position.push_back(static_cast<double>(building.z));
+    (void)entry.insert_or_assign("position", std::move(position));
+    if (building.yawDegrees != 0.0F) {
+        (void)entry.insert_or_assign("yaw_deg", static_cast<double>(building.yawDegrees));
+    }
+    if (building.interiorDarkening >= 0.0F) {
+        (void)entry.insert_or_assign("interior_darkening", static_cast<double>(building.interiorDarkening));
+    }
+    if (building.landingMode != ObjectBuildingLandingMode::Unspecified) {
+        (void)entry.insert_or_assign("landing_mode", std::string(LandingModeToString(building.landingMode)));
+    }
+    toml::array pieces;
+    pieces.reserve(building.pieces.size());
+    for (const ObjectBuildingPiece& piece : building.pieces) {
+        toml::table pieceEntry;
+        (void)pieceEntry.insert_or_assign("type", piece.typeId);
+        toml::array offset;
+        offset.push_back(static_cast<double>(piece.offsetX));
+        offset.push_back(static_cast<double>(piece.offsetY));
+        offset.push_back(static_cast<double>(piece.offsetZ));
+        (void)pieceEntry.insert_or_assign("offset", std::move(offset));
+        if (piece.yawDegrees != 0.0F) {
+            (void)pieceEntry.insert_or_assign("yaw_deg", static_cast<double>(piece.yawDegrees));
+        }
+        pieces.push_back(std::move(pieceEntry));
+    }
+    (void)entry.insert_or_assign("pieces", std::move(pieces));
+    return entry;
+}
+
+[[nodiscard]] toml::table SerializeBuildingRemoval(const ObjectBuildingRemoval& removal) {
+    toml::table entry;
+    (void)entry.insert_or_assign("id", removal.buildingId);
+    return entry;
+}
+
+[[nodiscard]] toml::table SerializeBuildingDarkening(const ObjectBuildingDarkening& override) {
+    toml::table entry;
+    (void)entry.insert_or_assign("id", override.buildingId);
+    (void)entry.insert_or_assign("interior_darkening", static_cast<double>(override.darkening));
+    return entry;
+}
+
 }  // namespace
 
 void SaveObjectEditLayer(const std::filesystem::path& path, const ObjectTable& editLayer) {
@@ -128,6 +199,28 @@ void SaveObjectEditLayer(const std::filesystem::path& path, const ObjectTable& e
         scatters.push_back(SerializeScatter(scatter));
     }
     (void)document.insert_or_assign("scatter", std::move(scatters));
+
+    // V0.9 / ADR 0036 决策三~四：成套建筑增量 + 按 id 的删除 + 室内变暗覆盖。
+    toml::array buildings;
+    buildings.reserve(editLayer.buildings.size());
+    for (const ObjectBuilding& building : editLayer.buildings) {
+        buildings.push_back(SerializeBuilding(building));
+    }
+    (void)document.insert_or_assign("building", std::move(buildings));
+
+    toml::array buildingRemovals;
+    buildingRemovals.reserve(editLayer.buildingRemovals.size());
+    for (const ObjectBuildingRemoval& removal : editLayer.buildingRemovals) {
+        buildingRemovals.push_back(SerializeBuildingRemoval(removal));
+    }
+    (void)document.insert_or_assign("remove_building", std::move(buildingRemovals));
+
+    toml::array buildingDarkenings;
+    buildingDarkenings.reserve(editLayer.buildingDarkenings.size());
+    for (const ObjectBuildingDarkening& override : editLayer.buildingDarkenings) {
+        buildingDarkenings.push_back(SerializeBuildingDarkening(override));
+    }
+    (void)document.insert_or_assign("building_darkening", std::move(buildingDarkenings));
 
     // 原子替换：先写临时文件，再 rename 覆盖 ⇒ 崩溃不会留下半个文件（口径同 ADR 0030）。
     const std::filesystem::path tempPath = path.string() + ".tmp";

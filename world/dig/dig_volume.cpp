@@ -1,4 +1,4 @@
-#include "dig/dig_volume.hpp"
+﻿#include "dig/dig_volume.hpp"
 
 #include "core/clock.hpp"
 #include "streaming/volume_build_pipeline.hpp"
@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <stdexcept>
 #include <utility>
 
 namespace vx {
@@ -330,6 +331,164 @@ void DigVolumeWorld::MeshBlock(const BlockCoord& coord) {
     const BlockSampler sampler(*this, stored);
     stored.mesh = BuildVolumeMesh(sampler);
     stored.fill = ClassifyFill(stored.density);  // T30：与密度同步（塌落邻域收缩依赖它）
+}
+
+// ---------------------------------------------------------------------------
+// V0.10 S3：存档差量（ADR 0037）
+// ---------------------------------------------------------------------------
+
+bool DigVolumeWorld::ExportBlockSave(const BlockCoord& coord, VolumeDirtyPayload& out) const {
+    const auto found = m_blocks.find(coord);
+    if (found == m_blocks.end()) {
+        return false;  // 未常驻 ⇒ 导不出（差量应在**卸载前**采集；ADR 0037 决策四）
+    }
+    const VolumeBlock& block = found->second;
+    const std::size_t  owned = kVolumeSaveVoxelCount;
+
+    out.density.assign(owned, 0);
+    for (int k = 0; k < kVolumeBlockSize; ++k) {
+        for (int j = 0; j < kVolumeBlockSize; ++j) {
+            for (int i = 0; i < kVolumeBlockSize; ++i) {
+                const std::size_t index = static_cast<std::size_t>(i) +
+                                          static_cast<std::size_t>(kVolumeBlockSize) *
+                                              (static_cast<std::size_t>(j) + static_cast<std::size_t>(kVolumeBlockSize) *
+                                                                                static_cast<std::size_t>(k));
+                out.density[index] = block.density[DensityIndex(i, j, k)];
+            }
+        }
+    }
+
+    // 材质**懒分配**：从未写过 ⇒ `materialPresent = false`（读回后仍走"回落列派生"的零内存路径）。
+    out.materialPresent = !block.material.empty();
+    out.material.clear();
+    if (out.materialPresent) {
+        out.material.assign(owned, kNoMaterialSlot);
+        for (int k = 0; k < kVolumeBlockSize; ++k) {
+            for (int j = 0; j < kVolumeBlockSize; ++j) {
+                for (int i = 0; i < kVolumeBlockSize; ++i) {
+                    const std::size_t index = static_cast<std::size_t>(i) +
+                                              static_cast<std::size_t>(kVolumeBlockSize) *
+                                                  (static_cast<std::size_t>(j) +
+                                                   static_cast<std::size_t>(kVolumeBlockSize) *
+                                                       static_cast<std::size_t>(k));
+                    out.material[index] = block.material[DensityIndex(i, j, k)];
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool DigVolumeWorld::ApplyBlockSave(const BlockCoord& coord, const VolumeDirtyPayload& payload) {
+    const auto found = m_blocks.find(coord);
+    if (found == m_blocks.end()) {
+        return false;  // 未常驻：不加载差量，等它被建出来时**再叠加**（ADR 0037 决策三）
+    }
+    const std::size_t owned = kVolumeSaveVoxelCount;
+    if (payload.density.size() != owned) {
+        throw std::invalid_argument("体积块存档：密度载荷长度不符（应为 32³）");
+    }
+    if (payload.materialPresent && payload.material.size() != owned) {
+        throw std::invalid_argument("体积块存档：材质载荷长度不符（应为 32³）");
+    }
+
+    VolumeBlock& block   = found->second;
+    bool         changed = false;
+
+    for (int k = 0; k < kVolumeBlockSize; ++k) {
+        for (int j = 0; j < kVolumeBlockSize; ++j) {
+            for (int i = 0; i < kVolumeBlockSize; ++i) {
+                const std::size_t index =
+                    static_cast<std::size_t>(i) +
+                    static_cast<std::size_t>(kVolumeBlockSize) *
+                        (static_cast<std::size_t>(j) +
+                         static_cast<std::size_t>(kVolumeBlockSize) * static_cast<std::size_t>(k));
+                std::int8_t& density = block.density[DensityIndex(i, j, k)];
+                if (density != payload.density[index]) {
+                    density = payload.density[index];
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    if (payload.materialPresent) {
+        if (block.material.empty()) {
+            // 与 `SetMaterialSlot` 同口径：懒分配（此块自此走"已写入优先"路径）。
+            block.material.assign(static_cast<std::size_t>(kVolumeSampleCount) * static_cast<std::size_t>(kVolumeSampleCount) *
+                                      static_cast<std::size_t>(kVolumeSampleCount),
+                                  kNoMaterialSlot);
+        }
+        for (int k = 0; k < kVolumeBlockSize; ++k) {
+            for (int j = 0; j < kVolumeBlockSize; ++j) {
+                for (int i = 0; i < kVolumeBlockSize; ++i) {
+                    const std::size_t index =
+                        static_cast<std::size_t>(i) +
+                        static_cast<std::size_t>(kVolumeBlockSize) *
+                            (static_cast<std::size_t>(j) +
+                             static_cast<std::size_t>(kVolumeBlockSize) * static_cast<std::size_t>(k));
+                    std::uint8_t& slot = block.material[DensityIndex(i, j, k)];
+                    if (slot != payload.material[index]) {
+                        slot    = payload.material[index];
+                        changed = true;  // 材质进顶点 ⇒ 变了就得重网格
+                    }
+                }
+            }
+        }
+    }
+
+    // 共享边界层（本块 + 已常驻邻块）：不重算的话，先恢复的那块会留着按"邻块尚未恢复"算出的边界值。
+    const bool boundaryChanged = SyncBlockBoundaryLayers(coord);
+    changed                    = changed || boundaryChanged;
+    if (changed) {
+        block.carved = true;                // 与 `WriteDensityRegion` 同口径：该块此后 `IsBlockDirty()` 为真
+        block.fill   = BlockFill::Mixed;    // 挖除只会把实心变空 ⇒ 失去"可整块排除"资格（T30 口径）
+    }
+    return changed;
+}
+
+bool DigVolumeWorld::SyncBlockBoundaryLayers(const BlockCoord& coord) {
+    // 本块 + 6 邻（只有**已常驻**的才参与）：每个块的边界层都从"**拥有**该采样的块"重新取值 ——
+    // `SampleDensity` 已实现"常驻 ⇒ 读块数据 / 非常驻 ⇒ 回退高度场推导"，故结果**不依赖恢复顺序**。
+    const BlockCoord candidates[7] = {
+        coord,
+        BlockCoord { coord.x - 1, coord.y, coord.z }, BlockCoord { coord.x + 1, coord.y, coord.z },
+        BlockCoord { coord.x, coord.y - 1, coord.z }, BlockCoord { coord.x, coord.y + 1, coord.z },
+        BlockCoord { coord.x, coord.y, coord.z - 1 }, BlockCoord { coord.x, coord.y, coord.z + 1 },
+    };
+
+    bool changed = false;
+    for (const BlockCoord& candidate : candidates) {
+        const auto found = m_blocks.find(candidate);
+        if (found == m_blocks.end()) {
+            continue;
+        }
+        VolumeBlock& block   = found->second;
+        const int    originX = BlockOriginBlocks(candidate.x);
+        const int    originY = BlockOriginBlocks(candidate.y);
+        const int    originZ = BlockOriginBlocks(candidate.z);
+        for (int k = 0; k <= kVolumeBlockSize; ++k) {
+            for (int j = 0; j <= kVolumeBlockSize; ++j) {
+                for (int i = 0; i <= kVolumeBlockSize; ++i) {
+                    const bool boundary = (i == kVolumeBlockSize) || (j == kVolumeBlockSize) || (k == kVolumeBlockSize);
+                    if (!boundary) {
+                        continue;
+                    }
+                    // 与 `FillBlockDensity` **同一口径**（`lround` 到 int8），故"非常驻"回退值与生成结果逐位一致。
+                    const std::int8_t value = static_cast<std::int8_t>(
+                        std::lround(SampleDensity(static_cast<double>(originX + i), static_cast<double>(originY + j),
+                                                  static_cast<double>(originZ + k))));
+                    std::int8_t& density = block.density[DensityIndex(i, j, k)];
+                    if (density != value) {
+                        density = value;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        block.fill = ClassifyFill(block.density);  // 边界层变了 ⇒ 填充分类同步（T30）
+    }
+    return changed;
 }
 
 void DigVolumeWorld::InitFromHeightField() {

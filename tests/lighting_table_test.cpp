@@ -575,3 +575,26 @@ TEST(LightingTable, UniformDefaultArgumentDisablesIbl) {
     EXPECT_FLOAT_EQ(uniform.fogIblEnabled, 0.0F);
     EXPECT_FLOAT_EQ(uniform.fogIblPrefilterLodMax, 0.0F);
 }
+
+// V0.9 / ADR 0036 决策一：室内变暗的全局默认值经**现成的空闲分量** `sunColorLinear.a` 投影。
+//   缺省 = `kDefaultInteriorDarkening`（0.45，与 ADR 0035 的写死常量同值 ⇒ 缺省行为与 V0.8 逐位一致）；
+//   `1.0` = 完全不调暗（着色器里乘 1.0 = 恒等 ⇒ 逐位退回"引入室内变暗之前"）。
+TEST(LightingTable, UniformCarriesInteriorDarkening) {
+    const LightingTable table = LightingTable::Default();
+
+    const LightingUniform byDefault = BuildLightingUniform(table, 0.0, 0.0, 0.0);
+    EXPECT_FLOAT_EQ(byDefault.interiorDarkening, vx::kDefaultInteriorDarkening);
+    EXPECT_FLOAT_EQ(byDefault.interiorDarkening, 0.45F);
+
+    const LightingUniform off = BuildLightingUniform(table, 0.0, 0.0, 0.0, /*environmentPrefilterMipCount=*/0U,
+                                                     /*interiorDarkening=*/1.0F);
+    EXPECT_FLOAT_EQ(off.interiorDarkening, 1.0F);
+
+    const LightingUniform custom = BuildLightingUniform(table, 0.0, 0.0, 0.0, 0U, /*interiorDarkening=*/0.20F);
+    EXPECT_FLOAT_EQ(custom.interiorDarkening, 0.20F);
+}
+
+// 复用空闲分量 ⇒ **不扩结构**：`sizeof(LightingUniform)` 仍 = 8 个 vec4。
+TEST(LightingTable, InteriorDarkeningDoesNotGrowUniform) {
+    EXPECT_EQ(sizeof(LightingUniform), static_cast<std::size_t>(8 * 16));
+}

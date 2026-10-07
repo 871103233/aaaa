@@ -5670,6 +5670,329 @@
 - 验证：无代码改动 ⇒ 不重跑构建 / 测试；门禁 `check-banned-identifiers.ps1` 仍 **220 文件 0 违规**。
 - 下一步 / 遗留：**§5.6 是唯一未决项**（须所有者裁定后写进 W1 的决策载体）；本批**未提交前不写代码**。
 
+## 2026-10-07  V0.9 落地：**室内变暗参数化 + 成套建筑的摆放**（W1~W5）
+
+- 需求（所有者 2026-10-07 四答）：① 调试开关 = **可调值** `--interior-darkening=<0~1>`；② 粒度 = **C**（全局默认 + 逐建筑覆盖 + 摆放成套建筑）；
+  ③ 落点 = **4 模式**（① 压平 / ② 半埋 / ③ 填充 / ④ 必须平整）；④ 调参作用域 = **B3**（预览态 + 选中态）。
+  并明确"**尽可能多开发、我暂时无法回复；不确定的先记录、后问我**"。
+- **W1 决策（硬前置，先落盘）**：新建 [`docs/adr/0036-...md`](adr/0036-interior-darkening-param-and-building-placement.md)（含备选与切换条件），
+  回填 [ADR 0032](adr/0032-object-palette-and-placement-mode.md)（摆放单位 / 编辑层 schema）与
+  [ADR 0035](adr/0035-modular-building-kit-and-enterable-spaces.md)（其决策四的写死常量被参数化取代），并同步 `adr/README`。
+  **唯一未决（§5.6）**：落点 **①/③ 会改地形** ⇒ 与 ADR 0035 决策五冲突、且地形改动无持久化 ⇒ 本阶段**不放行**（解析即抛、枚举保留、能力不删）；
+  **缺省模式 = ② 向下半埋（暂定，待所有者确认）**；"是否放行 / 是否连带做地形持久化"**列待裁项**（不静默）。
+- **3A 基线三问（动手前）**：① **业界参照** = UE5 Place Actors / Level Instance、Unity Prefab per-instance override、
+  UE5 Landscape flatten / Valheim 建造地面校验、UE5 Post Process Volume 逐空间参数；② **本项目判据** = 关掉（`=1.0`）逐位一致 /
+  不写字段逐位一致 / 预览与最终同源 / 保存往返逐字段一致 / 模式外逐位不变 / 非法即抛；③ **降级** = ①/③ 不放行 + 调参无滑条（均已在 ADR/计划留痕，非静默）。
+- **世界内一致性两关**：**真实世界** —— ②/④ 只改"锚点高度 / 是否允许放置"，**不碰地形场**（ADR 0004 硬约束 1 不变）；
+  **修仙世界** —— 未引入任何新设定（摆放的是**已存在**的 kit 建筑）⇒ `world-setting.md` 无需新增。
+- 做了什么（代码）：
+  1. **R1（W2）**：`engine/render/lighting_table.{hpp,cpp}` 新增 `kDefaultInteriorDarkening = 0.45` + `LightingUniform::interiorDarkening`
+     （**复用 `sunColorLinear.a` 的空闲分量**，`sizeof` 仍 = 128 B）；`BuildLightingUniform` 增末位参数；
+     `game/main.cpp` 解析 `--interior-darkening=<0~1>`（**非法 / 越界 / 带尾随字符 ⇒ 启动失败**，与既有旋钮的 WARN 回退**不同**，按所有者要求）；
+     `assets/shaders/mesh.frag` 删除写死的 `kInteriorSkyVisibility`，改取 uniform。
+  2. **R2（W3）**：`ObjectBuilding::interiorDarkening`（配置 `interior_darkening`，可选，`-1` = 用全局值）+ 解析校验 [0,1]；
+     `ObjectEnclosure::darkening` 带出；`InstancePose::enclosureDarkening` → 实例缓冲 `enclosureB.y`（**不加宽记录**，仍 96 B）；
+     `mesh.frag` 的 `computeSkyVisibility` 取「逐建筑覆盖，缺省用全局」（`< 0` ⇒ `lighting.sunColorLinear.a`）。
+  3. **R4（W5）**：`ObjectBuildingLandingMode`（`Unspecified` / `Sink` / `FlatOnly` / `Flatten` / `Fill`）+ `kBuildingSinkBlocks = 0.5` +
+     `kBuildingFlatToleranceBlocks = 0.5`；`[[remove_building]]`（按 **id**）/ `[[building_darkening]]`（覆盖）两张编辑层表 + 序列化；
+     `ComputeBuildingFootprintXZ`（**全部构件**的水平并集，供 ④ 判据）；解析期新增不变量「**建筑 id 不得与类型 id 重名**」；
+     `MergeObjectTables` 应用按 id 删除与变暗覆盖（指向不存在的 id ⇒ 抛）；
+     `game/main.cpp`：`F2` 选择器增**合成类别 `building_set`**（不进 `ObjectType::category` 值域）、`expandBuilding` 抽成**加载期与运行期共用**、
+     整座预览（`buildBuildingLocalMesh` 缓存）、`MakeUniqueBuildingId`（`模板#N`）、右键**删整座**（`slot.buildingId` 分组）、
+     落点模式 ④ 用 **5×5 footprint 采样**判定高差、`T` 循环模式。
+  4. **R3（W4）**：`[` / `]` 步进 0.05 —— 有**选中建筑**（准星指向）⇒ 改它（本层新增改字段 / 否则更新覆盖记录）；否则（建筑摆放中）改**待放值**；
+     两者都**即时生效**（实例数据每帧重传）；HUD 新增「建筑摆放横幅」与「选中态横幅」（**动态文本恒为纯 ASCII** ⇒ 无 CJK 字体也不缺字）；
+     `ui_text` 新增 2 条标签（EN/ZH 同长度）。
+- 为什么：
+  - **参数量化必须挂在有围合体的东西上**：单件没有屋顶并集 ⇒ 室内变暗对它无意义 ⇒ R4（摆放成套建筑）是 R2/R3 的前提（与 V0.9 立项时的判断一致）。
+  - **落点 ②/④ 不改地形**：这是"不静默推翻 ADR 0035 决策五"的具体做法；①/③ 保留枚举但解析报错 ⇒ 能力不删、将来放行只需补实现（切换条件见 ADR 0036 §五）。
+  - **零分叉**：运行期摆放复用加载期的 `expandBuilding` ⇒ 渲染 / 碰撞 / 剔除 / 实例化 / LOD 与加载期完全同一路径（避免"放下的和配置里的长得不一样"）。
+  - **删除按整座 + 按 id**：单件的 `[[remove]]`（类型 + 位置 + ε）无法区分同类型多实例 ⇒ 成套建筑改用 **id** 精确匹配（ADR 0036 决策四）。
+- 踩坑（教训）：`BuildPaletteModelFrom` / `stats` 里两次把常量与字段写在了**声明之前 / 漏了 `stats.` 前缀** ⇒ `/WX` 直接挡下（编译期即暴露，无运行期影响）。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`Launch-VsDevShell.ps1` → `cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4` + `/WX`）；5 个 shader 经 `glslc → SDL_shadercross` 产出 **SPIR-V + DXIL** 双格式。
+  2. **测试**：`ctest --preset debug` ⇒ **730/730 passed**（V0.8 基线 714，**+16**：`object_kit_test` **+10**
+     （变暗 3 + 落点模式 3 + id 不碰撞 1 + footprint 2 + …）、`object_edit_save_test` **+4**（建筑往返 / Merge 删除+覆盖 / 两条非法 id）、
+     `lighting_table_test` **+2**、`instance_batch_test` **+1**；另 1 为既有计数对齐）。
+  3. **门禁**：`check-banned-identifiers.ps1` ⇒ **scanned 220 file(s), 0 violation(s) / PASS**。
+  4. **运行（`--world=world_a --auto-test`，`build/v09_run2.out.txt`）**：`成套建筑（V0.8/V0.9 …）：1 座、展开 6 个构件（跳过 0）；其中 1 座带围合体代理` →
+     `物件层就绪 … 放置 145 / 139` → draw call **2235（首帧）/ 2243（流式对账后）** ⇒ **与 V0.8 逐位一致 = 零回归**；
+     退出汇总 `frames=1098 over33=0 over50=0 worst_ms=24.5`；**stderr 无 ERROR**。
+  5. **非法值**：`--interior-darkening=1.5` / `=abc` ⇒ 启动即报 `[ERROR] … 取值非法 … ⇒ 启动失败`、**退出码 1**（人工实测 1 条判据，符合 R1）。
+- 下一步 / 遗留（缺口，按"缺什么 / 为什么没做 / 切换条件"三项登记，详见 `plans/v0.9.md` §5 / `adr/README` §五）：
+  1. **落点 ①/③（压平 / 填充地形）不放行**：缺 = 会改地形的两种落点模式；为什么 = 与 ADR 0035 决策五冲突 + 地形改动**无持久化**（重启即丢）；
+     切换条件 = 所有者裁定放行（并定是否连带做地形持久化）⇒ 另立 ADR 后补实现（枚举与文案已在、能力未删）。
+  2. **缺省落点模式 = ② 暂定**：缺 = 所有者的最终裁定；切换条件 = 所有者确认（若取 ④ 只改 `kDefaultBuildingLandingMode` 一处）。
+  3. **摆放模式内调参用按键步进（无滑条）**：为什么 = 滑条需常驻面板 ⇒ 逼近"场景编辑器"暂缓项；切换条件 = 做受控建造 UI 时。
+  4. **运行时摆放 / 删除 / 保存的端到端人工验收未做**：为什么 = 本环境无法向前台窗口注入输入 / 截图；切换条件 = 所有者按 `plans/v0.9.md` §5.7 的 5 条目视验收。
+  5. **室内亮度的 A/B 读数（≥30%）未闭环**（V0.8 遗留）：本阶段已具备 A/B 手段（`=1.0` 对照）；切换条件 = 所有者目视。
+  本批**未提交**。
+
+## 2026-10-07  V0.9 收口（所有者验收通过）+ 缺陷修复（**打开 F1 无法操作**）+ V0.10 立项（存档）
+
+- 来源（所有者 2026-10-07）：① "验证以后期望的东西都验证通过了"（V0.9 人工验收通过）⇒ 本阶段**收口冻结**；
+  ② 下一阶段方向选 **"世界状态存档" + "先收口小项"**；③ §5.6 三问答：**放行落点 ①/③ + 连带做地形改动持久化**；
+  ④ 追加要求："**打开 F1 时不影响我的其它操作**"。
+- **缺陷修复（先判真伪，符合 SKILL「缺陷报告」）**：
+  - **契约**：`docs/ui-inventory.md` §2.2 明确 F1 面板是**只读展示、不提供操作项**；"只读叠加层不得抢玩法输入"。
+    **机制**：`game/main.cpp` 把 `debugOverlay.WantsCaptureMouse/Keyboard()` 也传进 `DecideInputSuppression`
+    （`game/gameplay_input.hpp`）；而 ImGui 在**只读叠加层**（F1 / 常驻 HUD）可见 / 被悬停 / 获得键盘焦点时**也会报告**
+    `io.WantCaptureKeyboard`（鼠标侧在相对模式下另有 `NoMouse` 兜住）⇒ 抑制把**键盘玩法动作**（移动 / 跳跃 / 飞行）吞掉
+    ⇒ "开着 F1 就无法操作"。**判定 = 确认是缺陷**（契约 + 机制齐备）。
+  - **改法（业界标准做法）**：**只读叠加层不参与输入互斥** —— 与 UE5 `stat` 系 HUD / Unity Profiler overlay 的"click-through、不抢输入"同口径；
+    实现 = 抑制**只由模态面板（系统面板 / 传送门菜单 / 物件选择器）决定**，不再采信 ImGui 的 Want 标志。
+  - 落地：`DecideInputSuppression(bool blockingPanelOpen)`（去掉两个 Want 参数，语义更单一）；
+    删除 `DebugOverlay::WantsCaptureMouse/Keyboard` 与 `m_wantCaptureMouse/Keyboard`（修复后**无消费者**，按"确定无用即彻底删除"处理）；
+    `SetGameplayMouseCaptured` 与其 `NoMouse` 保留（**ImGui 官方**对相对鼠标模式的建议做法，理由从"防误抑制"改为"防误判 hover"）；
+    `tests/gameplay_input_test.cpp` 重写为 3 例，其中 **`ReadOnlyOverlaysNeverSuppressGameplayInput`** 是本次**回归护栏**。
+- **V0.9 收口（冻结）**：`plans/v0.9.md` 标为**已完成 · 冻结**；`adr/README` 阶段表同步（v0.9 → 已完成（冻结，所有者已验收））。
+- **V0.10 立项 + 决策载体（SKILL「先落盘后施工」）**：
+  1. **新建 [`docs/adr/0037-...md`](adr/0037-world-state-save-v2-and-terrain-persistence.md)**（含备选与切换条件）：
+     **① 载体划分** —— 高度场脏列 / 脏体积块 → `.voxr` v2；**物件仍走可编辑层 TOML**（**不双份事实源**）；实体状态暂不做；
+     **② 字节布局冻结** —— 头部 64 B（magic `VXSAVE2\0` / `version` / `generatorVersion`（**地形参数内容哈希**）/
+     世界范围与种子 / 区域表 `schema_version` + 内容哈希 / `chunkCount` / CRC32）+ 索引 `chunkCount × 32 B`（按 key 升序）
+     + 数据段（**逐块 zstd**）；块 = `HeightDirtyTile`（**只存脏列**：`u16 columnIndex + i16 heightDelta`）×
+     `VolumeDirtyBlock`（`int8 density[32³]` + 可选 `u8 material[32³]`）；**单容器 + 位置表**（与 ADR 0026 同源）；
+     **③ 加载顺序**（区域标记 → 生成 → 叠加差量，**禁止颠倒**）；**④ 流式耦合**（**脏单元卸载前先落盘** + 延迟批量 flush + 退出强制 flush + worker 异步）；
+     **⑤ 版本与迁移纪律**；**⑥ 解除 ADR 0035 决策五**（放行落点 **① 压平 / ③ 填充**，走既有脏标记 → 重网格 → 碰撞重扫，分帧）。
+  2. **回填**：`references/save-and-serialization.md` **§3 由"待定"改为"已冻结"**（指向 ADR 0037，本文件只留"怎么落地"）；
+     `tech-plan-v2.0.md` **§6.4**（待定 → 已冻结）与 **§8 阶段对齐**（补 V0.10，注明即 §8 原文 V0.3 的"存档落盘"那条）；
+     `adr/README`（0037 行 / 0035 与 0036 的状态回填 / 阶段表 / §5.1 与 §5.3 缺口行）；`docs/adr/0035` 增「修订（V0.10）」。
+  3. **新建 [`docs/plans/v0.10.md`](plans/v0.10.md)**：主线 **S1~S7**（容器 / 地形脏列 / 脏体积块 / 流式耦合 + 异步落盘 /
+     落点 ①③ / 世界定义一致性 / 验收）+ 收口小项 **C1~C5**（ADR 0034 两个缺口 / 器物破坏状态切换 /
+     4 旋钮 + P99 读数 / 室内亮度 A-B），并写明**明确不做**（多槽存档 / 玩家状态 / 实体状态 / 物件搬进 `.voxr`）。
+- 为什么：
+  - **先冻结布局再写代码**：`references/save-and-serialization.md` §3 明令"定稿前禁止按任何草案实现读写" ⇒ ADR 0037 是硬前置；
+  - **只读叠加层不抢输入**是"控件标签即行为契约"的反向要求（面板没承诺任何交互，就不该妨碍交互）；
+  - **单一事实源**：存档不复制物件（可编辑层已承载），避免"哪个说了算"。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`Launch-VsDevShell.ps1` → `cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4 /WX`）。
+     （踩坑：首次链接失败 `LNK1168 无法打开 bin\voxel_game.exe 进行写入` —— 上轮冒烟残留一个 `voxel_game` 进程锁住 exe；`Stop-Process` 后重建通过。）
+  2. **测试**：`ctest --preset debug` ⇒ **728/728 passed**（V0.9 的 730 − 2：`gameplay_input_test` 由 5 例收敛为 3 例，
+     含新的回归护栏 `ReadOnlyOverlaysNeverSuppressGameplayInput`）。
+  3. **人工验收（待所有者）**：开 F1 ⇒ 仍能移动 / 转视角 / 左键发射 / 进 `F2` 摆放（原先键盘被吞）。
+- 下一步 / 遗留（详见 `plans/v0.10.md` §3）：
+  1. **S1 = `.voxr` v2 容器**（`world/save/world_save.*` + `tests/world_save_test.cpp`）—— **未开工**（决策已就绪，下一步即此）；
+  2. **C1~C3 收口小项**未开工（C1/C2 属 ADR 0034 缺口、C3 属 ADR 0013 器物状态口径）；
+  3. **C4 / C5 需所有者实测读数**（本环境无法注入输入 / 截图）；
+  4. 本批**未提交**。
+
+## 2026-10-07  V0.10 S1 落地：**`.voxr` v2 存档容器**（布局按 ADR 0037 冻结实现）
+
+- 范围：只做**容器 + 载荷编解码**（S1），**不接线**到世界层（S2/S3 才把地形 / 体积接上）。
+- 做了什么：
+  1. **新增 [`world/save/world_save.{hpp,cpp}`](world/save/world_save.hpp)**（第二个使用 zstd 的 `.cpp`，仍在 `world` 模块内；公共头不泄漏 zstd）：
+     **写入器** `WorldSaveWriter`（`SetHeader` + `SetChunk` + `WriteToFile`）与**读取器** `WorldSaveReader`（`Open` 校验 + `ReadChunk` 随机读）；
+     布局**逐字节照 ADR 0037 决策二**：头部 64 B（magic `VXSAVE2\0` / `version=2` / `flags`（**由块种类推导**）/
+     `generatorVersion` / 世界范围与种子 / 区域表 `schema_version` + 内容哈希 / `chunkCount` / `reserved` / **CRC32**）
+     \+ 索引 32 B/项（`kind|pad|x|y|z|offset|compressedSize|rawSize`，**按 key 升序**）+ 数据段（逐块 zstd，级别 3 固定 ⇒ 确定性）。
+  2. **载荷编解码（纯函数）**：`Encode/DecodeHeightDirtyTile`（`u32 count` + `count × {u16 列号, i16 差值}`，**紧凑小端无填充**；
+     列号越界 / 非严格升序 ⇒ 抛）与 `Encode/DecodeVolumeDirtyBlock`（`u8 materialPresent` + `pad[3]` + `int8 density[32³]` + 可选 `u8 material[32³]`）。
+  3. **`Fnv1a64`**（世界定义一致性哈希的基础；S6 会用）。
+  4. **写入安全**：临时文件 + `rename` **原子替换**；失败清理临时文件并抛（口径同 ADR 0030）。
+  5. **防坏档**：块数上限 16M、单块解压上限 512 MB、索引偏移必须落在 `[数据段起点, 文件大小)`、
+     **`flags` 必须与索引实际块种类一致**（可判定不变量）—— 任一不符**即抛**，不静默回退。
+  6. 构建与索引：`world/CMakeLists.txt` 增源文件（并更新 zstd 注释）、`tests/CMakeLists.txt` 增测试、
+     `docs/file-index.md` 增 `world/save/world_save.hpp` 行。
+- 为什么：
+  - **S1 先做、且不接线**：`references/save-and-serialization.md` §3 要求"布局冻结后才可写读写代码" ⇒ 先按冻结表把**容器**做对并用单测钉住，
+    再让世界层产出/消费载荷（S2/S3），避免"格式与接线同时改、出错难定位"；
+  - **flags 由块种类推导 + 读取时校验**：把"头部与索引不一致"变成**可判定**的坏档判据（而不是信任头部）；
+  - **紧凑小端无填充**：冻结格式不能依赖结构体对齐（否则换编译器 / 换平台读出不同字节）。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`Launch-VsDevShell.ps1` → `cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug` ⇒ **740/740 passed**（V0.9 基线 728，**+12** = `WorldSave.*`）：
+     空档往返 / 脏列块往返 / 体积块往返（带·不带材质）/ **两次写盘逐字节相同** / 未知版本拒绝 / 魔数错拒绝 /
+     头部校验和不符拒绝 / 文件缺失拒绝 / 空块拒绝 / 脏列编解码非法输入 / 体积块编解码非法输入 / `Fnv1a64` 确定性与敏感性。
+  3. **门禁**：`check-banned-identifiers.ps1` ⇒ **scanned 223 file(s), 0 violation(s) / PASS**（220 → 223）。
+- 下一步 / 遗留（详见 `plans/v0.10.md` §3）：
+  1. **S2 = 高度场脏列采集与叠加**（`world/terrain/terrain_world.*` 暴露"导出脏列差值 / 按差量叠加"）；
+  2. S3 脏体积块、S4 流式卸载前置落盘 + 异步 flush、S5 落点 ①/③、S6 世界定义一致性；
+  3. 本批**未提交**。
+
+## 2026-10-07  V0.10 S2 落地：**高度场脏列差量**（采集 / 叠加，只存脏列）
+
+- 来源（所有者 2026-10-07）："F1 按键的改动验收通过，开发下一步" ⇒ 按 `plans/v0.10.md` §3 的「下一步」推进 **S2**。
+- 范围：只做**地形侧**的差量采集 / 叠加 + 与 `.voxr` 的落盘往返（含单测）。
+  **不做**：流式卸载耦合、延迟 flush、worker 异步、游戏层接线（S4）、落点 ①/③（S5）。
+- **先评价再动手（SKILL 硬规则，已写进 `plans/v0.10.md` §2 之后的「S2 动手前评价」）**：
+  ① **业界参照（点名）** = **Minecraft Anvil**（只保存被修改过的区块；未改动靠种子重建）、
+  **UE5 Landscape Edit Layer / World Partition**（地形改动按层 / patch 保存，只写改动部分）、
+  **Unity `TerrainData`**（只写 heightmap 的改动区域）；本项目按 ADR 0037 已收敛为**逐列 `i16` 差量**（比 patch 更省）；
+  ② **判据** = ADR 0037 判据②「改 3 列 ⇒ 文件里只有这 3 条 entry、未改动 tile 不出现」+ 判据①「读回逐位一致」+ 红线 12「共享边界列不裂缝」；
+  ③ **不降级**（唯一取舍 = 差量基准用**纯函数重算**而非驻留 pristine 快照 ⇒ 省 ~8 KB/tile，属"不矛盾的更优做法"）。
+  **世界内一致性**：本项是引擎 / 存档能力、不引入玩法语义 ⇒ 不涉及 `world-setting.md`。
+- 做了什么：
+  1. **差量的内存表示 = 既有脏标记**（ADR 0037 决策四"不新开第二条记账"）：`TerrainWorld` 增
+     `std::set<TileCoord> m_editedTiles`，由 `WriteColumnHeight` **写入时顺带插入**（与既有"脏 tile"是同一份事实）；
+     `std::set` ⇒ 遍历天然 `TileCoord` 升序 ⇒ 导出 / 写盘顺序确定（红线 7）。
+  2. **基准同源**：把 `GenerateTile` 的"取数据"抽成私有 `BuildPristineTile(x, z) const`
+     （**含预制来源回退**，与生成路径逐字节同源）；`GenerateTile` / `ExportHeightEdits` / `ApplyHeightEdits` **三条路径共用**
+     ⇒ 差量的基准与生成结果不会漂移。
+  3. **采集** `ExportHeightEdits() const` ⇒ `std::vector<HeightEditTile>{ TileCoord, vector<HeightDirtyEntry> }`：
+     差量 = `当前高度 − 生成结果高度`（1/16 格）；**只导出本 tile 拥有的本地 0..63 列**（行主序，列号 0..4095）
+     —— 共享边界层（本地 64）由**拥有它的邻 tile**导出 ⇒ 每个世界列在文件里**恰好一次**；按 `(j, i)` 升序生成
+     ⇒ 天然满足 `EncodeHeightDirtyTile` 的**严格升序**前置；**零差量的 tile 不出现**在结果里（判据②）。
+     未常驻的脏 tile **跳过**（其差量应在卸载前落盘 ⇒ S4）。
+  4. **叠加** `ApplyHeightEdits(coord, entries, dirtyOut)`（读档路径，**必须在生成之后**，ADR 0037 决策三）：
+     目标值 = `生成结果 + 差量`（⇒ **幂等**，重复叠加结果相同），再走 **`WriteColumnHeight`** 按**世界列**写入
+     ⇒ 共享边界列写进全部持有它的 tile，**不裂缝**（红线 12）；`coord` 未常驻 ⇒ 无操作（等流式建出时再叠加）。
+  5. **观测 / 后续接口**：`IsTileEdited(coord)` / `EditedTileCount()`（供 S4 的"脏单元不卸 / 卸前先落盘"判定）。
+  6. **新增 [`tests/terrain_height_edits_test.cpp`](tests/terrain_height_edits_test.cpp) 8 例**：
+     未改动世界导出为空 / 改 3 列 ⇒ 恰好 3 条升序 entry（列号 + 差值逐条钉住）/ 已卸载的脏 tile 跳过不崩 /
+     未改动 tile 不落盘（文件 `chunkCount == 1`）/ **往返逐位一致**（写盘 → 读回 → 新世界生成后叠加 ⇒ 两张 tile 快照相等）/
+     **共享边界列只保存一次且两 tile 边界顶点逐位相等**（红线 12）/ 叠加幂等 / 对未常驻 tile 叠加为无操作。
+  7. `tests/CMakeLists.txt` 增测试文件。
+- 为什么：
+  - **只存差值而非绝对值**：ADR 0037 已冻结（生成算法升级后仍可叠加）；**基准用纯函数重算** ⇒ 不额外占常驻内存，
+    代价只是 flush 时对**少量脏 tile** 重算一次（且 flush 尚未接线 ⇒ 当前零热路径影响）。
+  - **列号域 = 本 tile 拥有的 64²**：这是冻结格式（`kHeightDirtyColumnCount = 4096`）唯一允许的域；
+    "每列恰好一次 + 写回时按世界列穿透边界层"同时满足**不重复存**与**不裂缝**两条硬约束。
+  - **幂等**（`生成结果 + 差量` 而非 `当前值 + 差量`）：把"叠加必须紧跟生成"从**隐含前提**变成**可判定的性质**（已有单测）。
+  - **`terrain_world.hpp` 复用 `save/world_save.hpp` 的 `HeightDirtyEntry`**：ADR 0037 决策四要求内存表示"不新开第二条记账"，
+    同一结构（POD）⇒ 落盘零转换、不产生第二份形状定义。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`Launch-VsDevShell.ps1` → `cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug` ⇒ **748/748 passed**（S1 基线 740，**+8** = `HeightEdits.*`）。
+  3. **门禁**：`check-banned-identifiers.ps1` ⇒ **scanned 224 file(s), 0 violation(s) / PASS**（223 → 224）。
+- 下一步 / 遗留（缺口，按"缺什么 / 为什么没做 / 切换条件"三项登记）：
+  1. **S3 = 脏体积块**未开工：缺 = 可挖体积块 `int8 density[32³]` + 可选 `u8 material[32³]` 的导出 / 读回 / 叠加；
+     为什么 = 本批按计划只做地形侧；切换条件 = 本轮评审通过后即开工（`world/dig/dig_volume.*` + S1 的 `Encode/DecodeVolumeDirtyBlock`）。
+  2. **差量已能落盘/读回，但尚未接线**：缺 = 实际写盘 / 读盘的触发点（延迟批量 flush + 退出强制 flush + worker 异步 + 卸载前置落盘）；
+     为什么 = 属 S4 范围（且需先有 S3 的脏体积）；切换条件 = S3 完成后进 S4（`game/main.cpp` + `world/streaming/*` 卸载钩子）。
+     当前地形改动**重启仍会丢**（与引入本批之前一致，无回归）。
+  3. **已知边界：`tile 边界列 + 拥有者未常驻` 的编辑在冻结格式里无法表示**（列号域只有本 tile 的 64²）：
+     为什么 = ADR 0037 冻结的列号域如此；当前流式窗口以玩家为中心（笔触必在窗口深处）⇒ **实际不可达**；
+     切换条件 = 出现"在流式窗口边缘改地形"的玩法（远程法术 / 建造），或按 ADR 0037 为边界列定义归属规则（须升 `version` + 迁移）。
+  4. **C4 / C5 仍需所有者实测读数**（P99 帧时间 / 室内亮度 A-B），本环境无法注入输入或截图。
+  本批**未提交**。
+
+## 2026-10-07  V0.10 S4（地形端到端）落地：**世界改动真的能落盘 / 读档了**
+
+- 来源（所有者 2026-10-07）："给出下一步开发建议" → 我给出三条路线与推荐；所有者选 **"S4 先接高度场"** 并追加
+  **"开始开发 s3 和 s4 内容"** ⇒ 本批先做 **S4 的地形端到端**（S3 体积块紧随其后）。
+- 范围：**读档 → 生成后叠加 → 卸载前采集 → 延迟批量 flush + 退出前强制 flush**（只接**高度场**）；
+  **不做**：S3 脏体积块、S5 落点 ①/③、S6 世界定义哈希（`generatorVersion` / `digRegionContentHash` 暂写 0 占位）、
+  多存档槽 / 玩家状态 / 实体状态。
+- **先评价再动手（SKILL 硬规则，已写进 `plans/v0.10.md` §2 之后）**：① **业界参照（点名）** = **Minecraft Anvil**
+  （脏区块才保存、未改动靠种子重建）、**UE5 World Partition / Landscape Edit Layer**（改动层**异步写盘**）、
+  **Unity `TerrainData` 异步保存 + 原子替换**；② **判据** = 「挖坑 → 退出 → 重启 ⇒ 坑仍在」/ 卸载脏单元**不丢改动** /
+  flush 期**无 > 50 ms 单帧** / `--world-save=off` 与引入前**逐位一致**；③ **不降级**。
+- **一处口径澄清（已回填 ADR 0037 决策四）**：决策四"未写的脏单元不得卸载"与决策五"主线程**绝不**阻塞在磁盘"
+  按字面读会冲突。取**交集**落地 = 卸载前**先把差量采集进内存会话**（改动**已离开该单元**、不会丢），
+  真正的 zstd + IO 仍由 **worker 异步**完成。目的（不丢改动）与硬边界（不冻结渲染帧）同时满足。
+- 做了什么：
+  1. **新增 [`world/save/world_state_save.{hpp,cpp}`](world/save/world_state_save.hpp)**：
+     `WorldStateSave`（**内存块表**：`WorldSaveChunkKey` → 逐块**原始未压缩载荷**；`SetChunk`（空载荷 = 删除）/
+     `EraseChunk` / `FindChunk` / `WriteToFile` / `LoadFromFile`）—— **不依赖地形 / 体积类型** ⇒ 可脱离 SDL / GPU 单测，
+     且"世界层采集"与"落盘"彻底解耦；`WorldSaveFlusher`（**单飞**异步写盘器：`Submit` 非阻塞、`Poll` / `WaitForIdle` 收包，
+     失败**上报**不吞；自持 **1 个 worker**，不借 tile / 块构建池 —— 那两者的契约是"构建"，借来跑 IO 会让任务归属含糊）。
+  2. **`WorldSaveReader::Keys()`**（S1 冻结的是**字节布局**、不是 API）：读档要"有哪些块"才能把整档搬进会话。
+  3. **`TerrainWorld` 增三件**：`ExportTileEdits(coord)`（单 tile 差量，`ExportHeightEdits` 改为复用它）、
+     `EditedTiles()`（脏 tile 坐标，升序）、`EditSerial()`（**每次写列高度 +1** ⇒ 调用方以 **O(1)** 判定"地形变过没有"，
+     避免每次 flush 都为所有脏 tile 重算生成结果）。
+  4. **`game/main.cpp` 的 `WorldStatePersistence`**（本轮胶水，收在一处便于核对）：
+     `RecordTile`（**卸载前**采集，`RemoveResidentTile` 之前调用）/ `ApplyTile`（**生成后**叠加，返回是否真叠加过 →
+     是则 `MeshTile` 重网格，因为 `Step` 装进来的网格是基于生成高度的）/ `Poll`（每帧一次，非阻塞收包；
+     **只有写盘成功才推进"已落盘水位"** ⇒ 失败自动重试）/ `Flush`（6 s 节流 + 退出前 `blocking`）。
+     接线四处：**启动装载**与**流式装载**各一处叠加、**流式卸载**前一处采集、**帧末**一处 flush、**轮末**一处强制 flush。
+  5. **开关 `--world-save=on|off`**（缺省 on；SKILL §五「已实现能力只允许用配置项关闭」）：关掉 ⇒ 不读不写、
+     行为与 V0.9 逐位一致（A/B 与故障隔离用）。
+  6. **存档路径** `<设置目录>/saves/world_<世界 id>.voxr`（与 `instances.toml` 同目录；一档一文件 ⇒ 切世界互不污染）；
+     档头记 `worldSeed` / tile 半径 ⇒ **不匹配即忽略并 WARN**（秘境被重置过？**不静默误读**）。
+  7. **测试**：新增 `tests/world_state_save_test.cpp` **8 例**（会话往返逐字节 / 缺档不算错 / 损坏档抛 / 空载荷=删除与幂等；
+     写盘器成功上报 / **单飞拒绝第二次提交** / 失败上报；**端到端**：编辑 → **卸载前采集** → 写盘 → 新世界生成后叠加
+     ⇒ 两张 tile 快照**逐位一致**）+ `terrain_height_edits_test.cpp` **+3 例**（单 tile 与整批采集一致 / `EditedTiles` 升序 /
+     `EditSerial` 只在真写地形时变）。
+- 为什么：
+  - **先接高度场、再补体积**：`S4` 是"能持久"从**能编码**变成**真生效**的那一步；先打通一条最小端到端路径
+    （垂直切片）能最早暴露"加载顺序 / 卸载时机 / 写盘时机"的集成问题，而 S3 只是同一机制的第二类载荷。
+  - **会话存"字节"而非结构体**：让"采集"与"落盘"解耦 ⇒ 会话可单测，且 S3 加体积块时**不用改会话**（只是多一类键）。
+  - **节流靠 `EditSerial` + 块数**（都是 O(1)）：没有这层判定，每次 flush 都要为每个脏 tile 重算一遍生成高度（昂贵）。
+  - **`ApplyTile` 之后重网格**：`Step` 装进来的网格是按**生成高度**建的；叠加差量后若不重网格，画面还是旧地形
+    （渲染 / 碰撞与数据不一致）。只在**真有差量**的 tile 上发生 ⇒ 正常地形零开销。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`Launch-VsDevShell.ps1` → `cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug` ⇒ **759/759 passed**（S2 基线 748，**+11**）。
+  3. **门禁**：`check-banned-identifiers.ps1` ⇒ **scanned 227 file(s), 0 violation(s) / PASS**（224 → 227）。
+  4. **冒烟（加载 / 切世界路径；`build/v010_s4_smoke.log`）**：`--world=world_a --auto-test --switch-test=world_b@8`
+     ⇒ `世界状态存档：世界 [world_a] 无既有档 ⇒ 本次从零开始` → `写盘通道 = worker 异步；延迟批量 flush 6 s + 退出前强制 flush`
+     → 会话 27.91 s 请求切到 world_b → `世界 [world_b] 无既有档 ⇒ 从零开始`；**stderr 无 ERROR**。
+  5. **冒烟（退出路径；`build/v010_s4_exit.log`）**：`--world=world_a --auto-test` 跑 ~38 s 后关闭窗口 ⇒
+     `世界卸载完成（V2b）… 渲染器网格槽位 5024` → `设置已保存` → `收到退出请求，主循环结束（累计 38.8 s）；
+     hitch 汇总：frames=549 over33=1 over50=0 worst_ms=36.9`；**无 ERROR**；`saves\` 下**没有**多出空档
+     （无差量 ⇒ 不写，符合"不产生空档、不覆盖好档"）。
+  6. **A/B（零回归）**：同一命令加 `--world-save=off`（`build/v010_s4_off.log`）⇒ draw call **2251 / hitch over50 = 0 /
+     worst 36.9 ms**，与 on 的运行**完全一致**；off 的开关日志按预期打出。
+- 下一步 / 遗留（缺口，按"缺什么 / 为什么没做 / 切换条件"三项登记）：
+  1. **S3 = 脏体积块**：缺 = 可挖体积块的 `int8 density[32³]` + 可选 `u8 material[32³]` 的导出 / 读回 / 叠加，
+     以及接进**同一条**会话 / flush / 读档通路（`DigVolumeWorld::IsBlockDirty` 已有 ⇒ 卸载前采集；
+     体积块的卸载在 `DigVolumeScheduler`）；为什么 = 本批按所有者选定的顺序先打通高度场；切换条件 = 本轮评审通过后**立即开工**。
+  2. **体积改动仍会丢**（重启后洞与碰撞体一起消失）：与引入本批之前一致（属 S3）；切换条件 = S3 落地。
+  3. **`generatorVersion` / `digRegionContentHash` 写 0 占位**（S6）：缺 = "地形参数 / 区域表改了 ⇒ 提示"；
+     为什么 = 需在地形参数与区域表上做**内容哈希纯函数**（另一步）；切换条件 = S6 开工（当前只有种子 / 半径校验）。
+  4. **"挖坑 → 重启 ⇒ 坑还在"的端到端人工验收未做**：为什么 = 本环境无法向前台窗口注入鼠标（无法发射光球产生地形改动）
+     ⇒ 自动跑不出"有差量"的档；切换条件 = **所有者按下述步骤目视**（`--world-save=off` 已自动核过零回归）。
+  5. **C4 / C5 仍需所有者实测读数**（P99 帧时间 / 室内亮度 A-B）。
+  本批**未提交**。
+
+## 2026-10-07  V0.10 S3 落地：**脏体积块**（挖出的洞 / 碰撞体不再重启即丢）
+
+- 来源（所有者 2026-10-07）："开发下一步" ⇒ 按 `plans/v0.10.md` §3 的「下一步」推进 **S3**（上一批已按所有者选定的
+  "S4 先接高度场"打通地形端到端；体积是该机制的第二类载荷）。
+- 范围：只做**体积块**的差量导出 / 读回 / 叠加 + 接进**同一条**会话 / flush / 读档通路。
+  **不做**：S5 落点 ①/③、S6 世界定义哈希（仍写 0 占位）。
+- **先评价再动手**（沿用 `plans/v0.10.md` 的 S4+S3 评价，本批是其"体积块"一半，无新降级）：
+  业界参照仍是 **Minecraft Anvil**（脏区块才保存）/ **UE5 World Partition**（改动层异步写盘）/ 本项目 **ADR 0026** 容器形态。
+- 做了什么：
+  1. **`DigVolumeWorld::ExportBlockSave` / `ApplyBlockSave`**（[`dig_volume.hpp`](world/dig/dig_volume.hpp) / `.cpp`）：
+     - **只导出该块"拥有的" 32³ 采样**（局部 `[0, 32)`）：体积块采样数组是 **33³**、相邻块**重叠一格**
+       （A 的局部 32 == B 的局部 0，同一个世界采样）⇒ 每块只导出自有那一格，每个世界采样在档里**恰好出现一次**
+       （与地表脏列"只导出本 tile 拥有的列"同一口径，也与冻结格式 `int8 density[32³]` 一致）；
+     - 材质**懒分配**语义原样保留：从未写过 ⇒ `materialPresent = 0`（读回后仍走"回落列派生"的零内存路径）；
+     - 非法载荷（长度不符）**即抛**；未常驻的块**导出 false / 叠加 false**（不猜）。
+  2. **共享边界层重算**（`SyncBlockBoundaryLayers`，本批最关键的一处）：读档写回的是**自有 32³**，
+     而**本块自己的网格**要读局部 32 那一层（= 邻块的自有值）⇒ 若不管，边界处等值面会**错一格**（裂缝）。
+     做法：写回后对"本块 + 6 个**已常驻**邻块"的边界层，按 `SampleDensity`（已实现"常驻 ⇒ 读块数据 /
+     非常驻 ⇒ 回退高度场推导"）重算 ⇒ 结果**不依赖恢复顺序**，只依赖"邻块是否已常驻"。
+  3. **`main.cpp` 的 `WorldStatePersistence` 扩展**：`VolumeKey` / `pendingVolumeBlocks`（读档时由文件的
+     `VolumeDirtyBlock` 键填好）/ `BeginVolumeApplies` / `ApplyPendingVolumeBlocks`（**分帧**，1 块/帧）；
+     flush 增**体积采集**（遍历常驻块取 `IsBlockDirty`）。
+  4. **为什么体积块不需要"卸载前采集"**：ADR 0020 决策五明令**脏块不得被正常卸载**（`UnloadBlock` 对脏块返回 false）
+     ⇒ 脏块一直常驻、flush 时直接从世界采集。唯一会丢的是"脏块超上限被强制淘汰"（`EvictBlock`，那条路径本就有 WARN），
+     且丢的至多是"上次 flush 之后的改动"。
+  5. **接线**：`Step` / 收包之后叠加 ⇒ 有改动的块排进**既有的延后队列**（`PendingDestruction::MergeVolumeBlocks`），
+     由它做重网格 + GPU 上传 + 碰撞体重建 —— **不在渲染帧内同步重网格**（SKILL 第四节）。
+  6. **测试**：新增 [`tests/dig_volume_save_test.cpp`](tests/dig_volume_save_test.cpp) **5 例**：
+     只导出自有采样 + 材质懒分配（含"写过一个槽位后 `materialPresent` 变真"）/ 挖洞后**导出 → 读回 → 再导出相同 + 网格逐顶点相同** /
+     **相邻两块跨界挖除**（先恢复右再恢复左 ⇒ 两块网格都与源逐顶点相同 ⇒ 边界层没裂）/ 载荷与生成结果一致 ⇒ 报"无改动" /
+     非法载荷即抛 + 未常驻不猜。
+- 为什么：
+  - **先做/后做的顺序**：`S4` 已把"会话 + 异步写盘 + 读档通路"打通，体积只是**多一类块键** ⇒ 本批几乎全在
+    `dig` 侧（导出的采样域 + 边界层）+ 两条接线，风险集中、可测。
+  - **边界层必须重算而不是"顺便也存"**：冻结格式就是 32³（存 33³ 会改冻结布局 ⇒ 需升版本 + 迁移，
+    而多出来的那一格是**邻块自有值**、本就不该重复存）。重算用的是**已有的** `SampleDensity` 语义 ⇒ 零新机制。
+  - **叠加走延后队列**：单块重网格 debug 下 5~9 ms，若在渲染帧内同步做会制造尖峰（沿用 T37 的既有形态）。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`Launch-VsDevShell.ps1` → `cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4 /WX`）。
+  2. **测试**：`ctest --preset debug` ⇒ **764/764 passed**（S4 基线 759，**+5**）。
+  3. **门禁**：`check-banned-identifiers.ps1` ⇒ **scanned 228 file(s), 0 violation(s) / PASS**（227 → 228）。
+  4. **冒烟**（`--world=world_a --auto-test`，~38 s，`build/v010_s3_smoke.log`）：读档行按预期打出
+     （`无既有档 ⇒ 从零开始` + `写盘通道 = worker 异步`）；**stderr 空、无 ERROR**；
+     退出汇总 `frames=638 over33=0 over50=0 worst_ms=32.1`；`saves\` 下**没有**多出空档（本次无改动 ⇒ 不写）。
+- 下一步 / 遗留（缺口，按"缺什么 / 为什么没做 / 切换条件"三项登记）：
+  1. **S5 = 落点模式 ①/③**：缺 = `flatten` / `fill` 两种落点的实现（`ParseLandingMode` 放行 + 放置时改地形 + 分帧）；
+     为什么 = 本批按顺序先补体积持久化；切换条件 = **本批评审通过后立即开工**（其地形改动天然可持久 —— 走已通的 S2/S4 通路）。
+  2. **S6 = 世界定义一致性**：缺 = `generatorVersion`（地形参数内容哈希）/ `digRegionContentHash` 的内容哈希纯函数 +
+     不匹配提示；为什么 = 属独立一步；切换条件 = S6 开工（当前只按 `worldSeed` / tile 半径校验，哈希字段写 0 占位）。
+  3. **"挖洞 → 重启 ⇒ 洞与碰撞体都在"的端到端人工验收未做**：为什么 = 本环境无法向前台窗口注入鼠标
+     ⇒ 自动跑不出"有差量"的档；切换条件 = **所有者按 `plans/v0.10.md` §3 的三条目视**
+     （自动侧已由 5 例单测 + 地形 A/B 零回归覆盖）。
+  4. **脏块超上限被强制淘汰时仍会丢**（`EvictBlock`）：与引入本批之前一致、且原本就有 WARN；
+     切换条件 = 若实测出现"淘汰导致玩家挖的洞消失"，再在淘汰前加采集（`RecordBlock`）或提高上限。
+  5. **C4 / C5 仍需所有者实测读数**（P99 帧时间 / 室内亮度 A-B）。
+  本批**未提交**。
+
 
 
 

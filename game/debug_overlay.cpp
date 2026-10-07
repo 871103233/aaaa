@@ -117,12 +117,11 @@ void DebugOverlay::BeginFrame() {
         m_visible || m_systemPanel.IsOpen() || m_portalMenuOpen || m_objectPaletteOpen || m_loadingActive ||
         m_hudVisible;
     if (!m_frameActive) {
-        m_wantCaptureMouse    = false;
-        m_wantCaptureKeyboard = false;
         return;
     }
 
-    // 相对鼠标模式下 SDL 给的绝对坐标无意义：对本帧 ImGui 置 NoMouse，避免把 UI 误判为被悬停。
+    // 相对鼠标模式下 SDL 给的绝对坐标无意义：对本帧 ImGui 置 NoMouse（ImGui 官方建议），
+    // 避免按绝对坐标把某个面板算成"被悬停"（V0.9 起它**不再**参与玩法输入抑制，见 `gameplay_input.hpp`）。
     ImGuiIO& io = ImGui::GetIO();
     if (m_gameplayMouseCaptured) {
         io.ConfigFlags |= ImGuiConfigFlags_NoMouse;
@@ -133,11 +132,6 @@ void DebugOverlay::BeginFrame() {
     ImGui_ImplSDL3_NewFrame();
     ImGui_ImplSDLGPU3_NewFrame();
     ImGui::NewFrame();
-
-    // 在构建本帧窗口**之前**采样捕获标志：ImGui 在此已按上一帧的布局算好 hover，
-    // 恒为"最近一帧 UI 是否想接管输入"，足够用于抑制本帧玩法输入（面板打开本身另会全量抑制）。
-    m_wantCaptureMouse    = io.WantCaptureMouse;
-    m_wantCaptureKeyboard = io.WantCaptureKeyboard;
 }
 
 void DebugOverlay::SetLoadingStatus(UiLabel stage, float progress) noexcept {
@@ -207,9 +201,20 @@ void DebugOverlay::BuildHud(const DebugStats& stats) {
     }
 
     // V0.5 E3：摆放模式横幅 —— 模式内**显式**告知键位（模式内左键/Esc/E 让位，见 ADR 0032）。
+    // V0.9 / ADR 0036：成套建筑摆放走**另一条**横幅（多出 落点模式 / 变暗值 两项）。
     if (stats.placementModeActive && !stats.placementTypeId.empty()) {
         ImGui::Separator();
-        ImGui::Text(UiText(UiLabel::PlacementModeHintFormat, cjk), stats.placementTypeId.c_str());
+        if (stats.placementBuildingMode) {
+            ImGui::Text(UiText(UiLabel::PlacementBuildingHintFormat, cjk), stats.placementTypeId.c_str(),
+                        stats.placementLandingMode.c_str(), stats.placementDarkeningValue);
+        } else {
+            ImGui::Text(UiText(UiLabel::PlacementModeHintFormat, cjk), stats.placementTypeId.c_str());
+        }
+    }
+    // V0.9：**选中态**横幅 —— 准星指向的已有建筑（`[` / `]` 改的就是它）。
+    if (!stats.placementSelectedBuilding.empty()) {
+        ImGui::Text(UiText(UiLabel::PlacementSelectedHintFormat, cjk), stats.placementSelectedBuilding.c_str(),
+                    stats.placementSelectedDarkening);
     }
 
     // 记录实际高度：F1 面板据此把初始位置排在 HUD 下方（避免左上角重叠）。

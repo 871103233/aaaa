@@ -72,19 +72,23 @@ void TerrainWorld::SetMapPreset(const MapPreset& preset) {
     m_mapEdits = preset.edits;
 }
 
-void TerrainWorld::GenerateTile(int tileX, int tileZ) {
-    // W7-S3b：生成逻辑抽为自由函数 `GenerateTerrainTileData`（worker 与主线程**共用同一份实现** ⇒ 逐位一致）。
+TerrainTile TerrainWorld::BuildPristineTile(int tileX, int tileZ) const {
+    TerrainTile tile;
+    tile.coord = TileCoord { tileX, tileZ };
     // V4（ADR 0026）：若设了**数据来源**（预制地图）则优先读它；来源缺该 tile ⇒ **回退程序化生成**
-    // （来源侧负责一次性告警；这里不静默吞掉，也不假装来源成功）。
-    const TileCoord coord { tileX, tileZ };
-    TerrainTile     tile;
-    tile.coord = coord;
+    //（来源侧负责一次性告警；这里不静默吞掉，也不假装来源成功）。
     // 来源返回 true ⇒ 该 tile **完整可用**（含 `maxSurfaceBlocks`，见 `ITerrainTileSource` 契约）⇒ 不再重复刷新。
     const bool filledFromSource = (m_tileSource != nullptr) && m_tileSource->FillTileHeights(tile);
     if (!filledFromSource) {
         tile = GenerateTerrainTileData(m_noise, m_mapEdits, tileX, tileZ);  // 程序化路径自带缓存刷新
     }
-    m_tiles[coord] = std::move(tile);
+    return tile;
+}
+
+void TerrainWorld::GenerateTile(int tileX, int tileZ) {
+    // W7-S3b：生成逻辑抽为自由函数 `GenerateTerrainTileData`（worker 与主线程**共用同一份实现** ⇒ 逐位一致）。
+    // S2 起"取数据"这一段进一步抽为 `BuildPristineTile`，使**存档差量的基准**与生成结果同源（ADR 0037）。
+    m_tiles[TileCoord { tileX, tileZ }] = BuildPristineTile(tileX, tileZ);
 }
 
 void TerrainWorld::MeshTile(int tileX, int tileZ, int lodLevel) {
@@ -229,6 +233,70 @@ void TerrainWorld::WriteColumnHeight(int worldX, int worldZ, Height height, std:
         }
         tile.SetAt(worldX - TileOriginColumn(tile.coord.x), worldZ - TileOriginColumn(tile.coord.z), value);
         dirtyOut.push_back(tile.coord);
+        m_editedTiles.insert(tile.coord);  // 高度场差量的内存表示（ADR 0037 决策四）
+        ++m_editSerial;                    // S4：调用方据此 O(1) 判定"地形变过没有"
+    }
+}
+
+std::vector<HeightDirtyEntry> TerrainWorld::ExportTileEdits(const TileCoord& coord) const {
+    std::vector<HeightDirtyEntry> entries;
+    const auto                    found = m_tiles.find(coord);
+    if (found == m_tiles.end()) {
+        return entries;  // 未常驻：不能凭空重算（差量应在**卸载前**采集；ADR 0037 决策四 / S4）
+    }
+    const TerrainTile pristine = BuildPristineTile(coord.x, coord.z);
+    // 只导出**本 tile 拥有的列**（本地 0..63，行主序）：共享边界层（本地 64）由**拥有它的邻 tile** 导出
+    // ⇒ 每个世界列在文件里**恰好出现一次**。按 (j, i) 升序生成 ⇒ 天然满足 `EncodeHeightDirtyTile` 的严格升序前置。
+    for (int j = 0; j < kTerrainTileSize; ++j) {
+        for (int i = 0; i < kTerrainTileSize; ++i) {
+            const Height current  = found->second.At(i, j);
+            const Height baseline = pristine.At(i, j);
+            if (current == baseline) {
+                continue;  // 该列与生成结果一致 ⇒ 不是脏列，不落盘（判据②）
+            }
+            const int delta = static_cast<int>(current) - static_cast<int>(baseline);  // ∈ [-8192, 8192] ⇒ 必装得下 i16
+            entries.push_back(
+                HeightDirtyEntry { static_cast<std::uint16_t>(j * kTerrainTileSize + i), static_cast<std::int16_t>(delta) });
+        }
+    }
+    return entries;
+}
+
+std::vector<TerrainWorld::HeightEditTile> TerrainWorld::ExportHeightEdits() const {
+    std::vector<HeightEditTile> exports;
+    for (const TileCoord& coord : m_editedTiles) {  // `std::set` ⇒ 已按 `TileCoord` 升序（写盘顺序确定）
+        HeightEditTile group;
+        group.coord   = coord;
+        group.entries = ExportTileEdits(coord);
+        if (!group.entries.empty()) {
+            exports.push_back(std::move(group));
+        }
+    }
+    return exports;
+}
+
+std::vector<TileCoord> TerrainWorld::EditedTiles() const {
+    return std::vector<TileCoord>(m_editedTiles.begin(), m_editedTiles.end());  // `std::set` 已升序
+}
+
+void TerrainWorld::ApplyHeightEdits(const TileCoord& coord, const std::vector<HeightDirtyEntry>& entries,
+                                    std::vector<TileCoord>& dirtyOut) {
+    if (entries.empty() || m_tiles.find(coord) == m_tiles.end()) {
+        return;  // 未常驻：不加载差量，等它被流式建出时**再叠加**（ADR 0037 决策三）
+    }
+    const TerrainTile pristine = BuildPristineTile(coord.x, coord.z);
+    for (const HeightDirtyEntry& entry : entries) {
+        if (entry.columnIndex >= kHeightDirtyColumnCount) {
+            continue;  // 越界（解码器已拒；此处只做防御，避免写坏别处）
+        }
+        const int i      = static_cast<int>(entry.columnIndex) % kTerrainTileSize;
+        const int j      = static_cast<int>(entry.columnIndex) / kTerrainTileSize;
+        // 目标值 = **生成结果 + 差量** ⇒ 幂等（重复叠加结果相同），且不依赖"当前值恰好是生成结果"。
+        const int target = std::clamp(static_cast<int>(pristine.At(i, j)) + static_cast<int>(entry.heightDelta),
+                                      kMinTerrainHeightUnits, kMaxTerrainHeightUnits);
+        // 按**世界列**写入：与 `WriteColumnHeight` 同语义（共享边界列写进全部持有它的 tile ⇒ 不裂缝，红线 12）。
+        WriteColumnHeight(TileOriginColumn(coord.x) + i, TileOriginColumn(coord.z) + j, static_cast<Height>(target),
+                          dirtyOut);
     }
 }
 

@@ -24,6 +24,7 @@ add_executable(voxel_tests
     destruction_queue_test.cpp
     dig_volume_test.cpp
     dig_volume_residency_test.cpp
+    dig_volume_save_test.cpp
     environment_test.cpp
     fixed_step_test.cpp
     frame_limiter_test.cpp
@@ -66,6 +67,7 @@ add_executable(voxel_tests
     surface_shell_test.cpp
     terrain_brush_hold_test.cpp
     terrain_brush_test.cpp
+    terrain_height_edits_test.cpp
     terrain_lod_test.cpp
     terrain_material_test.cpp
     terrain_material_texture_test.cpp
@@ -82,6 +84,8 @@ add_executable(voxel_tests
     world_fingerprint_test.cpp
     world_instance_save_test.cpp
     world_manager_test.cpp
+    world_save_test.cpp
+    world_state_save_test.cpp
 )
 
 # 让测试能定位仓库内已提交的资产（如 assets/config/materials.toml）。

@@ -143,6 +143,10 @@ enum class UiLabel : int {
     ObjectPalettePreviewHint,     ///< V0.5 E4 预览区操作提示（自动旋转 + 拖动转向）
     ObjectPalettePreviewEmpty,    ///< V0.5 E4 预览不可用（该类型几何为空）
 
+    // ---- 成套建筑摆放 / 室内变暗调参（V0.9；ADR 0036）----
+    PlacementBuildingHintFormat,   ///< 建筑摆放模式横幅（`%s` = 建筑 id（纯 ASCII）、`%s` = 落点模式 token（纯 ASCII）、`%.2f` = 待放变暗值）
+    PlacementSelectedHintFormat,   ///< 选中态横幅（`%s` = 被指向的建筑 id、`%.2f` = 该建筑当前的室内变暗值）
+
     kCount  ///< 标签总数（必须保持在最后）
 };
 
@@ -263,6 +267,8 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsEnglish = {
     "Preview",
     "spins automatically - drag to turn",
     "no preview (empty geometry)",
+    "PLACE BUILDING: '%s'  landing=%s  interior-darkening=%.2f  |  Q/E rotate  |  LMB place  |  RMB delete  |  T landing mode  |  [ ] darkening  |  F5 save  |  Esc exit",
+    "SELECTED BUILDING '%s'  interior-darkening=%.2f  ([ ] to adjust, F5 to save)",
 };
 
 /// 中文标签表：仅当**成功加载 CJK 字体**时启用（此时不可能缺字）。
@@ -379,6 +385,8 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsChinese = {
     "预览",
     "自动旋转 · 拖动可转向",
     "无预览（该类型几何为空）",
+    "摆放建筑：「%s」  落点=%s  室内变暗=%.2f  |  Q/E 旋转  |  左键放下  |  右键删除  |  T 落点模式  |  [ ] 变暗  |  F5 保存  |  Esc 退出",
+    "选中建筑「%s」  室内变暗=%.2f（[ ] 调整，F5 保存）",
 };
 
 /// 纯函数：判断字符串是否**只含 ASCII 字节**（`cjkFontAvailable = false` 时的硬约束）。

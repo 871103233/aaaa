@@ -31,6 +31,8 @@ add_library(voxel_world STATIC
     premade/premade_map.cpp
     premade/premade_terrain_source.cpp
     save/world_instance_save.cpp
+    save/world_save.cpp
+    save/world_state_save.cpp
     shell/surface_shell.cpp
     shell/surface_shell_residency.cpp
     streaming/dig_volume_residency.cpp
@@ -54,7 +56,8 @@ target_include_directories(voxel_world
     PRIVATE ${CMAKE_SOURCE_DIR}/third_party/FastNoiseLite
 )
 
-# zstd 只在 premade_map.cpp 内出现（公共头不泄漏）⇒ PRIVATE（vcpkg 提供的目标名 = `zstd::libzstd`）。
+# zstd 只在 world 模块的少数 .cpp 内出现（premade_map.cpp / save/world_save.cpp），公共头不泄漏 ⇒ PRIVATE
+# （vcpkg 提供的目标名 = `zstd::libzstd`）。
 target_link_libraries(voxel_world
     PUBLIC  voxel_build_options
     PUBLIC  voxel_engine              # 公共头暴露 MeshVertex / ITerrainQuery，故为 PUBLIC

@@ -101,11 +101,18 @@ struct EnvironmentSettings {
 };
 
 
+/// **室内变暗的全局缺省值**（V0.9 / [ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策一）。
+///
+/// 语义：判定为"室内"时环境项（天空光 / IBL）的乘子 ⇒ 暗 55%（与 [ADR 0035](../../docs/adr/0035-modular-building-kit-and-enterable-spaces.md)
+/// 决策四的写死常量 0.45 **同值** ⇒ 缺省行为与 V0.8 逐位一致）。
+/// **唯一来源**：启动参数 `--interior-darkening=<0~1>` 的缺省值，以及 `LightingUniform::interiorDarkening` 的初值。
+inline constexpr float kDefaultInteriorDarkening = 0.45F;
+
 /// 片元着色器的光照 uniform 块（`set = 3, binding = 1`），std140 布局。
 ///
 /// 字段排布与 `assets/shaders/mesh.frag` 的 `LightingBlock` **逐字对应**，每行一个 `vec4`：
 ///   - `sunDirectionIntensity` = `(方向 xyz, 强度)`
-///   - `sunColorLinear`        = `(太阳色 rgb, 0)`
+///   - `sunColorLinear`        = `(太阳色 rgb, **室内变暗的全局默认值**)`  ← V0.9 复用空闲分量（ADR 0036）
 ///   - `skyZenithIntensity`    = `(天顶色 rgb, 天空强度)`
 ///   - `skyHorizonLinear`      = `(地平色 rgb, 0)`
 ///   - `skyGroundLinear`       = `(地面反弹色 rgb, 0)`
@@ -123,7 +130,11 @@ struct LightingUniform {
     float sunColorR        = 1.0F;
     float sunColorG        = 1.0F;
     float sunColorB        = 1.0F;
-    float sunColorUnused   = 0.0F;
+    /// V0.9（[ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策一）：
+    /// **室内变暗的全局默认值**（`--interior-darkening=<0~1>`，缺省 `kDefaultInteriorDarkening`）。
+    /// `1.0` = 完全不调暗（环境项乘 1.0 = 恒等 ⇒ 逐位退回"引入室内变暗之前"的行为）。
+    /// **承载**：`sunColorLinear` 的 `.a` —— 复用**现成的空闲分量**，**不扩结构**（`sizeof` 不变）。
+    float interiorDarkening = 0.45F;
 
     float skyZenithR       = 0.0F;
     float skyZenithG       = 0.0F;
@@ -188,9 +199,14 @@ class LightingTable;
 /// `0` = 未启用 / 烘焙失败 ⇒ uniform 的 IBL 启用位为 0，着色器走**半球天空光回落路径**。
 /// 之所以由调用方传入"实际级数"而不是在这里读配置：**配置要求 ≠ 真的烘焙成功**
 /// （资源缺失、GPU 失败都要回落），而着色器必须与 GPU 上的贴图一致。
+///
+/// `interiorDarkening`（V0.9 / [ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策一）：
+/// 室内变暗的**全局默认值**（`--interior-darkening=<0~1>`）；缺省 = `kDefaultInteriorDarkening`。
+/// **前置条件**：∈ [0, 1]（由 `game/main.cpp` 的启动参数解析保证；非法值启动失败，本函数不再校验）。
 [[nodiscard]] LightingUniform BuildLightingUniform(const LightingTable& table, double cameraX, double cameraY,
                                                    double cameraZ,
-                                                   std::uint32_t environmentPrefilterMipCount = 0) noexcept;
+                                                   std::uint32_t environmentPrefilterMipCount = 0,
+                                                   float interiorDarkening = kDefaultInteriorDarkening) noexcept;
 
 /// 光照与雾配置表：启动期从 `assets/config/lighting.toml` 一次性读入（ADR 0005 / ADR 0010）。
 ///

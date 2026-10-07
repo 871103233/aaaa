@@ -3,6 +3,7 @@
 #include "generation/map_preset.hpp"
 #include "generation/terrain_noise.hpp"
 #include "render/camera.hpp"
+#include "save/world_save.hpp"  // `HeightDirtyEntry`：存档差量与本类的内存表示**同源**（ADR 0037 决策四）
 #include "terrain/material_table.hpp"
 #include "terrain/terrain_mesher.hpp"
 #include "terrain/terrain_tile.hpp"
@@ -12,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <vector>
 
 namespace vx {
@@ -189,6 +191,61 @@ public:
     /// **成本 O(1)**（T79①，候选 tile 同 `ReadColumnHeight`）。
     void WriteColumnHeight(int worldX, int worldZ, Height height, std::vector<TileCoord>& dirtyOut);
 
+    // ---- 高度场差量（存档；[ADR 0037](../../docs/adr/0037-world-state-save-v2-and-terrain-persistence.md) 决策二~四）----
+
+    /// 一个 tile 的**高度差量导出项**：`entries` 按 `columnIndex` **严格升序**
+    /// （可直接喂 `EncodeHeightDirtyTile`；列号 0..4095 = 行主序，**只含本 tile 拥有的 64² 列**）。
+    ///
+    /// 形态与 `.voxr` 的 `HeightDirtyEntry` **同源** —— ADR 0037 决策四要求"差量的内存表示复用既有脏标记、
+    /// 不新开第二条记账"，故直接复用该结构，落盘时零转换。
+    struct HeightEditTile {
+        TileCoord                     coord {};
+        std::vector<HeightDirtyEntry> entries;
+    };
+
+    /// 导出**全部已编辑 tile** 的高度差量（按 `TileCoord` 升序 ⇒ 写盘顺序确定，红线 7）。
+    ///
+    /// 差量 = `当前高度 − 生成结果高度`（皆 1/16 格，`HeightDirtyEntry::heightDelta`）。
+    /// 生成结果由**纯函数重算**（与 `GenerateTile` **同一数据路径**，含预制来源）—— 故不额外占内存、
+    /// 不引入第二条记账；未改动过的 tile **不出现**在结果里（ADR 0037 判据②）。
+    ///
+    /// 已卸载但记录为脏的 tile **跳过**（其差量应在卸载前落盘，见决策四 / 阶段计划 S4）。
+    [[nodiscard]] std::vector<HeightEditTile> ExportHeightEdits() const;
+
+    /// **单 tile** 的高度差量（未编辑 / 与生成结果无差异 / 未常驻 ⇒ 空）。口径与 `ExportHeightEdits` 逐字相同。
+    ///
+    /// 用途（S4）：① 单元**卸载前**采集（"不静默丢改动"）；② flush 时逐个常驻脏 tile 采集（避免一次遍历全部）。
+    [[nodiscard]] std::vector<HeightDirtyEntry> ExportTileEdits(const TileCoord& coord) const;
+
+    /// **已知被编辑过的 tile 坐标**（升序；含已被读档叠加过的）。供 S4 的 flush 遍历。
+    ///
+    /// 注意语义：它是"曾与生成结果不同"的集合，**不**保证该 tile 现在常驻、也**不**保证当前仍有差异
+    /// （编辑回原值后差量为空 ⇒ 采集结果为空，`SetChunk` 会删除该块）。
+    [[nodiscard]] std::vector<TileCoord> EditedTiles() const;
+
+    /// 叠加一个 tile 的高度差量（**读档路径**；必须在 `GenerateTile` **之后**调用 —— ADR 0037 决策三禁止颠倒）。
+    ///
+    /// 逐条按**世界列**写入（复用 `WriteColumnHeight` 的"写进全部持有该列的 tile"语义 ⇒ 共享边界列不裂缝，红线 12）；
+    /// 新增值 = `生成结果 + 差量` ⇒ **幂等**（重复叠加结果相同）。被改动的 tile 追加到 `dirtyOut` 并标记为已编辑。
+    /// `coord` 未常驻 ⇒ 无操作（等它被流式建出时再叠加，见决策三）。
+    void ApplyHeightEdits(const TileCoord& coord, const std::vector<HeightDirtyEntry>& entries,
+                          std::vector<TileCoord>& dirtyOut);
+
+    /// 该 tile 是否**被编辑过**（含读档叠加）。供流式"脏单元不卸 / 卸前先落盘"判定（ADR 0037 决策四）。
+    [[nodiscard]] bool IsTileEdited(const TileCoord& coord) const noexcept {
+        return m_editedTiles.find(coord) != m_editedTiles.end();
+    }
+
+    /// 已知被编辑的 tile 数（观测）。
+    [[nodiscard]] std::size_t EditedTileCount() const noexcept { return m_editedTiles.size(); }
+
+    /// **地形编辑序号**：`WriteColumnHeight` 每写进一个持有该列的 tile 就 `+1`（单调递增）。
+    ///
+    /// 用途（S4）：调用方以 **O(1)** 判定"自上次落盘以来地形有没有变过" ⇒ 没变就跳过
+    /// "重算全部差量"这一步（`ExportTileEdits` 要为每个脏 tile 重算一次生成结果，代价不低）。
+    /// 语义只保证"**有改动 ⇒ 序号必变**"（不保证"没变 ⇒ 序号不变"的反向严格性，也不保证步长）。
+    [[nodiscard]] std::uint64_t EditSerial() const noexcept { return m_editSerial; }
+
     // ---- 重网格 ----
 
     /// 只重网格 `dirty` 中列出的 tile（按坐标去重），返回实际重网格的 tile 数。
@@ -226,6 +283,12 @@ public:
     [[nodiscard]] const TerrainMaterialTable& Materials() const noexcept { return m_materials; }
 
 private:
+    /// 按当前世界定义（种子 / 生成参数 / 预设编辑 / **数据来源**）**重算**一个 tile 的初始高度（纯函数路径）。
+    ///
+    /// `GenerateTile` / `ExportHeightEdits` / `ApplyHeightEdits` 三条路径**共用同一实现** ⇒
+    /// 存档差量的**基准**与生成结果必然同源（否则差量会随"谁先算"而漂移）。
+    [[nodiscard]] TerrainTile BuildPristineTile(int tileX, int tileZ) const;
+
     std::uint64_t         m_seed = 0;
     TerrainMaterialTable  m_materials;
     TerrainNoiseGenerator m_noise;
@@ -245,6 +308,15 @@ private:
 
     /// `LoadTile` 回退到同步生成的累计次数（观测；有 worker 时必须稳定为 0）。
     std::size_t m_syncFallbackCount = 0;
+
+    /// **已编辑（当前高度 ≠ 生成结果）的 tile 集合** —— 高度场差量的**内存表示**（ADR 0037 决策四）。
+    ///
+    /// `std::set` ⇒ 遍历天然按 `TileCoord` 升序（导出 / 写盘顺序确定，红线 7）；只在 `WriteColumnHeight` /
+    /// `ApplyHeightEdits` 写入时插入，**不新开第二条记账**（与既有"脏 tile"是同一份事实）。
+    std::set<TileCoord> m_editedTiles;
+
+    /// **地形编辑序号**（语义见 `EditSerial()`）：每写进一个 tile 就 +1；`EditSerial()` 是它的只读视图。
+    std::uint64_t m_editSerial = 0;
 };
 
 }  // namespace vx

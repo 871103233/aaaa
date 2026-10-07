@@ -156,9 +156,28 @@ constexpr double kPiOver180 = 3.14159265358979323846 / 180.0;
                              "]（可选：floor / wall / wall_door / roof）");
 }
 
+/// 解析 `landing_mode`（V0.9；`[[building]]` 可选；[ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策四）。
+///
+/// **① `flatten` / ③ `fill` 不放行**：它们会**改地形** ⇒ 与 ADR 0035 决策五（首期只放地形之上、不裁地形）冲突，
+/// 且地形改动**没有持久化**（重启即丢）⇒ 解析期**明确报错**（不静默回退；枚举保留、能力不删）。
+[[nodiscard]] ObjectBuildingLandingMode ParseLandingMode(const std::string& text, const std::filesystem::path& path) {
+    if (text == "sink") {
+        return ObjectBuildingLandingMode::Sink;
+    }
+    if (text == "flat_only") {
+        return ObjectBuildingLandingMode::FlatOnly;
+    }
+    if (text == "flatten" || text == "fill") {
+        throw std::runtime_error(path.string() + ": [[building]].landing_mode [" + text +
+                                 "] **本阶段不放行**（会改动地形；与 ADR 0035 决策五冲突，且地形改动无持久化）"
+                                 "—— 见 ADR 0036 §五；请改用 sink（向下半埋）或 flat_only（落地必须平整）");
+    }
+    throw std::runtime_error(path.string() + ": 未知的落点模式 landing_mode [" + text +
+                             "]（本阶段可选：sink / flat_only）");
+}
+
 /// 物件类型的查找器（用于"落点引用的类型是否存在"这类校验）。
 using TypeLookup = std::function<const ObjectType*(const std::string&)>;
-
 /// 解析 `[[type]]` 段并**追加**到 `out`；`existing` 给出"已存在的类型"（重复检测用，可为恒空查找）。
 ///
 /// 规则（非法即抛）：`id` 非空且**不与 `existing` / 本段内重复**、`kind` 合法、`half_extent` 三分量为正、
@@ -546,6 +565,12 @@ void ParseBuildings(const toml::table& root, const std::filesystem::path& path, 
         if (building.id.empty()) {
             throw std::runtime_error(path.string() + ": [[building]].id 不能为空");
         }
+        // V0.9 / ADR 0036 决策四：**建筑 id 不得与任何类型 id 相同** —— 这是"F2 选择器里能无歧义判定
+        // 选中的是类型还是建筑"的可判定不变量（按"先查类型、再查建筑"解析即可，不需要额外的类别位）。
+        if (findType(building.id) != nullptr) {
+            throw std::runtime_error(path.string() + ": [[building]].id [" + building.id +
+                                     "] 与某个 [[type]].id 相同（两者是两个命名空间，必须不重名）");
+        }
         for (const ObjectBuilding& existing : out.buildings) {
             if (existing.id == building.id) {
                 throw std::runtime_error(path.string() + ": [[building]].id 重复 [" + building.id + "]");
@@ -556,6 +581,32 @@ void ParseBuildings(const toml::table& root, const std::filesystem::path& path, 
         building.x                    = static_cast<float>(anchor[0]);
         building.z                    = static_cast<float>(anchor[2]);
         building.yawDegrees           = static_cast<float>(ReadNumberOr(*entry, path, "yaw_deg", 0.0));
+
+        // V0.9 / ADR 0036 决策二：`interior_darkening`（**可选**，缺省 `-1` = 用全局值）。
+        // 语义：`[0, 1]` 为该建筑的室内变暗覆盖；越界 / 非数 ⇒ 抛（非法即抛，ADR 0005）。
+        if (const toml::node* darkeningNode = entry->get("interior_darkening"); darkeningNode != nullptr) {
+            const std::optional<double> darkening = darkeningNode->value<double>();
+            if (!darkening.has_value()) {
+                throw std::runtime_error(path.string() + ": [[building]] [" + building.id +
+                                         "] 的 interior_darkening 不是数值");
+            }
+            if (!(*darkening >= 0.0 && *darkening <= 1.0)) {
+                throw std::runtime_error(path.string() + ": [[building]] [" + building.id +
+                                         "] 的 interior_darkening 必须落在 [0, 1]（0 最暗、1 完全不调暗）");
+            }
+            building.interiorDarkening = static_cast<float>(*darkening);
+        }
+
+        // V0.9 / ADR 0036 决策四：`landing_mode`（**可选**，缺省 `Unspecified` = V0.8 行为）。
+        // `flatten` / `fill` **不放行** ⇒ 解析期抛（见 `ParseLandingMode`）。
+        if (const toml::node* landingNode = entry->get("landing_mode"); landingNode != nullptr) {
+            const std::optional<std::string> landing = landingNode->value<std::string>();
+            if (!landing.has_value()) {
+                throw std::runtime_error(path.string() + ": [[building]] [" + building.id +
+                                         "] 的 landing_mode 不是字符串");
+            }
+            building.landingMode = ParseLandingMode(*landing, path);
+        }
 
         const toml::array* pieceArray = (*entry)["pieces"].as_array();
         if (pieceArray == nullptr || pieceArray->empty()) {
@@ -585,6 +636,47 @@ void ParseBuildings(const toml::table& root, const std::filesystem::path& path, 
             building.pieces.push_back(std::move(piece));
         }
         out.buildings.push_back(std::move(building));
+    }
+}
+
+/// 解析 `[[remove_building]]` 与 `[[building_darkening]]`（V0.9；[ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策三/四）。
+///
+/// 规则（非法即抛）：`id` 非空；`interior_darkening` 必须 ∈ [0, 1]。
+/// **是否引用到存在的建筑**由 `MergeObjectTables` 判定（那里同时看得到发布清单与本层）。
+void ParseBuildingEdits(const toml::table& root, const std::filesystem::path& path, ObjectTable& out) {
+    if (const toml::array* removeArray = root["remove_building"].as_array(); removeArray != nullptr) {
+        for (const toml::node& node : *removeArray) {
+            const toml::table* entry = node.as_table();
+            if (entry == nullptr) {
+                throw std::runtime_error(path.string() + ": [[remove_building]] 的每个元素都必须是表");
+            }
+            ObjectBuildingRemoval removal;
+            removal.buildingId = ReadString(*entry, path, "id");
+            if (removal.buildingId.empty()) {
+                throw std::runtime_error(path.string() + ": [[remove_building]].id 不能为空");
+            }
+            out.buildingRemovals.push_back(std::move(removal));
+        }
+    }
+    if (const toml::array* darkenArray = root["building_darkening"].as_array(); darkenArray != nullptr) {
+        for (const toml::node& node : *darkenArray) {
+            const toml::table* entry = node.as_table();
+            if (entry == nullptr) {
+                throw std::runtime_error(path.string() + ": [[building_darkening]] 的每个元素都必须是表");
+            }
+            ObjectBuildingDarkening override;
+            override.buildingId = ReadString(*entry, path, "id");
+            if (override.buildingId.empty()) {
+                throw std::runtime_error(path.string() + ": [[building_darkening]].id 不能为空");
+            }
+            const double darkening = ReadNumber(*entry, path, "interior_darkening");
+            if (!(darkening >= 0.0 && darkening <= 1.0)) {
+                throw std::runtime_error(path.string() + ": [[building_darkening]] [" + override.buildingId +
+                                         "] 的 interior_darkening 必须落在 [0, 1]");
+            }
+            override.darkening = static_cast<float>(darkening);
+            out.buildingDarkenings.push_back(std::move(override));
+        }
     }
 }
 
@@ -702,6 +794,15 @@ const ObjectType* ObjectTable::Find(const std::string& id) const noexcept {
     return nullptr;
 }
 
+const ObjectBuilding* ObjectTable::FindBuilding(const std::string& id) const noexcept {
+    for (const ObjectBuilding& building : buildings) {
+        if (building.id == id) {
+            return &building;
+        }
+    }
+    return nullptr;
+}
+
 ObjectTable MergeObjectTables(const ObjectTable& base, const ObjectTable& overlay) {
     if (base.destructibleEnabled != overlay.destructibleEnabled) {
         throw std::runtime_error(
@@ -726,7 +827,59 @@ ObjectTable MergeObjectTables(const ObjectTable& base, const ObjectTable& overla
     merged.tiledScatters.insert(merged.tiledScatters.end(), overlay.tiledScatters.begin(), overlay.tiledScatters.end());
     merged.removals.insert(merged.removals.end(), overlay.removals.begin(), overlay.removals.end());
     // V0.8：成套建筑按文件顺序追加（发布清单 → 可编辑层），确定性不变（红线 7）。
-    merged.buildings.insert(merged.buildings.end(), overlay.buildings.begin(), overlay.buildings.end());
+    // V0.9 / ADR 0036 决策四：先按 `[[remove_building]]`（**按建筑 id 精确匹配**）过滤**发布清单**的建筑，
+    // 再追加本层新增建筑 —— 与单件 `[[remove]]` 同源（发布清单只读 ⇒ 差异落在可编辑层）。
+    {
+        merged.buildings.clear();
+        merged.buildings.reserve(base.buildings.size() + overlay.buildings.size());
+        for (const ObjectBuilding& building : base.buildings) {
+            bool removed = false;
+            for (const ObjectBuildingRemoval& removal : overlay.buildingRemovals) {
+                if (removal.buildingId == building.id) {
+                    removed = true;
+                    break;
+                }
+            }
+            if (!removed) {
+                merged.buildings.push_back(building);
+            }
+        }
+        merged.buildings.insert(merged.buildings.end(), overlay.buildings.begin(), overlay.buildings.end());
+        merged.buildingRemovals.insert(merged.buildingRemovals.end(), overlay.buildingRemovals.begin(),
+                                       overlay.buildingRemovals.end());
+        // 校验：`[[remove_building]]` 的目标必须存在（在发布清单里）。
+        for (const ObjectBuildingRemoval& removal : overlay.buildingRemovals) {
+            bool found = false;
+            for (const ObjectBuilding& building : base.buildings) {
+                if (building.id == removal.buildingId) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                throw std::runtime_error("可编辑层的 [[remove_building]] 指向不存在的建筑 id：[" +
+                                         removal.buildingId + "]");
+            }
+        }
+        // V0.9 / ADR 0036 决策三：把 `[[building_darkening]]` 覆盖到**合并后**的对应建筑上（**就地改**）；
+        // 目标不存在 ⇒ 抛（写错的 id / 已被删 ⇒ 不静默）。
+        for (const ObjectBuildingDarkening& override : overlay.buildingDarkenings) {
+            bool applied = false;
+            for (ObjectBuilding& building : merged.buildings) {
+                if (building.id == override.buildingId) {
+                    building.interiorDarkening = override.darkening;
+                    applied                    = true;
+                    break;
+                }
+            }
+            if (!applied) {
+                throw std::runtime_error("可编辑层的 [[building_darkening]] 指向不存在的建筑 id：[" +
+                                         override.buildingId + "]");
+            }
+        }
+        merged.buildingDarkenings.insert(merged.buildingDarkenings.end(), overlay.buildingDarkenings.begin(),
+                                         overlay.buildingDarkenings.end());
+    }
     return merged;
 }
 
@@ -792,7 +945,61 @@ ObjectEnclosure ComputeBuildingEnclosure(const ObjectBuilding& building, const O
     enclosure.halfX    = static_cast<float>((maxX - minX) * 0.5);
     enclosure.halfZ    = static_cast<float>((maxZ - minZ) * 0.5);
     enclosure.ceilingY = static_cast<float>(ceiling);
+    // V0.9 / ADR 0036 决策二：把逐建筑变暗覆盖原样带出（`-1` = 用全局值）。
+    enclosure.darkening = building.interiorDarkening;
     return enclosure;
+}
+
+bool ComputeBuildingFootprintXZ(const ObjectBuilding& building, const ObjectTable& table, float& outMinX,
+                                float& outMaxX, float& outMinZ, float& outMaxZ) noexcept {
+    // 与 `game/main.cpp` 的构件展开 / `ComputeBuildingEnclosure` **同一约定**（绕 +Y：x' = c·x + s·z、z' = −s·x + c·z）。
+    const double yawRadians = static_cast<double>(building.yawDegrees) * kPiOver180;
+    const double cosYaw     = std::cos(yawRadians);
+    const double sinYaw     = std::sin(yawRadians);
+
+    bool   hasPiece = false;
+    double minX = 0.0;
+    double maxX = 0.0;
+    double minZ = 0.0;
+    double maxZ = 0.0;
+    for (const ObjectBuildingPiece& piece : building.pieces) {
+        const ObjectType* type = table.Find(piece.typeId);
+        if (type == nullptr || type->kind != ObjectAssetKind::Kit) {
+            continue;  // 兜底：只有 kit 构件参与占地（加载期已保证类型存在）
+        }
+        const double pieceYaw = yawRadians + static_cast<double>(piece.yawDegrees) * kPiOver180;
+        const double absCos   = std::abs(std::cos(pieceYaw));
+        const double absSin   = std::abs(std::sin(pieceYaw));
+        const double halfX    = absCos * static_cast<double>(type->halfExtentX) +
+                             absSin * static_cast<double>(type->halfExtentZ);
+        const double halfZ = absSin * static_cast<double>(type->halfExtentX) +
+                             absCos * static_cast<double>(type->halfExtentZ);
+        const double offsetX = cosYaw * static_cast<double>(piece.offsetX) + sinYaw * static_cast<double>(piece.offsetZ);
+        const double offsetZ = -sinYaw * static_cast<double>(piece.offsetX) + cosYaw * static_cast<double>(piece.offsetZ);
+        const double centerX = static_cast<double>(building.x) + offsetX;
+        const double centerZ = static_cast<double>(building.z) + offsetZ;
+
+        if (!hasPiece) {
+            hasPiece = true;
+            minX = centerX - halfX;
+            maxX = centerX + halfX;
+            minZ = centerZ - halfZ;
+            maxZ = centerZ + halfZ;
+        } else {
+            minX = std::min(minX, centerX - halfX);
+            maxX = std::max(maxX, centerX + halfX);
+            minZ = std::min(minZ, centerZ - halfZ);
+            maxZ = std::max(maxZ, centerZ + halfZ);
+        }
+    }
+    if (!hasPiece || !(maxX > minX) || !(maxZ > minZ)) {
+        return false;
+    }
+    outMinX = static_cast<float>(minX);
+    outMaxX = static_cast<float>(maxX);
+    outMinZ = static_cast<float>(minZ);
+    outMaxZ = static_cast<float>(maxZ);
+    return true;
 }
 
 std::vector<ObjectPlacement> RemovePlacementsByRemoval(const std::vector<ObjectPlacement>& placements,
@@ -854,6 +1061,8 @@ ObjectTable ObjectTable::LoadFromFile(const std::filesystem::path& path) {
     ParsePlacementsAndScatters(root, path, [&table](const std::string& id) { return table.Find(id); }, table);
     // V0.8：`[[building]]`（成套建筑）—— 引用本清单的类型表。
     ParseBuildings(root, path, [&table](const std::string& id) { return table.Find(id); }, table);
+    // V0.9：`[[remove_building]]` / `[[building_darkening]]`（存在性校验在 Merge）。
+    ParseBuildingEdits(root, path, table);
 
     return table;
 }
@@ -903,6 +1112,8 @@ ObjectTable ObjectTable::LoadOverlayFromFile(const std::filesystem::path& path, 
             return fromBase != nullptr ? fromBase : overlay.Find(id);
         },
         overlay);
+    // V0.9：`[[remove_building]]` / `[[building_darkening]]`（存在性校验在 Merge）。
+    ParseBuildingEdits(root, path, overlay);
 
     return overlay;
 }

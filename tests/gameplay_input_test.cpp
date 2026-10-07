@@ -9,43 +9,29 @@ using vx::InputSuppression;
 
 }  // namespace
 
-// 面板关闭且 ImGui 未接管任何输入：玩法输入全部放行。
-TEST(GameplayInput, NothingSuppressedWhenNoUiWantsInput) {
-    const InputSuppression suppression = DecideInputSuppression(/*panelOpen=*/false, /*wantCaptureMouse=*/false,
-                                                                /*wantCaptureKeyboard=*/false);
+// 无**模态面板**打开：玩法输入全部放行。
+TEST(GameplayInput, NothingSuppressedWhenNoBlockingPanel) {
+    const InputSuppression suppression = DecideInputSuppression(/*blockingPanelOpen=*/false);
     EXPECT_FALSE(suppression.keyboardGameplay);
     EXPECT_FALSE(suppression.cameraLook);
     EXPECT_FALSE(suppression.mouseAction);
 }
 
-// ImGui 只接管鼠标：视角与鼠标玩法动作被抑制，键盘玩法不受影响。
-TEST(GameplayInput, MouseCaptureSuppressesLookAndBrushOnly) {
-    const InputSuppression suppression = DecideInputSuppression(false, /*wantCaptureMouse=*/true, false);
-    EXPECT_TRUE(suppression.cameraLook) << "拖音量滑块 / 悬停面板时不得转视角";
-    EXPECT_TRUE(suppression.mouseAction) << "点面板按钮不得发射光球";
-    EXPECT_FALSE(suppression.keyboardGameplay) << "鼠标被接管不应连带禁用键盘移动";
+// **V0.9 回归**（缺陷：打开 F1 后无法移动 / 转视角）：F1 调试面板与常驻 HUD 都是**只读叠加层**，
+// 都不进 `AnyBlockingPanelOpen()` ⇒ 调用点传入 `false` ⇒ 玩法输入**一律放行**。
+// 旧实现把 ImGui 的 `WantCaptureMouse|Keyboard` 也计入抑制，而 ImGui 在这两个只读叠加层可见 / 被悬停 /
+// 获得键盘焦点时会报告它们 ⇒ 键盘玩法被吞。本用例把"只读叠加层不产生抑制"这一契约钉住。
+TEST(GameplayInput, ReadOnlyOverlaysNeverSuppressGameplayInput) {
+    const InputSuppression suppression = DecideInputSuppression(false);
+    EXPECT_FALSE(suppression.keyboardGameplay) << "开着 F1 / HUD 时仍必须能移动 / 跳跃 / 飞行";
+    EXPECT_FALSE(suppression.cameraLook) << "开着 F1 / HUD 时仍必须能转视角";
+    EXPECT_FALSE(suppression.mouseAction) << "开着 F1 / HUD 时仍必须能发射";
 }
 
-// ImGui 只接管键盘：键盘玩法被抑制，鼠标类别不受影响。
-TEST(GameplayInput, KeyboardCaptureSuppressesKeyboardOnly) {
-    const InputSuppression suppression = DecideInputSuppression(false, false, /*wantCaptureKeyboard=*/true);
+// 模态面板（系统面板 / 传送门菜单 / 物件选择器）打开：三类全量抑制（玩法输入绝不泄漏到世界）。
+TEST(GameplayInput, BlockingPanelSuppressesEverything) {
+    const InputSuppression suppression = DecideInputSuppression(/*blockingPanelOpen=*/true);
     EXPECT_TRUE(suppression.keyboardGameplay);
-    EXPECT_FALSE(suppression.cameraLook);
-    EXPECT_FALSE(suppression.mouseAction);
-}
-
-// 两者都被接管：全部抑制。
-TEST(GameplayInput, BothCapturedSuppressesEverything) {
-    const InputSuppression suppression = DecideInputSuppression(false, true, true);
-    EXPECT_TRUE(suppression.keyboardGameplay);
-    EXPECT_TRUE(suppression.cameraLook);
-    EXPECT_TRUE(suppression.mouseAction);
-}
-
-// 系统面板打开：即使 ImGui 本帧未报告 Want 标志，也一律抑制（模态面板期间玩法输入绝不泄漏）。
-TEST(GameplayInput, OpenPanelSuppressesEverythingRegardlessOfWantFlags) {
-    const InputSuppression suppression = DecideInputSuppression(/*panelOpen=*/true, false, false);
-    EXPECT_TRUE(suppression.keyboardGameplay);
-    EXPECT_TRUE(suppression.cameraLook);
+    EXPECT_TRUE(suppression.cameraLook) << "点面板按钮不得发射光球 / 不得转视角";
     EXPECT_TRUE(suppression.mouseAction);
 }

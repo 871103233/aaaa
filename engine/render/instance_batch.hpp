@@ -26,6 +26,10 @@ struct InstancePose {
     float enclosureHalfX    = 0.0F;
     float enclosureHalfZ    = 0.0F;
     float enclosureCeilingY = 0.0F;  ///< 屋檐下沿的**绝对世界高度**（格）
+
+    /// **逐建筑变暗覆盖**（V0.9 / [ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策二）：
+    /// 打包进 `enclosureB.y`。`< 0` = 该建筑未给出 `interior_darkening` ⇒ 用全局值；`[0, 1]` = 覆盖。
+    float enclosureDarkening = -1.0F;
 };
 
 /// 单个实例在 GPU 实例缓冲中的**字节数**：`mat4`(64) + `vec4`(16) + `vec4`(16) = 96。
@@ -72,7 +76,7 @@ inline constexpr std::uint32_t kInstancePoseBytes = 96U;
         slot[18] = pose.enclosureHalfX;
         slot[19] = pose.enclosureHalfZ;
         slot[20] = pose.enclosureCeilingY;
-        slot[21] = 0.0F;  // 预留
+        slot[21] = pose.enclosureDarkening;  // V0.9：逐建筑变暗覆盖（< 0 = 用全局值）
         slot[22] = 0.0F;  // 预留
         slot[23] = pose.enclosureEnabled ? 1.0F : 0.0F;
     }

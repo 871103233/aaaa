@@ -541,4 +541,112 @@ TEST(ObjectKitEnclosure, IsDeterministic) {
     EXPECT_FLOAT_EQ(a.ceilingY, b.ceilingY);
 }
 
+// --------------------------- V0.9：室内变暗参数化（ADR 0036 决策一~二）---------------------------
+
+/// `[[building]].interior_darkening`（可选）⇒ 原样落进 `ObjectEnclosure::darkening`（供实例缓冲透传）。
+TEST(ObjectKitDarkening, BuildingInteriorDarkeningIsCarriedByEnclosure) {
+    std::string content = kBuildingBase;
+    // 在 `[[building]]` 段内插入 `interior_darkening`。
+    const std::string anchor = "id = \"hut\"\n";
+    content.insert(content.find(anchor) + anchor.size(), "interior_darkening = 0.20\n");
+    const TempToml    file("vx_kit_building_darken.toml", content);
+    const ObjectTable table = ObjectTable::LoadFromFile(file.path());
+
+    ASSERT_EQ(table.buildings.size(), 1U);
+    EXPECT_FLOAT_EQ(table.buildings[0].interiorDarkening, 0.20F);
+    const ObjectEnclosure enclosure = ComputeBuildingEnclosure(table.buildings[0], table, 10.0F);
+    EXPECT_TRUE(enclosure.enabled);
+    EXPECT_FLOAT_EQ(enclosure.darkening, 0.20F);  // 逐建筑覆盖被原样带出（<0 = 用全局值）
+}
+
+/// 未给出 `interior_darkening` ⇒ `-1`（= 用全局值）⇒ 与"只设全局值"逐位一致（判据②）。
+TEST(ObjectKitDarkening, MissingInteriorDarkeningMeansUseGlobal) {
+    const TempToml    file("vx_kit_building_darken_default.toml", kBuildingBase);
+    const ObjectTable table = ObjectTable::LoadFromFile(file.path());
+    EXPECT_FLOAT_EQ(table.buildings[0].interiorDarkening, -1.0F);
+    EXPECT_FLOAT_EQ(ComputeBuildingEnclosure(table.buildings[0], table, 0.0F).darkening, -1.0F);
+}
+
+/// 非法值（越界 / 非数）⇒ 解析即抛（ADR 0005；不静默钳制）。
+TEST(ObjectKitDarkening, InvalidInteriorDarkeningThrows) {
+    for (const char* value : { "1.5", "-0.2" }) {
+        std::string content = kBuildingBase;
+        const std::string anchor = "id = \"hut\"\n";
+        content.insert(content.find(anchor) + anchor.size(),
+                       std::string("interior_darkening = ") + value + "\n");
+        const TempToml file("vx_kit_building_darken_bad.toml", content);
+        ExpectLoadThrows(file.path());
+    }
+}
+
+// --------------------------- V0.9：落点 4 模式（ADR 0036 决策四~五）---------------------------
+
+/// `landing_mode = "sink"` / `"flat_only"` 可解析（两者**不改地形** ⇒ 放行）。
+TEST(ObjectKitLanding, ParsesSinkAndFlatOnly) {
+    for (const std::pair<const char*, vx::ObjectBuildingLandingMode> entry :
+         { std::make_pair("sink", vx::ObjectBuildingLandingMode::Sink),
+           std::make_pair("flat_only", vx::ObjectBuildingLandingMode::FlatOnly) }) {
+        std::string content = kBuildingBase;
+        const std::string anchor = "id = \"hut\"\n";
+        content.insert(content.find(anchor) + anchor.size(),
+                       std::string("landing_mode = \"") + entry.first + "\"\n");
+        const TempToml    file("vx_kit_building_landing.toml", content);
+        const ObjectTable table = ObjectTable::LoadFromFile(file.path());
+        EXPECT_EQ(table.buildings[0].landingMode, entry.second);
+    }
+}
+
+/// `landing_mode = "flatten"` / `"fill"` **本阶段不放行**（会改地形 ⇒ 解析即抛；能力不删）。
+TEST(ObjectKitLanding, RejectsTerrainModifyingModes) {
+    for (const char* value : { "flatten", "fill" }) {
+        std::string content = kBuildingBase;
+        const std::string anchor = "id = \"hut\"\n";
+        content.insert(content.find(anchor) + anchor.size(),
+                       std::string("landing_mode = \"") + value + "\"\n");
+        const TempToml file("vx_kit_building_landing_bad.toml", content);
+        ExpectLoadThrows(file.path());
+    }
+}
+
+/// 未知落点模式串 ⇒ 抛。
+TEST(ObjectKitLanding, RejectsUnknownMode) {
+    std::string content = kBuildingBase;
+    const std::string anchor = "id = \"hut\"\n";
+    content.insert(content.find(anchor) + anchor.size(), "landing_mode = \"nope\"\n");
+    const TempToml file("vx_kit_building_landing_unknown.toml", content);
+    ExpectLoadThrows(file.path());
+}
+
+/// 建筑 id 与类型 id **不得重名**（V0.9：F2 选择器据此无歧义判定"选的是类型还是建筑"）。
+TEST(ObjectKitParse, BuildingIdMustNotCollideWithTypeId) {
+    std::string content = kBuildingBase;
+    const std::string from = "id = \"hut\"\n";
+    content.replace(content.find(from), from.size(), "id = \"kit_floor\"\n");
+    const TempToml file("vx_kit_building_id_collision.toml", content);
+    ExpectLoadThrows(file.path());
+}
+
+// --------------------------- V0.9：建筑地面投影（footprint；落点模式 ④ 的判据来源）---------------------------
+
+/// `ComputeBuildingFootprintXZ` = **全部构件**的水平并集（不只是屋顶）：`hut` = 地板 + 屋顶，各 4×4、重合。
+TEST(ObjectKitFootprint, ComputesUnionOfAllPieces) {
+    const TempToml    file("vx_kit_footprint.toml", kBuildingBase);
+    const ObjectTable table = ObjectTable::LoadFromFile(file.path());
+
+    float minX = 0.0F, maxX = 0.0F, minZ = 0.0F, maxZ = 0.0F;
+    ASSERT_TRUE(vx::ComputeBuildingFootprintXZ(table.buildings[0], table, minX, maxX, minZ, maxZ));
+    EXPECT_FLOAT_EQ(minX, -10.0F);  // 锚点 (-8,-8) ± 2（地板 / 屋顶同为绕 Y 正方形）
+    EXPECT_FLOAT_EQ(maxX, -6.0F);
+    EXPECT_FLOAT_EQ(minZ, -10.0F);
+    EXPECT_FLOAT_EQ(maxZ, -6.0F);
+}
+
+/// 无有效构件 ⇒ `false`（调用方按"无法判定 ⇒ 拒绝"处理）。
+TEST(ObjectKitFootprint, EmptyBuildingYieldsFalse) {
+    vx::ObjectBuilding  building;
+    const vx::ObjectTable table;
+    float minX = 0.0F, maxX = 0.0F, minZ = 0.0F, maxZ = 0.0F;
+    EXPECT_FALSE(vx::ComputeBuildingFootprintXZ(building, table, minX, maxX, minZ, maxZ));
+}
+
 }  // namespace

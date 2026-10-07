@@ -247,7 +247,9 @@
 
 ### 6.4 待定
 
-`.voxr` v2 的**精确字节布局待定**，须在**首次存档实现前**冻结（登记见 §0.3）；执行细则见 `../.trae/skills/voxel-engine-dev-standards/references/save-and-serialization.md`。
+`.voxr` v2 的**精确字节布局已冻结**（[ADR 0037](adr/0037-world-state-save-v2-and-terrain-persistence.md)，2026-10-07）：
+**头部 64 B + 索引 `chunkCount × 32 B` + 数据段（逐块 zstd）**，块类型 = `HeightDirtyTile`（**只存脏列**）/ `VolumeDirtyBlock`。
+实现进度见 [`plans/v0.10.md`](plans/v0.10.md)；执行细则见 `../.trae/skills/voxel-engine-dev-standards/references/save-and-serialization.md` §3。
 
 ---
 
@@ -387,7 +389,10 @@
 > - **V0.5**「三世界 A/B/C + 传送 + 可破坏土堆」＝ [`plans/v0.5.md`](plans/v0.5.md)（**进行中**，余 V6 / V7）；
 > - **V0.6**「大世界内容填充（地形感知放置 + 流式 + 气候判据）」＝ [`plans/v0.6.md`](plans/v0.6.md) / [ADR 0033](adr/0033-world-content-placement-and-streaming.md)（**已完成**）；
 > - **V0.7**「物件规模化（GPU 实例化 + 远景 LOD 链 + 物理共享 Shape）」＝ [`plans/v0.7.md`](plans/v0.7.md) / [ADR 0034](adr/0034-object-instancing-and-hlod.md)（**已完成**）；
-> - **V0.8**「建筑 kit 与人工可进入空间（+ 最小室内变暗）」＝ [`plans/v0.8.md`](plans/v0.8.md) / [ADR 0035](adr/0035-modular-building-kit-and-enterable-spaces.md)（**已完成**，**当前阶段**）。
+> - **V0.8**「建筑 kit 与人工可进入空间（+ 最小室内变暗）」＝ [`plans/v0.8.md`](plans/v0.8.md) / [ADR 0035](adr/0035-modular-building-kit-and-enterable-spaces.md)（**已完成**）；
+> - **V0.9**「室内变暗参数化 + 成套建筑的摆放」＝ [`plans/v0.9.md`](plans/v0.9.md) / [ADR 0036](adr/0036-interior-darkening-param-and-building-placement.md)（**已完成（冻结）**，所有者已验收）；
+> - **V0.10**「世界状态存档（`.voxr` v2）+ 地形改动持久化 + 落点模式 ①/③」＝ [`plans/v0.10.md`](plans/v0.10.md) / [ADR 0037](adr/0037-world-state-save-v2-and-terrain-persistence.md)（**进行中**，**当前阶段**；字节布局已冻结）。
+>   该阶段即本节 §8 原文 **V0.3（生成系统与持久化）的"存档落盘"** 那条（生成系统部分已在阶段 W / V0.6 落地）。
 >
 > **仍未做 / 暂缓的完整清单**见 `docs/adr/README.md` **§五「已登记缺口汇总」**（纯索引，细节与切换条件在各自 ADR / 计划里）。
 > **本节 V0.3（生成系统与持久化）与 V0.4（玩法与动态实体）的内容仍未被取代** —— 其中"存档落盘"仍是**整块未开工**（§6 + §0.3 的字节布局冻结前置）。

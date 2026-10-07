@@ -88,10 +88,11 @@ layout(location = 1) in vec3 v_normal;
 layout(location = 2) flat in float v_material;
 // W6e：逐网格不透明度 ∈ [0,1]（1 = 不透明）。< 1 时按 Bayer 抖动 discard 做 dither 淡出（见文件末）。
 layout(location = 3) in float v_fade;
-// V0.8 室内变暗（[ADR 0035](../../docs/adr/0035-modular-building-kit-and-enterable-spaces.md) 决策四）：
+// V0.8 室内变暗（[ADR 0035](../../docs/adr/0035-modular-building-kit-and-enterable-spaces.md) 决策四 /
+// V0.9 [ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策二）：
 // 逐**实例**围合体代理（`flat`，与两个顶点着色器同位置）。`v_enclosureB.w = 0` ⇒ 未启用（地表 / 室外物件）。
 layout(location = 4) flat in vec4 v_enclosureA;  // xy = 围合体中心 XZ，zw = 半尺寸 XZ（世界坐标）
-layout(location = 5) flat in vec4 v_enclosureB;  // x = 屋檐下沿绝对高度，w = 启用位（1/0）
+layout(location = 5) flat in vec4 v_enclosureB;  // x = 屋檐下沿绝对高度，y = **逐建筑变暗覆盖**（< 0 = 用全局），w = 启用位（1/0）
 
 layout(location = 0) out vec4 o_color;
 
@@ -122,13 +123,15 @@ const float kMinRoughness   = 0.045;
 const float kF0Dielectric   = 0.04;
 const float kPi             = 3.14159265358979323846;
 
-// ---- V0.8 室内变暗（ADR 0035 决策四）：围合体判据的常量 ----
+// ---- V0.8/V0.9 室内变暗（ADR 0035 决策四 / ADR 0036 决策一~二）：围合体判据的常量 ----
 //
-// kInteriorSkyVisibility：判定为"室内"时，环境项（天空光 / IBL）乘以它 ⇒ **暗 55%**（判据要求 ≥ 30%）。
-//   直接光不受它影响 —— 直接光是否被遮挡由级联阴影负责（本项只补"天空光不被阴影遮挡"的缺口）。
+// 室内变暗的**乘子不再写死**：V0.9 起取「逐建筑覆盖，缺省用全局值」——
+//   全局值 = `lighting.sunColorLinear.a`（启动参数 `--interior-darkening=<0~1>`，缺省 0.45）；
+//   逐建筑覆盖 = `v_enclosureB.y`（`< 0` = 未给出 ⇒ 用全局值；`[0,1]` = 覆盖）。
+//   `1.0` = 完全不调暗 ⇒ 环境项乘 1.0 = **恒等** ⇒ 逐位退回"引入室内变暗之前"的行为。
+// 直接光不受它影响 —— 直接光是否被遮挡由级联阴影负责（本项只补"天空光不被阴影遮挡"的缺口）。
 // kInteriorCeilingEpsilon：屋檐下沿的判定容差（格）—— 屋檐构件的**底面**恰在下沿高度，
 //   容差把它（= 室内天花板）算作室内，而其**顶面**（下沿 + 板厚）仍算室外（受光正确）。
-const float kInteriorSkyVisibility  = 0.45;
 const float kInteriorCeilingEpsilon = 0.05;
 
 // ---- 细节与宏观调制（数值全部来自 uniform 或确定性的世界坐标，不留第二份配置常量）----
@@ -185,7 +188,7 @@ layout(set = 3, binding = 0, std140) uniform MaterialBlock {
 /// 一次性 `pow(c, 2.2)` 转换；而材质 albedo 来自纹理、无法预转，故仍在 main() 内逐像素转线性。
 layout(set = 3, binding = 1, std140) uniform LightingBlock {
     vec4 sunDirectionIntensity;  // xyz = 由地表指向太阳的单位方向（世界空间）, w = 强度
-    vec4 sunColorLinear;         // rgb = 太阳颜色（线性光）, a = 未用
+    vec4 sunColorLinear;         // rgb = 太阳颜色（线性光）, a = **室内变暗的全局默认值**（V0.9 / ADR 0036 决策一）
     vec4 skyZenithIntensity;     // rgb = 天顶色（线性光）, a = 天空光强度
     vec4 skyHorizonLinear;       // rgb = 地平色（线性光）, a = 未用
     vec4 skyGroundLinear;        // rgb = 地面反弹色（线性光）, a = 未用
@@ -430,16 +433,20 @@ float computeSkyVisibility(vec3 worldPosition, vec3 geometricNormal) {
     if (v_enclosureB.w < 0.5) {
         return 1.0;  // 未启用（地表 / 室外物件 / 非实例化路径）⇒ 整段跳过
     }
-    const vec2 rel = worldPosition.xz - v_enclosureA.xy;
+    // V0.9 / ADR 0036 决策一~二：变暗乘子 = 「逐建筑覆盖，缺省用全局值」。
+    //   `v_enclosureB.y < 0` = 该建筑未给 `interior_darkening` ⇒ 用全局值（`lighting.sunColorLinear.a`）；
+    //   ≥ 0 = 逐建筑覆盖。`1.0` ⇒ 下面乘 1.0 = **恒等**（逐位退回"引入室内变暗之前"的行为）。
+    const float interiorFactor = (v_enclosureB.y >= 0.0) ? v_enclosureB.y : lighting.sunColorLinear.a;
+    const vec2  rel     = worldPosition.xz - v_enclosureA.xy;
     if (abs(rel.x) > v_enclosureA.z || abs(rel.y) > v_enclosureA.w) {
         return 1.0;  // ① 不在围合体水平范围内（含屋顶外表面、墙外侧面）⇒ 室外
     }
     if (abs(geometricNormal.y) >= 0.5) {
         // ② 水平面：不高于屋檐下沿 ⇒ 地板 / 天花板 = 室内；屋顶顶面（下沿 + 板厚）⇒ 室外。
-        return (worldPosition.y <= v_enclosureB.x + kInteriorCeilingEpsilon) ? kInteriorSkyVisibility : 1.0;
+        return (worldPosition.y <= v_enclosureB.x + kInteriorCeilingEpsilon) ? interiorFactor : 1.0;
     }
     // ② 竖直面：法线的水平分量指向中心 ⇒ 朝内的墙面 = 室内。
-    return (dot(geometricNormal.xz, rel) < 0.0) ? kInteriorSkyVisibility : 1.0;
+    return (dot(geometricNormal.xz, rel) < 0.0) ? interiorFactor : 1.0;
 }
 
 void main() {

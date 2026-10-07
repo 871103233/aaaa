@@ -207,6 +207,30 @@ struct ObjectBuildingPiece {
     float       yawDegrees = 0.0F;   ///< 相对锚点朝向的附加 yaw（度，绕 +Y）
 };
 
+/// **成套建筑的落点处理模式**（V0.9，配置 `landing_mode`；[ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策四）。
+///
+/// 口径：**逐建筑记录、随保存落进可编辑层**；`Unspecified` = 与 V0.8 逐位一致（保证"模式外逐位不变"）。
+/// **本阶段只实现 `Sink` / `FlatOnly`**（两者**不改地形**）；`Flatten` / `Fill` 会改地形 ⇒
+/// 与 [ADR 0035](../../docs/adr/0035-modular-building-kit-and-enterable-spaces.md) 决策五冲突、且地形改动无持久化
+/// ⇒ **不放行**：枚举保留、解析遇到即抛（能力不删，见 ADR 0036 §五）。
+enum class ObjectBuildingLandingMode : std::uint8_t {
+    Unspecified,  ///< 未给出 ⇒ 锚点 = 地表高度（V0.8 行为：不下沉、不校验）
+    Sink,         ///< ② 向下半埋：整体下沉 `kBuildingSinkBlocks`（层高相对偏移不变）
+    FlatOnly,     ///< ④ 落地必须平整：footprint 内高差 ≤ `kBuildingFlatToleranceBlocks` 才允许放置
+    Flatten,      ///< ① 顺手压平地形（**不放行**：会改地形）
+    Fill,         ///< ③ 悬空处填充（**不放行**：会改地形）
+};
+
+/// 落点模式 **② 向下半埋**的下沉量（格）。
+inline constexpr float kBuildingSinkBlocks = 0.5F;
+
+/// 落点模式 **④ 落地必须平整** 的 footprint 内**允许高差**（格）。
+inline constexpr float kBuildingFlatToleranceBlocks = 0.5F;
+
+/// **交互摆放时的缺省落点模式**（V0.9 / ADR 0036 决策四）：**② 向下半埋**（**暂定，待所有者确认**）。
+/// 为什么取它：① 不改地形（不冲突 ADR 0035 决策五）；② 永不拒绝放置（摆放工具不应"点了没反应"）。
+inline constexpr ObjectBuildingLandingMode kDefaultBuildingLandingMode = ObjectBuildingLandingMode::Sink;
+
 /// **一座成套建筑**（V0.8，配置 `[[building]]`；[ADR 0035](../../docs/adr/0035-modular-building-kit-and-enterable-spaces.md) 决策三）。
 ///
 /// 为什么需要它：ADR 0028 决策二要求"人工可进入空间 = 模块化 kit"；kit 由**多件**拼成、且**竖直方向要堆叠**，
@@ -218,6 +242,38 @@ struct ObjectBuilding {
     float       z = 0.0F;
     float       yawDegrees = 0.0F;   ///< 锚点朝向（度）—— 整座建筑绕 Y 的朝向
     std::vector<ObjectBuildingPiece> pieces;  ///< 构件清单（**非空**；按文件顺序 ⇒ 确定性）
+
+    /// **逐建筑室内变暗覆盖**（V0.9，配置 `interior_darkening`；**可选**，
+    /// [ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策二）。
+    ///
+    /// 语义：`-1` = **未给出** ⇒ 用**全局值**（`--interior-darkening=<0~1>`）；`[0, 1]` = 该建筑覆盖
+    /// （`1.0` = 完全不调暗）。承载 = 实例缓冲的空闲分量 `enclosureB.y`（**不加宽记录**）。
+    /// **不写该字段 ⇒ 与只设全局值时逐位一致**（判据②）。
+    /// 非法值（越界 / 非数）⇒ 解析期抛（ADR 0005）。
+    float interiorDarkening = -1.0F;
+
+    /// **落点处理模式**（V0.9，配置 `landing_mode`；**可选**，缺省 `Unspecified` = V0.8 行为）。
+    /// 让安装 anchor Y 的计算随模式不同：`Sink` ⇒ 下沉 `kBuildingSinkBlocks`；`Unspecified` ⇒ 不下沉。
+    /// `FlatOnly` 的"是否平整"需运行时用地形采样判定（见 `ComputeBuildingFootprintXZ`）。
+    ObjectBuildingLandingMode landingMode = ObjectBuildingLandingMode::Unspecified;
+};
+
+/// **一条成套建筑删除项**（V0.9，可编辑层配置 `[[remove_building]]`；
+/// [ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策四）。
+///
+/// 与单件 `[[remove]]` 的差异：**按建筑 `id` 精确匹配** ⇒ 不存在"同类型同位置无法区分"的限制
+/// （[ADR 0032](../../docs/adr/0032-object-palette-and-placement-mode.md) 的已知限制只适用于单件）。
+struct ObjectBuildingRemoval {
+    std::string buildingId;  ///< 目标建筑 id（必须非空）
+};
+
+/// **一条室内变暗覆盖**（V0.9，可编辑层配置 `[[building_darkening]]`；
+/// [ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策三）。
+///
+/// 用途：对**发布清单 / 上一轮编辑层**里已有的建筑**就地改** `interior_darkening`（发布清单只读 ⇒ 差异落在本层）。
+struct ObjectBuildingDarkening {
+    std::string buildingId;      ///< 目标建筑 id（必须非空、且应存在于合并后的建筑表中）
+    float       darkening = 0.0F; ///< 目标值，必须 ∈ [0, 1]
 };
 
 struct ObjectTable;  // 前置声明：`ComputeBuildingEnclosure` 只按引用使用它（定义在下方）
@@ -239,6 +295,9 @@ struct ObjectEnclosure {
     float halfX    = 0.0F;   ///< 围合体半尺寸 XZ（格），必须 > 0（否则 `enabled = false`）
     float halfZ    = 0.0F;
     float ceilingY = 0.0F;   ///< **屋檐下沿**的绝对世界高度（格）= 最低屋顶构件的底面高度
+    /// **逐建筑变暗覆盖**（V0.9 / [ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策二）：
+    /// 取自 `ObjectBuilding::interiorDarkening`；`-1` = 用全局值、`[0,1]` = 覆盖。
+    float darkening = -1.0F;
 };
 
 /// **纯函数、确定性**（红线 7）：由建筑声明 + 类型表 + 锚点地表高度，求该建筑的围合体代理。
@@ -252,6 +311,14 @@ struct ObjectEnclosure {
 /// 前置条件：`anchorSurfaceY` = 该建筑锚点的**地表高度**（格），由调用方按地表求解。
 [[nodiscard]] ObjectEnclosure ComputeBuildingEnclosure(const ObjectBuilding& building, const ObjectTable& table,
                                                        float anchorSurfaceY) noexcept;
+
+/// **纯函数、确定性**（红线 7）：由建筑声明 + 类型表求该建筑**全部构件**的水平并集 AABB（世界 XZ，格）。
+///
+/// 与 `ComputeBuildingEnclosure`（只看屋顶）的差异：这是**整座建筑的地面投影**（所有 `kit` 构件参与），
+/// 供落点模式 ④（"落地必须平整"）在地形上采样 footprint 内的起伏。
+/// 返回 `false` ⇒ 无有效构件（调用方按"无法判定 ⇒ 拒绝 + 提示"处理）。
+[[nodiscard]] bool ComputeBuildingFootprintXZ(const ObjectBuilding& building, const ObjectTable& table, float& outMinX,
+                                              float& outMaxX, float& outMinZ, float& outMaxZ) noexcept;
 
 /// 物件配置：**类型表 + 放置清单**，来自同一个 TOML（`assets/config/objects.toml`）。
 /// 加载失败（文件缺失 / 语法错 / 字段缺失 / 取值非法 / `id` 重复 / `placement` 引用不存在的类型）
@@ -276,6 +343,8 @@ struct ObjectTable {
     std::vector<ObjectScatterTiled> tiledScatters;  ///< 按文件顺序（确定性；V0.6 C3：`[[scatter_tiled]]` 流式形态）
     std::vector<ObjectRemoval>   removals;    ///< 按文件顺序（确定性；E3：可编辑层的删除项）
     std::vector<ObjectBuilding>  buildings;   ///< 按文件顺序（确定性；V0.8：成套建筑）
+    std::vector<ObjectBuildingRemoval>   buildingRemovals;   ///< 按文件顺序（确定性；V0.9：`[[remove_building]]`）
+    std::vector<ObjectBuildingDarkening> buildingDarkenings;  ///< 按文件顺序（确定性；V0.9：`[[building_darkening]]`）
 
     /// 从 TOML 文件加载并校验；失败抛 `std::runtime_error`。
     [[nodiscard]] static ObjectTable LoadFromFile(const std::filesystem::path& path);
@@ -291,6 +360,9 @@ struct ObjectTable {
 
     /// 按 `id` 查类型；不存在返回 `nullptr`。
     [[nodiscard]] const ObjectType* Find(const std::string& id) const noexcept;
+
+    /// 按 `id` 查**成套建筑**（V0.9）；不存在返回 `nullptr`。
+    [[nodiscard]] const ObjectBuilding* FindBuilding(const std::string& id) const noexcept;
 };
 
 /// 把**可编辑层**（`overlay`，手工摆放的落点）**叠加**到**发布清单**（`base`）之上（阶段 V0.5 的 E1）。

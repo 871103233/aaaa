@@ -60,6 +60,7 @@
 #include "premade/premade_map.hpp"
 #include "premade/premade_terrain_source.hpp"
 #include "save/world_instance_save.hpp"
+#include "save/world_state_save.hpp"  // V0.10 S4：世界状态差量（`.voxr` v2）的会话与异步写盘
 #include "shell/surface_shell.hpp"
 #include "water/river.hpp"
 #include "test_mode.hpp"
@@ -138,6 +139,238 @@ namespace {
     }
     return save;
 }
+
+// ---------------------------------------------------------------
+// V0.10 S4：世界状态存档（`.voxr` v2 的**运行期会话**；[ADR 0037](../../docs/adr/0037-world-state-save-v2-and-terrain-persistence.md) 决策三 / 四 / 五）
+//   采集（主线程，只对**脏 tile**）→ 会话（内存块表）→ 异步写盘（worker）→ 收包
+// 与 V10 的"秘境绑定"平行：那个存**元数据**（种子 / 第几次生成），这个存**世界改动**（高度场差量）。
+// ---------------------------------------------------------------
+
+/// 本机**世界状态存档**路径：`<设置目录>/saves/world_<id>.voxr`（与 `instances.toml` 同目录）。
+///
+/// 为什么按**世界 id** 一档一文件（单槽自动，口径同 ADR 0030）：切世界时各世界的改动互不污染；
+/// 档内头部再记 `worldSeed` / tile 半径 ⇒ 种子变了（秘境被重置）按**不匹配拒绝**（不静默误读）。
+[[nodiscard]] std::filesystem::path WorldStateSavePath(const std::string& worldId) {
+    return vx::SystemSettingsPath().parent_path() / "saves" / ("world_" + worldId + ".voxr");
+}
+
+/// 一个世界一轮的**世界状态落盘**：会话 + 异步写盘器 + 节流记账。
+///
+/// 三件事各归其位（SKILL 第四节「主线程绝不阻塞在磁盘」）：
+///   - **采集**（主线程）：只对**脏 tile** 重算差量（`ExportTileEdits`）；`TerrainWorld::EditSerial()`
+///     让"自上次落盘以来没变过"时 **O(1)** 跳过（否则每次 flush 都要为每个脏 tile 重算一次生成结果）；
+///   - **写盘**（worker）：zstd + 文件 IO；主线程只提交快照 + 收包 —— **永不**在渲染帧内等磁盘；
+///   - **卸载前采集**（`RecordTile`）：脏 tile 离开常驻集合**之前**把差量搬进会话 ⇒ 卸载**不丢改动**
+///     （ADR 0037 决策四的**目的**；与决策五"主线程不阻塞磁盘"取交集 —— 见 `plans/v0.10.md` 的口径澄清）。
+struct WorldStatePersistence {
+    /// 延迟批量 flush 间隔（秒）。ADR 0037 决策四给的是 5~10 s ⇒ 取中间值。
+    static constexpr double kFlushIntervalSeconds = 6.0;
+
+    bool                                enabled = true;
+    std::filesystem::path               path;
+    vx::WorldStateSave                  state;
+    std::optional<vx::WorldSaveFlusher> flusher;  ///< 只在 `enabled` 时构造（不白建线程池）
+    double                              nextFlushAtSeconds = 0.0;
+
+    std::uint64_t flushedSerial   = 0;  ///< 上次**写盘成功**时的地形编辑序号
+    std::size_t   flushedChunks   = 0;  ///< 上次**写盘成功**时的块数
+    std::uint64_t submittedSerial = 0;  ///< 在飞快照对应的地形编辑序号
+    std::size_t   submittedChunks = 0;
+    std::size_t   flushedCount    = 0;  ///< 成功写盘次数（观测 / 退出日志）
+    bool          warnedFailure   = false;
+
+    /// 高度场脏列的块键（`(tileX, 0, tileZ)` —— ADR 0037 决策二冻结）。
+    [[nodiscard]] static vx::WorldSaveChunkKey HeightKey(const vx::TileCoord& coord) noexcept {
+        return vx::WorldSaveChunkKey { vx::WorldSaveChunkKind::HeightDirtyTile, coord.x, 0, coord.z };
+    }
+
+    /// 脏体积块的块键（坐标 = 体积块坐标；ADR 0037 决策二冻结）。
+    [[nodiscard]] static vx::WorldSaveChunkKey VolumeKey(const vx::BlockCoord& coord) noexcept {
+        return vx::WorldSaveChunkKey { vx::WorldSaveChunkKind::VolumeDirtyBlock, coord.x, coord.y, coord.z };
+    }
+
+    /// 尚未叠加的**体积块**载荷（键 = 块坐标）。读档时由文件里的 `VolumeDirtyBlock` 键填好；
+    /// 块**就位（常驻）之后**才叠加（ADR 0037 决策三：差量只作用于已生成的单元）。
+    std::set<vx::BlockCoord> pendingVolumeBlocks;
+
+    /// 读档后调用一次：把文件里的体积块键登记为"待叠加"。
+    void BeginVolumeApplies() {
+        if (!enabled) {
+            return;
+        }
+        for (const auto& entry : state.Chunks()) {
+            if (entry.first.kind != vx::WorldSaveChunkKind::VolumeDirtyBlock) {
+                continue;
+            }
+            pendingVolumeBlocks.insert(vx::BlockCoord { entry.first.x, entry.first.y, entry.first.z });
+        }
+    }
+
+    /// 每帧推进：把**已常驻**的待叠加体积块叠加进世界（至多 `maxBlocks` 个/帧）。
+    /// 有改动的块坐标追加到 `appliedOut` —— 调用方把它排进**既有的延后队列**
+    /// （重网格 + GPU 上传 + 碰撞体重建，按帧预算摊平），**不在渲染帧内同步重网格**。
+    ///
+    /// 体积块**不需要"卸载前采集"**：ADR 0020 决策五明令**脏块不得被正常卸载**（`UnloadBlock` 对脏块返回 false）
+    /// ⇒ 脏块一直常驻、flush 时直接从世界采集。唯一会丢的是"脏块超上限被强制淘汰"（`EvictBlock`，
+    /// 那条路径本就有 WARN），丢的至多是"上次 flush 之后的改动"。
+    std::size_t ApplyPendingVolumeBlocks(vx::DigVolumeWorld& volumes, std::size_t maxBlocks,
+                                         std::vector<vx::BlockCoord>& appliedOut) {
+        if (!enabled || pendingVolumeBlocks.empty()) {
+            return 0;
+        }
+        std::size_t applied = 0;
+        for (auto it = pendingVolumeBlocks.begin(); it != pendingVolumeBlocks.end() && applied < maxBlocks;) {
+            const vx::BlockCoord             coord = *it;
+            const std::vector<std::uint8_t>* raw   = state.FindChunk(VolumeKey(coord));
+            if (raw == nullptr) {
+                it = pendingVolumeBlocks.erase(it);  // 档里已无该块（被覆盖 / 撤销）⇒ 不再等
+                continue;
+            }
+            if (volumes.Blocks().find(coord) == volumes.Blocks().end()) {
+                ++it;  // 未常驻 ⇒ 等它被建出来（ADR 0037 决策三）
+                continue;
+            }
+            const vx::VolumeDirtyPayload payload = vx::DecodeVolumeDirtyBlock(*raw);
+            if (volumes.ApplyBlockSave(coord, payload)) {
+                appliedOut.push_back(coord);
+            }
+            it = pendingVolumeBlocks.erase(it);
+            ++applied;
+        }
+        return applied;
+    }
+
+    /// 卸载**之前**采集该 tile 的差量（ADR 0037 决策四）。
+    void RecordTile(vx::TerrainWorld& world, const vx::TileCoord& coord) {
+        if (!enabled) {
+            return;
+        }
+        const std::vector<vx::HeightDirtyEntry> entries = world.ExportTileEdits(coord);
+        if (entries.empty()) {
+            state.EraseChunk(HeightKey(coord));  // 已回到生成值 ⇒ 撤掉这条块（自动收敛）
+        } else {
+            state.SetChunk(HeightKey(coord), vx::EncodeHeightDirtyTile(entries));
+        }
+    }
+
+    /// 读档：**生成之后**叠加差量（ADR 0037 决策三"禁止颠倒"）。返回是否真的叠加过。
+    bool ApplyTile(vx::TerrainWorld& world, const vx::TileCoord& coord) {
+        if (!enabled) {
+            return false;
+        }
+        const std::vector<std::uint8_t>* raw = state.FindChunk(HeightKey(coord));
+        if (raw == nullptr) {
+            return false;
+        }
+        const std::vector<vx::HeightDirtyEntry> entries = vx::DecodeHeightDirtyTile(*raw);
+        if (entries.empty()) {
+            return false;
+        }
+        std::vector<vx::TileCoord> touched;
+        world.ApplyHeightEdits(coord, entries, touched);
+        return true;
+    }
+
+    /// **非阻塞**收包（每帧一次）：只有写盘**成功**才推进"已落盘水位" ⇒ 失败会在下个间隔自动重试。
+    void Poll() {
+        if (flusher == std::nullopt) {
+            return;
+        }
+        std::string error;
+        if (!flusher->Poll(error)) {
+            return;
+        }
+        if (error.empty()) {
+            ++flushedCount;
+            flushedSerial = submittedSerial;
+            flushedChunks = submittedChunks;
+            warnedFailure = false;
+            return;
+        }
+        if (!warnedFailure) {
+            warnedFailure = true;
+            VX_LOG_WARN("世界状态存档（V0.10 / ADR 0037）：写盘失败 ⇒ **保留上一份好档**、下个间隔重试：%s",
+                        error.c_str());
+        }
+    }
+
+    /// 触发一次写盘。`blocking = true`（退出前强制）⇒ 先把在飞那次收干净，再同步等本次写完。
+    void Flush(vx::TerrainWorld& world, vx::DigVolumeWorld& volumes, double nowSeconds, const char* trigger,
+               bool blocking) {
+        if (!enabled || flusher == std::nullopt) {
+            return;
+        }
+        if (flusher->Busy()) {
+            if (!blocking) {
+                return;  // 异步路径：下轮再试（不排队堆积）
+            }
+            std::string error;
+            flusher->WaitForIdle(error);  // 退出前：收干净在飞的那次（渲染帧内**走不到这里**）
+            if (error.empty()) {
+                ++flushedCount;
+                flushedSerial = submittedSerial;
+                flushedChunks = submittedChunks;
+            } else {
+                VX_LOG_WARN("世界状态存档（V0.10）：退出前收取在飞写盘时报错：%s", error.c_str());
+            }
+        }
+        if (!blocking && nowSeconds < nextFlushAtSeconds) {
+            return;
+        }
+        nextFlushAtSeconds = nowSeconds + kFlushIntervalSeconds;
+
+        const std::uint64_t serial = world.EditSerial();
+        if (!blocking && serial == flushedSerial && state.ChunkCount() == flushedChunks) {
+            return;  // 自上次落盘以来**没有任何改动** ⇒ 不空转 IO
+        }
+        // 采集：把**仍常驻**的脏 tile 的当前差量覆盖进会话（已卸载的那些保持会话里的值 —— 卸载前已采）。
+        for (const vx::TileCoord& coord : world.EditedTiles()) {
+            if (world.FindTile(coord.x, coord.z) == nullptr) {
+                continue;
+            }
+            const std::vector<vx::HeightDirtyEntry> entries = world.ExportTileEdits(coord);
+            if (entries.empty()) {
+                state.EraseChunk(HeightKey(coord));
+            } else {
+                state.SetChunk(HeightKey(coord), vx::EncodeHeightDirtyTile(entries));
+            }
+        }
+        // 采集（体积块）：脏块按 ADR 0020 决策五**不会被正常卸载** ⇒ 直接从常驻集合里采（无需卸载前挂钩）。
+        for (const vx::BlockCoord& coord : volumes.ResidentBlocks()) {
+            if (!volumes.IsBlockDirty(coord)) {
+                continue;  // 未改动 ⇒ 不落盘（判据②）
+            }
+            vx::VolumeDirtyPayload payload;
+            if (volumes.ExportBlockSave(coord, payload)) {
+                state.SetChunk(VolumeKey(coord), vx::EncodeVolumeDirtyBlock(payload));
+            }
+        }
+        if (state.ChunkCount() == 0U) {
+            return;  // 一处改动都没有 ⇒ 不产生空档（也就不会覆盖掉上一份好档）
+        }
+        submittedSerial = serial;
+        submittedChunks = state.ChunkCount();
+        if (!flusher->Submit(state, path)) {  // 拷一份给 worker（主线程之后仍可改 `state`）
+            return;
+        }
+        VX_LOG_INFO("世界状态存档（V0.10 / ADR 0037）：提交写盘 %zu 块（触发：%s）—— 序列化 / 压缩 / IO 全在 worker，"
+                    "主线程只提交快照 + 收包",
+                    submittedChunks, trigger);
+        if (blocking) {
+            std::string error;
+            flusher->WaitForIdle(error);
+            if (error.empty()) {
+                ++flushedCount;
+                flushedSerial = submittedSerial;
+                flushedChunks = submittedChunks;
+                VX_LOG_INFO("世界状态存档（V0.10）：退出前**强制写盘完成**（累计成功 %zu 次；%s）",
+                            flushedCount, path.string().c_str());
+            } else {
+                VX_LOG_WARN("世界状态存档（V0.10）：退出前强制写盘失败 ⇒ 保留上一份好档：%s", error.c_str());
+            }
+        }
+    }
+};
 
 // ---------------------------------------------------------------
 // 场景参数（默认加载 3×3 tile 的预设地图 test_range，范围由地图文件决定）
@@ -359,8 +592,19 @@ struct WorldAabb {
     return true;
 }
 
+/// V0.9（[ADR 0036](../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策四）：
+/// `F2` 选择器里**成套建筑**的**合成类别名** —— 它是"成套建筑"这一**另一种实体**的入口，
+/// **不进** `ObjectType::category` 值域（[ADR 0032](../docs/adr/0032-object-palette-and-placement-mode.md) 决策二不变）。
+/// 取值必须是**纯 ASCII**（选择器直接显示类别名；无 CJK 字体时不得缺字）。
+constexpr const char* kBuildingSetCategoryName = "building_set";
+
 /// 由类型表构造**选择器显示数据**（V0.5 E3）：一级 = 类别、二级 = 类型 id；并把 `currentTypeId` 位置作为初始选中。
-[[nodiscard]] vx::PaletteModel BuildPaletteModelFrom(const vx::ObjectTable& table, const std::string& currentTypeId) {
+///
+/// V0.9 / [ADR 0036](../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策四：
+/// **追加一个合成的「成套建筑」类别**（`kBuildingSetCategoryName`），其二级项 = `table.buildings` 的 id
+/// （按文件顺序 ⇒ 确定性）。它**不在** `ObjectType::category` 值域里（那是类型表的字段）；
+/// 由于解析期已强制"建筑 id 与类型 id 不重名"，游戏层按"先查类型、再查建筑"即可**无歧义**解析。
+[[nodiscard]] vx::PaletteModel BuildPaletteModelFrom(const vx::ObjectTable& table, const std::string& currentId) {
     vx::PaletteModel                       model;
     const std::vector<vx::PaletteCategory> categories = vx::BuildPalette(table);
     std::size_t                            selectedCategory = 0;
@@ -371,9 +615,23 @@ struct WorldAabb {
         ids.reserve(categories[categoryIndex].types.size());
         for (std::size_t typeIndex = 0; typeIndex < categories[categoryIndex].types.size(); ++typeIndex) {
             ids.push_back(categories[categoryIndex].types[typeIndex]->id);
-            if (categories[categoryIndex].types[typeIndex]->id == currentTypeId) {
+            if (categories[categoryIndex].types[typeIndex]->id == currentId) {
                 selectedCategory = categoryIndex;
                 selectedType     = typeIndex;
+            }
+        }
+        model.typeIdsByCategory.push_back(std::move(ids));
+    }
+    // V0.9：成套建筑（合成类别；列表为空则不出现该类别）。
+    if (!table.buildings.empty()) {
+        model.categoryNames.push_back(kBuildingSetCategoryName);
+        std::vector<std::string> ids;
+        ids.reserve(table.buildings.size());
+        for (const vx::ObjectBuilding& building : table.buildings) {
+            ids.push_back(building.id);
+            if (building.id == currentId) {
+                selectedCategory = model.categoryNames.size() - 1U;
+                selectedType     = ids.size() - 1U;
             }
         }
         model.typeIdsByCategory.push_back(std::move(ids));
@@ -381,6 +639,23 @@ struct WorldAabb {
     model.state.categoryIndex = selectedCategory;
     model.state.typeIndex     = selectedType;
     return model;
+}
+
+/// V0.9 / [ADR 0036](../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策四：
+/// 为**新摆放**的成套建筑生成一个在该世界内**唯一**的 id（模板 id 已存在 ⇒ 取 `模板#N` 的最小空闲 N）。
+/// **确定性**（红线 7）：同一个"已存在集合"总是给出同一个 N。
+[[nodiscard]] std::string MakeUniqueBuildingId(const vx::ObjectTable& table, const vx::ObjectTable& edits,
+                                               const std::string& templateId) {
+    const auto exists = [&](const std::string& id) {
+        return table.FindBuilding(id) != nullptr || edits.FindBuilding(id) != nullptr;
+    };
+    for (int suffix = 1; suffix < 1000000; ++suffix) {
+        const std::string candidate = templateId + "#" + std::to_string(suffix);
+        if (!exists(candidate)) {
+            return candidate;
+        }
+    }
+    return templateId;  // 不可达（百万级同名建筑）
 }
 
 /// 从"编辑层新增落点"里按（类型 + 平面位置 + ε）删掉一条；删到返回 true（V0.5 E3 的删除分流）。
@@ -393,6 +668,36 @@ struct WorldAabb {
         }
     }
     return false;
+}
+
+/// V0.9 / [ADR 0036](../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策四：
+/// 从"编辑层新增成套建筑"里按 **id**（精确匹配）删掉一座；删到返回 true。
+/// 与 `EraseEditLayerPlacement` 的差异：建筑有**唯一 id** ⇒ 不需要"类型 + 平面位置 + ε"的模糊匹配。
+[[nodiscard]] bool EraseEditLayerBuilding(std::vector<vx::ObjectBuilding>& buildings, const std::string& buildingId) {
+    for (auto it = buildings.begin(); it != buildings.end(); ++it) {
+        if (it->id == buildingId) {
+            buildings.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
+/// V0.9 / ADR 0036 决策四：落点模式的**配置 token**（纯 ASCII ⇒ 无 CJK 字体时 HUD 也不缺字）。
+[[nodiscard]] const char* LandingModeToken(vx::ObjectBuildingLandingMode mode) noexcept {
+    switch (mode) {
+        case vx::ObjectBuildingLandingMode::Sink:
+            return "sink";
+        case vx::ObjectBuildingLandingMode::FlatOnly:
+            return "flat_only";
+        case vx::ObjectBuildingLandingMode::Flatten:
+            return "flatten";
+        case vx::ObjectBuildingLandingMode::Fill:
+            return "fill";
+        case vx::ObjectBuildingLandingMode::Unspecified:
+            return "unspecified";
+    }
+    return "unspecified";
 }
 
 /// W7-S3b：地表 **LOD 分环**（[ADR 0024](../../docs/adr/0024-terrain-streaming-and-lod.md) 决策二）。
@@ -723,6 +1028,9 @@ constexpr float kPlacementRemoveTolerance = 0.5F;
 /// 用户的拖动偏移叠加在它之上（见 `PaletteModel::previewYawRadians`）。
 constexpr float kPalettePreviewSpinRadiansPerSecond = 0.6F;
 
+/// V0.9 / ADR 0036 决策三：摆放模式里 `[` / `]` 调整室内变暗的**步进**。
+constexpr float kPlacementDarkenStep = 0.05F;
+
 /// 相机视线方向 = 屏幕中心"准星"的方向。
 ///
 /// 第三人称下视线由 `eye → target` 给出：相机可能被避障 / 离地间隙抬高，因此**不能**用 yaw / pitch
@@ -966,6 +1274,9 @@ struct ObjectSlot {
     /// 该物件所属建筑的**围合体代理**（世界坐标）。`enabled = false` ⇒ 室外物件（逐位退回旧行为）。
     /// 由成套建筑展开时**按建筑统一**写入（同一座建筑的每个构件带同一份围合体）⇒ 片元能判定"是否室内"。
     vx::ObjectEnclosure          enclosure {};
+    /// **V0.9：来源建筑 id**（[ADR 0036](../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策四）。
+    /// 空串 = 非成套建筑构件（单件 `[[placement]]` / 散布 / 动态）。右键删除与选中态调参**按整座**处理。
+    std::string                  buildingId;
 };
 
 /// 支撑探测的**下探深度**（格）：探测点取"底面中心 − 该深度"。小于它 ⇒ 视为脚下已是空的。
@@ -1837,6 +2148,13 @@ constexpr std::size_t kVolumeResidencyActionsPerFrame = 1;
 /// 上界明确 ⇒ 主线程单帧成本有界（SKILL 第四节：新增每帧工作必须"有上界"）。
 constexpr std::size_t kVolumeBuildsInstalledPerFrame = 4;
 
+/// V0.10 S3：每帧最多**叠加**几个存档体积块（读档路径）。
+///
+/// 叠加本身只改数组（廉价），但随后必须重网格 + 上传 + 重建碰撞体 —— 那三件事已入延后队列，
+/// 这里限 1 个/帧是让"需要进队列的重活"有上界（每块 debug 下 5~9 ms）。
+/// 只对**被挖过的**块发生，故正常世界里绝大多数帧该值为 0。
+constexpr std::size_t kVolumeSaveAppliesPerFrame = 1;
+
 /// 网格上传的**每批个数**：单个网格的上传是一次阻塞拷贝，取 4 使其 ≲ 5 ms。
 constexpr std::size_t kMeshUploadsPerSlice = 4;
 
@@ -2057,6 +2375,25 @@ int main(int argc, char** argv) {
         }
     }
 
+    // V0.10 S4（[ADR 0037](../../docs/adr/0037-world-state-save-v2-and-terrain-persistence.md)）：`--world-save=on|off`
+    // —— **世界状态存档**（高度场差量 → `.voxr` v2）的开关（缺省 **on**）。SKILL §五「已实现能力只允许用配置项关闭」：
+    // 关掉后**既不读档也不写盘**（行为与 V0.9 逐位一致），用于 A/B 对照与故障隔离。
+    bool worldSaveEnabled = true;
+    for (const std::string& argument : arguments) {
+        constexpr const char* kWorldSavePrefix = "--world-save=";
+        if (argument.rfind(kWorldSavePrefix, 0) != 0) {
+            continue;
+        }
+        const std::string value = argument.substr(std::char_traits<char>::length(kWorldSavePrefix));
+        if (value == "off" || value == "0" || value == "false") {
+            worldSaveEnabled = false;
+        } else if (value == "on" || value == "1" || value == "true") {
+            worldSaveEnabled = true;
+        } else {
+            VX_LOG_WARN("`--world-save` 取值非法（应为 on|off）：%s ⇒ 保持缺省 on", value.c_str());
+        }
+    }
+
     // V0.7 H3：`--object-collision-radius=<格>` —— 静态物件**物理体**的半径裁剪（缺省 `kObjectCollisionRadiusBlocks`；
     // `0` = **关闭裁剪**，回到"每体常驻"的旧行为）。用于 H3 的 A/B 实测（`plans/v0.7.md` §4）。
     double objectCollisionRadiusBlocks = kObjectCollisionRadiusBlocks;
@@ -2087,6 +2424,35 @@ int main(int argc, char** argv) {
         } catch (const std::exception&) {
             VX_LOG_WARN("`--object-lod-distance` 取值非法 ⇒ 保持缺省 %.0f 格", kObjectLodDistanceBlocks);
             objectLodDistanceBlocks = kObjectLodDistanceBlocks;
+        }
+    }
+
+    // V0.9（[ADR 0036](../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策一）：
+    // `--interior-darkening=<0~1>` —— 室内变暗的**全局默认值**（缺省 `kDefaultInteriorDarkening` = 0.45）。
+    // 口径（与 `--object-instancing` 的 WARN + 静默回退**不同**）：**非法值（越界 / 非数 / 空 / 带尾随字符）⇒ 启动失败**。
+    // `1.0` = 完全不调暗 ⇒ 环境项乘 1.0 = 恒等 ⇒ **逐位退回"引入室内变暗之前"的行为**（判据①）。
+    float interiorDarkening = vx::kDefaultInteriorDarkening;
+    for (const std::string& argument : arguments) {
+        constexpr const char* kInteriorDarkeningPrefix = "--interior-darkening=";
+        if (argument.rfind(kInteriorDarkeningPrefix, 0) != 0) {
+            continue;
+        }
+        const std::string value = argument.substr(std::char_traits<char>::length(kInteriorDarkeningPrefix));
+        bool              parsed = false;
+        try {
+            std::size_t  consumed    = 0;
+            const double parsedValue = std::stod(value, &consumed);
+            if (consumed == value.size() && parsedValue >= 0.0 && parsedValue <= 1.0) {
+                interiorDarkening = static_cast<float>(parsedValue);
+                parsed            = true;
+            }
+        } catch (const std::exception&) {
+            parsed = false;
+        }
+        if (!parsed) {
+            VX_LOG_ERROR("`--interior-darkening` 取值非法：\"%s\"（必须是 [0, 1] 区间的数值；1 = 完全不调暗）⇒ 启动失败",
+                         value.c_str());
+            return EXIT_FAILURE;
         }
     }
 
@@ -2460,6 +2826,9 @@ int main(int argc, char** argv) {
         input.BindKey(vx::ActionId::PlacementRepeatLast, SDL_SCANCODE_F3);     // V0.5 E3：重复上次
         input.BindKey(vx::ActionId::PlacementSave, SDL_SCANCODE_F5);           // V0.5 E3：保存可编辑层
         input.BindMouseButton(vx::ActionId::PlacementRemove, SDL_BUTTON_RIGHT);  // V0.5 E3：摆放模式删除
+        input.BindKey(vx::ActionId::PlacementLandingMode, SDL_SCANCODE_T);        // V0.9：成套建筑落点模式循环
+        input.BindKey(vx::ActionId::PlacementDarkenDown, SDL_SCANCODE_LEFTBRACKET);   // V0.9：室内变暗 −
+        input.BindKey(vx::ActionId::PlacementDarkenUp, SDL_SCANCODE_RIGHTBRACKET);    // V0.9：室内变暗 +
         input.BindMouseButton(vx::ActionId::Attack, SDL_BUTTON_LEFT);   // T27：左键 = 发射光球（摆放模式内 = 放下）
         input.BindMouseAxis(vx::ActionId::LookX, vx::MouseAxis::X);
         input.BindMouseAxis(vx::ActionId::LookY, vx::MouseAxis::Y);
@@ -2750,6 +3119,8 @@ int main(int argc, char** argv) {
         std::vector<vx::BlockCoord> volumeResidencyChanged;  ///< 每帧调度产生的"建 / 卸"块（复用缓冲）
         std::vector<vx::BlockCoord> volumeCreated;           ///< 本帧新建的块（入延后队列，复用缓冲）
         std::vector<vx::TileCoord>  volumeTouchedTiles;      ///< 本帧接管状态翻转的 tile（入延后队列，复用缓冲）
+        /// V0.10 S3：本帧**叠加了存档差量**的体积块（入同一延后队列：重网格 + 上传 + 碰撞体，复用缓冲）
+        std::vector<vx::BlockCoord> volumeSaveApplied;
 
         // ---- V4（[ADR 0026](../docs/adr/0026-premade-map-format-and-bake-tool.md)）：`source = premade` ⇒
         // 地表数据来自**离线烘焙的预制文件**（不再程序化生成）。**校验即抛**：文件缺失 / 魔数错 / 版本不符 /
@@ -2784,6 +3155,68 @@ int main(int argc, char** argv) {
         world.SetMapPreset(preset);  // 噪声先行、编辑覆盖其上（必须在 LoadTile 之前）
         // V4：注入地表数据源（`nullptr` ⇒ 程序化，与从前**逐位一致**）。必须在 LoadTile 之前。
         world.SetTileSource(premadeTerrainSource.get());
+
+        // ---- V0.10 S4：世界状态存档（`.voxr` v2）—— **读档** + 会话 ----
+        // 世界 id：走清单时用清单 id；走 `--map=` 时用地图文件名 ⇒ 一档一文件（`WorldStateSavePath`）。
+        // 读档失败（语法 / 版本 / 校验和）由 `LoadFromFile` **抛**（被外层捕获并报出，**不静默误读**）。
+        const std::string worldSaveId =
+            (roundManifest != nullptr) ? roundManifest->id : std::filesystem::path(mapFile).stem().string();
+        WorldStatePersistence worldState;
+        worldState.enabled = worldSaveEnabled;
+        worldState.path    = WorldStateSavePath(worldSaveId);
+        {
+            vx::WorldSaveHeader header;
+            // S6（未开工）：`generatorVersion`（地形参数内容哈希）/ `digRegionContentHash` 暂写 0 —— 不假装已校验。
+            header.generatorVersion       = 0;
+            header.tileRadiusX            = preset.tileRadiusX;
+            header.tileRadiusZ            = preset.tileRadiusZ;
+            header.worldSeed              = static_cast<std::int64_t>(preset.seed);
+            header.digRegionSchemaVersion = 0;
+            header.digRegionContentHash   = 0;
+            worldState.state.SetHeader(header);
+        }
+        if (worldState.enabled) {
+            std::error_code mkdirError;
+            std::filesystem::create_directories(worldState.path.parent_path(), mkdirError);
+            if (mkdirError) {
+                // 不静默：目录建不出来 ⇒ 后续写入会失败（只 WARN，不影响本次游戏）。
+                VX_LOG_WARN("世界状态存档（V0.10）：无法创建目录 %s —— %s（本次将无法写入）",
+                            worldState.path.parent_path().string().c_str(), mkdirError.message().c_str());
+            }
+            bool                     found       = false;
+            const vx::WorldStateSave loaded      = vx::WorldStateSave::LoadFromFile(worldState.path, found);
+            const vx::WorldSaveHeader& loadedHeader = loaded.Header();
+            const bool               matches =
+                found && loadedHeader.worldSeed == static_cast<std::int64_t>(preset.seed) &&
+                loadedHeader.tileRadiusX == preset.tileRadiusX && loadedHeader.tileRadiusZ == preset.tileRadiusZ;
+            if (!found) {
+                VX_LOG_INFO("世界状态存档（V0.10 / ADR 0037）：世界 [%s] 无既有档（%s）⇒ 本次从零开始",
+                            worldSaveId.c_str(), worldState.path.string().c_str());
+            } else if (!matches) {
+                VX_LOG_WARN("世界状态存档（V0.10）：档 %s 与当前世界定义**不匹配**（档内 种子 %lld / 半径 [%d, %d]；"
+                            "当前 种子 %llu / 半径 [%d, %d]）⇒ **忽略该档**（不静默误读；秘境被重置过？）",
+                            worldState.path.string().c_str(), static_cast<long long>(loadedHeader.worldSeed),
+                            loadedHeader.tileRadiusX, loadedHeader.tileRadiusZ,
+                            static_cast<unsigned long long>(preset.seed), preset.tileRadiusX, preset.tileRadiusZ);
+            } else {
+                worldState.state = loaded;
+                worldState.BeginVolumeApplies();  // 体积块差量：登记为"待叠加"（块就位后才叠加）
+                const std::size_t volumeBlocks = worldState.pendingVolumeBlocks.size();
+                VX_LOG_INFO("世界状态存档（V0.10 / ADR 0037）：已读档 %s —— **%zu 个脏单元**"
+                            "（高度场 %zu 个 tile + 体积 %zu 个块；后者待块常驻后**分帧叠加**）；"
+                            "差量一律在**生成之后**叠加（ADR 0037 决策三：禁止颠倒）",
+                            worldState.path.string().c_str(), loaded.ChunkCount(),
+                            loaded.ChunkCount() - volumeBlocks, volumeBlocks);
+            }
+            worldState.flusher.emplace();  // 写盘线程池（1 个 worker；不可用时 `Submit` 同步执行）
+            VX_LOG_INFO("世界状态存档（V0.10）：写盘通道 = %s；延迟批量 flush %.0f s + **退出前强制 flush**",
+                        worldState.flusher->HasWorkers() ? "worker 异步（主线程只提交快照 + 收包）"
+                                                         : "**线程池不可用 ⇒ 同步写盘**",
+                        WorldStatePersistence::kFlushIntervalSeconds);
+        } else {
+            VX_LOG_INFO("世界状态存档（V0.10）：**已由 `--world-save=off` 关闭** ⇒ 不读档、不写盘"
+                        "（行为与 V0.9 逐位一致）");
+        }
 
         // V0.6 C5：**流式散布**的地貌判据要读"地貌掩罩" ⇒ 单独持有一个噪声生成器。
         // 纯函数、线程安全；口径只由 `(seed, terrainParams)` 决定（与 `world` / 建块 worker 各自的实例互不影响）。
@@ -2958,6 +3391,11 @@ int main(int argc, char** argv) {
                     (void)tileScheduler.Step(world, kTerrainTilesPerLoadSlice, terrainResidencyChanged);
                     for (const vx::TileCoord& coord : terrainResidencyChanged) {
                         // 世界数据已由 `Step`（从预取缓存）安装 ⇒ 这里只登记常驻集合（GPU / 碰撞在后续阶段）。
+                        // V0.10 S4：启动装载同样要在**生成之后**叠加存档差量（ADR 0037 决策三）——
+                        // 启动时读档的意义就在于"进去就看见上次挖的坑"，不能只对流式装载生效。
+                        if (worldState.ApplyTile(world, coord)) {
+                            world.MeshTile(coord.x, coord.z, tileScheduler.LodLevelForTile(coord));
+                        }
                         // ⚠️ 四个并行数组**必须同步增长**（同下标 = 同一 tile）；漏掉任一个都会让后续
                         // `SyncResidentTileCollision` 的按下标写入越界（曾经真的踩到）。
                         tileCoords.push_back(coord);
@@ -3692,26 +4130,24 @@ int main(int argc, char** argv) {
             addObjectSlot(instance);
         }
 
-        // ---- V0.8：**成套建筑**（`[[building]]`）展开为逐构件物件（[ADR 0035](../docs/adr/0035-modular-building-kit-and-enterable-spaces.md) 决策三）----
+        // ---- V0.8/V0.9：**成套建筑**（`[[building]]`）展开为逐构件物件（[ADR 0035](../docs/adr/0035-modular-building-kit-and-enterable-spaces.md) 决策三）----
         // 为什么必须在游戏层展开：构件要**竖直堆叠**（墙压地板、屋顶压墙），而逐件 `[[placement]]` 的 `y`
         // 一律按地表高度求解（见上）⇒ 只有"锚点解算**一次**地表高度 + 构件用**相对偏移**"才能得到正确层高。
         // 构件与逐件放置走**同一条装配路径**（`objectLayer.Place` + `addObjectSlot`）⇒ 渲染 / 碰撞 / 剔除 /
         // 实例化 / 远景 LOD **零分叉**；朝向旋转与 `RotateMeshAboutY` **同一约定**（绕 +Y 右手系）。
+        // V0.9：抽成 `expandBuilding`，**加载期与运行期摆放共用**；落点模式在此决定锚点高度（`Sink` 下沉）。
         std::size_t buildingPieceTotal = 0;
         std::size_t buildingSkipped    = 0;
         std::size_t buildingEnclosed   = 0;  ///< 带围合体代理（= 可进入空间）的建筑数
-        for (const vx::ObjectBuilding& building : objects.buildings) {
-            float anchorSurface = 0.0F;
-            if (!world.QueryHeight(building.x, building.z, anchorSurface)) {
-                VX_LOG_WARN("建筑 [%s] 的锚点 (%.1f, %.1f) 无地表数据 ⇒ 跳过整座建筑（%zu 个构件）",
-                            building.id.c_str(), static_cast<double>(building.x), static_cast<double>(building.z),
-                            building.pieces.size());
-                buildingSkipped += building.pieces.size();
-                continue;
+        const auto  expandBuilding     = [&](const vx::ObjectBuilding& building, float anchorSurfaceY) {
+            // V0.9 / ADR 0036 决策四：落点模式决定锚点实际高度（`Unspecified` / `FlatOnly` ⇒ 与 V0.8 一致，不下沉）。
+            float anchorY = anchorSurfaceY;
+            if (building.landingMode == vx::ObjectBuildingLandingMode::Sink) {
+                anchorY -= vx::kBuildingSinkBlocks;
             }
             // V0.8 室内变暗：由屋顶构件的并集求出该建筑的**围合体代理**（纯函数，红线 7），
             // 整座建筑的每个构件带**同一份** ⇒ 片元能一致地判定自己是否在室内。
-            const vx::ObjectEnclosure enclosure = vx::ComputeBuildingEnclosure(building, objects, anchorSurface);
+            const vx::ObjectEnclosure enclosure = vx::ComputeBuildingEnclosure(building, objects, anchorY);
             if (enclosure.enabled) {
                 ++buildingEnclosed;
             }
@@ -3726,7 +4162,7 @@ int main(int argc, char** argv) {
                 vx::ObjectPlacement placedPiece;
                 placedPiece.typeId     = piece.typeId;
                 placedPiece.x          = building.x + rotatedX;
-                placedPiece.y          = anchorSurface + piece.offsetY;  // **绝对高度**（不再按地表求解 = 堆叠）
+                placedPiece.y          = anchorY + piece.offsetY;  // **绝对高度**（不再按地表求解 = 堆叠）
                 placedPiece.z          = building.z + rotatedZ;
                 placedPiece.yawDegrees = building.yawDegrees + piece.yawDegrees;
 
@@ -3739,13 +4175,25 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 addObjectSlot(instance);
-                objectSlots.back().enclosure = enclosure;  // V0.8：构件带建筑的围合体（室内变暗）
+                objectSlots.back().enclosure  = enclosure;    // V0.8：构件带建筑的围合体（室内变暗）
+                objectSlots.back().buildingId = building.id;  // V0.9 / ADR 0036：删除与调参**按整座**记账
                 ++buildingPieceTotal;
             }
+        };
+        for (const vx::ObjectBuilding& building : objects.buildings) {
+            float anchorSurface = 0.0F;
+            if (!world.QueryHeight(building.x, building.z, anchorSurface)) {
+                VX_LOG_WARN("建筑 [%s] 的锚点 (%.1f, %.1f) 无地表数据 ⇒ 跳过整座建筑（%zu 个构件）",
+                            building.id.c_str(), static_cast<double>(building.x), static_cast<double>(building.z),
+                            building.pieces.size());
+                buildingSkipped += building.pieces.size();
+                continue;
+            }
+            expandBuilding(building, anchorSurface);
         }
         if (!objects.buildings.empty()) {
-            VX_LOG_INFO("成套建筑（V0.8 / ADR 0035）：%zu 座、展开 %zu 个构件（跳过 %zu）；其中 %zu 座带**围合体代理**"
-                        "（室内变暗 V0.8）；模数对齐由类型表的 module_blocks 保证、层高由构件相对偏移保证",
+            VX_LOG_INFO("成套建筑（V0.8/V0.9 / ADR 0035·0036）：%zu 座、展开 %zu 个构件（跳过 %zu）；其中 %zu 座带**围合体代理**"
+                        "（室内变暗）；模数对齐由类型表的 module_blocks 保证、层高由构件相对偏移保证",
                         objects.buildings.size(), buildingPieceTotal, buildingSkipped, buildingEnclosed);
         }
 
@@ -4185,52 +4633,145 @@ int main(int argc, char** argv) {
         std::string   lastPlaceTypeId;          ///< `F3` 重复上次**实际放下**的类型（空 = 还没放过）
         float         lastPlaceYawDeg = 0.0F;   ///< `F3` 重复上次**实际放下**的朝向（度）
         vx::MeshHandle previewHandle {};        ///< 幽灵预览的 GPU 网格（仅模式内有效）
-        std::string   previewTypeId;            ///< 预览网格对应的类型（变了才重建）
-        /// 本帧的预览落点（模式内每帧刷新；`nullopt` = 准星没命中地表 / 无类型 ⇒ 不显示预览、不可放下）。
+        std::string   previewTypeId;            ///< 预览网格对应的**单位**（类型 id 或建筑 id；变了才重建）
+        /// 本帧的预览落点（模式内每帧刷新；`nullopt` = 准星没命中地表 / 无单位 ⇒ 不显示预览、不可放下）。
         std::optional<vx::GroundPick> previewHit;
+        // ---- V0.9（[ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md) 决策三~四）----
+        bool          placeIsBuilding = false;    ///< 摆放单位是**成套建筑**（而非单件类型）
+        /// 建筑摆放的**待放室内变暗值**（`[`/`]` 调；初值 = 全局值 ⇒ 与"只设全局值"逐位一致）。
+        float         placementDarkening = interiorDarkening;
+        /// 建筑摆放的**落点模式**（`T` 循环；初值 = 缺省 ② 向下半埋）。
+        vx::ObjectBuildingLandingMode placementLandingMode = vx::kDefaultBuildingLandingMode;
+        /// 本帧预览是否**被落点模式拒绝**（④ 落地必须平整 且不满足）⇒ 不可放下。
+        bool          previewBlocked = false;
+        /// 准星指向的**已有建筑** id（**选中态**；空串 = 没指向建筑）。
+        std::string   hoveredBuildingId;
+        float         hoveredBuildingDarkening = 0.0F;
+        /// 成套建筑的**整座合并局部网格**（预览用；按建筑 id 缓存，只建一次）。
+        std::unordered_map<std::string, vx::MeshData> buildingMeshCache;
 
-        const auto enterPlacement = [&](const std::string& typeId) {
-            const vx::ObjectType* type = objects.Find(typeId);
-            if (type == nullptr) {
-                VX_LOG_WARN("摆放模式（E3）：类型 [%s] 不在当前世界的类型表内 ⇒ 不进入摆放模式", typeId.c_str());
+        /// V0.9：把一座成套建筑的全部构件**合并成一个局部网格**（预览用；**同源** `BuildKitPieceMesh`）。
+        /// 口径：构件按**相对偏移**平移、（相对）朝向烘进顶点；**不含**建筑自身 yaw（那由渲染位姿施加）。
+        /// 纯 CPU、只在"换建筑"时执行一次（面数级 ⇒ 与"面板动作"绑定，不进玩法热路径）。
+        const auto buildBuildingLocalMesh = [&](const vx::ObjectBuilding& building) -> const vx::MeshData& {
+            const auto cached = buildingMeshCache.find(building.id);
+            if (cached != buildingMeshCache.end()) {
+                return cached->second;
+            }
+            vx::MeshData merged;
+            for (const vx::ObjectBuildingPiece& piece : building.pieces) {
+                const vx::ObjectType* type = objects.Find(piece.typeId);
+                if (type == nullptr) {
+                    continue;
+                }
+                const vx::MeshData  pieceMesh = vx::RotateMeshAboutY(buildLocalMesh(*type), piece.yawDegrees);
+                const std::uint32_t base      = static_cast<std::uint32_t>(merged.vertices.size());
+                for (vx::MeshVertex vertex : pieceMesh.vertices) {
+                    vertex.position[0] += piece.offsetX;
+                    vertex.position[1] += piece.offsetY;
+                    vertex.position[2] += piece.offsetZ;
+                    merged.vertices.push_back(vertex);
+                }
+                for (const std::uint32_t index : pieceMesh.indices) {
+                    merged.indices.push_back(base + index);
+                }
+            }
+            return buildingMeshCache.emplace(building.id, std::move(merged)).first->second;
+        };
+
+        /// V0.9：落点模式 ④（落地必须平整）的判据 —— footprint 内地形高差 ≤ `kBuildingFlatToleranceBlocks`。
+        /// 采样 = footprint AABB 上 **5×5 规则网格**（确定性，红线 7）；无地形数据 ⇒ 视为不通过。
+        const auto buildingFootprintIsFlat = [&](const vx::ObjectBuilding& building) -> bool {
+            float minX = 0.0F, maxX = 0.0F, minZ = 0.0F, maxZ = 0.0F;
+            if (!vx::ComputeBuildingFootprintXZ(building, objects, minX, maxX, minZ, maxZ)) {
+                return false;
+            }
+            float lowest = 0.0F, highest = 0.0F;
+            bool  have   = false;
+            constexpr int kSamples = 5;
+            for (int ix = 0; ix < kSamples; ++ix) {
+                for (int iz = 0; iz < kSamples; ++iz) {
+                    const float x = minX + (maxX - minX) * static_cast<float>(ix) / static_cast<float>(kSamples - 1);
+                    const float z = minZ + (maxZ - minZ) * static_cast<float>(iz) / static_cast<float>(kSamples - 1);
+                    float       height = 0.0F;
+                    if (!world.QueryHeight(x, z, height)) {
+                        return false;  // 无地形数据 ⇒ 不通过（不猜）
+                    }
+                    if (!have) {
+                        lowest = highest = height;
+                        have            = true;
+                    } else {
+                        lowest  = std::min(lowest, height);
+                        highest = std::max(highest, height);
+                    }
+                }
+            }
+            return have && (highest - lowest) <= vx::kBuildingFlatToleranceBlocks;
+        };
+
+        const auto enterPlacement = [&](const std::string& id) {
+            // V0.9 / ADR 0036 决策四：单位可能是**单件类型**（`objects.Find`）或**成套建筑**（`objects.FindBuilding`）。
+            // 解析期已强制"建筑 id 与类型 id 不重名" ⇒ 这里的"先查类型、再查建筑"**无歧义**。
+            const vx::ObjectType*     type     = objects.Find(id);
+            const vx::ObjectBuilding* building = (type == nullptr) ? objects.FindBuilding(id) : nullptr;
+            if (type == nullptr && building == nullptr) {
+                VX_LOG_WARN("摆放模式：单位 [%s] 既不在类型表、也不是成套建筑 ⇒ 不进入摆放模式", id.c_str());
                 return;
             }
-            if (type->kind == vx::ObjectAssetKind::Portal) {
+            if (type != nullptr && type->kind == vx::ObjectAssetKind::Portal) {
                 // 传送门需要 `target_world`（见 `ObjectPlacement`），**不能**就地摆放 ⇒ 明确拒绝并说明。
-                VX_LOG_WARN("摆放模式（E3）：传送门 [%s] 需要 target_world ⇒ 不能就地摆放（请写进可编辑层）",
-                            typeId.c_str());
+                VX_LOG_WARN("摆放模式：传送门 [%s] 需要 target_world ⇒ 不能就地摆放（请写进可编辑层）", id.c_str());
                 return;
             }
-            placeTypeId     = typeId;
-            lastPlaceTypeId = typeId;
-            lastPlaceYawDeg = 0.0F;
-            placementYawDeg = 0.0F;
-            placementMode   = true;
+            placeTypeId       = id;
+            placeIsBuilding   = (building != nullptr);
+            lastPlaceTypeId   = id;
+            lastPlaceYawDeg   = 0.0F;
+            placementYawDeg   = 0.0F;
+            placementMode     = true;
+            previewBlocked    = false;
+            if (placeIsBuilding) {
+                // V0.9：建筑摆放的**待放值**初值 = 模板自身的 `interior_darkening`（未给 ⇒ 全局值）。
+                placementDarkening =
+                    (building->interiorDarkening >= 0.0F) ? building->interiorDarkening : interiorDarkening;
+            }
             // 抑制"进模式那一帧的这次点击"：面板按钮的那次按下在松手前一直有效
             // （否则关面板恢复捕获后会立刻射出一颗光球，见 `fireSuppressUntilRelease` 的说明）。
             fireSuppressUntilRelease = true;
             mouseCaptured            = window.SetRelativeMouseMode(captureBeforePanel);  // 关面板 ⇒ 恢复打开前捕获
-            VX_LOG_INFO("摆放模式（E3）：进入，类型 [%s]（Q/E 旋转、左键放下、右键删除、F3 重复、F5 保存、Esc 退出）",
-                        typeId.c_str());
+            if (placeIsBuilding) {
+                VX_LOG_INFO("摆放模式（V0.9 建筑）：进入，建筑 [%s]（Q/E 旋转、左键放下、右键删除整座、T 落点模式 %s、"
+                            "[ ] 调室内变暗 %.2f、F3 重复、F5 保存、Esc 退出）",
+                            id.c_str(), LandingModeToken(placementLandingMode),
+                            static_cast<double>(placementDarkening));
+            } else {
+                VX_LOG_INFO("摆放模式（E3）：进入，类型 [%s]（Q/E 旋转、左键放下、右键删除、F3 重复、F5 保存、Esc 退出）",
+                            id.c_str());
+            }
         };
         const auto exitPlacement = [&]() {
-            placementMode = false;
+            placementMode  = false;
+            placeIsBuilding = false;
+            previewBlocked = false;
             previewHit.reset();
+            hoveredBuildingId.clear();
             if (previewHandle.IsValid()) {
                 renderer.ReleaseMesh(previewHandle);
                 previewHandle = vx::MeshHandle {};
             }
             previewTypeId.clear();
-            VX_LOG_INFO("摆放模式（E3）：退出");
+            VX_LOG_INFO("摆放模式（E3/V0.9）：退出");
         };
         const auto saveEditLayer = [&]() {
             try {
                 vx::SaveObjectEditLayer(objectsEditPath, editLayerState);
                 pickFeedback = "saved";
-                VX_LOG_INFO("可编辑层已保存（E3）：%s（类型 %zu、放置 %zu、删除 %zu、散布 %zu）",
+                VX_LOG_INFO("可编辑层已保存（E3/V0.9）：%s（类型 %zu、放置 %zu、删除 %zu、散布 %zu；成套建筑 %zu、"
+                            "删建筑 %zu、变暗覆盖 %zu）",
                             objectsEditPath.string().c_str(), editLayerState.types.size(),
                             editLayerState.placements.size(), editLayerState.removals.size(),
-                            editLayerState.scatters.size());
+                            editLayerState.scatters.size(), editLayerState.buildings.size(),
+                            editLayerState.buildingRemovals.size(), editLayerState.buildingDarkenings.size());
             } catch (const std::exception& error) {
                 VX_LOG_ERROR("可编辑层保存失败（E3）：%s", error.what());
             }
@@ -4240,19 +4781,24 @@ int main(int argc, char** argv) {
         /// 成本为**常数级**（一次射线 + 一次 64 B 位姿推送），不随世界总量增长；**不建碰撞体、不进物件槽表**
         /// （不参与剔除 / 支撑 / 破坏；ADR 0032 决策七）。
         const auto updatePlacementPreview = [&]() {
-            const vx::ObjectType* type = objects.Find(placeTypeId);
-            if (type == nullptr || type->kind == vx::ObjectAssetKind::Portal) {
+            const vx::ObjectType*     type     = objects.Find(placeTypeId);
+            const vx::ObjectBuilding* building = placeIsBuilding ? objects.FindBuilding(placeTypeId) : nullptr;
+            if (building == nullptr && (type == nullptr || type->kind == vx::ObjectAssetKind::Portal)) {
                 previewHit.reset();
+                previewBlocked = false;
                 return;
             }
             if (previewTypeId != placeTypeId || !previewHandle.IsValid()) {
                 if (previewHandle.IsValid()) {
                     renderer.ReleaseMesh(previewHandle);
                 }
-                previewHandle = renderer.UploadMesh(buildLocalMesh(*type), glm::dvec3(0.0));
+                // V0.9：单件 = 类型几何；成套建筑 = **整座合并几何**（与最终展开**同源** `BuildKitPieceMesh`）。
+                const vx::MeshData previewMesh =
+                    (building != nullptr) ? buildBuildingLocalMesh(*building) : buildLocalMesh(*type);
+                previewHandle = renderer.UploadMesh(previewMesh, glm::dvec3(0.0));
                 previewTypeId = placeTypeId;
                 if (!previewHandle.IsValid()) {
-                    VX_LOG_WARN("摆放模式（E3）：类型 [%s] 的预览网格上传失败（网格为空）", placeTypeId.c_str());
+                    VX_LOG_WARN("摆放模式：单位 [%s] 的预览网格上传失败（网格为空）", placeTypeId.c_str());
                 }
             }
             const vx::CameraView previewView = camera.Evaluate(1.0, &cameraQuery);
@@ -4262,36 +4808,130 @@ int main(int argc, char** argv) {
                                            [&](float x, float z, float& outHeight) {
                                                return world.QueryHeight(x, z, outHeight);
                                            });
+            previewBlocked = false;
             if (!previewHit.has_value() || !previewHandle.IsValid()) {
                 return;
             }
-            const glm::dvec3 origin(static_cast<double>(previewHit->x), static_cast<double>(previewHit->surfaceY),
+            float anchorY = previewHit->surfaceY;
+            float yawDeg  = placementYawDeg;
+            if (building != nullptr) {
+                // V0.9 / ADR 0036 决策四：落点模式 ④ —— footprint 不平 ⇒ **拒绝**（不显示可放的预览）。
+                if (placementLandingMode == vx::ObjectBuildingLandingMode::FlatOnly &&
+                    !buildingFootprintIsFlat(*building)) {
+                    previewBlocked = true;
+                    previewHit.reset();
+                    return;
+                }
+                // ② 向下半埋：整体下沉（层高相对偏移不变）；其余模式（`Unspecified` / `FlatOnly`）不下沉。
+                if (placementLandingMode == vx::ObjectBuildingLandingMode::Sink) {
+                    anchorY -= vx::kBuildingSinkBlocks;
+                }
+                // 建筑渲染位姿的 yaw = **模板自身朝向 + 用户旋转**（与最终展开逐字同源）。
+                yawDeg += building->yawDegrees;
+            }
+            const glm::dvec3 origin(static_cast<double>(previewHit->x), static_cast<double>(anchorY),
                                     static_cast<double>(previewHit->z));
-            const glm::quat rotation = glm::angleAxis(glm::radians(placementYawDeg), glm::vec3(0.0F, 1.0F, 0.0F));
+            const glm::quat rotation = glm::angleAxis(glm::radians(yawDeg), glm::vec3(0.0F, 1.0F, 0.0F));
             renderer.SetMeshTransform(previewHandle, origin, rotation);
             renderer.SetMeshOpacity(previewHandle, kPlacementPreviewOpacity);
         };
 
-        /// 右键删除：拾取准星指向的**最近**物件 ⇒ 释放网格 + 碰撞体 + 实体，并记入**编辑层**。
-        /// 记账分流（ADR 0032 决策五）：**本层新增**的落点直接从本层删掉；**发布清单 / 散布**来的落点记一条 `[[remove]]`。
-        const auto deleteObjectUnderCrosshair = [&]() {
-            const vx::CameraView deleteView = camera.Evaluate(1.0, &cameraQuery);
-            const glm::vec3      deleteDir  = AimDirection(camera, cameraQuery);
-            ObjectSlot*          target     = nullptr;
-            float                bestT      = kPickMaxDistance;
+        /// V0.9：准星指向的**最近物件槽**（删除与**选中态调参**共用；`nullptr` = 没指向）。
+        const auto pickObjectUnderCrosshair = [&]() -> ObjectSlot* {
+            const vx::CameraView pickView = camera.Evaluate(1.0, &cameraQuery);
+            const glm::vec3      pickDir  = AimDirection(camera, cameraQuery);
+            ObjectSlot*          target   = nullptr;
+            float                bestT    = kPickMaxDistance;
             for (ObjectSlot& slot : objectSlots) {
                 if (slot.removed || !slot.bounds.valid) {
                     continue;
                 }
                 float t = 0.0F;
-                if (RayHitsAabb(deleteView.eye, deleteDir, slot.bounds, t) && t < bestT) {
+                if (RayHitsAabb(pickView.eye, pickDir, slot.bounds, t) && t < bestT) {
                     bestT  = t;
                     target = &slot;
                 }
             }
+            return target;
+        };
+
+        /// V0.9 / ADR 0036 决策三：把某座建筑的室内变暗值落到**本层**（玩家摆放的改其字段；其余写覆盖记录）并即时生效。
+        const auto applyBuildingDarkening = [&](const std::string& buildingId, float value) {
+            const float clamped = std::clamp(value, 0.0F, 1.0F);
+            // ① 即时生效：该建筑的所有构件槽（渲染在下一帧读到）。
+            for (ObjectSlot& slot : objectSlots) {
+                if (!slot.removed && slot.buildingId == buildingId) {
+                    slot.enclosure.darkening = clamped;
+                }
+            }
+            // ② 落到可编辑层：本层新增的建筑改字段；发布清单 / 上一轮来的建筑写 `[[building_darkening]]` 覆盖。
+            bool inEditLayer = false;
+            for (vx::ObjectBuilding& building : editLayerState.buildings) {
+                if (building.id == buildingId) {
+                    building.interiorDarkening = clamped;
+                    inEditLayer                = true;
+                    break;
+                }
+            }
+            if (!inEditLayer) {
+                bool updated = false;
+                for (vx::ObjectBuildingDarkening& override : editLayerState.buildingDarkenings) {
+                    if (override.buildingId == buildingId) {
+                        override.darkening = clamped;
+                        updated            = true;
+                        break;
+                    }
+                }
+                if (!updated) {
+                    vx::ObjectBuildingDarkening override;
+                    override.buildingId = buildingId;
+                    override.darkening  = clamped;
+                    editLayerState.buildingDarkenings.push_back(std::move(override));
+                }
+            }
+            pickFeedback = "darken " + buildingId;
+            VX_LOG_INFO("摆放模式（V0.9）：建筑 [%s] 的室内变暗 → %.2f（F5 保存后重启仍在）", buildingId.c_str(),
+                        static_cast<double>(clamped));
+        };
+
+        /// 右键删除：拾取准星指向的**最近**物件 ⇒ 释放网格 + 碰撞体 + 实体，并记入**编辑层**。
+        /// 记账分流（ADR 0032 决策五）：**本层新增**的落点直接从本层删掉；**发布清单 / 散布**来的落点记一条 `[[remove]]`。
+        /// V0.9 / ADR 0036 决策四：命中**成套建筑**的构件 ⇒ **删除整座**，并按 `[[remove_building]]`（**按 id**）记账。
+        const auto deleteObjectUnderCrosshair = [&]() {
+            ObjectSlot* target = pickObjectUnderCrosshair();
             if (target == nullptr) {
                 pickFeedback = "no object";
-                VX_LOG_WARN("摆放模式（E3）：右键指向 %.0f 格内没有可删除的物件", static_cast<double>(kPickMaxDistance));
+                VX_LOG_WARN("摆放模式（E3/V0.9）：右键指向 %.0f 格内没有可删除的物件",
+                            static_cast<double>(kPickMaxDistance));
+                return;
+            }
+            // ---- V0.9：整座建筑 ----
+            if (!target->buildingId.empty()) {
+                const std::string buildingId = target->buildingId;
+                std::size_t       removedPieces = 0;
+                for (ObjectSlot& slot : objectSlots) {
+                    if (!slot.removed && slot.buildingId == buildingId) {
+                        DestroyObjectSlot(slot, objectLayer, physics, renderer);
+                        ++removedPieces;
+                    }
+                }
+                if (!EraseEditLayerBuilding(editLayerState.buildings, buildingId)) {
+                    // 发布清单 / 上一轮来的建筑 ⇒ 记一条按 id 的删除项；并清掉它可能的变暗覆盖（避免悬挂）。
+                    vx::ObjectBuildingRemoval removal;
+                    removal.buildingId = buildingId;
+                    editLayerState.buildingRemovals.push_back(std::move(removal));
+                    for (auto it = editLayerState.buildingDarkenings.begin();
+                         it != editLayerState.buildingDarkenings.end();) {
+                        if (it->buildingId == buildingId) {
+                            it = editLayerState.buildingDarkenings.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
+                pickFeedback = "deleted building";
+                VX_LOG_INFO("摆放模式（V0.9）：**已删除整座建筑** [%s]（%zu 个构件一并释放；F5 保存后重启不再出现）",
+                            buildingId.c_str(), removedPieces);
                 return;
             }
             const std::string typeId = (target->type != nullptr) ? target->type->id : std::string {};
@@ -4319,8 +4959,48 @@ int main(int argc, char** argv) {
         bool         palettePreviewMeshReady = false;  ///< 该类型是否有可预览几何
         float        palettePreviewSpinSeconds = 0.0F;  ///< 自动旋转相位（秒；只在面板打开时推进）
 
-        /// 左键放下：与加载期**同一** `addObjectSlot` 路径（渲染 / 碰撞同源），并记入**本层新增落点**。
+        /// 左键放下：与加载期**同一** `addObjectSlot` / `expandBuilding` 路径（渲染 / 碰撞同源），并记入**本层增量**。
+        /// V0.9 / ADR 0036 决策四：单位是**成套建筑**时 ⇒ 复制模板 + 生成唯一 id + 整座展开 + 落进 `[[building]]`。
         const auto placeObjectAtPreview = [&]() {
+            if (placeIsBuilding) {
+                const vx::ObjectBuilding* tmpl = objects.FindBuilding(placeTypeId);
+                if (tmpl == nullptr) {
+                    pickFeedback = "no building";
+                    return;
+                }
+                if (previewBlocked) {
+                    pickFeedback = "flat-only rejected";
+                    VX_LOG_WARN("摆放模式（V0.9）：落点模式 flat_only —— footprint 高差 > %.2f 格 ⇒ **本次未放下**"
+                                "（T 切到 sink 可强制放下）",
+                                static_cast<double>(vx::kBuildingFlatToleranceBlocks));
+                    return;
+                }
+                if (!previewHit.has_value()) {
+                    pickFeedback = "no ground hit";
+                    VX_LOG_WARN("摆放模式（V0.9）：准星 %.0f 格内未命中地表 ⇒ 本次未放下",
+                                static_cast<double>(kPickMaxDistance));
+                    return;
+                }
+                vx::ObjectBuilding placed  = *tmpl;  // 复制模板（pieces / 落点模式字段等）
+                placed.id                  = MakeUniqueBuildingId(objects, editLayerState, tmpl->id);
+                placed.x                   = previewHit->x;
+                placed.z                   = previewHit->z;
+                placed.yawDegrees          = tmpl->yawDegrees + placementYawDeg;
+                placed.interiorDarkening   = placementDarkening;    // 待放值（具体值；`[`/`]` 可调）
+                placed.landingMode         = placementLandingMode;  // 落点模式（`T` 可切）
+                expandBuilding(placed, previewHit->surfaceY);       // 与加载期同一条展开路径
+                editLayerState.buildings.push_back(placed);         // 本层增量（F5 保存即持久化）
+
+                lastPlaceYawDeg = placementYawDeg;
+                pickFeedback    = "placed building";
+                VX_LOG_INFO("摆放模式（V0.9）：**已放下整座建筑** [%s]（模板 [%s]）@ (%.2f, %.2f) h %.2f、朝向 %.1f°、"
+                            "落点 %s、室内变暗 %.2f、%zu 个构件（F5 保存后重启仍在）",
+                            placed.id.c_str(), tmpl->id.c_str(), static_cast<double>(placed.x),
+                            static_cast<double>(placed.z), static_cast<double>(previewHit->surfaceY),
+                            static_cast<double>(placementYawDeg), LandingModeToken(placementLandingMode),
+                            static_cast<double>(placementDarkening), placed.pieces.size());
+                return;
+            }
             if (!previewHit.has_value()) {
                 pickFeedback = "no ground hit";
                 VX_LOG_WARN("摆放模式（E3）：准星 %.0f 格内未命中地表 ⇒ 本次未放下",
@@ -4431,12 +5111,12 @@ int main(int argc, char** argv) {
             debugOverlay.BeginFrame();
             double uiMs = uiTimer.EndMs();
 
-            // T15：玩法输入抑制——面板打开或 ImGui 想接管鼠标 / 键盘时，吞掉对应类别，
-            // 使"点按钮"不会挖地、"拖音量"不会转相机。决策为纯函数（见 `gameplay_input.hpp`）。
-            // V9：**任一面板打开**（系统面板 或 传送门菜单）都全量抑制玩法输入。
-            const vx::InputSuppression suppression =
-                vx::DecideInputSuppression(debugOverlay.AnyBlockingPanelOpen(), debugOverlay.WantsCaptureMouse(),
-                                           debugOverlay.WantsCaptureKeyboard());
+            // T15：玩法输入抑制——**只在模态面板（系统面板 / 传送门菜单 / 物件选择器）打开时**抑制，
+            // 决策为纯函数（见 `gameplay_input.hpp`）。
+            // V0.9 缺陷修复：**不再采信 ImGui 的 `WantCaptureMouse|Keyboard`** —— 只读叠加层（常驻 HUD /
+            // **F1 调试面板**）可见 / 被悬停 / 获得键盘焦点时 ImGui 也会报告它们，据此抑制会导致
+            // "开着 F1 无法移动 / 转视角"。只读叠加层不提供操作项 ⇒ 不得抢玩法输入。
+            const vx::InputSuppression suppression = vx::DecideInputSuppression(debugOverlay.AnyBlockingPanelOpen());
 
             // T14 捕获状态机（仅在**任一面板关闭**时）：未捕获时的点击用于重新捕获，状态机把它标记为
             // "已被捕获消费"，随后消费掉鼠标左键边沿，使这次点击绝不会落到发射上。
@@ -4617,6 +5297,42 @@ int main(int argc, char** argv) {
                 }
                 placementYawDeg = std::fmod(placementYawDeg + 360.0F, 360.0F);  // 归一化到 [0, 360)
 
+                // V0.9 / ADR 0036 决策四：`T` 循环**落点模式**（仅在摆成套建筑时生效；单件摆放时边沿照常消费）。
+                if (input.ConsumePressed(vx::ActionId::PlacementLandingMode)) {
+                    if (placeIsBuilding) {
+                        placementLandingMode = (placementLandingMode == vx::ObjectBuildingLandingMode::Sink)
+                                                   ? vx::ObjectBuildingLandingMode::FlatOnly
+                                                   : vx::ObjectBuildingLandingMode::Sink;
+                        VX_LOG_INFO("摆放模式（V0.9）：落点模式 → %s", LandingModeToken(placementLandingMode));
+                    }
+                }
+                // V0.9 / ADR 0036 决策三：**选中态** —— 准星指向的已有建筑（`[`/`]` 改的就是它）。
+                // 成本 = 一次射线 + 逐槽 AABB 测试（常数级；只在**摆放模式**内，不进玩法热路径）。
+                hoveredBuildingId.clear();
+                if (const ObjectSlot* hovered = pickObjectUnderCrosshair();
+                    hovered != nullptr && !hovered->buildingId.empty()) {
+                    hoveredBuildingId        = hovered->buildingId;
+                    hoveredBuildingDarkening = (hovered->enclosure.darkening >= 0.0F) ? hovered->enclosure.darkening
+                                                                                    : interiorDarkening;
+                }
+                // `[` / `]`：有**选中建筑** ⇒ 改它；否则（建筑摆放中）改**待放值**；单件摆放 ⇒ 提示无可调对象。
+                const float darkenDelta =
+                    (input.ConsumePressed(vx::ActionId::PlacementDarkenDown) ? -kPlacementDarkenStep : 0.0F) +
+                    (input.ConsumePressed(vx::ActionId::PlacementDarkenUp) ? kPlacementDarkenStep : 0.0F);
+                if (darkenDelta != 0.0F) {
+                    if (!hoveredBuildingId.empty()) {
+                        const float updated = std::clamp(hoveredBuildingDarkening + darkenDelta, 0.0F, 1.0F);
+                        applyBuildingDarkening(hoveredBuildingId, updated);
+                        hoveredBuildingDarkening = updated;
+                    } else if (placeIsBuilding) {
+                        placementDarkening = std::clamp(placementDarkening + darkenDelta, 0.0F, 1.0F);
+                        VX_LOG_INFO("摆放模式（V0.9）：待放室内变暗 → %.2f", static_cast<double>(placementDarkening));
+                    } else {
+                        pickFeedback = "no building selected";
+                        VX_LOG_WARN("摆放模式：室内变暗只对**成套建筑**有效（单件物件没有围合体）");
+                    }
+                }
+
                 updatePlacementPreview();
                 if (attackPressedEdge) {
                     placeObjectAtPreview();
@@ -4624,6 +5340,12 @@ int main(int argc, char** argv) {
                 if (input.ConsumePressed(vx::ActionId::PlacementRemove)) {
                     deleteObjectUnderCrosshair();
                 }
+            } else {
+                // 非摆放模式：这些键的边沿照常消费（不留残余），但不产生任何效果。
+                (void)input.ConsumePressed(vx::ActionId::PlacementLandingMode);
+                (void)input.ConsumePressed(vx::ActionId::PlacementDarkenDown);
+                (void)input.ConsumePressed(vx::ActionId::PlacementDarkenUp);
+                hoveredBuildingId.clear();
             }
 
             // `F3` 重复上次 / `F5` 保存：面板打开时**不生效**（避免与面板控件抢输入；边沿照常消费）。
@@ -5011,6 +5733,15 @@ int main(int argc, char** argv) {
                         pendingDestruction.MergeTiles(volumeTouchedTiles);
                     }
                 }
+                // V0.10 S3：把**已常驻**的存档体积块叠加进世界（每帧 ≤ 1 个；**生成之后**才叠加 —— ADR 0037 决策三）。
+                // 有改动的块排进**同一个延后队列**（重网格 + 上传 + 碰撞体），不在渲染帧内同步重网格。
+                volumeSaveApplied.clear();
+                if (worldState.ApplyPendingVolumeBlocks(digVolumes, kVolumeSaveAppliesPerFrame, volumeSaveApplied) > 0U) {
+                    pendingDestruction.MergeVolumeBlocks(volumeSaveApplied);
+                    VX_LOG_INFO("世界状态存档（V0.10 / S3）：本帧叠加 %zu 个**存档体积块**"
+                                "（待叠加还剩 %zu 个；重网格 / 上传 / 碰撞体已入延后队列）",
+                                volumeSaveApplied.size(), worldState.pendingVolumeBlocks.size());
+                }
                 if (wasBusy && !volumeScheduler.HasPendingWork() && digVolumes.PendingBuildCount() == 0U) {
                     // 一次"窗口调整"**收尾后**记一条（每次跨越 tile 边界一条，不逐帧刷屏）——走动验收的可观测证据。
                     // 必须放在上面的同步之后：否则本帧那一个动作还没落到 `volumeSlots` 上，打印出来的计数会差一个。
@@ -5118,11 +5849,19 @@ int main(int argc, char** argv) {
                         for (const vx::TileCoord& coord : terrainResidencyChanged) {
                             // `Step` 已经改过世界：**世界里有 ⇒ 这是新建**（登记 + 上传 + 碰撞）；否则是卸载。
                             if (world.HasTile(coord.x, coord.z)) {
+                                // V0.10 S4：**生成之后**叠加该 tile 的存档差量（ADR 0037 决策三：顺序不得颠倒）。
+                                // 叠加改了高度 ⇒ `Step` 装进来的网格已过期，按当前 LOD 重网格一次
+                                //（只在**真有差量**的 tile 上发生；正常地形一字不动 ⇒ 零回归）。
+                                if (worldState.ApplyTile(world, coord)) {
+                                    world.MeshTile(coord.x, coord.z, tileScheduler.LodLevelForTile(coord));
+                                }
                                 const std::size_t index = AppendResidentTile(tileResidency, coord);
                                 UploadResidentTile(tileResidency, index);
                                 // 新 tile 只可能出现在窗口边缘（Chebyshev 33）⇒ 通常不在碰撞半径内；按判据如实处理。
                                 syncTerrainCollision(index, NeedsTerrainCollision(tileScheduler.Window(), coord));
                             } else {
+                                // V0.10 S4：脏 tile 离开常驻集合**之前**把差量搬进会话 ⇒ 卸载**不丢改动**。
+                                worldState.RecordTile(world, coord);
                                 (void)RemoveResidentTile(tileResidency, coord);
                             }
                         }
@@ -5656,6 +6395,8 @@ int main(int argc, char** argv) {
                     pose.enclosureHalfX    = slot.enclosure.halfX;
                     pose.enclosureHalfZ    = slot.enclosure.halfZ;
                     pose.enclosureCeilingY = slot.enclosure.ceilingY;
+                    // V0.9 / ADR 0036 决策二：逐建筑变暗覆盖（`-1` = 该建筑未给出 ⇒ 片元用全局值）。
+                    pose.enclosureDarkening = slot.enclosure.darkening;
                     // H4：按到渲染原点（≈ 相机）的距离分组；远处**且有代理**的走低模代理。
                     InstancePoseGroup& group = instancePoseGroups[slot.type->id];
                     const glm::dvec3   delta = slot.position - renderOrigin;
@@ -5829,6 +6570,12 @@ int main(int argc, char** argv) {
             stats.placementTypeId        = placeTypeId;             // V0.5 E2：坐标拾取辅助当前类型（空串 = 不显示）
             stats.lastPickFeedback       = pickFeedback;            // V0.5 E2：最近一次拾取反馈（空串 = 不显示）
             stats.placementModeActive    = placementMode;           // V0.5 E3：摆放模式横幅（true ⇒ HUD 显示键位提示）
+            // V0.9 / ADR 0036：成套建筑摆放横幅 + **选中态**横幅（动态文本恒为纯 ASCII ⇒ 无 CJK 字体也不缺字）。
+            stats.placementBuildingMode = placementMode && placeIsBuilding;
+            stats.placementLandingMode  = stats.placementBuildingMode ? LandingModeToken(placementLandingMode) : "";
+            stats.placementDarkeningValue = placementDarkening;
+            stats.placementSelectedBuilding  = placementMode ? hoveredBuildingId : std::string {};
+            stats.placementSelectedDarkening = hoveredBuildingDarkening;
             stats.physicsReady      = true;
 
             // T24：渲染开销取自引擎的通用统计；绘制数为**最近一次** RenderFrame（面板早于本帧渲染）。
@@ -5912,7 +6659,7 @@ int main(int argc, char** argv) {
             const vx::LightingUniform lightingUniform = vx::BuildLightingUniform(
                 lighting, static_cast<double>(view.eye.x), static_cast<double>(view.eye.y),
                 static_cast<double>(view.eye.z),
-                environmentIblReady ? vx::kEnvironmentPrefilterMipCount : 0U);
+                environmentIblReady ? vx::kEnvironmentPrefilterMipCount : 0U, interiorDarkening);
             renderer.SetLightingUniform(&lightingUniform, sizeof(lightingUniform));
 
             // 相机常量（T39 起 `relativeView` 在**构建绘制列表之前**就已算好，见那里的视锥剔除）。
@@ -6011,6 +6758,12 @@ int main(int argc, char** argv) {
                             terrainBuildInFlight.size(), terrainCaughtUpThisFrame ? "yes" : "no");
             }
 
+            // V0.10 S4：世界状态存档 —— **非阻塞收包** + 按间隔 flush。
+            // 放在帧末：本帧的编辑与流式装卸都已结算，采集到的就是"本帧最终状态"。
+            // 写盘（zstd + IO）全在 worker ⇒ 这里只有"拷快照 + 提交"，**不阻塞渲染帧**（SKILL 第四节）。
+            worldState.Poll();
+            worldState.Flush(world, digVolumes, sessionClock.ElapsedSeconds(), "延迟批量 flush", /*blocking*/ false);
+
             // V2b：会话墙钟推进 —— `Clock::ElapsedSeconds()` **只在 `Tick()` 时累计**，
             // 而 `--switch-test` 的秒数以它为准 ⇒ 必须每帧 `Tick` 一次（否则它恒为 0，到点判断永不成立）。
             (void)sessionClock.Tick();
@@ -6029,6 +6782,12 @@ int main(int argc, char** argv) {
         // 不交还的话每切一次世界，`MeshRenderer` 的网格槽位就永久多一批（V2b 验收判据 = "卸载不留残"）。
         // Jolt 物体不需逐个移除：`PhysicsWorld` 等世界级对象都是**本轮局部变量**，随作用域析构。
         // ================================================================================
+        // ================================================================================
+        // V0.10 S4：**退出 / 切世界前强制落盘**（ADR 0037 决策四）—— 此刻 `world` 仍存活、差量可采。
+        // 这里**允许阻塞**（帧循环已结束 ⇒ 不存在"冻结画面"）；正常路径下上一帧提交的异步写盘已完成。
+        worldState.Flush(world, digVolumes, sessionClock.ElapsedSeconds(),
+                         quitRequested ? "退出前强制 flush" : "切世界前强制 flush", /*blocking*/ true);
+
         for (vx::MeshHandle& handle : tileHandles) {
             if (handle.IsValid()) { renderer.ReleaseMesh(handle); }
         }

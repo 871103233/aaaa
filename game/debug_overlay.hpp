@@ -103,6 +103,18 @@ struct DebugStats {
 
     /// V0.5 E3：是否处于**摆放模式**（true ⇒ HUD 显示摆放模式横幅 `PlacementModeHintFormat`）。
     bool          placementModeActive = false;
+
+    // ---- V0.9（[ADR 0036](../../docs/adr/0036-interior-darkening-param-and-building-placement.md)）：成套建筑摆放 ----
+    /// 摆放模式是否在摆**成套建筑**（true ⇒ HUD 用 `PlacementBuildingHintFormat`）。
+    bool          placementBuildingMode = false;
+    /// 当前落点模式的**配置 token**（纯 ASCII：`sink` / `flat_only`；非建筑模式为空串）。
+    std::string   placementLandingMode;
+    /// 建筑摆放模式下的**待放室内变暗值**（`[` / `]` 调整）。
+    float         placementDarkeningValue = 0.0F;
+    /// 准星指向的**已有建筑** id（纯 ASCII；空串 = 没指向建筑）—— **选中态**调参的显示。
+    std::string   placementSelectedBuilding;
+    /// 被指向建筑当前的**有效**室内变暗值（`-1`（用全局值）时显示全局值）。
+    float         placementSelectedDarkening = 0.0F;
 };
 
 /// 极简 ImGui 调试面板（T9）。基于 imgui 的 **SDL3 平台后端 + SDL3_gpu 渲染后端**。
@@ -202,18 +214,12 @@ public:
     /// 全运行期不变，启动时设置一次。
     void SetTestMode(TestModeInfo mode) { m_testMode = std::move(mode); }
 
-    /// 本帧 ImGui 是否想接管鼠标 / 键盘（`io.WantCaptureMouse` / `WantCaptureKeyboard`）。
-    ///
-    /// 只在**本帧已开始 ImGui 帧**时有效；未开始（面板与调试面板都隐藏）时恒为 false。
-    /// 供 `main` 的输入抑制纯函数使用（见 `gameplay_input.hpp`）。
-    [[nodiscard]] bool WantsCaptureMouse() const noexcept { return m_wantCaptureMouse; }
-    [[nodiscard]] bool WantsCaptureKeyboard() const noexcept { return m_wantCaptureKeyboard; }
-
     /// 通知 ImGui 玩法当前是否处于**相对鼠标（捕获）**状态。
     ///
-    /// 相对模式下 SDL 报告的鼠标绝对坐标无意义，若照常喂给 ImGui，会把"悬停"算到 UI 上，
-    /// 从而误抑制玩法视角。捕获期间据此置 `ImGuiConfigFlags_NoMouse`（面板打开时必已释放捕获，
-    /// 因此不影响面板交互）。
+    /// 相对模式下 SDL 报告的鼠标绝对坐标无意义；按 ImGui 官方建议在捕获期间置
+    /// `ImGuiConfigFlags_NoMouse`，让 ImGui 不去按绝对坐标算 `HoveredWindow`（否则光标停在
+    /// 面板上时会给控件加悬停高亮）。**注意（V0.9）**：玩法输入抑制**不再**依赖 ImGui 的
+    /// `WantCapture*`（见 `gameplay_input.hpp`），因此本标志只影响 ImGui 自身的悬停判定。
     void SetGameplayMouseCaptured(bool captured) noexcept { m_gameplayMouseCaptured = captured; }
 
     /// 设置**加载画面**的状态：阶段标签 + 总进度（`progress ∈ [0,1]`）。
@@ -288,9 +294,6 @@ private:
 
     /// 本帧是否已调用 `ImGui::NewFrame`（调试面板或系统面板可见时为 true）。
     bool m_frameActive = false;
-    /// 本帧开始 ImGui 帧后采样的 ImGui 捕获标志（供输入抑制决策）。
-    bool m_wantCaptureMouse    = false;
-    bool m_wantCaptureKeyboard = false;
     /// 玩法是否处于相对鼠标（捕获）状态；为 true 时对本帧 ImGui 置 `NoMouse`。
     bool m_gameplayMouseCaptured = false;
 

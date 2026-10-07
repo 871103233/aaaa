@@ -32,6 +32,9 @@ enum class ActionId : std::uint8_t {
     PlacementRepeatLast,  ///< 摆放模式：重复上次类型 + 朝向（V0.5 E3；`F3`）
     PlacementSave,        ///< 保存到可编辑层（V0.5 E3；`F5`；模式内外均可）
     PlacementRemove,      ///< 摆放模式：删除指向的物件（V0.5 E3；鼠标右键）
+    PlacementLandingMode, ///< 摆放模式：循环切换成套建筑的**落点模式**（V0.9；`T`；仅建筑摆放）
+    PlacementDarkenDown,  ///< 摆放模式：室内变暗 −0.05（V0.9；`[`；预览态调待放值 / 选中态调已有建筑）
+    PlacementDarkenUp,    ///< 摆放模式：室内变暗 +0.05（V0.9；`]`；同上）
 
     Count,
 };

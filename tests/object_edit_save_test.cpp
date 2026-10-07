@@ -185,4 +185,148 @@ TEST(ObjectEditSave, RejectsUnknownSchemaVersion) {
     EXPECT_THROW(static_cast<void>(ObjectTable::LoadOverlayFromFile(file.path(), base)), std::runtime_error);
 }
 
+// --------------------------- V0.9：成套建筑 / 按 id 删除 / 变暗覆盖（ADR 0036 决策三~四）--------------------------
+
+using vx::ComputeBuildingEnclosure;
+using vx::MergeObjectTables;
+using vx::ObjectBuilding;
+using vx::ObjectBuildingDarkening;
+using vx::ObjectBuildingLandingMode;
+using vx::ObjectBuildingPiece;
+using vx::ObjectBuildingRemoval;
+using vx::ObjectKitRole;
+
+/// 发布清单：两个 kit 类型 + 两座建筑（`hut` / `hall`）—— 供编辑层引用 / 删除 / 覆盖。
+ObjectTable MakeKitBase() {
+    ObjectTable base;
+    base.destructibleEnabled = true;
+
+    ObjectType floor;
+    floor.id           = "kit_floor";
+    floor.kind         = ObjectAssetKind::Kit;
+    floor.kitRole      = ObjectKitRole::Floor;
+    floor.moduleBlocks = 4.0F;
+    floor.halfExtentX  = 2.0F;
+    floor.halfExtentY  = 0.15F;
+    floor.halfExtentZ  = 2.0F;
+    floor.destructible = false;
+    base.types.push_back(floor);
+
+    ObjectType roof = floor;
+    roof.id             = "kit_roof";
+    roof.kitRole        = ObjectKitRole::Roof;
+    base.types.push_back(roof);
+
+    for (const char* id : { "hut", "hall" }) {
+        ObjectBuilding building;
+        building.id = id;
+        building.x  = 3.0F;
+        building.z  = 4.0F;
+        ObjectBuildingPiece piece;
+        piece.typeId = "kit_floor";
+        building.pieces.push_back(piece);
+        ObjectBuildingPiece roofPiece;
+        roofPiece.typeId  = "kit_roof";
+        roofPiece.offsetY = 3.3F;
+        building.pieces.push_back(roofPiece);
+        base.buildings.push_back(std::move(building));
+    }
+    return base;
+}
+
+/// 编辑层增量：新增一座建筑（`tower`）+ 删除 `hut` + 覆盖 `hall` 的变暗。
+ObjectTable MakeBuildingEditLayer() {
+    ObjectTable layer;
+    layer.destructibleEnabled = true;
+
+    ObjectBuilding tower;
+    tower.id                 = "tower";
+    tower.x                  = 10.0F;
+    tower.z                  = 20.0F;
+    tower.yawDegrees         = 45.0F;
+    tower.interiorDarkening  = 0.30F;
+    tower.landingMode        = ObjectBuildingLandingMode::Sink;
+    ObjectBuildingPiece floor;
+    floor.typeId = "kit_floor";
+    tower.pieces.push_back(floor);
+    ObjectBuildingPiece roof;
+    roof.typeId     = "kit_roof";
+    roof.offsetY    = 3.3F;
+    roof.yawDegrees = 90.0F;
+    tower.pieces.push_back(roof);
+    layer.buildings.push_back(std::move(tower));
+
+    ObjectBuildingRemoval removal;
+    removal.buildingId = "hut";
+    layer.buildingRemovals.push_back(std::move(removal));
+
+    ObjectBuildingDarkening overrideEntry;
+    overrideEntry.buildingId = "hall";
+    overrideEntry.darkening  = 0.20F;
+    layer.buildingDarkenings.push_back(std::move(overrideEntry));
+
+    return layer;
+}
+
+TEST(ObjectEditSave, RoundTripsBuildingsRemovalsAndDarkening) {
+    const TempPath file("voxel_edit_save_buildings.toml");
+    const ObjectTable base  = MakeKitBase();
+    const ObjectTable layer = MakeBuildingEditLayer();
+
+    SaveObjectEditLayer(file.path(), layer);
+    const ObjectTable readBack = ObjectTable::LoadOverlayFromFile(file.path(), base);
+
+    // 建筑（本层新增）：逐字段一致。
+    ASSERT_EQ(readBack.buildings.size(), 1U);
+    EXPECT_EQ(readBack.buildings[0].id, "tower");
+    EXPECT_FLOAT_EQ(readBack.buildings[0].x, 10.0F);
+    EXPECT_FLOAT_EQ(readBack.buildings[0].z, 20.0F);
+    EXPECT_FLOAT_EQ(readBack.buildings[0].yawDegrees, 45.0F);
+    EXPECT_FLOAT_EQ(readBack.buildings[0].interiorDarkening, 0.30F);
+    EXPECT_EQ(readBack.buildings[0].landingMode, ObjectBuildingLandingMode::Sink);
+    ASSERT_EQ(readBack.buildings[0].pieces.size(), 2U);
+    EXPECT_EQ(readBack.buildings[0].pieces[0].typeId, "kit_floor");
+    EXPECT_FLOAT_EQ(readBack.buildings[0].pieces[1].offsetY, 3.3F);
+    EXPECT_FLOAT_EQ(readBack.buildings[0].pieces[1].yawDegrees, 90.0F);
+
+    // 删除项 / 变暗覆盖。
+    ASSERT_EQ(readBack.buildingRemovals.size(), 1U);
+    EXPECT_EQ(readBack.buildingRemovals[0].buildingId, "hut");
+    ASSERT_EQ(readBack.buildingDarkenings.size(), 1U);
+    EXPECT_EQ(readBack.buildingDarkenings[0].buildingId, "hall");
+    EXPECT_FLOAT_EQ(readBack.buildingDarkenings[0].darkening, 0.20F);
+}
+
+TEST(ObjectEditSave, MergeAppliesBuildingRemovalAndDarkening) {
+    const TempPath file("voxel_edit_save_buildings_merge.toml");
+    const ObjectTable base  = MakeKitBase();
+    const ObjectTable layer = MakeBuildingEditLayer();
+
+    SaveObjectEditLayer(file.path(), layer);
+    const ObjectTable overlay = ObjectTable::LoadOverlayFromFile(file.path(), base);
+    const ObjectTable merged  = MergeObjectTables(base, overlay);
+
+    // `hut` 被按 id 删除；`hall` 保留且被覆盖为 0.20；本层新增 `tower` 追加在后。
+    ASSERT_EQ(merged.buildings.size(), 2U);
+    EXPECT_EQ(merged.buildings[0].id, "hall");
+    EXPECT_FLOAT_EQ(merged.buildings[0].interiorDarkening, 0.20F);
+    EXPECT_EQ(merged.buildings[1].id, "tower");
+    // 围合体把覆盖后的值带出（渲染链路：Merge → ComputeBuildingEnclosure → 实例缓冲）。
+    EXPECT_FLOAT_EQ(ComputeBuildingEnclosure(merged.buildings[0], merged, 0.0F).darkening, 0.20F);
+}
+
+TEST(ObjectEditSave, MergeRejectsBuildingRemovalForUnknownId) {
+    ObjectTable base  = MakeKitBase();
+    ObjectTable layer = MakeBuildingEditLayer();
+    layer.buildingRemovals[0].buildingId = "does_not_exist";
+    EXPECT_THROW(static_cast<void>(MergeObjectTables(base, layer)), std::runtime_error);
+}
+
+TEST(ObjectEditSave, MergeRejectsBuildingDarkeningForUnknownId) {
+    ObjectTable base  = MakeKitBase();
+    ObjectTable layer = MakeBuildingEditLayer();
+    layer.buildingDarkenings[0].buildingId = "does_not_exist";
+    EXPECT_THROW(static_cast<void>(MergeObjectTables(base, layer)), std::runtime_error);
+}
+
 }  // namespace

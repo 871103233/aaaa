@@ -153,4 +153,19 @@ TEST(InstanceBatch, PackWritesDisabledEnclosureByDefault) {
     EXPECT_FLOAT_EQ(out[23], 0.0F);
 }
 
+/// V0.9：逐建筑变暗覆盖写在 `enclosureB.y`（偏移 21）；缺省 = `-1`（= 片元用全局值）。
+TEST(InstanceBatch, PackWritesEnclosureDarkening) {
+    std::vector<InstancePose> poses(1);
+    poses[0].enclosureEnabled   = true;
+    poses[0].enclosureDarkening = 0.20F;
+    std::vector<float> out(kFloatsPerInstance, 0.0F);
+    ASSERT_EQ(PackInstanceTransforms(poses.data(), 1U, 1U, glm::dvec3(0.0), out.data()), 1U);
+    EXPECT_FLOAT_EQ(out[21], 0.20F);
+
+    InstancePose fallback;  // 未给出 ⇒ -1（用全局值）
+    std::vector<float> outDefault(kFloatsPerInstance, 0.0F);
+    ASSERT_EQ(PackInstanceTransforms(&fallback, 1U, 1U, glm::dvec3(0.0), outDefault.data()), 1U);
+    EXPECT_FLOAT_EQ(outDefault[21], -1.0F);
+}
+
 }  // namespace

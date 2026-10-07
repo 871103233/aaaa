@@ -218,7 +218,7 @@ LightingTable LightingTable::Default() {
 }
 
 LightingUniform BuildLightingUniform(const LightingTable& table, double cameraX, double cameraY, double cameraZ,
-                                     std::uint32_t environmentPrefilterMipCount) noexcept {
+                                     std::uint32_t environmentPrefilterMipCount, float interiorDarkening) noexcept {
     const SunLight& sun = table.Sun();
     const SkyLight& sky = table.Sky();
     const FogLayer& fog = table.Fog();
@@ -274,6 +274,9 @@ LightingUniform BuildLightingUniform(const LightingTable& table, double cameraX,
     uniform.fogIblEnabled = (environmentPrefilterMipCount > 0) ? 1.0F : 0.0F;
     uniform.fogIblPrefilterLodMax =
         (environmentPrefilterMipCount > 0) ? static_cast<float>(environmentPrefilterMipCount - 1) : 0.0F;
+
+    // V0.9 / ADR 0036 决策一：室内变暗的全局默认值（复用 `sunColorLinear.a` 的现成空闲分量，不扩结构）。
+    uniform.interiorDarkening = interiorDarkening;
 
     return uniform;
 }
