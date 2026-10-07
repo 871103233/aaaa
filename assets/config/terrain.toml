@@ -101,3 +101,15 @@ water_depth_blocks       = 2.0    # 水面距河床底的高度（格）
 jitter_radians           = 0.35   # 下坡方向的最大抖动偏角（弧度）
 jitter_frequency         = 0.01   # 抖动噪声频率（波长 ≈ 100 格）
 seed_channel             = 8      # 与通道 1~7 不重复
+
+# ---- 气候：温度 + 湿度（V0.6 C7 / tech-plan-v2.0 §3.1）----
+#
+# 语义：两张独立的 **2D 低频噪声**，各自归一化到 [0,1]；**只供"内容放置判据"使用**（`[[scatter_tiled]]` 的
+#   `min/max_temperature`、`min/max_humidity`），**不参与任何地形生成** ⇒ 调参 / 缺省都不改变地形输出。
+#   波长取得很大（≈ 1100 / 700 格）⇒ 成片的大尺度气候带，而不是碎斑。
+# 约束（加载时校验）：频率 > 0；两个 seed_channel 均为正整数且**互不相同**（否则温度与湿度完全相关）。
+[climate]
+temperature_frequency   = 0.0009   # 波长 ≈ 1100 格
+humidity_frequency      = 0.0014   # 波长 ≈ 700 格
+temperature_seed_channel = 9       # 与通道 1~8 不重复
+humidity_seed_channel    = 10      # 与通道 1~9 不重复

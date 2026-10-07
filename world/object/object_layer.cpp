@@ -22,6 +22,9 @@ namespace {
 /// 首个物件 id（0 保留为"无效"）。
 constexpr std::uint32_t kFirstObjectId = 1;
 
+/// 度 → 弧度（构件朝向换算；与 `game/main.cpp` 的 `glm::radians` 同口径）。
+constexpr double kPiOver180 = 3.14159265358979323846 / 180.0;
+
 [[nodiscard]] std::string Describe(const std::filesystem::path& path, const char* field) {
     return path.string() + ": 字段 [" + field + "] ";
 }
@@ -128,8 +131,29 @@ constexpr std::uint32_t kFirstObjectId = 1;
     if (text == "model") {
         return ObjectAssetKind::Model;  // V8：外部模型（必须带 model_file）
     }
+    if (text == "kit") {
+        return ObjectAssetKind::Kit;  // V0.8：模块化建筑构件（必须带 kit_role + module_blocks）
+    }
     throw std::runtime_error(path.string() + ": 未知的物件形态 [" + text +
-                             "]（可选：dirt_pile / stone / crate / portal / model）");
+                             "]（可选：dirt_pile / stone / crate / portal / model / kit）");
+}
+
+/// 解析 `kit_role`（V0.8；**仅 `kind = "kit"` 可给**）。
+[[nodiscard]] ObjectKitRole ParseKitRole(const std::string& text, const std::filesystem::path& path) {
+    if (text == "floor") {
+        return ObjectKitRole::Floor;
+    }
+    if (text == "wall") {
+        return ObjectKitRole::Wall;
+    }
+    if (text == "wall_door") {
+        return ObjectKitRole::WallDoor;
+    }
+    if (text == "roof") {
+        return ObjectKitRole::Roof;
+    }
+    throw std::runtime_error(path.string() + ": 未知的构件角色 kit_role [" + text +
+                             "]（可选：floor / wall / wall_door / roof）");
 }
 
 /// 物件类型的查找器（用于"落点引用的类型是否存在"这类校验）。
@@ -214,6 +238,60 @@ void ParseTypeEntries(const toml::array& typeArray, const std::filesystem::path&
         // 传送门必须归到 `portal` 类别（否则会在选择器里混进别的一级列表）。
         if (type.kind == ObjectAssetKind::Portal && type.category != "portal") {
             throw std::runtime_error(path.string() + ": 形态 portal 的类型 [" + type.id + "] 的 category 必须是 \"portal\"");
+        }
+
+        // V0.8：`kit_role` / `module_blocks`（**仅 `kind == "kit"` 可给**；与 `model_file` 同口径：非法即抛）。
+        const toml::node* kitRoleNode = entry->get("kit_role");
+        const toml::node* moduleNode  = entry->get("module_blocks");
+        if (type.kind == ObjectAssetKind::Kit) {
+            if (kitRoleNode == nullptr) {
+                throw std::runtime_error(path.string() + ": 形态 kit 的类型 [" + type.id + "] 缺少 kit_role");
+            }
+            const std::optional<std::string> kitRole = kitRoleNode->value<std::string>();
+            if (!kitRole.has_value()) {
+                throw std::runtime_error(Describe(path, "kit_role") + "不是字符串（id = " + type.id + "）");
+            }
+            type.kitRole = ParseKitRole(*kitRole, path);
+
+            if (moduleNode == nullptr) {
+                throw std::runtime_error(path.string() + ": 形态 kit 的类型 [" + type.id + "] 缺少 module_blocks");
+            }
+            const std::optional<double> moduleBlocks = moduleNode->value<double>();
+            if (!moduleBlocks.has_value() || !(*moduleBlocks > 0.0)) {
+                throw std::runtime_error(path.string() + ": 类型 [" + type.id + "] 的 module_blocks 必须是正数");
+            }
+            type.moduleBlocks = static_cast<float>(*moduleBlocks);
+
+            // **可判定不变量**（ADR 0035 判据③"接缝错位 = 0"）：水平占地必须正好覆盖**整数个模数格**。
+            // 容差 1e-4 格（远小于任何可见缝宽），越界即抛 —— 避免"看起来能拼、贴上去有缝"的静默错配。
+            const auto isMultiple = [](double extent, double module) {
+                const double cells = extent / module;
+                return std::abs(cells - std::round(cells)) <= 1.0e-4;
+            };
+            if (!isMultiple(2.0 * static_cast<double>(type.halfExtentX), *moduleBlocks) ||
+                !isMultiple(2.0 * static_cast<double>(type.halfExtentZ), *moduleBlocks)) {
+                throw std::runtime_error(path.string() + ": 类型 [" + type.id +
+                                         "] 的 module_blocks 必须整除水平尺寸 2*half_extent.x / 2*half_extent.z");
+            }
+            // **可进入性的硬保证**（ADR 0035 判据①/②）：门洞墙必须**留得下门楣**、且**两侧留得下墙垛**。
+            if (type.kitRole == ObjectKitRole::WallDoor) {
+                if (!(2.0F * type.halfExtentY > kKitDoorClearanceBlocks)) {
+                    throw std::runtime_error(path.string() + ": 类型 [" + type.id + "] 的 wall_door 太矮：2*half_extent.y 必须 > " +
+                                             std::to_string(kKitDoorClearanceBlocks) + " 格（否则门洞通到顶、没有门楣）");
+                }
+                if (!(kKitDoorWidthBlocks < 2.0F * type.halfExtentX)) {
+                    throw std::runtime_error(path.string() + ": 类型 [" + type.id + "] 的 wall_door 太窄：门洞宽 " +
+                                             std::to_string(kKitDoorWidthBlocks) + " 格必须小于 2*half_extent.x（否则没有墙垛）");
+                }
+            }
+        } else {
+            if (kitRoleNode != nullptr) {
+                throw std::runtime_error(path.string() + ": 只有形态 kit 可以给出 kit_role（类型 [" + type.id + "]）");
+            }
+            if (moduleNode != nullptr) {
+                throw std::runtime_error(path.string() + ": 只有形态 kit 可以给出 module_blocks（类型 [" + type.id +
+                                         "]）");
+            }
         }
 
         out.types.push_back(std::move(type));
@@ -317,6 +395,111 @@ void ParsePlacementsAndScatters(const toml::table& root, const std::filesystem::
         }
     }
 
+    // V0.6 C3：`[[scatter_tiled]]`（可选）—— **流式（地形感知）散布**（[ADR 0033](../../docs/adr/0033-world-content-placement-and-streaming.md) 决策五）。
+    // 与 `[[scatter]]`（圆域、局部手工散布）**并存**：本段是"按 tile 归属 + 地形判据过滤"的形态，内容随 tile 常驻窗口增删。
+    // 校验（非法即抛，ADR 0005）：`type` 必须存在；`cell_blocks > 0`；坡度 / 高度区间不得倒置；`landforms` 非空且取值合法。
+    if (const toml::array* tiledArray = root["scatter_tiled"].as_array(); tiledArray != nullptr) {
+        for (const toml::node& node : *tiledArray) {
+            const toml::table* entry = node.as_table();
+            if (entry == nullptr) {
+                throw std::runtime_error(path.string() + ": [[scatter_tiled]] 的每个元素都必须是表");
+            }
+            ObjectScatterTiled tiled;
+            tiled.typeId = ReadString(*entry, path, "type");
+            const ObjectType* streamedType = findType(tiled.typeId);
+            if (streamedType == nullptr) {
+                throw std::runtime_error(path.string() + ": [[scatter_tiled]].type 引用了不存在的类型 [" +
+                                         tiled.typeId + "]");
+            }
+            // 传送门**不可流式**：它需要 `target_world` 与交互登记（`game` 层的门表）⇒ 由流式生成会得到一个
+            // "摆着但按 E 没反应"的门（写了却不生效的静默配置）。故一律拒绝，传送门只能走显式 `[[placement]]`。
+            if (streamedType->kind == ObjectAssetKind::Portal) {
+                throw std::runtime_error(path.string() + ": [[scatter_tiled]] 不支持传送门类型 [" + tiled.typeId +
+                                         "]（需 target_world 与交互登记 ⇒ 只能显式 [[placement]]）");
+            }
+            const std::int64_t seed = static_cast<std::int64_t>(ReadNumber(*entry, path, "seed"));
+            if (seed < 0) {
+                throw std::runtime_error(path.string() + ": [[scatter_tiled]].seed 不能为负（type = " + tiled.typeId +
+                                         "）");
+            }
+            tiled.seed = static_cast<std::uint64_t>(seed);
+
+            tiled.cellBlocks = static_cast<float>(ReadNumberOr(*entry, path, "cell_blocks", 16.0));
+            if (!(tiled.cellBlocks > 0.0F)) {
+                throw std::runtime_error(path.string() + ": [[scatter_tiled]].cell_blocks 必须为正（type = " +
+                                         tiled.typeId + "）");
+            }
+            tiled.minSlopeDegrees = static_cast<float>(ReadNumberOr(*entry, path, "min_slope_deg", 0.0));
+            tiled.maxSlopeDegrees = static_cast<float>(ReadNumberOr(*entry, path, "max_slope_deg", 45.0));
+            if (!(tiled.minSlopeDegrees >= 0.0F && tiled.minSlopeDegrees <= tiled.maxSlopeDegrees &&
+                  tiled.maxSlopeDegrees <= 90.0F)) {
+                throw std::runtime_error(path.string() +
+                                         ": [[scatter_tiled]] 的坡度区间非法（需 0 ≤ min_slope_deg ≤ max_slope_deg ≤ 90，type = " +
+                                         tiled.typeId + "）");
+            }
+            tiled.minHeightBlocks = static_cast<float>(ReadNumberOr(*entry, path, "min_height_blocks", 0.0));
+            tiled.maxHeightBlocks = static_cast<float>(ReadNumberOr(*entry, path, "max_height_blocks", 512.0));
+            if (!(tiled.minHeightBlocks <= tiled.maxHeightBlocks)) {
+                throw std::runtime_error(path.string() +
+                                         ": [[scatter_tiled]] 的高度带非法（需 min_height_blocks ≤ max_height_blocks，type = " +
+                                         tiled.typeId + "）");
+            }
+
+            // `landforms`（可选）：给出后**只**放列出的地貌（值域 plains / hills / mountains；非空、未知值即抛）。
+            if (const toml::node* landformsNode = entry->get("landforms"); landformsNode != nullptr) {
+                const toml::array* landforms = landformsNode->as_array();
+                if (landforms == nullptr) {
+                    throw std::runtime_error(path.string() + ": [[scatter_tiled]].landforms 不是数组（type = " +
+                                             tiled.typeId + "）");
+                }
+                if (landforms->empty()) {
+                    throw std::runtime_error(path.string() + ": [[scatter_tiled]].landforms 不能为空（type = " +
+                                             tiled.typeId + "）");
+                }
+                tiled.allowPlains    = false;
+                tiled.allowHills     = false;
+                tiled.allowMountains = false;
+                for (const toml::node& item : *landforms) {
+                    const std::optional<std::string> name = item.value<std::string>();
+                    if (!name.has_value()) {
+                        throw std::runtime_error(path.string() +
+                                                 ": [[scatter_tiled]].landforms 的元素必须是字符串（type = " +
+                                                 tiled.typeId + "）");
+                    }
+                    if (*name == "plains") {
+                        tiled.allowPlains = true;
+                    } else if (*name == "hills") {
+                        tiled.allowHills = true;
+                    } else if (*name == "mountains") {
+                        tiled.allowMountains = true;
+                    } else {
+                        throw std::runtime_error(path.string() + ": [[scatter_tiled]].landforms 含未知值 [" + *name +
+                                                 "]（合法值 = plains / hills / mountains）");
+                    }
+                }
+            }
+
+            // 气候区间（V0.6 C7；**可选**，缺省 = 全区间 ⇒ 不约束）。
+            tiled.minTemperature = static_cast<float>(ReadNumberOr(*entry, path, "min_temperature", 0.0));
+            tiled.maxTemperature = static_cast<float>(ReadNumberOr(*entry, path, "max_temperature", 1.0));
+            tiled.minHumidity    = static_cast<float>(ReadNumberOr(*entry, path, "min_humidity", 0.0));
+            tiled.maxHumidity    = static_cast<float>(ReadNumberOr(*entry, path, "max_humidity", 1.0));
+            if (!(tiled.minTemperature >= 0.0F && tiled.minTemperature <= tiled.maxTemperature &&
+                  tiled.maxTemperature <= 1.0F)) {
+                throw std::runtime_error(
+                    path.string() + ": [[scatter_tiled]] 的温度区间非法（需 0 ≤ min_temperature ≤ max_temperature ≤ 1，type = " +
+                    tiled.typeId + "）");
+            }
+            if (!(tiled.minHumidity >= 0.0F && tiled.minHumidity <= tiled.maxHumidity && tiled.maxHumidity <= 1.0F)) {
+                throw std::runtime_error(
+                    path.string() + ": [[scatter_tiled]] 的湿度区间非法（需 0 ≤ min_humidity ≤ max_humidity ≤ 1，type = " +
+                    tiled.typeId + "）");
+            }
+
+            out.tiledScatters.push_back(std::move(tiled));
+        }
+    }
+
     // E3：`[[remove]]`（可选）—— 表达"删掉某个落点"（仅可编辑层有意义；解析器共用）。
     // 匹配口径：同 `type` 且**平面距离 ≤ tolerance**（缺省 0.5 格）；**已知限制**：同类型同位置无法区分（ADR 0032）。
     if (const toml::array* removeArray = root["remove"].as_array(); removeArray != nullptr) {
@@ -339,6 +522,69 @@ void ParsePlacementsAndScatters(const toml::table& root, const std::filesystem::
             }
             out.removals.push_back(std::move(removal));
         }
+    }
+}
+
+/// 解析 `[[building]]`（V0.8；[ADR 0035](../../docs/adr/0035-modular-building-kit-and-enterable-spaces.md) 决策三）。
+///
+/// 规则（非法即抛）：`id` 非空且不与**已有建筑**重复；`pieces` 非空；每个 `pieces[].type` 必须存在；
+/// **不得引用 `Portal`**（传送门需要 `target_world`，而构件项没有该字段 ⇒ 写了就是静默失效，一律拒绝）。
+/// 缺省（配置里没有 `[[building]]`）⇒ 本表为空 ⇒ **与引入本形态之前逐位一致**。
+void ParseBuildings(const toml::table& root, const std::filesystem::path& path, const TypeLookup& findType,
+                    ObjectTable& out) {
+    const toml::array* buildingArray = root["building"].as_array();
+    if (buildingArray == nullptr) {
+        return;
+    }
+    for (const toml::node& node : *buildingArray) {
+        const toml::table* entry = node.as_table();
+        if (entry == nullptr) {
+            throw std::runtime_error(path.string() + ": [[building]] 的每个元素都必须是表");
+        }
+        ObjectBuilding building;
+        building.id = ReadString(*entry, path, "id");
+        if (building.id.empty()) {
+            throw std::runtime_error(path.string() + ": [[building]].id 不能为空");
+        }
+        for (const ObjectBuilding& existing : out.buildings) {
+            if (existing.id == building.id) {
+                throw std::runtime_error(path.string() + ": [[building]].id 重复 [" + building.id + "]");
+            }
+        }
+        // 锚点水平位置（`position` 与 `[[placement]]` 同写作口径；**y 分量忽略** —— 锚点的地表高度在加载期解算）。
+        const std::array<double, 3> anchor = ReadVec3(*entry, path, "position");
+        building.x                    = static_cast<float>(anchor[0]);
+        building.z                    = static_cast<float>(anchor[2]);
+        building.yawDegrees           = static_cast<float>(ReadNumberOr(*entry, path, "yaw_deg", 0.0));
+
+        const toml::array* pieceArray = (*entry)["pieces"].as_array();
+        if (pieceArray == nullptr || pieceArray->empty()) {
+            throw std::runtime_error(path.string() + ": [[building]] [" + building.id + "] 的 pieces 不能为空");
+        }
+        for (const toml::node& pieceNode : *pieceArray) {
+            const toml::table* pieceTable = pieceNode.as_table();
+            if (pieceTable == nullptr) {
+                throw std::runtime_error(path.string() + ": [[building]].pieces 的每个元素都必须是表");
+            }
+            ObjectBuildingPiece piece;
+            piece.typeId = ReadString(*pieceTable, path, "type");
+            const ObjectType* pieceType = findType(piece.typeId);
+            if (pieceType == nullptr) {
+                throw std::runtime_error(path.string() + ": [[building]].pieces.type 引用了不存在的类型 [" +
+                                         piece.typeId + "]");
+            }
+            if (pieceType->kind == ObjectAssetKind::Portal) {
+                throw std::runtime_error(path.string() + ": [[building]].pieces 不得引用传送门 [" + piece.typeId +
+                                         "]（传送门需要 target_world，构件项没有该字段）");
+            }
+            const std::array<double, 3> offset = ReadVec3(*pieceTable, path, "offset");
+            piece.offsetX   = static_cast<float>(offset[0]);
+            piece.offsetY   = static_cast<float>(offset[1]);
+            piece.offsetZ   = static_cast<float>(offset[2]);
+            piece.yawDegrees = static_cast<float>(ReadNumberOr(*pieceTable, path, "yaw_deg", 0.0));
+            building.pieces.push_back(std::move(piece));
+        }
+        out.buildings.push_back(std::move(building));
     }
 }
 
@@ -477,13 +723,76 @@ ObjectTable MergeObjectTables(const ObjectTable& base, const ObjectTable& overla
     merged.placements = RemovePlacementsByRemoval(base.placements, overlay.removals);
     merged.placements.insert(merged.placements.end(), overlay.placements.begin(), overlay.placements.end());
     merged.scatters.insert(merged.scatters.end(), overlay.scatters.begin(), overlay.scatters.end());
+    merged.tiledScatters.insert(merged.tiledScatters.end(), overlay.tiledScatters.begin(), overlay.tiledScatters.end());
     merged.removals.insert(merged.removals.end(), overlay.removals.begin(), overlay.removals.end());
+    // V0.8：成套建筑按文件顺序追加（发布清单 → 可编辑层），确定性不变（红线 7）。
+    merged.buildings.insert(merged.buildings.end(), overlay.buildings.begin(), overlay.buildings.end());
     return merged;
 }
 
 bool IsValidObjectCategory(const std::string& category) noexcept {
     return category == "vegetation" || category == "rock" || category == "prop" || category == "building" ||
            category == "portal" || category == "misc";
+}
+
+ObjectEnclosure ComputeBuildingEnclosure(const ObjectBuilding& building, const ObjectTable& table,
+                                        float anchorSurfaceY) noexcept {
+    ObjectEnclosure enclosure;
+    // 与 `game/main.cpp` 的构件展开**同一约定**（绕 +Y：x' = c·x + s·z、z' = −s·x + c·z）。
+    const double yawRadians = static_cast<double>(building.yawDegrees) * kPiOver180;
+    const double cosYaw     = std::cos(yawRadians);
+    const double sinYaw     = std::sin(yawRadians);
+
+    bool  hasRoof = false;
+    double minX = 0.0;
+    double maxX = 0.0;
+    double minZ = 0.0;
+    double maxZ = 0.0;
+    double ceiling = 0.0;
+    for (const ObjectBuildingPiece& piece : building.pieces) {
+        const ObjectType* type = table.Find(piece.typeId);
+        if (type == nullptr || type->kind != ObjectAssetKind::Kit || type->kitRole != ObjectKitRole::Roof) {
+            continue;  // 兜底：只有屋顶构件参与围合（加载期已保证类型存在）
+        }
+        // 构件的**总朝向** = 建筑 yaw + 构件附加 yaw ⇒ 旋转后 AABB 的半尺寸按总朝向算。
+        const double pieceYaw = yawRadians + static_cast<double>(piece.yawDegrees) * kPiOver180;
+        const double absCos   = std::abs(std::cos(pieceYaw));
+        const double absSin   = std::abs(std::sin(pieceYaw));
+        const double halfX    = absCos * static_cast<double>(type->halfExtentX) +
+                             absSin * static_cast<double>(type->halfExtentZ);
+        const double halfZ = absSin * static_cast<double>(type->halfExtentX) +
+                             absCos * static_cast<double>(type->halfExtentZ);
+        const double offsetX = cosYaw * static_cast<double>(piece.offsetX) + sinYaw * static_cast<double>(piece.offsetZ);
+        const double offsetZ = -sinYaw * static_cast<double>(piece.offsetX) + cosYaw * static_cast<double>(piece.offsetZ);
+        const double centerX = static_cast<double>(building.x) + offsetX;
+        const double centerZ = static_cast<double>(building.z) + offsetZ;
+        const double bottom  = static_cast<double>(anchorSurfaceY) + static_cast<double>(piece.offsetY);
+
+        if (!hasRoof) {
+            hasRoof = true;
+            minX = centerX - halfX;
+            maxX = centerX + halfX;
+            minZ = centerZ - halfZ;
+            maxZ = centerZ + halfZ;
+            ceiling = bottom;
+        } else {
+            minX    = std::min(minX, centerX - halfX);
+            maxX    = std::max(maxX, centerX + halfX);
+            minZ    = std::min(minZ, centerZ - halfZ);
+            maxZ    = std::max(maxZ, centerZ + halfZ);
+            ceiling = std::min(ceiling, bottom);  // 屋顶并集的**最低**下沿
+        }
+    }
+    if (!hasRoof || !(maxX > minX) || !(maxZ > minZ)) {
+        return enclosure;  // 无屋顶（或退化为零面积）⇒ 不是可进入空间，保持 enabled = false
+    }
+    enclosure.enabled  = true;
+    enclosure.centerX  = static_cast<float>((minX + maxX) * 0.5);
+    enclosure.centerZ  = static_cast<float>((minZ + maxZ) * 0.5);
+    enclosure.halfX    = static_cast<float>((maxX - minX) * 0.5);
+    enclosure.halfZ    = static_cast<float>((maxZ - minZ) * 0.5);
+    enclosure.ceilingY = static_cast<float>(ceiling);
+    return enclosure;
 }
 
 std::vector<ObjectPlacement> RemovePlacementsByRemoval(const std::vector<ObjectPlacement>& placements,
@@ -543,6 +852,8 @@ ObjectTable ObjectTable::LoadFromFile(const std::filesystem::path& path) {
     }
     ParseTypeEntries(*typeArray, path, [](const std::string&) -> const ObjectType* { return nullptr; }, table);
     ParsePlacementsAndScatters(root, path, [&table](const std::string& id) { return table.Find(id); }, table);
+    // V0.8：`[[building]]`（成套建筑）—— 引用本清单的类型表。
+    ParseBuildings(root, path, [&table](const std::string& id) { return table.Find(id); }, table);
 
     return table;
 }
@@ -578,6 +889,14 @@ ObjectTable ObjectTable::LoadOverlayFromFile(const std::filesystem::path& path, 
         ParseTypeEntries(*typeArray, path, [&base](const std::string& id) { return base.Find(id); }, overlay);
     }
     ParsePlacementsAndScatters(
+        root, path,
+        [&base, &overlay](const std::string& id) {
+            const ObjectType* fromBase = base.Find(id);
+            return fromBase != nullptr ? fromBase : overlay.Find(id);
+        },
+        overlay);
+    // V0.8：可编辑层也可追加成套建筑（引用"发布清单 ∪ 本层新增"的类型）。
+    ParseBuildings(
         root, path,
         [&base, &overlay](const std::string& id) {
             const ObjectType* fromBase = base.Find(id);

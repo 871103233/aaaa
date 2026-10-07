@@ -53,6 +53,10 @@ layout(location = 1) out vec3 v_normal;
 layout(location = 2) flat out float v_material;
 // W6e：逐网格不透明度（插值无害；同一网格所有顶点同值）。
 layout(location = 3) out float v_fade;
+// V0.8 室内变暗：**非实例化路径没有围合体代理** ⇒ 恒写"未启用"（片元据此整段跳过室内变暗）。
+// 位置必须与 `mesh_instanced.vert` 一致（两者共用 `mesh.frag`）。
+layout(location = 4) flat out vec4 v_enclosureA;
+layout(location = 5) flat out vec4 v_enclosureB;
 
 void main() {
     // 网格局部坐标 → 渲染原点相对坐标（片元据此 + 渲染原点还原世界坐标）。
@@ -85,4 +89,7 @@ void main() {
     v_material         = inMaterial;
     // W6e：逐网格不透明度（CPU 侧恒显式写入：不透明网格为 1.0，淡出中的主角 < 1.0）。
     v_fade             = meshTransform.meshParams.x;
+    // V0.8：地表 / 非实例化物件**没有**围合体代理 ⇒ 启用位 0 ⇒ 片元不做室内变暗（逐位退回旧行为）。
+    v_enclosureA       = vec4(0.0);
+    v_enclosureB       = vec4(0.0);
 }

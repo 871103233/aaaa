@@ -93,6 +93,19 @@ struct TerrainRiverParams {
     std::uint64_t seedChannel            = 8;      ///< 与既有通道 1~7 不重复
 };
 
+/// 气候参数（V0.6 C7）：**温度 / 湿度两张 2D 低频噪声** —— `tech-plan-v2.0.md` §3.1
+/// "2D 温度与湿度出生物群系，且**与高度图解耦**"。
+///
+/// 语义：两张噪声各自归一化到 `[0, 1]`（与 `LandformMaskAt` 同口径），**只供内容放置判据使用**
+/// （`PlacementRule` 的温度 / 湿度区间），**不参与任何地形生成** ⇒ 调参 / 缺省不影响既有地形输出。
+/// 通道号必须与既有 8 个通道（1~8）不重复。
+struct TerrainClimateParams {
+    float         temperatureFrequency   = 0.0009F;  ///< 温度噪声频率（波长 ≈ 1100 格 ⇒ 大尺度气候带）
+    float         humidityFrequency      = 0.0014F;  ///< 湿度噪声频率（波长 ≈ 700 格）
+    std::uint64_t temperatureSeedChannel = 9;        ///< 与既有通道 1~8 不重复
+    std::uint64_t humiditySeedChannel    = 10;       ///< 与既有通道 1~9 不重复
+};
+
 /// 地表生成参数（W3 起从代码常量外提为配置；**默认值 == 引入本层之前的三层噪声数值**）。
 ///
 /// 依据：`docs/tech-plan-v2.0.md` §3.1「生成参数全部来自 TOML」与 ADR 0005（启动期校验、非法即抛）。
@@ -119,6 +132,9 @@ struct TerrainGenerationParams {
 
     /// 河流（W6 地表体积壳使用）。默认**关闭** ⇒ 不参与任何现有路径。
     TerrainRiverParams river {};
+
+    /// 气候（V0.6 C7：温度 / 湿度；只供内容放置判据，**不参与地形生成**）。
+    TerrainClimateParams climate {};
 
     /// **默认参数**：地貌分区**关闭** ⇒ 输出与引入本层之前逐位一致（既有测试与既有世界不受影响）。
     [[nodiscard]] static TerrainGenerationParams Default() noexcept { return {}; }

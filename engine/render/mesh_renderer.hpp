@@ -1,6 +1,7 @@
 #pragma once
 
 #include "render/camera.hpp"
+#include "render/instance_batch.hpp"
 #include "render/shadow_cascade.hpp"
 
 #include <SDL3/SDL.h>
@@ -127,6 +128,20 @@ struct MeshHandle {
     [[nodiscard]] bool IsValid() const noexcept { return id != 0; }
 };
 
+/// 一批**同原型**实例（V0.7 H1 / [ADR 0034](../../docs/adr/0034-object-instancing-and-hlod.md)）：
+/// 由 `UploadInstancedMesh` 创建的原型 + **本帧可见实例**的世界位姿数组。
+///
+/// 约定：
+///   - `poses` 的生命周期**只需覆盖本次 `RenderFrame` 调用** —— 引擎在帧内 **一次** 上传到该原型的
+///     实例 storage buffer（**禁止**逐实例推送 / 上传，SKILL 第四节硬规则 3）；
+///   - `count` 超过原型创建时的容量 ⇒ **截断**并 WARN（不静默、不崩）；
+///   - 主通道与阴影通道**共用同一份**实例缓冲 ⇒ 阴影与几何不可能错位。
+struct InstanceBatch {
+    MeshHandle          prototype {};      ///< `UploadInstancedMesh` 返回的原型句柄
+    const InstancePose* poses = nullptr;   ///< 世界位姿数组（可为空 ⇒ 本批跳过）
+    std::uint32_t       count = 0;         ///< 实例数（0 ⇒ 跳过）
+};
+
 /// 通用 2D 纹理数组的 GPU 句柄。`id == 0` 表示无效句柄。
 struct TextureArrayHandle {
     std::uint32_t id = 0;
@@ -179,6 +194,11 @@ struct RenderStats {
     std::uint64_t triangleCount = 0;  ///< 本帧实际绘制的三角形数（Σ `indexCount / 3`）
     std::uint64_t vertexCount   = 0;  ///< 本帧实际绘制的顶点数（Σ `vertexCount`）
     std::uint64_t textureBytes  = 0;  ///< 当前持有的纹理显存字节总量（含 mip 链）
+    /// 当前持有的**网格缓冲**显存字节总量（顶点 + 索引 + 骨骼矩阵；V0.7 H0 起纳入记账）。
+    ///
+    /// 为什么单列：ADR 0010 的记账义务原先**只统计纹理**，网格缓冲未入账
+    /// ⇒ 无法判断"实例化省下的显存 / 新增的实例缓冲"，也无法核对 ADR 0024 的 VRAM 预算。
+    std::uint64_t meshBytes     = 0;
 
     /// 本帧**等待交换链纹理**的毫秒数（`SDL_WaitAndAcquireGPUSwapchainTexture` 内）。
     ///
@@ -312,6 +332,18 @@ public:
     /// 前置条件：`0 < jointCapacity <= kMaxSkinJoints`；索引都在顶点范围内。空网格返回无效句柄。
     [[nodiscard]] MeshHandle UploadSkinnedMesh(const SkinnedMeshData& mesh, const glm::dvec3& origin,
                                                std::uint32_t jointCapacity);
+
+    /// 创建并按容量上传一个**实例化原型**（V0.7 H1 / [ADR 0034](../../docs/adr/0034-object-instancing-and-hlod.md)）。
+    ///
+    /// 与 `UploadMesh` 的差别：
+    ///   - 顶点承载**原型网格的局部坐标**（**不登记**"网格原点"；每个实例的位姿由 `InstanceBatch::poses` 给）；
+    ///   - 额外分配一块**实例 storage buffer**（`maxInstances × 96 B` = `kInstancePoseBytes`：变换 `mat4`
+    ///     + 围合体 `vec4` ×2），容量**创建时定死**
+    ///     （满足 SKILL 硬规则 4：资源创建不得发生在渲染热路径）；缓冲字节计入 `RenderStats::meshBytes`；
+    ///   - 绘制走**实例化管线**（`mesh_instanced.vert`）⇒ **每原型一次**绘制（`numInstances = 可见实例数`）。
+    ///
+    /// 前置条件：`prototype` 非空、`maxInstances >= 1`；否则返回**无效句柄**（不抛）。
+    [[nodiscard]] MeshHandle UploadInstancedMesh(const MeshData& prototype, std::uint32_t maxInstances);
 
     /// 设置一个**蒙皮**网格本帧的骨骼矩阵（`jointCount` 个 `mat4`；引擎只做**整块**拷贝到 GPU）。
     ///
@@ -498,12 +530,17 @@ public:
     [[nodiscard]] bool RenderFrame(const MeshHandle* meshes, std::size_t meshCount, const SDL_FColor& clearColor,
                                    IRenderOverlay* overlay = nullptr,
                                    const ShadowCascadeDrawList* shadowLists = nullptr,
-                                   std::size_t shadowListCount = 0);
+                                   std::size_t shadowListCount = 0,
+                                   const InstanceBatch* batches = nullptr, std::size_t batchCount = 0);
 
 private:
     struct MeshResources {
         SDL_GPUBuffer* vertexBuffer = nullptr;
         SDL_GPUBuffer* indexBuffer  = nullptr;
+        /// 顶点 / 索引 / 骨骼矩阵缓冲的**字节数**（V0.7 H0：显存记账；随创建与 `ReleaseMesh` 增减）。
+        std::uint64_t  vertexBytes = 0;
+        std::uint64_t  indexBytes  = 0;
+        std::uint64_t  boneBytes   = 0;
         std::uint32_t  vertexCount  = 0;  ///< 顶点缓冲**容量**（上传时的顶点数；就地刷新不得改变它）
         std::uint32_t  indexCount   = 0;  ///< 索引缓冲**容量**（`UpdateMeshGeometry` 只能写这个前缀之内）
         /// 本帧**实际绘制**的索引数（T42）：`UploadMesh` = 上传的索引数；变长网格由 `UpdateMeshGeometry`
@@ -544,6 +581,18 @@ private:
         std::uint32_t jointCapacity     = 0;
         /// 骨骼矩阵 storage buffer（`mat4 × jointCapacity`）；非蒙皮网格恒为 `nullptr`。
         SDL_GPUBuffer* boneMatrixBuffer = nullptr;
+
+        // ---- 实例化原型（V0.7 H1 / ADR 0034）----
+        /// 是否为**实例化原型**：走实例化管线，绘制用 `numInstances = instanceCount`。
+        bool          instanced        = false;
+        /// **实例 storage buffer**（`kInstancePoseBytes × instanceCapacity`）；非实例化网格恒为 `nullptr`。
+        SDL_GPUBuffer* instanceBuffer  = nullptr;
+        /// 实例缓冲的**容量**（实例数；创建时定死）。
+        std::uint32_t instanceCapacity = 0;
+        /// 本帧实际绘制的实例数（`RenderFrame` 写入；0 = 本帧不可见）。
+        std::uint32_t instanceCount    = 0;
+        /// 实例缓冲字节数（记账：`instanceCapacity × 96`）。
+        std::uint64_t instanceBytes    = 0;
         /// 本帧已设置的骨骼矩阵数（`SetSkinningMatrices` 写入）。
         std::uint32_t boneMatrixCount   = 0;
         /// 本帧待上传的骨骼矩阵（`jointCapacity × 16` 个 float；**上传时一次分配**，之后只 memcpy）。
@@ -653,8 +702,26 @@ private:
     /// （缓冲容量在上传网格时已定死）。
     void UploadSkinningMatrices(SDL_GPUCommandBuffer* commandBuffer);
 
-    /// 把纹理显存**按项**打到日志（材质数组 / 深度 / HDR / 阴影），供预算核对（ADR 0010 记账义务）。
-    void LogTextureAccounting(std::uint32_t width, std::uint32_t height) const;
+    /// V0.7 H1：把本帧所有**实例批次**的位姿**一次**上传到各自原型的实例缓冲（一次 map + 逐批 copy，
+    /// **不创建任何 GPU 资源**、不做同步等待）。返回是否提交成功（失败 ⇒ 本帧不画实例，WARN 由调用方给）。
+    [[nodiscard]] bool UploadInstances(SDL_GPUCommandBuffer* commandBuffer, const InstanceBatch* batches,
+                                       std::size_t batchCount);
+
+    /// V0.7 H1：绘制**实例化批次**（主通道与阴影通道共用同一实现）。
+    /// `matrixStorageBuffer` = binding 0 的顶点 storage buffer（主通道 = 相机、阴影 = 该级光空间矩阵）；
+    /// 实例变换固定绑在 binding 1。逐批推一次 `MeshTransformUniform`（矩阵字段被着色器忽略，
+    /// 只带 `meshParams` 的逐批不透明度）。`pushEmissive` 仅主通道为 true（与 `DrawMeshes` 同义：
+    /// 逐原型推自发光，避免继承上一条绘制留下的值）；实例原型当前恒为非自发光 ⇒ 推零值。
+    /// 每批**一次**绘制（`num_instances = 本帧实例数`）⇒ draw call 与物件数解耦。
+    void DrawInstancedBatches(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURenderPass* pass,
+                              const InstanceBatch* batches, std::size_t batchCount,
+                              SDL_GPUGraphicsPipeline* instancedPipeline, SDL_GPUBuffer* matrixStorageBuffer,
+                              bool pushEmissive, EmissivePushState& emissiveState,
+                              MeshTransformPushState& transformState);
+
+    /// 把 **GPU 显存**按项打到日志（纹理：材质数组 / 深度 / HDR / 阴影 / 环境；**网格缓冲**：顶点 + 索引 + 骨骼），
+    /// 供预算核对（ADR 0010 记账义务；网格部分由 V0.7 H0 纳入）。
+    void LogVramAccounting(std::uint32_t width, std::uint32_t height) const;
 
     /// 把 `m_cameraUniform` 传到相机常量的 GPU 缓冲。
     void UploadCameraUniform(SDL_GPUCommandBuffer* commandBuffer);
@@ -686,6 +753,24 @@ private:
 
     /// 常驻的蒙皮顶点着色器（与 `m_meshVertexShader` 同理由：档位变化要重建管线）。
     SDL_GPUShader* m_skinnedVertexShader = nullptr;
+
+    // ---- 实例化（V0.7 H1 / [ADR 0034](../../docs/adr/0034-object-instancing-and-hlod.md)）----
+
+    /// 实例化**主通道**管线（顶点 = `mesh_instanced.vert`，声明 **2 个**顶点 storage buffer：相机 + 实例变换）；
+    /// 与 `m_pipeline` **同生共死**（随 MSAA 档位在 `CreateMainPipeline` 里重建）。
+    SDL_GPUGraphicsPipeline* m_instancedPipeline = nullptr;
+
+    /// 常驻的实例化顶点着色器（档位变化要重建管线，理由同 `m_meshVertexShader`）。
+    SDL_GPUShader* m_instancedVertexShader = nullptr;
+
+    /// 实例化**阴影**管线（`shadow_instanced.vert` + 空入口 `shadow.frag`）+ 常驻其顶点着色器。
+    /// 阴影目标恒为单采样 ⇒ 构造期创建一次（不随 MSAA 档位变化）。
+    SDL_GPUGraphicsPipeline* m_shadowInstancedPipeline   = nullptr;
+    SDL_GPUShader*           m_shadowInstancedVertexShader = nullptr;
+
+    /// 实例位姿上传的**常驻**暂存缓冲（所有批次共用；一次 map + 逐批 copy，稳态不重建）。
+    SDL_GPUTransferBuffer* m_instanceStagingBuffer   = nullptr;
+    std::uint32_t          m_instanceStagingCapacity = 0;
 
     /// 蒙皮**阴影**通道管线：`shadow_skinned.vert` + 空入口 `shadow.frag`（无颜色目标、只写深度）。
     /// 与采样数无关（阴影目标恒为单采样）⇒ 构造期创建一次。

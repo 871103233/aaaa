@@ -9,6 +9,9 @@
 #   mesh.*     —— 真正的网格渲染路径（MeshRenderer）用；
 #   mesh_skinned.vert / shadow_skinned.vert —— 蒙皮网格（T69）：主通道与阴影通道各一条，
 #               片元阶段复用 mesh.frag / shadow.frag；
+#   mesh_instanced.vert / shadow_instanced.vert —— **实例化**网格（V0.7 H1 / ADR 0034）：
+#               逐实例变换来自顶点只读 storage buffer，主通道与阴影通道各一条；
+#               片元阶段同样复用 mesh.frag / shadow.frag；
 #   shadow.vert/.frag —— 阴影深度通道（T21b / ADR 0010 P1）用（纯深度写入，片元为空入口）；
 #   tonemap.*  —— HDR 色调映射通道（T20 / ADR 0010 P0）用（其 .vert 亦为全屏三角，T67 起被天空与烘焙共用）。
 #   sky.frag / ibl_irradiance.frag / ibl_prefilter.frag / ibl_brdf_lut.frag
@@ -45,8 +48,10 @@ add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/triangle.frag)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/mesh.vert)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/mesh.frag)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/mesh_skinned.vert)
+add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/mesh_instanced.vert)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/shadow.vert)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/shadow_skinned.vert)
+add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/shadow_instanced.vert)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/shadow.frag)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/tonemap.vert)
 add_shader(voxel_game ${CMAKE_SOURCE_DIR}/assets/shaders/tonemap.frag)

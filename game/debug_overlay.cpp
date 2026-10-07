@@ -519,6 +519,8 @@ void DebugOverlay::BuildUI(const DebugStats& stats, SystemPanelContext& panelCon
             static_cast<std::size_t>(stats.vertexCount));
     StatRow(UiText(UiLabel::TextureVram, cjk), UiText(UiLabel::TextureVramFormat, cjk),
             static_cast<double>(stats.textureBytes) / (1024.0 * 1024.0));
+    StatRow(UiText(UiLabel::MeshVram, cjk), UiText(UiLabel::TextureVramFormat, cjk),
+            static_cast<double>(stats.meshBytes) / (1024.0 * 1024.0));
 
     // T24：CPU 帧时间分解（毫秒，显示到 0.01 ms）——由 main 用单调计时分别测量。
     ImGui::SeparatorText(UiText(UiLabel::SectionCpuFrameTime, cjk));

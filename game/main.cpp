@@ -29,8 +29,10 @@
 #include "object/object_edit_save.hpp"  // V0.5 E3：保存可编辑层
 #include "object/object_layer.hpp"
 #include "object/object_mesh.hpp"
+#include "object/object_placement_rule.hpp"  // V0.6 C5：流式散布（地形感知放置规则）
 #include "object/object_scatter.hpp"  // V8：程序化散布（纯函数）
 #include "object/object_support.hpp"
+#include "object/terrain_sampling.hpp"  // V0.6 C5：地形采样（坡度 / 高度 / 地貌）
 #include "object_palette.hpp"  // V0.5 E3：选择器纯逻辑
 #include "orb.hpp"
 #include "out_of_bounds.hpp"
@@ -956,6 +958,14 @@ struct ObjectSlot {
     float                        yawDegrees = 0.0F;
     bool                         dynamic = false;  ///< 是否已转动态刚体（转后不再转回，由 Jolt 休眠）
     bool                         removed = false;  ///< 是否已被摧毁（句柄已释放）
+    /// **V0.6 C5：流式散布的来源** —— `streamed == true` 表示该物件由 `[[scatter_tiled]]` 生成，
+    /// 属于 `streamedTile` 这个 tile；离开内容半径 / 非常驻时按 tile 整批移除（ADR 0033 决策三）。
+    bool                         streamed = false;
+    vx::TileCoord                streamedTile {};  ///< 仅 `streamed == true` 时有意义
+    /// **V0.8 室内变暗**（[ADR 0035](../docs/adr/0035-modular-building-kit-and-enterable-spaces.md) 决策四）：
+    /// 该物件所属建筑的**围合体代理**（世界坐标）。`enabled = false` ⇒ 室外物件（逐位退回旧行为）。
+    /// 由成套建筑展开时**按建筑统一**写入（同一座建筑的每个构件带同一份围合体）⇒ 片元能判定"是否室内"。
+    vx::ObjectEnclosure          enclosure {};
 };
 
 /// 支撑探测的**下探深度**（格）：探测点取"底面中心 − 该深度"。小于它 ⇒ 视为脚下已是空的。
@@ -966,6 +976,88 @@ constexpr int kObjectSupportCheckIntervalSteps = 10;
 
 /// 被爆炸"炸飞"的初速度（格/秒；仅用于**不可破坏**物件被炸开）。
 constexpr float kObjectBlastSpeedBlocksPerSecond = 7.0F;
+
+// ---------------------------------------------------------------------------
+// V0.6 C5：**流式散布**（地形感知）—— 预算与口径常量（[ADR 0033](../docs/adr/0033-world-content-placement-and-streaming.md) 决策三 / 六）
+// ---------------------------------------------------------------------------
+
+/// **内容半径**（tile）：只在与玩家所在 tile 的 Chebyshev 距离 ≤ 该值的 tile 内生成程序化内容。
+///
+/// 为什么**不是整个常驻窗口**（半径 33 tile ≈ 2112 m ⇒ 4489 个 tile）：内容量会直接撞 draw call 预算
+///（[ADR 0024](../docs/adr/0024-terrain-streaming-and-lod.md) ≤ 6000 次/帧；每个物件 = 1 次提交 + 1 个 Jolt 静态体）。
+/// 8 tile ≈ 512 m，与 ADR 0024 的 **Ring 0** 同尺度 ⇒ 近场细节。**这是"密度 / 画质"旋钮**，实测 draw call 后再调。
+constexpr int kStreamedContentRadiusTiles = 8;
+
+/// 每帧最多处理的**内容 tile** 数（分帧推进 ⇒ 生成 / 移除都不冻结画面，SKILL 第四节）。
+constexpr std::size_t kStreamedTilesPerFrame = 2;
+
+/// 求坡度时的**邻点距离**（格）—— 与地表高度场的列分辨率（1 格）一致。
+constexpr float kStreamedSlopeHalfStepBlocks = 1.0F;
+
+// ---------------------------------------------------------------------------
+// V0.7 H2：**物件实例化**（[ADR 0034](../docs/adr/0034-object-instancing-and-hlod.md) 决策一）—— 阈值与容量
+// ---------------------------------------------------------------------------
+
+/// 每个 `ObjectType` 的**实例缓冲容量**（实例数；`UploadInstancedMesh` 创建时定死）。
+///
+/// 取 1024：当前散布步长 `cell_blocks = 40` ⇒ 每 tile 至多 1 个候选点，内容窗口 17×17 = 289 tile
+/// ⇒ 单类型上界 ≈ 289（远小于 1024）；缓冲字节 = `1024 × 64 B = 64 KB`/类型，可忽略。
+/// 超容量由 `MeshRenderer::UploadInstances` **截断 + WARN**（不静默）。
+constexpr std::uint32_t kObjectInstanceCapacity = 1024;
+
+/// 触发实例化的**最小可见实例数**：某类型的可见静态实例低于它 ⇒ 回落**旧逐网格路径**。
+///
+/// 为什么需要：实例化每帧要付"一次暂存上传 + 两次 storage buffer 绑定"的固定成本，
+/// 只有当同类型实例足够多时才划算（业界同理：UE5 ISM 对小批量不优于逐网格）。
+/// **这是"密度 / 收益"旋钮**，取值 4 为经验起点（待实测微调；判据见 `plans/v0.7.md` §4）。
+constexpr std::size_t kObjectInstanceMinCount = 4;
+
+/// V0.7 H4（[ADR 0034](../docs/adr/0034-object-instancing-and-hlod.md) 决策四）：远景 LOD 链的**切换距离**（格，
+/// 到**渲染原点** ≈ 相机）。超过它改画**低模代理**（顶点聚类，加载期生成）⇒ 远景顶点量下降。
+///
+/// 取 200 格（≈ 256 m）：该距离上物件（半尺寸 ~1.5 格）的像素占有率 < 1% ⇒ 代理的轮廓差异**不可察**
+/// （"切换在远处完成，无 pop"）。`--object-lod-distance=0` 关闭 LOD 链（全部用原网格）。
+constexpr double kObjectLodDistanceBlocks = 200.0;
+
+/// 低模代理的**聚类格距**（格，局部坐标）：越小越精细。取 0.5 格 —— 对半尺寸 1~2 格的物件约保留
+/// 30%~60% 顶点（实测见 `docs/devlog.md`），轮廓变化远小于一个像素级容差。
+constexpr float kObjectProxyCellBlocks = 0.5F;
+
+/// V0.7 H3（[ADR 0034](../docs/adr/0034-object-instancing-and-hlod.md) 决策三）：静态物件的**物理体碰撞半径**（格）。
+///
+/// 只给该半径内的静态物件建 / 保留 Jolt 静态体 ⇒ **体数与世界内容量解耦**（内容半径 8 tile ≈ 512 格，
+/// 再收敛到"玩家真能碰到"的范围）。取 128 格 ≈ 玩家以 7 格/秒跑 18 秒的距离，远超交互 / 碰撞相关范围；
+/// 越界只在"玩家移动"时逐个移除（分帧预算），入界**立即**建体（不会出现"该挡却没挡"）。
+constexpr double kObjectCollisionRadiusBlocks = 128.0;
+
+/// 每帧最多**移除**多少个越界静态体（**新增不设预算** —— 碰撞正确性优先）。
+constexpr std::size_t kObjectBodyRemovalBudgetPerFrame = 32;
+
+/// V0.7 H3：把**共享形状**用在一个静态物件上（原点 + yaw 朝向）。
+[[nodiscard]] vx::PhysicsWorld::BodyHandle AddSharedObjectBody(vx::PhysicsWorld& physics,
+                                                              vx::PhysicsWorld::SharedMeshShape shape,
+                                                              const glm::dvec3& origin, float yawDegrees) {
+    return physics.AddStaticMeshBody(
+        shape, origin, glm::angleAxis(glm::radians(yawDegrees), glm::vec3(0.0F, 1.0F, 0.0F)));
+}
+
+/// 把配置里的流式散布条目转成**纯函数判据**（`PlacementRule`）。
+[[nodiscard]] vx::PlacementRule ToPlacementRule(const vx::ObjectScatterTiled& tiled) noexcept {
+    vx::PlacementRule rule;
+    rule.cellBlocks      = tiled.cellBlocks;
+    rule.minSlopeDegrees = tiled.minSlopeDegrees;
+    rule.maxSlopeDegrees = tiled.maxSlopeDegrees;
+    rule.minHeightBlocks = tiled.minHeightBlocks;
+    rule.maxHeightBlocks = tiled.maxHeightBlocks;
+    rule.allowPlains     = tiled.allowPlains;
+    rule.allowHills      = tiled.allowHills;
+    rule.allowMountains  = tiled.allowMountains;
+    rule.minTemperature  = tiled.minTemperature;
+    rule.maxTemperature  = tiled.maxTemperature;
+    rule.minHumidity     = tiled.minHumidity;
+    rule.maxHumidity     = tiled.maxHumidity;
+    return rule;
+}
 
 /// 物件质量（**占位口径**，只影响掉落 / 被炸飞的手感；正式数据随 kit 资产引入）。
 [[nodiscard]] constexpr float ObjectPlaceholderMass(vx::ObjectAssetKind kind) noexcept {
@@ -1119,6 +1211,43 @@ void CheckObjectSupports(std::vector<ObjectSlot>& slots, const GameOrbWorldQuery
             ConvertObjectToDynamic(slot, physics, glm::vec3(0.0F))) {
             VX_LOG_INFO("物件 [%s] 失去支撑（脚下地表 / 体积已被移除）⇒ 转动态刚体**掉落**",
                         slot.type->id.c_str());
+        }
+    }
+}
+
+/// V0.7 H3：**静态物件碰撞体半径裁剪**（[ADR 0034](../../docs/adr/0034-object-instancing-and-hlod.md) 决策三）——
+/// 只保留玩家 `kObjectCollisionRadiusBlocks` 内的静态物件物理体 ⇒ **体数与世界内容量解耦**。
+///
+/// 语义：
+///   - 入界 / 缺体 ⇒ **立即**建体（碰撞正确性优先，不设预算 ⇒ 不会出现"该挡却没挡"）；
+///   - 出界 ⇒ **分帧**移除（每帧至多 `kObjectBodyRemovalBudgetPerFrame`，不冻结画面）；
+///   - **动态物件不参与**（掉落 / 被炸飞的体必须一直在，且它们总在玩家附近）；
+///   - **无共享形状**的类型不参与（保持"每体一形状、常驻"的旧行为，逐位不变）。
+void ReconcileObjectBodies(
+    std::vector<ObjectSlot>& slots,
+    const std::unordered_map<std::string, vx::PhysicsWorld::SharedMeshShape>& shapeByType,
+    vx::PhysicsWorld& physics, const glm::dvec3& playerPosition, double radiusBlocks) {
+    if (radiusBlocks <= 0.0) {
+        return;  // 裁剪已关闭（`--object-collision-radius=0`）⇒ 保持"每体常驻"的旧行为
+    }
+    const double radiusSquared = radiusBlocks * radiusBlocks;
+    std::size_t  removed       = 0;
+    for (ObjectSlot& slot : slots) {
+        if (slot.removed || slot.dynamic || slot.type == nullptr) {
+            continue;
+        }
+        const auto shape = shapeByType.find(slot.type->id);
+        if (shape == shapeByType.end() || !shape->second.IsValid()) {
+            continue;  // 无共享形状 ⇒ 不裁剪（旧行为）
+        }
+        const glm::dvec3 delta   = slot.position - playerPosition;
+        const bool       inRange = glm::dot(delta, delta) <= radiusSquared;
+        if (inRange && slot.body == 0) {
+            slot.body = AddSharedObjectBody(physics, shape->second, slot.position, slot.yawDegrees);
+        } else if (!inRange && slot.body != 0 && removed < kObjectBodyRemovalBudgetPerFrame) {
+            physics.RemoveBody(slot.body);
+            slot.body = 0;
+            ++removed;
         }
     }
 }
@@ -1908,6 +2037,59 @@ int main(int argc, char** argv) {
         }
     }
 
+    // V0.7 H2（[ADR 0034](../../docs/adr/0034-object-instancing-and-hlod.md)）：`--object-instancing=on|off`
+    // —— 物件实例化路径开关（缺省 **on**）。这是 SKILL §五「已实现能力只允许用配置项关闭」的关闭开关：
+    // 关掉后物件**全部**回落旧逐网格路径（行为与 V0.6 逐位一致），用于 A/B 实测（`plans/v0.7.md` §4 的
+    // "物件数 ⇒ draw call"前后对比）与故障隔离。**不影响任何缺省行为**。
+    bool objectInstancingEnabled = true;
+    for (const std::string& argument : arguments) {
+        constexpr const char* kObjectInstancingPrefix = "--object-instancing=";
+        if (argument.rfind(kObjectInstancingPrefix, 0) != 0) {
+            continue;
+        }
+        const std::string value = argument.substr(std::char_traits<char>::length(kObjectInstancingPrefix));
+        if (value == "off" || value == "0" || value == "false") {
+            objectInstancingEnabled = false;
+        } else if (value == "on" || value == "1" || value == "true") {
+            objectInstancingEnabled = true;
+        } else {
+            VX_LOG_WARN("`--object-instancing` 取值非法（应为 on|off）：%s ⇒ 保持缺省 on", value.c_str());
+        }
+    }
+
+    // V0.7 H3：`--object-collision-radius=<格>` —— 静态物件**物理体**的半径裁剪（缺省 `kObjectCollisionRadiusBlocks`；
+    // `0` = **关闭裁剪**，回到"每体常驻"的旧行为）。用于 H3 的 A/B 实测（`plans/v0.7.md` §4）。
+    double objectCollisionRadiusBlocks = kObjectCollisionRadiusBlocks;
+    for (const std::string& argument : arguments) {
+        constexpr const char* kCollisionRadiusPrefix = "--object-collision-radius=";
+        if (argument.rfind(kCollisionRadiusPrefix, 0) != 0) {
+            continue;
+        }
+        try {
+            objectCollisionRadiusBlocks =
+                std::stod(argument.substr(std::char_traits<char>::length(kCollisionRadiusPrefix)));
+        } catch (const std::exception&) {
+            VX_LOG_WARN("`--object-collision-radius` 取值非法 ⇒ 保持缺省 %.0f 格", kObjectCollisionRadiusBlocks);
+            objectCollisionRadiusBlocks = kObjectCollisionRadiusBlocks;
+        }
+    }
+
+    // V0.7 H4：`--object-lod-distance=<格>` —— 远景 LOD 链的切换距离（缺省 `kObjectLodDistanceBlocks`；
+    // `0` = **关闭 LOD 链**，全部用原网格）。用于 H4 的 A/B 实测（`plans/v0.7.md` §4）。
+    double objectLodDistanceBlocks = kObjectLodDistanceBlocks;
+    for (const std::string& argument : arguments) {
+        constexpr const char* kLodDistancePrefix = "--object-lod-distance=";
+        if (argument.rfind(kLodDistancePrefix, 0) != 0) {
+            continue;
+        }
+        try {
+            objectLodDistanceBlocks = std::stod(argument.substr(std::char_traits<char>::length(kLodDistancePrefix)));
+        } catch (const std::exception&) {
+            VX_LOG_WARN("`--object-lod-distance` 取值非法 ⇒ 保持缺省 %.0f 格", kObjectLodDistanceBlocks);
+            objectLodDistanceBlocks = kObjectLodDistanceBlocks;
+        }
+    }
+
     // W7-S4：`--autofly=<秒>` —— **确定性自动化飞行**（仅测试用；缺省 0 = 不启用）。
     // 为什么需要：W7 的验收判据要求"10km 飞越全图"的实测证据，而本环境无法用
     // `tools/vx_perf_input.ps1` 向游戏注入按键（注入只到达**前台**窗口，CI / 无头会话抢不到，
@@ -2602,6 +2784,10 @@ int main(int argc, char** argv) {
         world.SetMapPreset(preset);  // 噪声先行、编辑覆盖其上（必须在 LoadTile 之前）
         // V4：注入地表数据源（`nullptr` ⇒ 程序化，与从前**逐位一致**）。必须在 LoadTile 之前。
         world.SetTileSource(premadeTerrainSource.get());
+
+        // V0.6 C5：**流式散布**的地貌判据要读"地貌掩罩" ⇒ 单独持有一个噪声生成器。
+        // 纯函数、线程安全；口径只由 `(seed, terrainParams)` 决定（与 `world` / 建块 worker 各自的实例互不影响）。
+        const vx::TerrainNoiseGenerator placementNoise(preset.seed, terrainParams);
         // T8 层间交接（ADR 0011）＋ T61：判据 = **当前常驻集合**（ADR 0020 决策三），故必须在 LoadTile 之前设置。
         // W4：**地表壳**的近场区域 + 级联四边形过滤器（可挖体积接管 ∪ 地表壳接管）。
         // 区域按 tile 对齐 ⇒ 被跳过的四边形整块落在若干 tile 内 ⇒ 那些 tile 的网格变空 ⇒
@@ -3162,6 +3348,85 @@ int main(int argc, char** argv) {
                                                 materialSlot);
         };
 
+        // V0.7 H2：为**每个 `ObjectType` 预建一个实例化原型**（`UploadInstancedMesh`）。
+        // **加载期**建好 ⇒ **绝不在渲染帧内创建 GPU 资源**（SKILL 第四节硬规则 4）。
+        // 原型几何 = `buildLocalMesh`（与逐物件网格**逐位同源**）⇒ 两条绘制路径视觉等价（ADR 0034 决策一）。
+        // 上传失败 / 空网格 ⇒ 无效句柄 ⇒ 该类型自动回落旧逐网格路径（不静默：下面集合处统一报一次）。
+        std::unordered_map<std::string, vx::MeshHandle> instancePrototypeByType;
+        instancePrototypeByType.reserve(objects.types.size());
+        // V0.7 H4：每个类型的**低模代理原型**（顶点聚类，加载期生成）。没有更小的代理时不建（等同原网格无意义）。
+        std::unordered_map<std::string, vx::MeshHandle> instanceProxyByType;
+        instanceProxyByType.reserve(objects.types.size());
+        if (objectInstancingEnabled) {
+            std::size_t prototypeCount = 0;
+            std::size_t proxyVertexBefore = 0;
+            std::size_t proxyVertexAfter  = 0;
+            for (const vx::ObjectType& type : objects.types) {
+                const vx::MeshData  fullMesh  = buildLocalMesh(type);
+                const vx::MeshHandle prototype = renderer.UploadInstancedMesh(fullMesh, kObjectInstanceCapacity);
+                instancePrototypeByType.emplace(type.id, prototype);
+                if (prototype.IsValid()) {
+                    ++prototypeCount;
+                } else {
+                    VX_LOG_WARN("物件 [%s] 的实例化原型创建失败（空网格？）⇒ 该类型走旧逐网格路径", type.id.c_str());
+                }
+                // H4：低模代理 —— 只在**确实更小**（顶点更少）时才建，避免白占一份实例缓冲与网格。
+                const vx::MeshData proxyMesh = vx::BuildLowPolyProxy(fullMesh, kObjectProxyCellBlocks);
+                if (proxyMesh.vertices.size() < fullMesh.vertices.size()) {
+                    const vx::MeshHandle proxy = renderer.UploadInstancedMesh(proxyMesh, kObjectInstanceCapacity);
+                    if (proxy.IsValid()) {
+                        instanceProxyByType.emplace(type.id, proxy);
+                        proxyVertexBefore += fullMesh.vertices.size();
+                        proxyVertexAfter += proxyMesh.vertices.size();
+                    }
+                }
+            }
+            VX_LOG_INFO("物件实例化（V0.7 H2 / ADR 0034）：已建 %zu / %zu 个类型原型（每类型容量 %u 实例）",
+                        prototypeCount, objects.types.size(), kObjectInstanceCapacity);
+            if (!instanceProxyByType.empty() && proxyVertexBefore > 0) {
+                const double savedPercent = 100.0 * (1.0 - static_cast<double>(proxyVertexAfter) /
+                                                               static_cast<double>(proxyVertexBefore));
+                VX_LOG_INFO("物件远景 LOD 链（V0.7 H4 / ADR 0034）：%zu 个类型有低模代理 —— 远景顶点 %zu → %zu"
+                            "（**−%.0f%%**）；切换距离 %.0f 格、聚类格距 %.2f 格",
+                            instanceProxyByType.size(), proxyVertexBefore, proxyVertexAfter, savedPercent,
+                            kObjectLodDistanceBlocks, static_cast<double>(kObjectProxyCellBlocks));
+            }
+        } else {
+            VX_LOG_INFO("物件实例化（V0.7 H2 / ADR 0034）：**已由 `--object-instancing=off` 关闭** ⇒ 全部走旧逐网格路径");
+        }
+
+        // V0.7 H3：为**每个 `ObjectType` 建一个可共享的碰撞形状**（`physics.CreateSharedMeshShape`）。
+        // 几何取**未旋转**的局部网格；物件朝向由**刚体旋转**承担 ⇒ 同类型的 N 个物件只构建**一次** `MeshShape`
+        // （Jolt 的 `MeshShape` 不可变且构建昂贵）⇒ 形状内存 / 构建成本与实例数解耦（ADR 0034 决策三）。
+        // 与渲染实例化**相互独立**（即便 `--object-instancing=off`，共享形状仍然生效）。
+        std::unordered_map<std::string, vx::PhysicsWorld::SharedMeshShape> sharedShapeByType;
+        sharedShapeByType.reserve(objects.types.size());
+        {
+            std::size_t shapeCount = 0;
+            for (const vx::ObjectType& type : objects.types) {
+                const vx::MeshData       localMesh = buildLocalMesh(type);
+                const std::vector<float> positions = FlattenObjectPositions(localMesh);
+                if (positions.size() < 12U) {  // 空网格 / 顶点不足 ⇒ 无法建形状（该类型回落旧路径）
+                    sharedShapeByType.emplace(type.id, vx::PhysicsWorld::SharedMeshShape {});
+                    continue;
+                }
+                vx::PhysicsWorld::MeshDesc desc;
+                desc.positions     = positions.data();
+                desc.vertexCount   = localMesh.vertices.size();
+                desc.indices       = localMesh.indices.data();
+                desc.triangleCount = localMesh.indices.size() / 3U;
+                const vx::PhysicsWorld::SharedMeshShape shape = physics.CreateSharedMeshShape(desc);
+                sharedShapeByType.emplace(type.id, shape);
+                if (shape.IsValid()) {
+                    ++shapeCount;
+                } else {
+                    VX_LOG_WARN("物件 [%s] 的共享碰撞形状创建失败 ⇒ 该类型回落「每体一形状」路径", type.id.c_str());
+                }
+            }
+            VX_LOG_INFO("物件共享碰撞形状（V0.7 H3 / ADR 0034）：已建 %zu / %zu 个类型的共享 Shape（引用计数）",
+                        shapeCount, objects.types.size());
+        }
+
         // V8：落点清单 = **显式 `[[placement]]`（按文件顺序）+ 程序化 `[[scatter]]` 展开**（按文件顺序）。
         // 顺序固定 ⇒ "遍历顺序 = 放置顺序"（确定性，红线 7）仍然成立。
         std::vector<vx::ObjectPlacement> objectPlan = objects.placements;
@@ -3187,9 +3452,10 @@ int main(int argc, char** argv) {
         std::vector<vx::PortalEntry> portals;  // V3：供"最近门"查询（交互用）
         portals.reserve(2U);
 
-        // 建一个**物件槽**（GPU 网格 + 静态三角网碰撞体 + 剔除包围盒）并登记。
-        // **加载期与运行期（`F2` 就地摆放）共用同一实现** ⇒ "谁画谁挡"同源、包围盒口径一致，不会出现两套几何。
-        const auto addObjectSlot = [&](const vx::ObjectInstance& instance) {
+        // 建一个**物件槽**（GPU 网格 + 静态三角网碰撞体 + 剔除包围盒）。
+        // **加载期、运行期（`F2` 就地摆放）与流式散布（V0.6 C5）共用同一实现** ⇒
+        // "谁画谁挡"同源、包围盒口径一致，不会出现两套几何。
+        const auto makeObjectSlot = [&](const vx::ObjectInstance& instance) -> ObjectSlot {
             const vx::MeshData localMesh    = buildLocalMesh(*instance.type);
             const vx::MeshData colliderMesh = vx::RotateMeshAboutY(localMesh, instance.yawDegrees);
             const glm::dvec3   origin(static_cast<double>(instance.x), static_cast<double>(instance.y),
@@ -3212,23 +3478,191 @@ int main(int argc, char** argv) {
                 renderer.SetMeshTransform(slot.handle, origin, rotation);
             }
 
-            // 静态碰撞体：与渲染**共用同一份几何**（朝向烘进顶点 ⇒ "谁画谁挡"同源）。
-            const std::vector<float>   positions = FlattenObjectPositions(colliderMesh);
-            vx::PhysicsWorld::MeshDesc collider;
-            collider.positions     = positions.data();
-            collider.vertexCount   = colliderMesh.vertices.size();
-            collider.indices       = colliderMesh.indices.data();
-            collider.triangleCount = colliderMesh.indices.size() / 3U;
-            collider.originX       = origin.x;
-            collider.originY       = origin.y;
-            collider.originZ       = origin.z;
-            slot.body              = physics.AddMesh(collider);
+            // 静态碰撞体（V0.7 H3 / ADR 0034 决策三）：优先用**共享 Shape** —— 几何 = 未旋转局部网格，
+            // 朝向由**刚体旋转**承担（与"把 yaw 烘进顶点 + 单位朝向"逐位等价 ⇒ 碰撞行为不变）；
+            // 某类型没有可用的共享形状时回落"每体一形状"（旧路径，把 yaw 烘进顶点）。
+            const auto sharedShape = sharedShapeByType.find(instance.type->id);
+            if (sharedShape != sharedShapeByType.end() && sharedShape->second.IsValid()) {
+                slot.body = AddSharedObjectBody(physics, sharedShape->second, origin, instance.yawDegrees);
+            } else {
+                const std::vector<float>   positions = FlattenObjectPositions(colliderMesh);
+                vx::PhysicsWorld::MeshDesc collider;
+                collider.positions     = positions.data();
+                collider.vertexCount   = colliderMesh.vertices.size();
+                collider.indices       = colliderMesh.indices.data();
+                collider.triangleCount = colliderMesh.indices.size() / 3U;
+                collider.originX       = origin.x;
+                collider.originY       = origin.y;
+                collider.originZ       = origin.z;
+                slot.body              = physics.AddMesh(collider);
+            }
             if (slot.body == 0) {
                 VX_LOG_WARN("物件 [%s] 的静态碰撞体创建失败（渲染仍在 ⇒ 只会「看得见走得穿」）",
                             instance.type->id.c_str());
             }
+            return slot;
+        };
+        const auto addObjectSlot = [&](const vx::ObjectInstance& instance) {
+            objectSlots.push_back(makeObjectSlot(instance));
+        };
 
-            objectSlots.push_back(std::move(slot));
+        // ---- V0.6 C5：**流式散布**（地形感知；[ADR 0033](../docs/adr/0033-world-content-placement-and-streaming.md) 决策三）----
+        // 与 `[[scatter]]`（圆域、一次摆完）不同：`[[scatter_tiled]]` 的物件**随 tile 常驻窗口增删** ——
+        //   - 候选点 = `PlanTileCandidates`（**tile 局部、确定性**）⇒ 同一个 tile 永远生成同一批点；
+        //   - 过滤 = `SamplePlacement`（中心差分坡度 + 地表高度 + 地貌）+ `IsPlacementAllowed`（四项判据）；
+        //   - 生命周期 = **槽位池复用**（红线 10）：卸载只把槽位标 `removed` 并入自由表、**绝不缩短数组**
+        //     ⇒ 其它系统（剔除 / 支撑 / 破坏 / 渲染）持有的下标**恒稳定**，成本与世界总量无关；
+        //   - 每帧**预算**（`kStreamedTilesPerFrame`）⇒ 生成 / 移除都不冻结画面（SKILL 第四节）。
+        std::map<vx::TileCoord, std::vector<std::size_t>> streamedTileSlots;  // tile → objectSlots 下标
+        std::vector<std::size_t>                          freeObjectSlots;     // 已卸载槽位（复用）
+        std::size_t                                       streamedCreatedTotal = 0;
+        std::size_t                                       streamedRemovedTotal = 0;
+        std::size_t                                       streamedTilesWithObjects = 0;
+        bool                                              streamedPassLogged       = false;
+        const bool                                        streamedEnabled      = !objects.tiledScatters.empty();
+        if (streamedEnabled) {
+            VX_LOG_INFO("流式散布（V0.6 C5）：启用 —— 规则 %zu 条、内容半径 %d tile（≈ %d 格）",
+                        objects.tiledScatters.size(), kStreamedContentRadiusTiles,
+                        kStreamedContentRadiusTiles * vx::kTerrainTileSize);
+        }
+
+        // 生成一个流式物件（候选点已通过地形判据）。前置：该列有地表数据。
+        const auto createStreamedObject = [&](const vx::ObjectScatterTiled& tiled, const vx::ScatterPoint& point,
+                                              const vx::TileCoord& tile) -> bool {
+            float surface = 0.0F;
+            if (!world.QueryHeight(point.x, point.z, surface)) {
+                return false;  // 该列无地表数据（tile 未就绪）⇒ 跳过；该 tile 不记条目，下一帧重扫
+            }
+            vx::ObjectPlacement placed;
+            placed.typeId     = tiled.typeId;
+            placed.x          = point.x;
+            placed.y          = surface;
+            placed.z          = point.z;
+            placed.yawDegrees = point.yawDegrees;
+
+            const std::uint32_t id = objectLayer.Place(objects, placed);
+            vx::ObjectInstance  instance;
+            if (!objectLayer.Get(id, instance)) {
+                (void)objectLayer.Remove(id);  // 兜底：实体登记了却取不回 ⇒ 撤销（不留孤儿实体）
+                return false;
+            }
+            std::size_t index = 0;
+            if (!freeObjectSlots.empty()) {
+                index = freeObjectSlots.back();
+                freeObjectSlots.pop_back();
+            } else {
+                index = objectSlots.size();
+                objectSlots.emplace_back();
+            }
+            objectSlots[index]              = makeObjectSlot(instance);
+            objectSlots[index].streamed     = true;
+            objectSlots[index].streamedTile = tile;
+            streamedTileSlots[tile].push_back(index);
+            ++streamedCreatedTotal;
+            if (streamedCreatedTotal == 1U) {
+                VX_LOG_INFO("流式散布（V0.6 C5）：**首个物件已生成** —— tile (%d, %d)、类型 [%s]", tile.x, tile.z,
+                            tiled.typeId.c_str());
+            }
+            return true;
+        };
+
+        // 每帧对账（预算内）：① 移除"已出内容半径 / 已非常驻"的 tile 的物件；② 为进入内容半径的 tile 生成物件。
+        const auto reconcileStreamedObjects = [&]() {
+            if (!streamedEnabled) {
+                return;
+            }
+            const int  centerX       = tileScheduler.Window().centerTileX;
+            const int  centerZ       = tileScheduler.Window().centerTileZ;
+            const auto withinContent = [&](const vx::TileCoord& coord) {
+                const int dx = (coord.x >= centerX) ? (coord.x - centerX) : (centerX - coord.x);
+                const int dz = (coord.z >= centerZ) ? (coord.z - centerZ) : (centerZ - coord.z);
+                return dx <= kStreamedContentRadiusTiles && dz <= kStreamedContentRadiusTiles;
+            };
+
+            // ① 移除（预算内）。
+            std::size_t removedTiles = 0;
+            for (auto it = streamedTileSlots.begin();
+                 it != streamedTileSlots.end() && removedTiles < kStreamedTilesPerFrame;) {
+                const vx::TileCoord coord = it->first;
+                if (withinContent(coord) && world.HasTile(coord.x, coord.z)) {
+                    ++it;
+                    continue;
+                }
+                const std::size_t slotCount = it->second.size();
+                for (const std::size_t index : it->second) {
+                    DestroyObjectSlot(objectSlots[index], objectLayer, physics, renderer);
+                    freeObjectSlots.push_back(index);
+                }
+                it = streamedTileSlots.erase(it);
+                ++removedTiles;
+                ++streamedRemovedTotal;
+                if (streamedRemovedTotal == 1U) {
+                    VX_LOG_INFO("流式散布（V0.6 C5）：**首个 tile 已随窗口移除** —— tile (%d, %d)、回收 %zu 个物件进槽位池",
+                                coord.x, coord.z, slotCount);
+                }
+            }
+
+            // ② 生成（预算内）：内容半径内、已常驻、且尚无条目的 tile。
+            std::size_t createdTiles = 0;
+            bool        budgetHit    = false;
+            for (int tz = centerZ - kStreamedContentRadiusTiles; tz <= centerZ + kStreamedContentRadiusTiles; ++tz) {
+                for (int tx = centerX - kStreamedContentRadiusTiles; tx <= centerX + kStreamedContentRadiusTiles;
+                     ++tx) {
+                    if (createdTiles >= kStreamedTilesPerFrame) {
+                        budgetHit = true;
+                        break;
+                    }
+                    const vx::TileCoord coord { tx, tz };
+                    if (!world.HasTile(tx, tz) || streamedTileSlots.find(coord) != streamedTileSlots.end()) {
+                        continue;
+                    }
+                    const std::size_t before = streamedCreatedTotal;
+                    for (const vx::ObjectScatterTiled& tiled : objects.tiledScatters) {
+                        const vx::PlacementRule rule = ToPlacementRule(tiled);
+                        for (const vx::ScatterPoint& point : vx::PlanTileCandidates(rule, tiled.seed, coord)) {
+                            const vx::PlacementSample sample = vx::SamplePlacement(
+                                point.x, point.z, kStreamedSlopeHalfStepBlocks,
+                                [&world](float x, float z) {
+                                    float height = 0.0F;
+                                    (void)world.QueryHeight(x, z, height);
+                                    return height;
+                                },
+                                [&](float x, float z) {
+                                    return vx::ClassifyLandform(
+                                        placementNoise.LandformMaskAt(static_cast<std::int64_t>(std::floor(x)),
+                                                                      static_cast<std::int64_t>(std::floor(z))),
+                                        terrainParams.landform);
+                                },
+                                [&](float x, float z) {
+                                    return placementNoise.TemperatureAt(static_cast<std::int64_t>(std::floor(x)),
+                                                                        static_cast<std::int64_t>(std::floor(z)));
+                                },
+                                [&](float x, float z) {
+                                    return placementNoise.HumidityAt(static_cast<std::int64_t>(std::floor(x)),
+                                                                     static_cast<std::int64_t>(std::floor(z)));
+                                });
+                            if (vx::IsPlacementAllowed(rule, sample)) {
+                                (void)createStreamedObject(tiled, point, coord);
+                            }
+                        }
+                    }
+                    if (streamedCreatedTotal > before) {
+                        ++streamedTilesWithObjects;
+                    }
+                    streamedTileSlots[coord];  // 记条目（空也记 ⇒ 同一 tile 不重复扫描）
+                    ++createdTiles;
+                }
+                if (budgetHit) {
+                    break;
+                }
+            }
+            // 一次"整窗对账"跑完 ⇒ 打印一次（进度可见；此后按玩家移动增量增删）。
+            if (!budgetHit && !streamedPassLogged) {
+                streamedPassLogged = true;
+                VX_LOG_INFO("流式散布（V0.6 C5）：内容窗口**对账完成** —— 已登记 %zu 个 tile（其中 %zu 个 tile 有物件）、"
+                            "累计生成 %zu 个物件",
+                            streamedTileSlots.size(), streamedTilesWithObjects, streamedCreatedTotal);
+            }
         };
 
         std::size_t objectSkipped = 0;
@@ -3257,10 +3691,69 @@ int main(int argc, char** argv) {
             }
             addObjectSlot(instance);
         }
-        VX_LOG_INFO("物件层就绪（V0b/V0c/V3/V8）：清单 %s；放置 %zu / %zu 个物件（渲染 + 静态碰撞：其中传送门 %zu、"
-                    "散布点 %zu、模型文件 %zu 个），类型表 %zu 项；可破坏总开关 = %s%s",
+
+        // ---- V0.8：**成套建筑**（`[[building]]`）展开为逐构件物件（[ADR 0035](../docs/adr/0035-modular-building-kit-and-enterable-spaces.md) 决策三）----
+        // 为什么必须在游戏层展开：构件要**竖直堆叠**（墙压地板、屋顶压墙），而逐件 `[[placement]]` 的 `y`
+        // 一律按地表高度求解（见上）⇒ 只有"锚点解算**一次**地表高度 + 构件用**相对偏移**"才能得到正确层高。
+        // 构件与逐件放置走**同一条装配路径**（`objectLayer.Place` + `addObjectSlot`）⇒ 渲染 / 碰撞 / 剔除 /
+        // 实例化 / 远景 LOD **零分叉**；朝向旋转与 `RotateMeshAboutY` **同一约定**（绕 +Y 右手系）。
+        std::size_t buildingPieceTotal = 0;
+        std::size_t buildingSkipped    = 0;
+        std::size_t buildingEnclosed   = 0;  ///< 带围合体代理（= 可进入空间）的建筑数
+        for (const vx::ObjectBuilding& building : objects.buildings) {
+            float anchorSurface = 0.0F;
+            if (!world.QueryHeight(building.x, building.z, anchorSurface)) {
+                VX_LOG_WARN("建筑 [%s] 的锚点 (%.1f, %.1f) 无地表数据 ⇒ 跳过整座建筑（%zu 个构件）",
+                            building.id.c_str(), static_cast<double>(building.x), static_cast<double>(building.z),
+                            building.pieces.size());
+                buildingSkipped += building.pieces.size();
+                continue;
+            }
+            // V0.8 室内变暗：由屋顶构件的并集求出该建筑的**围合体代理**（纯函数，红线 7），
+            // 整座建筑的每个构件带**同一份** ⇒ 片元能一致地判定自己是否在室内。
+            const vx::ObjectEnclosure enclosure = vx::ComputeBuildingEnclosure(building, objects, anchorSurface);
+            if (enclosure.enabled) {
+                ++buildingEnclosed;
+            }
+            const float yawRadians = glm::radians(building.yawDegrees);
+            const float cosYaw     = std::cos(yawRadians);
+            const float sinYaw     = std::sin(yawRadians);
+            for (const vx::ObjectBuildingPiece& piece : building.pieces) {
+                // 与 `RotateMeshAboutY` 逐字同源：x' = c·x + s·z、z' = −s·x + c·z。
+                const float rotatedX = cosYaw * piece.offsetX + sinYaw * piece.offsetZ;
+                const float rotatedZ = -sinYaw * piece.offsetX + cosYaw * piece.offsetZ;
+
+                vx::ObjectPlacement placedPiece;
+                placedPiece.typeId     = piece.typeId;
+                placedPiece.x          = building.x + rotatedX;
+                placedPiece.y          = anchorSurface + piece.offsetY;  // **绝对高度**（不再按地表求解 = 堆叠）
+                placedPiece.z          = building.z + rotatedZ;
+                placedPiece.yawDegrees = building.yawDegrees + piece.yawDegrees;
+
+                const std::uint32_t id = objectLayer.Place(objects, placedPiece);
+                vx::ObjectInstance  instance;
+                if (!objectLayer.Get(id, instance)) {
+                    VX_LOG_WARN("建筑 [%s] 的构件 [%s] 实例化失败 ⇒ 跳过该构件", building.id.c_str(),
+                                piece.typeId.c_str());
+                    ++buildingSkipped;
+                    continue;
+                }
+                addObjectSlot(instance);
+                objectSlots.back().enclosure = enclosure;  // V0.8：构件带建筑的围合体（室内变暗）
+                ++buildingPieceTotal;
+            }
+        }
+        if (!objects.buildings.empty()) {
+            VX_LOG_INFO("成套建筑（V0.8 / ADR 0035）：%zu 座、展开 %zu 个构件（跳过 %zu）；其中 %zu 座带**围合体代理**"
+                        "（室内变暗 V0.8）；模数对齐由类型表的 module_blocks 保证、层高由构件相对偏移保证",
+                        objects.buildings.size(), buildingPieceTotal, buildingSkipped, buildingEnclosed);
+        }
+
+        VX_LOG_INFO("物件层就绪（V0b/V0c/V3/V8/V0.8）：清单 %s；放置 %zu / %zu 个物件（渲染 + 静态碰撞：其中传送门 %zu、"
+                    "散布点 %zu、模型文件 %zu 个、成套建筑构件 %zu 个），类型表 %zu 项；可破坏总开关 = %s%s",
                     objectsPath.string().c_str(), objectSlots.size(), objectPlan.size(), portals.size(), scatterPointCount,
-                    modelCache.size(), objects.types.size(), objects.destructibleEnabled ? "开" : "关",
+                    modelCache.size(), buildingPieceTotal, objects.types.size(),
+                    objects.destructibleEnabled ? "开" : "关",
                     (objectSkipped == 0U) ? "" : "（有落点被跳过，见上方 WARN）");
 
         vx::PhysicsWorld::CapsuleDesc capsule;
@@ -3516,6 +4009,29 @@ int main(int argc, char** argv) {
         }
         std::vector<vx::MeshHandle> shadowDynamicHandles;
         shadowDynamicHandles.reserve(2 + orbHandles.size() + static_cast<std::size_t>(collapseSpec.maxActiveUnits));
+        // V0.7 H2：物件的**实例化分组**（跨帧复用 ⇒ 稳态零分配）——
+        //   ① `instancePoseGroups`：类型 id → 本帧可见静态实例位姿（外层 map 常驻、内层 vector 保留容量）；
+        //   ② `instanceBatches`：本帧真正提交的批次（其 `poses` 指向 ① 的 vector 数据，生命周期覆盖本帧 `RenderFrame`）；
+        //   ③ `instancedTypeIds`：本帧走实例化的类型（旧路径据此排除重复提交）。
+        // V0.7 H4：按类型分**近 / 远两组**（远景组用低模代理）—— 其余口径同 H2。
+        struct InstancePoseGroup {
+            std::vector<vx::InstancePose> nearPoses;  ///< 切换距离内 ⇒ 原网格
+            std::vector<vx::InstancePose> farPoses;   ///< 切换距离外 ⇒ 低模代理（无代理时并入近组）
+            /// V0.8 室内变暗：本组是否含**带围合体代理**的实例（= 成套建筑构件）。含则**不受实例化阈值限制** ——
+            /// 围合体只能经逐实例数据（实例缓冲）送到 GPU，若回落旧逐网格路径就没有该通道（构件数常 < 阈值）。
+            bool hasEnclosure = false;
+        };
+        std::unordered_map<std::string, InstancePoseGroup> instancePoseGroups;
+        instancePoseGroups.reserve(objects.types.size());
+        std::vector<vx::InstanceBatch> instancedBatches;
+        instancedBatches.reserve(objects.types.size());
+        std::vector<std::string> instancedTypeIds;
+        instancedTypeIds.reserve(objects.types.size());
+        bool instancingLogged = false;  ///< 首次真正走实例化时打印一次（观测留痕）
+        /// H2 的"前后对比"证据：0 = 未记、1 = 已记"首帧"、2 = 已记"流式加载完成"。
+        int instancedDrawCallLogStage = 0;
+        bool objectBodyCullLogged = false;  ///< H3：流式对账完成后打印一次物理体总数（裁剪效果）
+        bool lodChainLogged = false;        ///< H4：首次有实例走低模代理时打印一次（远景顶点量）
         // P3（ADR 0031）：遮挡剔除的 CPU 深度图 —— 跨帧复用（尺寸固定 ⇒ 稳态零分配）。
         vx::OcclusionDepthGrid occlusionGrid;
         vx::ResetOcclusionDepthGrid(occlusionGrid, kOcclusionGridWidth, kOcclusionGridHeight);
@@ -4613,7 +5129,22 @@ int main(int argc, char** argv) {
                         ++installActions;
                     }
                 }
+                // V0.6 C5：内容随 tile 常驻窗口增删（预算内）。确定性由"每个 tile 的候选点是纯函数"保证；
+                // 分帧只改"何时可见"，不改结果（红线 7）。
+                reconcileStreamedObjects();
                 terrainStreamInstallMs = terrainStreamClock.Tick() * 1000.0;
+
+                // V0.7 H3：静态物件碰撞体收敛到玩家碰撞半径内（新建立即、移除分帧）⇒ 体数与内容量解耦。
+                if (!sharedShapeByType.empty()) {
+                    ReconcileObjectBodies(objectSlots, sharedShapeByType, physics,
+                                          physics.GetCharacterState(character).position, objectCollisionRadiusBlocks);
+                }
+                if (!objectBodyCullLogged && streamedPassLogged) {
+                    objectBodyCullLogged = true;
+                    VX_LOG_INFO("物件碰撞裁剪（V0.7 H3 / ADR 0034）：内容对账完成后**物理体总数 %zu** —— 静态物件体按 "
+                                "%.0f 格半径裁剪（共享 Shape %zu 个类型、引用计数；越界分帧移除、入界立即建）",
+                                physics.BodyCount(), objectCollisionRadiusBlocks, sharedShapeByType.size());
+                }
 
                 // **LOD 切换（relod）**：只改**网格**，不改世界数据。
                 // 有 worker ⇒ 提交**重网格任务**（高度快照进 worker，网格化离开渲染帧）；结果在 `drain` 里安装、
@@ -5022,6 +5553,26 @@ int main(int argc, char** argv) {
                 }
             };
 
+            /// V0.7 H2：静态网格是否**可能落进任意一级阴影盒**（廉价**并集预筛**，保守）。
+            ///
+            /// 为什么需要：实例化物件**不走** `submitStaticCasters`（其阴影由实例化批次统一投影），
+            /// 若只按"主视锥可见"筛选实例，则**视锥外但仍能投影到视野内**的物件会漏掉阴影（可见回退）。
+            /// 故实例收集用"主视锥可见 **或** 落进阴影并集"作为相关判据（多收的会被光空间盒裁剪，无害）。
+            const auto castsIntoAnyCascade = [&](const WorldAabb& bounds) {
+                if (shadowCascades <= 0) {
+                    return false;
+                }
+                if (!bounds.valid) {
+                    return true;  // 无包围盒 ⇒ 保守（与 `submitStaticCasters` 同口径）
+                }
+                const glm::vec3 origin  = glm::vec3(renderOrigin);
+                const glm::vec3 minimum = bounds.min - origin;
+                const glm::vec3 maximum = bounds.max - origin;
+                return !(maximum.x < shadowUnionMin.x || minimum.x > shadowUnionMax.x ||
+                         maximum.y < shadowUnionMin.y || minimum.y > shadowUnionMax.y ||
+                         maximum.z < shadowUnionMin.z || minimum.z > shadowUnionMax.z);
+            };
+
             std::size_t visibleTiles   = 0;
             std::size_t visibleVolumes = 0;
             std::size_t visibleShells  = 0;
@@ -5059,16 +5610,126 @@ int main(int argc, char** argv) {
                 submitStaticCasters(shellHandles[i], shellBounds[i]);
             }
             // V0b：物件层（ADR 0004 层③）—— **静网格**，同走两套剔除。
-            // 提交量由剔除结果决定（SKILL 第四节硬规则 3）；物件不移动 ⇒ 位姿在上传时一次登记。
+            // V0.7 H2：静态物件优先走**实例化**（按类型分组、每类型一次绘制）——
+            //   ① 收集：本帧**可见**（视锥 + 遮挡）且**静态**（未转动态 / 未摧毁）的物件按类型归组；
+            //   ② 判定：某类型可见实例数 ≥ `kObjectInstanceMinCount` ⇒ 进实例化批次（该类型物件**不再**逐网格提交）；
+            //            低于阈值 / 无有效原型 / 动态物件 ⇒ 回落旧逐网格路径（逐网格提交 + 逐级阴影剔除）；
+            //   ③ 阴影：实例化批次由 `RenderFrame` 在主 / 阴影通道各画一次（同源实例缓冲 ⇒ 阴影一致）。
+            for (auto& entry : instancePoseGroups) {
+                entry.second.nearPoses.clear();  // 保留容量：稳态零分配
+                entry.second.farPoses.clear();
+                entry.second.hasEnclosure = false;
+            }
+            instancedBatches.clear();
+            instancedTypeIds.clear();
+            std::size_t instancedObjectCount = 0;   // 进实例化批次的物件总数（主视锥可见 + 仅阴影相关）
+            std::size_t instancedMainVisible = 0;   // 其中**主视锥**可见的（供日志"通过剔除"口径）
+            const double lodDistanceSquared =
+                (objectLodDistanceBlocks > 0.0) ? objectLodDistanceBlocks * objectLodDistanceBlocks : 0.0;
+            if (objectInstancingEnabled) {
+                for (const ObjectSlot& slot : objectSlots) {
+                    if (slot.removed || slot.dynamic || slot.type == nullptr) {
+                        continue;  // 动态 / 已摧毁 ⇒ 旧路径（它们的位姿每帧在变）
+                    }
+                    const auto prototype = instancePrototypeByType.find(slot.type->id);
+                    if (prototype == instancePrototypeByType.end() || !prototype->second.IsValid()) {
+                        continue;  // 无原型 ⇒ 旧路径
+                    }
+                    // 相关判据 = 主视锥可见（且未被遮挡）**或** 可能落进任一阴影盒（见 `castsIntoAnyCascade`）。
+                    // 后者保证"视锥外但会给视野内投影"的物件不至于丢阴影（ADR 0034 判据④ 阴影一致）。
+                    const bool mainVisible =
+                        VisibleToFrustum(frustum, slot.bounds, renderOrigin) && !occludedStatic(slot.bounds);
+                    if (!mainVisible && !castsIntoAnyCascade(slot.bounds)) {
+                        continue;
+                    }
+                    if (mainVisible) {
+                        ++instancedMainVisible;
+                    }
+                    vx::InstancePose pose;
+                    pose.origin   = slot.position;
+                    pose.rotation = glm::angleAxis(glm::radians(slot.yawDegrees), glm::vec3(0.0F, 1.0F, 0.0F));
+                    // V0.8 室内变暗（ADR 0035 决策四）：把该物件所属建筑的围合体代理透传给 GPU
+                    // （室外物件保持 `enclosureEnabled = false` ⇒ 片元整段跳过）。
+                    pose.enclosureEnabled  = slot.enclosure.enabled;
+                    pose.enclosureCenterX  = slot.enclosure.centerX;
+                    pose.enclosureCenterZ  = slot.enclosure.centerZ;
+                    pose.enclosureHalfX    = slot.enclosure.halfX;
+                    pose.enclosureHalfZ    = slot.enclosure.halfZ;
+                    pose.enclosureCeilingY = slot.enclosure.ceilingY;
+                    // H4：按到渲染原点（≈ 相机）的距离分组；远处**且有代理**的走低模代理。
+                    InstancePoseGroup& group = instancePoseGroups[slot.type->id];
+                    const glm::dvec3   delta = slot.position - renderOrigin;
+                    const bool         useProxy = lodDistanceSquared > 0.0 &&
+                                          glm::dot(delta, delta) > lodDistanceSquared &&
+                                          instanceProxyByType.find(slot.type->id) != instanceProxyByType.end();
+                    group.hasEnclosure = group.hasEnclosure || pose.enclosureEnabled;  // V0.8：见下方阈值例外
+                    if (useProxy) {
+                        group.farPoses.push_back(pose);
+                    } else {
+                        group.nearPoses.push_back(pose);
+                    }
+                }
+                const auto pushBatch = [&](const vx::MeshHandle prototype, std::vector<vx::InstancePose>& poses) {
+                    vx::InstanceBatch batch;
+                    batch.prototype = prototype;
+                    batch.poses     = poses.data();
+                    batch.count     = static_cast<std::uint32_t>(poses.size());
+                    instancedBatches.push_back(batch);
+                };
+                for (auto& entry : instancePoseGroups) {
+                    const std::size_t total = entry.second.nearPoses.size() + entry.second.farPoses.size();
+                    // V0.8 例外：含围合体代理的组（= 成套建筑构件）**不受阈值限制** —— 围合体只能经实例缓冲
+                    // 送到 GPU；若因构件数少而回落旧逐网格路径，室内变暗就整段失效（见 InstancePoseGroup 说明）。
+                    if (total < kObjectInstanceMinCount && !entry.second.hasEnclosure) {
+                        continue;  // 低于阈值且无围合体 ⇒ 该类型改走旧逐网格路径
+                    }
+                    // H4：近 / 远各一批（远景用低模代理）；某组为空则不产生批次（不白付一次绘制）。
+                    if (!entry.second.nearPoses.empty()) {
+                        pushBatch(instancePrototypeByType[entry.first], entry.second.nearPoses);
+                    }
+                    if (!entry.second.farPoses.empty()) {
+                        pushBatch(instanceProxyByType[entry.first], entry.second.farPoses);
+                    }
+                    instancedTypeIds.push_back(entry.first);
+                    instancedObjectCount += total;
+                }
+                // H4 观测：首次有实例走低模代理时打印一次（远景顶点量下降的实测证据）。
+                if (!lodChainLogged && objectLodDistanceBlocks > 0.0) {
+                    std::size_t farCount = 0;
+                    for (const auto& entry : instancePoseGroups) {
+                        farCount += entry.second.farPoses.size();
+                    }
+                    if (farCount > 0U) {
+                        lodChainLogged = true;
+                        VX_LOG_INFO("物件远景 LOD 链（V0.7 H4 / ADR 0034）：本帧 %zu 个实例走**低模代理**（> %.0f 格）、"
+                                    "%zu 个走原网格；实例化批次 %zu 个",
+                                    farCount, objectLodDistanceBlocks, instancedObjectCount - farCount,
+                                    instancedBatches.size());
+                    }
+                }
+            }
+            // 旧路径：**未被实例化接管**的物件（动态 / 无原型 / 低于阈值）逐个提交 + 逐级阴影剔除。
             for (const ObjectSlot& slot : objectSlots) {
-                if (!slot.handle.IsValid()) {
+                if (slot.removed || !slot.handle.IsValid()) {
                     continue;
+                }
+                if (slot.type != nullptr && !slot.dynamic &&
+                    std::find(instancedTypeIds.begin(), instancedTypeIds.end(), slot.type->id) !=
+                        instancedTypeIds.end()) {
+                    continue;  // 该类型的静态物件已进实例化批次 ⇒ 不重复提交
                 }
                 if (VisibleToFrustum(frustum, slot.bounds, renderOrigin) && !occludedStatic(slot.bounds)) {
                     frameHandles.push_back(slot.handle);
                     ++visibleObjects;
                 }
                 submitStaticCasters(slot.handle, slot.bounds);
+            }
+            visibleObjects += instancedMainVisible;  // 日志口径 = 主视锥通过剔除的物件总数（含实例化）
+            if (!instancingLogged && !instancedBatches.empty()) {
+                instancingLogged = true;
+                VX_LOG_INFO("物件实例化（V0.7 H2 / ADR 0034）：本帧 %zu 个类型 / %zu 个静态物件走实例化（每类型 1 次绘制，"
+                            "主 + 阴影各一次）；阈值 = %zu 个可见实例",
+                            instancedBatches.size(), instancedObjectCount, kObjectInstanceMinCount);
             }
             // V0.5 E3：摆放模式的**幽灵预览**（半透明抖动淡出）—— 只进主通道，**不投影阴影**
             // （它是"还没放下的东西"）；预览网格独立于 `objectSlots`（不建碰撞体、不进剔除 / 支撑 / 破坏）。
@@ -5176,6 +5837,7 @@ int main(int argc, char** argv) {
             stats.triangleCount = renderStats.triangleCount;
             stats.vertexCount   = renderStats.vertexCount;
             stats.textureBytes  = renderStats.textureBytes;
+            stats.meshBytes     = renderStats.meshBytes;  // V0.7 H0：网格缓冲显存（顶点 + 索引 + 骨骼）
             // T28 / T29：体积碰撞体数与累计塌落体素数（纯展示，用于验证"洞能走进去、支撑缺失会塌"）。
             stats.volumeBodyCount    = volumeCollision.BlockBodyCount();
             stats.collapseMovedVoxels = editContext.totalCollapseVoxels;
@@ -5270,8 +5932,21 @@ int main(int argc, char** argv) {
             // P1：把**逐级联**的阴影绘制列表交给渲染器（`RenderFrame` 内每级只画自己那份，
             // 不再对每级重画主通道列表）⇒ draw call 由「提交网格 ×（1 + 级数）」降下来。
             if (!renderer.RenderFrame(frameHandles.data(), frameHandles.size(), clearColor, &debugOverlay,
-                                      shadowCascadeLists, vx::kMaxShadowCascades)) {
+                                      shadowCascadeLists, vx::kMaxShadowCascades, instancedBatches.data(),
+                                      instancedBatches.size())) {
                 VX_LOG_DEBUG("本帧未取得交换链纹理（窗口最小化？），跳过渲染");
+            }
+            // V0.7 H2 观测留痕：打印**实测 draw call**（含主 / 阴影两个通道），两次 ——
+            //   ① 首帧（近场 139 个显式物件）；② 流式内容**对账完成**后（再 + ~69 个散布物件）。
+            // 同一日志在 `--object-instancing=off` 下也打印 ⇒ 两次运行构成"物件数 ⇒ draw call"的
+            // **前后两点**（`plans/v0.7.md` §4 的判据）。
+            if (instancedDrawCallLogStage == 0 || (instancedDrawCallLogStage == 1 && streamedPassLogged)) {
+                const char* stageLabel = (instancedDrawCallLogStage == 0) ? "首帧" : "流式内容对账完成后";
+                ++instancedDrawCallLogStage;
+                VX_LOG_INFO("物件提交（V0.7 H2 / ADR 0034）：**实测 draw call = %u 次/帧**（%s；实例化=%s；含主 + 阴影通道）"
+                            " —— 逐网格提交 %zu 个网格 + 实例化 %zu 个批次（覆盖 %zu 个物件）",
+                            renderer.Stats().drawCalls, stageLabel, objectInstancingEnabled ? "on" : "off",
+                            submittedThisFrame, instancedBatches.size(), instancedObjectCount);
             }
             const double renderMs = renderTimer.EndMs();
             cpuCost = CpuFrameCost { logicMs, uiMs, renderMs };  // 本帧值：面板在下一帧读、尖峰日志在帧末读
@@ -5303,10 +5978,12 @@ int main(int argc, char** argv) {
                 const double untimedMs = std::max(0.0, frameMs - measuredMs);
                 VX_LOG_WARN("帧尖峰 %.1f ms（阈值 %.0f ms）：输入 %.2f + 逻辑 %.2f + UI %.2f + 剔除 %.2f + "
                             "重定基 %.2f + 动态上传 %.2f + uniform %.2f + 渲染提交 %.2f + 限帧 %.2f = %.2f，"
-                            "**未计时 %.2f** ms；draw call %u、提交网格 %zu、固定步 %d、等交换链 %.2f ms ⇒ 主要受限在 %s",
+                            "**未计时 %.2f** ms；draw call %u、提交网格 %zu、固定步 %d、等交换链 %.2f ms、"
+                            "**网格缓冲 %.1f MB** ⇒ 主要受限在 %s",
                             frameMs, kHitchThresholdMs, inputMs, cpuCost.logicMs, cpuCost.uiMs, cullMs, rebaseMs,
                             dynamicUploadMs, uniformMs, cpuCost.renderMs, throttleMs, measuredMs, untimedMs,
                             renderStats.drawCalls, submittedThisFrame, plan.steps, renderStats.swapchainWaitMs,
+                            static_cast<double>(renderStats.meshBytes) / (1024.0 * 1024.0),
                             (renderStats.swapchainWaitMs > cpuCost.renderMs * 0.5)
                                 ? "等交换链（GPU / 呈现）"
                                 : "CPU 侧（逻辑 / UI / 提交）");
@@ -5363,6 +6040,17 @@ int main(int argc, char** argv) {
         }
         for (ObjectSlot& slot : objectSlots) {
             if (slot.handle.IsValid()) { renderer.ReleaseMesh(slot.handle); }
+        }
+        // V0.7 H2/H3：交还本轮的**实例化原型**网格与**共享碰撞形状** —— 否则每切一次世界就多留一批，
+        // 破坏 V2b 的"卸载不留残"判据（`MeshSlotCount` 应趋于稳定）。
+        for (auto& entry : instancePrototypeByType) {
+            if (entry.second.IsValid()) { renderer.ReleaseMesh(entry.second); }
+        }
+        for (auto& entry : instanceProxyByType) {
+            if (entry.second.IsValid()) { renderer.ReleaseMesh(entry.second); }
+        }
+        for (auto& entry : sharedShapeByType) {
+            if (entry.second.IsValid()) { physics.ReleaseSharedMeshShape(entry.second); }
         }
         // V0.5 E3：摆放模式的**幽灵预览**网格（若有）也一并交还，避免切换世界时泄漏一个网格槽位。
         if (previewHandle.IsValid()) { renderer.ReleaseMesh(previewHandle); }

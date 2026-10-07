@@ -15,6 +15,7 @@
 
 namespace {
 
+using vx::BuildLowPolyProxy;
 using vx::BuildObjectMesh;
 using vx::BuildObjectMeshFromModel;
 using vx::MeshData;
@@ -310,6 +311,50 @@ TEST(ObjectMesh, ModelWithFlatAxisUsesRemainingAxesForScale) {
         }
         EXPECT_NEAR(vertex.position[1], 0.0F, kEps);  // 平面贴地
     }
+}
+
+// ---- V0.7 H4：低模代理（顶点聚类）----
+
+/// 聚类代理：**顶点数单调下降**（同格顶点合并）、索引仍合法、法线仍单位、且**不产生空网格**。
+TEST(ObjectMesh, LowPolyProxyReducesVerticesAndStaysValid) {
+    // 石块：径向 20 × 环 8 ≈ 大量顶点 ⇒ 用 0.5 格的格距聚类后应显著下降。
+    ObjectType type;
+    type.kind   = ObjectAssetKind::Stone;
+    type.id     = "proxy_stone";
+    const MeshData full = BuildObjectMesh(type, ObjectMeshSpec { 20, 8 });
+    ASSERT_GT(full.vertices.size(), 32U);
+
+    const MeshData proxy = BuildLowPolyProxy(full, 0.5F);
+    EXPECT_LT(proxy.vertices.size(), full.vertices.size());   // 顶点下降
+    EXPECT_LT(proxy.indices.size(), full.indices.size());     // 索引下降
+    ASSERT_FALSE(proxy.indices.empty());                      // 绝不是空代理
+
+    for (const std::uint32_t index : proxy.indices) {
+        ASSERT_LT(index, proxy.vertices.size());              // 索引合法
+    }
+    for (const MeshVertex& vertex : proxy.vertices) {
+        const float length = std::sqrt(vertex.normal[0] * vertex.normal[0] +
+                                       vertex.normal[1] * vertex.normal[1] +
+                                       vertex.normal[2] * vertex.normal[2]);
+        EXPECT_NEAR(length, 1.0F, 1.0e-3F);                   // 法线单位
+    }
+}
+
+/// 格距越大 ⇒ 顶点越少（单调性），且格距 ≤ 0 或过度聚类时**回退原网格**。
+TEST(ObjectMesh, LowPolyProxyIsMonotoneAndFallsBackSafely) {
+    ObjectType type;
+    type.kind = ObjectAssetKind::Stone;
+    type.id   = "proxy_stone";
+    const MeshData full  = BuildObjectMesh(type, ObjectMeshSpec { 16, 6 });
+    const MeshData fine  = BuildLowPolyProxy(full, 0.25F);
+    const MeshData coarse = BuildLowPolyProxy(full, 0.5F);
+    EXPECT_LE(coarse.vertices.size(), fine.vertices.size());
+
+    // 关闭（格距 0）⇒ 原样返回（逐位一致）。
+    EXPECT_EQ(BuildLowPolyProxy(full, 0.0F).vertices.size(), full.vertices.size());
+    // 过度聚类（格距远大于尺寸）⇒ 回退原网格，而不是返回空代理。
+    const MeshData absurd = BuildLowPolyProxy(full, 1000.0F);
+    EXPECT_EQ(absurd.vertices.size(), full.vertices.size());
 }
 
 }  // namespace

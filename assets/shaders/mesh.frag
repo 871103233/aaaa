@@ -26,6 +26,10 @@
 //      **粗糙度 / AO 取贴图绝对值**（层基准值不参与）、层色 tint 由 CPU 侧置 1、**宏观变化改用该层 albedo 放大采样**
 //      （`u_macro` 槽位此时绑的就是 albedo 数组，见 `SetSampledTextureArrays` 的调用处）。
 //      资源缺失时由 CPU 侧 **WARN 并回落**程序生成贴图（`textureMode.x = 0`），着色器两条路径都在。
+//   8. **室内变暗（V0.8 / ADR 0035 决策四）**：逐实例的**围合体代理**（屋顶构件并集的世界包围盒 +
+//      屋檐下沿高度）判定"该片元是否在室内" ⇒ 是则把**环境项**（半球天空光 / IBL）乘 `kInteriorSkyVisibility`
+//      （0.45，暗 55%）。直接光不受影响（它由级联阴影负责遮挡）。**判据**：同材质在室内的屏上亮度
+//      比室外低 ≥ 30%。未启用（地表 / 室外物件 / 非实例化路径）时该分支**整段跳过**，逐位退回旧行为。
 //
 // PBR 公式（每片元；`N` 为几何 + 法线贴图后的世界法线，`L` 由地表指向太阳，`V` 由地表指向相机，
 // `H = normalize(L + V)`，`α = roughness²`）：
@@ -84,6 +88,10 @@ layout(location = 1) in vec3 v_normal;
 layout(location = 2) flat in float v_material;
 // W6e：逐网格不透明度 ∈ [0,1]（1 = 不透明）。< 1 时按 Bayer 抖动 discard 做 dither 淡出（见文件末）。
 layout(location = 3) in float v_fade;
+// V0.8 室内变暗（[ADR 0035](../../docs/adr/0035-modular-building-kit-and-enterable-spaces.md) 决策四）：
+// 逐**实例**围合体代理（`flat`，与两个顶点着色器同位置）。`v_enclosureB.w = 0` ⇒ 未启用（地表 / 室外物件）。
+layout(location = 4) flat in vec4 v_enclosureA;  // xy = 围合体中心 XZ，zw = 半尺寸 XZ（世界坐标）
+layout(location = 5) flat in vec4 v_enclosureB;  // x = 屋檐下沿绝对高度，w = 启用位（1/0）
 
 layout(location = 0) out vec4 o_color;
 
@@ -113,6 +121,15 @@ const int kMaxShadowCascades = 4;
 const float kMinRoughness   = 0.045;
 const float kF0Dielectric   = 0.04;
 const float kPi             = 3.14159265358979323846;
+
+// ---- V0.8 室内变暗（ADR 0035 决策四）：围合体判据的常量 ----
+//
+// kInteriorSkyVisibility：判定为"室内"时，环境项（天空光 / IBL）乘以它 ⇒ **暗 55%**（判据要求 ≥ 30%）。
+//   直接光不受它影响 —— 直接光是否被遮挡由级联阴影负责（本项只补"天空光不被阴影遮挡"的缺口）。
+// kInteriorCeilingEpsilon：屋檐下沿的判定容差（格）—— 屋檐构件的**底面**恰在下沿高度，
+//   容差把它（= 室内天花板）算作室内，而其**顶面**（下沿 + 板厚）仍算室外（受光正确）。
+const float kInteriorSkyVisibility  = 0.45;
+const float kInteriorCeilingEpsilon = 0.05;
 
 // ---- 细节与宏观调制（数值全部来自 uniform 或确定性的世界坐标，不留第二份配置常量）----
 
@@ -395,6 +412,36 @@ float bayer4x4(vec2 pixelCoord) {
     return (float(value) + 0.5) / 16.0;
 }
 
+/// **天空可见性** ∈ [0, 1]（V0.8 室内变暗 / [ADR 0035](../../docs/adr/0035-modular-building-kit-and-enterable-spaces.md) 决策四）：
+/// 1 = 室外（环境项全亮）、`kInteriorSkyVisibility` = 判定为室内（环境项按此调暗）。
+///
+/// 判据（逐片元、**零额外采样**、全在世界坐标下）：
+///   ① 片元的 **XZ** 落在围合体（屋顶构件并集的世界包围盒）内；
+///   ② 且该面属于"室内面"：
+///      - **竖直面**：法线的水平分量**指向围合体中心**（`dot(N.xz, rel) < 0`）⇒ 朝内的墙面；
+///        （朝外的墙面 / 屋外任意面 `dot ≥ 0` ⇒ 室外，受光不变）
+///      - **水平面**（地板 / 天花板）：高度 ≤ 屋檐下沿 `+ kInteriorCeilingEpsilon` ⇒ 室内。
+///
+/// 为什么用解析式围合体而不是逐顶点烘焙 AO：本阶段 kit 构件是**共享原型**
+/// （同一原型被多座建筑 / 多处摆放复用），逐原型烘焙无法区分墙的内侧与外侧；而离线烘焙
+/// （业界参照 UE5 Lightmass / Volumetric Lightmap、Unity Lightmap + Light Probes）需要尚不具备的烘焙管线
+/// ⇒ 取最接近的替代（见 `world/object/object_layer.hpp` 的 `ObjectEnclosure` 说明与 ADR 0035 决策四）。
+float computeSkyVisibility(vec3 worldPosition, vec3 geometricNormal) {
+    if (v_enclosureB.w < 0.5) {
+        return 1.0;  // 未启用（地表 / 室外物件 / 非实例化路径）⇒ 整段跳过
+    }
+    const vec2 rel = worldPosition.xz - v_enclosureA.xy;
+    if (abs(rel.x) > v_enclosureA.z || abs(rel.y) > v_enclosureA.w) {
+        return 1.0;  // ① 不在围合体水平范围内（含屋顶外表面、墙外侧面）⇒ 室外
+    }
+    if (abs(geometricNormal.y) >= 0.5) {
+        // ② 水平面：不高于屋檐下沿 ⇒ 地板 / 天花板 = 室内；屋顶顶面（下沿 + 板厚）⇒ 室外。
+        return (worldPosition.y <= v_enclosureB.x + kInteriorCeilingEpsilon) ? kInteriorSkyVisibility : 1.0;
+    }
+    // ② 竖直面：法线的水平分量指向中心 ⇒ 朝内的墙面 = 室内。
+    return (dot(geometricNormal.xz, rel) < 0.0) ? kInteriorSkyVisibility : 1.0;
+}
+
 void main() {
     const vec3  worldPosition   = v_relativePosition + material.renderOrigin.xyz;
     const vec3  geometricNormal = normalize(v_normal);
@@ -616,7 +663,9 @@ void main() {
 
     const vec3 directDiffuse  = kD * albedoLinear * sunRadiance * nDotL;
     const vec3 directSpecular = specularBrdf * sunRadiance * nDotL;
-    const vec3 ambient        = ambientDiffuse + ambientSpecular;
+    // V0.8 室内变暗：环境项（天空光 / IBL）按**天空可见性**调制；直接光不受影响（它由级联阴影负责遮挡）。
+    const float skyVisibility = computeSkyVisibility(worldPosition, geometricNormal);
+    const vec3 ambient        = (ambientDiffuse + ambientSpecular) * skyVisibility;
 
     const vec3 litColor = directDiffuse + directSpecular + ambient;
 

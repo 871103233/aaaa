@@ -276,6 +276,15 @@ struct PhysicsWorld::Impl {
     std::vector<std::uint32_t>  freeBodySlots;
     std::vector<CharacterEntry> characters;
 
+    /// V0.7 H3：**可共享的网格形状**表（引用计数；槽位复用 ⇒ 反复创建 / 释放不抬高数组）。
+    /// `sharedShapeRefs[i] == 0` 表示该槽空闲（`shape` 也可能为空 RefC）。
+    struct SharedShapeEntry {
+        JPH::ShapeRefC shape;
+        std::uint32_t  refs = 0;
+    };
+    std::vector<SharedShapeEntry> sharedShapes;
+    std::vector<std::uint32_t>    freeSharedShapeSlots;
+
     /// **水平世界原点**（[ADR 0025](../../docs/adr/0025-large-world-coordinate-precision.md)）：进出 Jolt 的
     /// 水平位置 = 世界坐标 − 原点；垂直方向不重定基（垂直范围 ≤ 512 格，且高度场采样是绝对高度）。
     /// 默认 `(0, 0)` ⇒ 与引入本项之前逐位等价。
@@ -467,6 +476,57 @@ bool PhysicsWorld::UpdateHeightField(BodyHandle handle, const HeightFieldDesc& d
     m_impl->system->GetBodyInterface().SetShape(bodyID, shape, /*inUpdateMassProperties=*/false,
                                                 JPH::EActivation::DontActivate);
     return true;
+}
+
+PhysicsWorld::SharedMeshShape PhysicsWorld::CreateSharedMeshShape(const MeshDesc& desc) {
+    const JPH::ShapeRefC shape = build_mesh_shape(desc);
+    if (shape == nullptr) {
+        return SharedMeshShape {};  // 失败原因已在 `build_mesh_shape` 内记录
+    }
+    std::uint32_t slot = 0;
+    if (!m_impl->freeSharedShapeSlots.empty()) {
+        slot                       = m_impl->freeSharedShapeSlots.back();
+        m_impl->freeSharedShapeSlots.pop_back();
+        m_impl->sharedShapes[slot] = Impl::SharedShapeEntry { shape, 1U };
+    } else {
+        slot = static_cast<std::uint32_t>(m_impl->sharedShapes.size());
+        m_impl->sharedShapes.push_back(Impl::SharedShapeEntry { shape, 1U });
+    }
+    return SharedMeshShape { slot + 1 };
+}
+
+void PhysicsWorld::ReleaseSharedMeshShape(SharedMeshShape shape) noexcept {
+    if (!shape.IsValid() || shape.id > m_impl->sharedShapes.size()) {
+        return;
+    }
+    Impl::SharedShapeEntry& entry = m_impl->sharedShapes[shape.id - 1];
+    if (entry.refs == 0U) {
+        return;  // 已释放过（重复释放为无操作）
+    }
+    if (--entry.refs == 0U) {
+        // 只放掉**本类持有的这一份**引用：仍活着的刚体各自通过 `ShapeRefC` 持有形状 ⇒ 不会悬垂。
+        entry.shape = JPH::ShapeRefC {};
+        m_impl->freeSharedShapeSlots.push_back(shape.id - 1);
+    }
+}
+
+PhysicsWorld::BodyHandle PhysicsWorld::AddStaticMeshBody(SharedMeshShape shape, const glm::dvec3& origin,
+                                                         const glm::quat& rotation) {
+    if (!shape.IsValid() || shape.id > m_impl->sharedShapes.size() ||
+        m_impl->sharedShapes[shape.id - 1].shape == nullptr) {
+        return 0;
+    }
+    const JPH::Quat joltRotation(rotation.x, rotation.y, rotation.z, rotation.w);
+    JPH::BodyCreationSettings bodySettings(m_impl->sharedShapes[shape.id - 1].shape,
+                                           m_impl->ToLocalPosition(origin.x, origin.y, origin.z), joltRotation,
+                                           JPH::EMotionType::Static, kObjectLayerStatic);
+    const JPH::BodyID bodyID =
+        m_impl->system->GetBodyInterface().CreateAndAddBody(bodySettings, JPH::EActivation::DontActivate);
+    if (bodyID.IsInvalid()) {
+        VX_LOG_ERROR("创建共享形状的静态网格刚体失败");
+        return 0;
+    }
+    return m_impl->RegisterBody(bodyID);
 }
 
 /// `PreparedMeshShape` 的**定义**（不透明：只在物理层可见 ⇒ 公共头不泄漏 Jolt 类型）。

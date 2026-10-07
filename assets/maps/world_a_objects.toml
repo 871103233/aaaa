@@ -152,6 +152,50 @@ destructible = false
 category = "prop"
 
 # ---------------------------------------------------------------------------
+# V0.8：**模块化建筑 kit**（代理体；ADR 0035）—— 统一模数 4.0 格，可直接拼成没有错缝的房间
+# ---------------------------------------------------------------------------
+# 口径：`kind = "kit"` 必须给 `kit_role` 与 `module_blocks`；水平占地必须是模数的**整数倍**
+# （解析期强制，非法即抛）⇒ 相邻构件的接缝错位恒为 0。墙 / 门洞墙的高 = 2*half_extent.y = 3.0 格，
+# 门洞净高 2.2 格 > 角色总高 1.80 格 ⇒ **可进入**（由 BuildKitPieceMesh 的几何保证）。
+# **代理体**：正式 kit 美术资产未引入（ADR 0035 决策二：先用程序化代理体，备选 CC0 近风格 kit）。
+
+[[type]]
+id = "kit_floor"
+kind = "kit"
+kit_role = "floor"                   # 地板：厚 0.30 格，顶面 = 可站面
+half_extent = [2.0, 0.15, 2.0]       # 水平 4.0 × 4.0 = 1 个模数格
+module_blocks = 4.0
+destructible = false
+category = "building"
+
+[[type]]
+id = "kit_wall"
+kind = "kit"
+kit_role = "wall"                    # 墙：高 3.0 格、厚 0.30 格（沿局部 Z 居中）
+half_extent = [2.0, 1.5, 2.0]
+module_blocks = 4.0
+destructible = false
+category = "building"
+
+[[type]]
+id = "kit_wall_door"
+kind = "kit"
+kit_role = "wall_door"               # 带门洞的墙：洞口宽 1.6 / 净高 2.2 格
+half_extent = [2.0, 1.5, 2.0]
+module_blocks = 4.0
+destructible = false
+category = "building"
+
+[[type]]
+id = "kit_roof"
+kind = "kit"
+kit_role = "roof"                    # 屋顶：厚 0.30 格
+half_extent = [2.0, 0.15, 2.0]
+module_blocks = 4.0
+destructible = false
+category = "building"
+
+# ---------------------------------------------------------------------------
 # 显式放置（2 个传送门 + 1 个土堆 + 一个小营地）
 # ---------------------------------------------------------------------------
 
@@ -271,3 +315,51 @@ center = [0.0, 0.0]
 radius = 80.0
 count = 12
 seed = 1010
+
+# ---------------------------------------------------------------------------
+# 流式（地形感知）散布（V0.6 C5 / ADR 0033）—— **随玩家窗口增删**：
+# 只在与玩家所在 tile 的 Chebyshev 距离 ≤ 8 tile（≈ 512 m）的**常驻** tile 内生成（近场细节）。
+#   - 候选点由 `PlanTileCandidates` 按 tile 局部确定性生成（同种子逐位可复现）；
+#   - 再按 `tech-plan §3.3` 四项判据过滤：**坡度区间 / 高度带 / 地貌 / 互斥间距**；
+#   - `cell_blocks` = 抖动网格步长（⇒ 最小间距 > 0.5×cell）；`floor(64 / cell_blocks)` = 每 tile 候选点数。
+#   - 底面 Y 仍由**地表高度**求解（贴地、不悬空）；渲染与碰撞同源。
+# 与上面的 `[[scatter]]`（圆域、一次摆完）**并存**：这里只做"山体细节造型"（岩石散在山地）。
+# ---------------------------------------------------------------------------
+
+[[scatter_tiled]]
+type = "boulder"
+seed = 2001
+cell_blocks = 40.0                   # floor(64 / 40) = 1 个候选点 / tile ⇒ 数量与 draw call 可控
+max_slope_deg = 45.0                 # 陡崖不放（避免悬空 / 穿地）
+landforms = ["hills", "mountains"]   # 只在丘陵 / 山川
+
+# 第二条：**气候判据**示例（V0.6 C7）—— 只在**偏湿**的平原 / 丘陵放灌木（干热 / 陡坡处不长）。
+[[scatter_tiled]]
+type = "bush"
+seed = 2002
+cell_blocks = 40.0
+max_slope_deg = 30.0
+landforms = ["plains", "hills"]
+min_humidity = 0.55                  # [0,1]：≥ 0.55 = 偏湿（气候来自 terrain.toml 的 [climate]）
+
+# ---------------------------------------------------------------------------
+# V0.8：**成套建筑**（`[[building]]`）—— 一座 4×4 格的**可进入小屋**（ADR 0035 决策三 / 判据①②）
+# ---------------------------------------------------------------------------
+# 锚点 = 小屋中心的地面落点（出生平台已压平至 120 格 ⇒ 保证水平）；构件用**相对偏移**表达**层高**：
+#   地板厚 0.30（顶面 = 可站面）→ 墙高 3.0（起于 0.30）→ 屋顶（起于 3.30）⇒ 室内净高 3.0 格。
+# 东墙用 `kit_wall_door`（门朝东、洞口 1.6 × 2.2 格）⇒ 角色可从东侧走进去（判据①）。
+# 构件朝向：南北墙 `yaw_deg = 0`（板沿 Z 薄）；东西墙 `yaw_deg = 90`（板沿 X 薄）。
+# **室内变暗（ADR 0035 决策四）**：加载期由**屋顶构件并集**求出围合体代理（世界 4×4 + 屋檐下沿 3.3 格），
+#   整座建筑的每个构件带同一份 ⇒ 片元把**环境项（天空光 / IBL）**乘 0.45（暗 55%）；**直接光不受影响**。
+[[building]]
+id = "spawn_hut"
+position = [-8.0, 0.0, -8.0]         # y 分量忽略（锚点地表高度在加载期解算一次）
+yaw_deg  = 0.0
+pieces = [
+    { type = "kit_floor",     offset = [0.0, 0.0, 0.0] },
+    { type = "kit_wall",      offset = [0.0, 0.3, -2.0] },
+    { type = "kit_wall",      offset = [0.0, 0.3, 2.0] },
+    { type = "kit_wall",      offset = [-2.0, 0.3, 0.0], yaw_deg = 90.0 },
+    { type = "kit_wall_door", offset = [2.0, 0.3, 0.0], yaw_deg = 90.0 },
+    { type = "kit_roof",      offset = [0.0, 3.3, 0.0] },
+]

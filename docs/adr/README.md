@@ -43,6 +43,9 @@
 | [0030](0030-instance-save-slot.md) | **秘境实例的持久化 = 单槽元数据存档**：只存秘境绑定（`world_id` / `seed` / `generation`）到 `saves/instances.toml`（TOML + `schema_version`；**未知版本拒绝**；临时文件 + `rename` 原子替换；`seed` 十进制字符串以无损 u64）；读档装回走独立入口 `RestoreInstance` | **有效** | 落地所有者 2026-10-06 的存档槽三答（**单槽自动 / 仅秘境绑定 / `%APPDATA%\voxel-engine\voxel_game\saves\`**），使"与玩家绑定"跨启动成立。依据：`references/save-and-serialization.md` §1 允许 `level.dat` 类**元数据**用文本 ⇒ **本项不是世界状态存档、不触发 `.voxr` v2 字节布局冻结**。备选（`.voxr` 二进制 / 多槽 + 槽位 UI / 连玩家状态与世界改动一起存 / 写进 `settings.toml` / 读不到就删档）已留档并写明切换条件 |
 | [0031](0031-occlusion-culling-software.md) | **遮挡剔除 = CPU 软件遮挡**（地形高度场作遮挡体 → 低分辨率 NDC 深度图 → 候选 AABB 的保守层级 Z 测试） | **有效（能力默认休眠）** | 落实所有者 2026-10-06"继续完成 2.3 档"中的 P3，并**收敛逾期的 `SKILL.md` 待收敛项 6**。依据（实测）：**SDL3_gpu 无遮挡查询 API** ⇒ 硬件遮挡查询（UE5 HOQ）不可用；**默认 MSAA=2× 且 SDL_gpu 不支持深度 resolve** ⇒ 深度回读亦不可用 ⇒ 取最接近的替代（CPU 软件遮挡）。**实测结论：该最小路线零收益**（A 世界 draw call 1414→1413、覆盖仅 2%、剔除相位 +21 ms）⇒ **缺省关闭（休眠）**，代码 / 单测 / ADR 保留。备选（HOQ / 深度回读 HZB / 不做 / 逐格射线）已留档并写明切换条件 |
 | [0032](0032-object-palette-and-placement-mode.md) | **物件选择器与摆放模式**：`F2` = 二级列表（`category` + 类型）→ 进入摆放模式（**幽灵预览** + `Q`/`E` 旋转 + 左键放下 + 右键删除 + `F3` 重复上次 + `F5` 保存）；**模式内输入让位、模式外逐位不变**；编辑层扩 `[[remove]]` 与 `ObjectType.category`；保存**原子替换**写 `objects_edit_file`；**选择器内模型预览 = CPU 正交投影小图**（决策八：同源几何 + 背面剔除 + 朗伯明暗 + 深度升序；自动旋转 + 拖动转向；**零 GPU 资源、不改渲染器**） | **有效** | 落实所有者 2026-10-06 需求（"按下 F2 出现仓库选择 → 选模型 → 预览摆放 + 方向"；含保存、右键删除；**追加**"在选择模型的界面增加预览功能"）。依据（业界）：Valheim 建造锤、Fortnite Creative / The Sims 建造目录、UE5 Place Actors；放置预览复用 `SetMeshOpacity` 的**抖动淡出**（不引入 alpha 混合 ⇒ 不破坏深度排序）；选择器预览的业界参照 = UE5 Content Browser 缩略图 / Unity Project 实时缩略图（均为**离屏渲染**）。备选（全屏建造 UI / gizmo 手柄 / 分类推断 / 写回发布清单 / 保注释序列化 / 删除仅限本次新增 / **离屏真缩略图**）已留档并写明切换条件 |
+| [0033](0033-world-content-placement-and-streaming.md) | **大世界程序化内容放置与流式**：放置规则 = `tech-plan §3.3` 四项判据（**坡度 / 高度带 / 地貌 / 互斥间距**，**配置驱动、非法即抛**）；候选点 = **分块确定性**（tile 局部抖动网格 ⇒ 只看"当前 tile + 种子"即可重建，红线 15）；内容随 **tile 常驻窗口**（ADR 0024）**增删**（离开 ⇒ 移除），**分帧 + 预取**、窗口内数量**有界**；复用物件层（ADR 0004 层③ / ADR 0029 的 `Model` 形态），**几何绝不写进地形场**；`[[scatter]]`（圆域）**保留**（局部手工散布），新增 `[[scatter_tiled]]`（流式形态） | **有效** | 落实所有者 2026-10-07 设定的主线「**大世界地图 + 静态物体摆放 / 创造**」与 `SKILL.md` §五「逐部件归属判定表」的判定（**山体细节 = 物件层 + 地形感知放置规则**）。依据（业界）：UE5 Landscape + Foliage/Scatter、Unity Terrain 树/细节层、Far Cry / Horizon 的岩石崖壁网格按规则贴合；**宏观形体仍是高度场**（UE5 Landscape / Unity Terrain）。**已确认降级**：无实例化 / HLOD ⇒ 密度受控、不得全图铺开（**已于 2026-10-07 由 [0034](0034-object-instancing-and-hlod.md) 解除**）；无真实生物群系（用 W3 地貌分区占位，C7 起加**气候区间判据**）；备选（泊松盘 / 开局全量生成 / 只保留圆域散布 / 先做实例化）已留档并写明切换条件 |
+| [0034](0034-object-instancing-and-hlod.md) | **物件 GPU 实例化 + 远景 LOD 链 + 物理共享 Shape**：每原型一次绘制（per-instance 变换放**顶点 storage buffer**，`firstInstance` 定位；主 / 阴影通道**共用同一实例缓冲**）；实例数据**每帧一次上传**（禁逐实例 push）；物理 = **共享 `Shape`（Jolt 引用计数）+ 半径裁剪**；远景 = **原型 LOD 链**（**不做** impostor）；**旧逐网格路径保留不删** | **有效**；**解冻 `plans/v0.5.md` §1.15 的 P4**（所有者 2026-10-07 指示"考虑物件实例化 / HLOD"并四答冻结） | 落实所有者 2026-10-07 三答：① 做到"**实例化 + 远景 LOD 链**"（不做 impostor）② 物理 **共享 Shape + 半径裁剪** ③ 新建阶段 `v0.7`。依据（**已核实 SDL3_gpu，非推测**）：顶点阶段 storage buffer、`SDL_DrawGPUIndexedPrimitives(instanceCount, firstInstance)`、indirect、compute 均可用 ⇒ 无需更底层后端。业界参照：UE5 ISM/HISM、Unity GPU Instancing / BatchRendererGroup、Godot MultiMesh、Jolt 共享 Shape。备选（CPU 合并网格 / 只做剔除 / impostor / 合并式 HLOD / GPU-driven）已留档并写明切换条件 |
+| [0035](0035-modular-building-kit-and-enterable-spaces.md) | **模块化建筑 kit 与人工可进入空间**（+ 最小室内变暗）：新增 `kind = "kit"` 构件（`kit_role` ∈ floor/wall/wall_door/roof + `module_blocks`）+ `[[building]]` 成套建筑（锚点 + 构件**相对偏移** = 堆叠的唯一来源）；**模数整除占地**与**门洞净高 ≥ 2.2 格**为解析期强制的可判定不变量；构件复用既有装配路径（渲染 / 碰撞 / 剔除 / 实例化 / LOD **零分叉**）；室内变暗 = **逐实例解析式「围合体」代理**（屋顶并集的世界包围盒 + 屋檐下沿）⇒ 片元把**环境项（天空光 / IBL）**乘 0.45；实例缓冲 64 → **96 B** | **有效** | 落实所有者 2026-10-07 "**规划并开发建筑 kit / 人工可进入空间**" 与四答冻结（① 阶段 = **完整闭环** ② 美术 = **程序化代理体**、CC0 近风格 kit 记备选 ③ 结合 = **首期只放地形之上**、其余留痕 ④ 光照 = **最小室内变暗**）+ "未覆盖的备选方案与后续工作**记录留痕**"。依据（业界）：UE5 Modular Building Kit + Grid Snapping、Unity ProBuilder、Godot GridMap；室内明暗 UE5 Lightmass / Volumetric Lightmap、Unity Lightmap + Light Probes；超大室内 Skyrim / Elden Ring 的 load door。**已确认降级**：无正式美术 kit / 不嵌入地形 / 室内变暗为解析式近似（切换条件见该 ADR）。备选（CC0 kit / 纯体素挖空 / 嵌入地形（离线裁地形 + 留通道）/ 独立空间实例 / 逐顶点烘焙 AO / 不做室内变暗 / 合并式 HLOD / 建筑持久化）已留档并写明切换条件 |
 
 状态取值：**有效** / **被取代** / **作废**。
 
@@ -62,8 +65,12 @@
 | --- | --- | --- |
 | `docs/plans/v0.1.md` | V0.1 最小闭环 | **进行中（仅收口遗留：I1 Linux CI / 人工目视验收）** —— 其余任务已闭环，`ctest` 314/314；**遗留项不阻塞 V0.2** |
 | `docs/plans/v0.2.md` | **V0.2 世界成立（1×1 km）＝ 阶段 ⓐ** | **已完成（冻结，2026-10-05）**：T58–T63 全部落地；**T63 的四条人工目视 / 手感项已由所有者验收通过** ⇒ 见该文件 §4 与 `docs/devlog.md` 2026-10-05 条目 |
-| `docs/plans/v0.3.md` | **V0.3 表现与深度（美术资源先行）＝ 阶段 ⓒ** —— **当前阶段** | **已落盘、待开工**（2026-09-29；先落计划再施工，**开工前须由所有者回答该文件 §1.1 的三项裁定**）；顺序为 **ⓐ → ⓒ → ⓑ**（ⓑ 玩法骨架暂缓） |
-| `docs/plans/v0.5.md` | **阶段 V0.5：三世界 A/B/C + 传送 + 可破坏土堆**（[ADR 0028](0028-world-families-and-static-asset-first.md)） —— **当前阶段** | **进行中（2026-10-06）**：**V0 / V0b / V0c / V1 / V2a / V2b / V2c（④ 已登记为已知限制）/ V3 / V3c / V4 / V5 / V8 / V9 / V10 已完成**；**余 V6**（运行期任意位置摆可破坏土堆；触发与尺寸待所有者定）/ **V7**（性能与阶段验收）。详见该文件任务表与 §3 |
+| `docs/plans/v0.3.md` | **V0.3 表现与深度（美术资源先行）＝ 阶段 ⓒ** —— **未开工 / 已顺延**（**不再是当前阶段**：当前阶段见下表 v0.8） | **已落盘、待开工**（2026-09-29；先落计划再施工，**开工前须由所有者回答该文件 §1.1 的三项裁定**）；顺序为 **ⓐ → ⓒ → ⓑ**（ⓑ 玩法骨架暂缓）。**2026-10-06 起被 [ADR 0028](0028-world-families-and-static-asset-first.md) 的三世界主线插入** ⇒ 实际执行的是 v0.5 → v0.6 → v0.7 → v0.8；本计划的**剩余项**（含逐模型贴图 / UV、角色建模等"表现与深度"长尾）仍未开工 |
+| `docs/plans/v0.5.md` | **阶段 V0.5：三世界 A/B/C + 传送 + 可破坏土堆**（[ADR 0028](0028-world-families-and-static-asset-first.md)） —— **非当前阶段**（当前见 v0.8） | **进行中（2026-10-06）**：**V0 / V0b / V0c / V1 / V2a / V2b / V2c（④ 已登记为已知限制）/ V3 / V3c / V4 / V5 / V8 / V9 / V10 已完成**；**余 V6**（运行期任意位置摆可破坏土堆；触发与尺寸待所有者定）/ **V7**（性能与阶段验收）。详见该文件任务表与 §3 |
+| `docs/plans/v0.6.md` | **阶段 V0.6：大世界内容填充（地形感知放置 + 流式 + 气候判据）**（[ADR 0033](0033-world-content-placement-and-streaming.md)） | **已完成（2026-10-07）**：C1~C7 全部落地（四项判据 + 气候（C7）+ 分块确定性候选点 + `[[scatter_tiled]]` 配置 + 地形采样 + **流式接线** + 文档）；`ctest` **680/680**；**待人工 P99 读数 + 密度调优**（见该文件 §3） |
+| `docs/plans/v0.7.md` | **阶段 V0.7：物件规模化（GPU 实例化 + 远景 LOD 链 + 物理共享 Shape）**（[ADR 0034](0034-object-instancing-and-hlod.md)） | **已完成（2026-10-07）**：H0~H5 全部落地 —— **GPU 实例化**（每原型一次绘制、主 / 阴影共用实例缓冲）、**物理共享 `Shape` + 半径裁剪**、**远景 LOD 链**（顶点聚类代理）；实测 draw call **2800 → 2219**（物件 132→201 而 draw call 增量 **0**）、远景顶点 **−83%**；`ctest` **689/689**、门禁 0 违规。**待人工 P99 读数 + 旋钮调优 + 逐物件网格未移除**（见该文件 §3 / §4 与 `devlog`） |
+| `docs/plans/v0.8.md` | **阶段 V0.8：建筑 kit 与人工可进入空间（+ 最小室内变暗）**（[ADR 0035](0035-modular-building-kit-and-enterable-spaces.md)） | **已完成（2026-10-07）**：K1~K6 全部落地 —— `kind="kit"` 构件（4 角色 + 模数校验 + **门洞净高不变量**）、`[[building]]` 成套建筑（锚点 + 相对偏移 = 堆叠）、A 世界 4 个 kit 类型 + 1 座可进入小屋（4×4）、**最小室内变暗**（逐实例解析式围合体 → 环境项 ×0.45；实例缓冲 64 → 96 B）；实测 **1 座 / 6 构件 / 1 座带围合体**、draw call **2240 → 2235**（零回归）；`ctest` **714/714**、门禁 **220 文件 0 违规**。**待人工目视室内亮度比 + 嵌入地形 / 正式美术 kit 未做**（见该文件 §3 / §4 与 `devlog`） |
+| `docs/plans/v0.9.md` | **阶段 V0.9：室内变暗参数化 + 成套建筑的摆放**（[ADR 0032](0032-object-palette-and-placement-mode.md) / [ADR 0035](0035-modular-building-kit-and-enterable-spaces.md)） —— **当前阶段** | **未开工（需求已记录，2026-10-07）**：所有者三答冻结 —— ① 调试开关 = **可调值** `--interior-darkening=<0~1>`；② 「室内变暗」作为摆放时的功能参数粒度 = **C（全局默认 + 逐建筑覆盖 + 摆放成套建筑）**；③ 本轮**只落需求与交接包**，实现留给下一轮。任务 W1~W6 + **硬前置 P3（开工前先落决策）** + 5 条阻塞见该文件 |
 | `docs/plans/v0.4.md` | **阶段 W：10km×10km 大世界（架构路线 A）** | **部分完成 / 被取代**：W0~W6h 已完成；**W7-S3b①「体积壳随玩家流式」已回滚**，由 [ADR 0028](0028-world-families-and-static-asset-first.md) 取代（工作转入 v0.5）（2026-10-06 更新；所有者裁定 10km / 预制 / 流式 / 破坏休眠 / 真三维洞穴+悬垂；**W0 落盘 / W1 精度 / W2 预制地图（含 `voxel_bake` CLI）/ W3 地貌分区 / W4 地表体积壳 / W4b 坐标 HUD / W5 洞穴网络 / W6 河流 + 水体已完成，下一步 W7 流式 + LOD 分环**）；在 ⓒ 之后、ⓑ 之前插入（ADR 0023~0027） |
 
 ## 四、维护规则
@@ -72,3 +79,55 @@
 2. 方案文档换版 → 本表状态列同步，并把旧版标为「被取代 / 部分被取代」。
 3. 阶段闭环 → 阶段计划标为「已完成（冻结）」，新阶段新建文件并更新本表。
 4. 本表与实际情况不符时，**先报告再改**（见 SKILL.md 第八节）。
+
+## 五、已登记缺口汇总（未做 / 暂缓）
+
+**口径**：本表是**纯索引**（每行只写"缺什么 + 权威写处"），**不重述细节、不写第二份切换条件** ——
+细节与切换条件一律以**链接到的 ADR / 计划**为准（SSOT 口径，见 `SKILL.md` 六.5~六.6）。
+**怎么用**：想知道"还剩什么没做"看本表；想知道"为什么没做 / 什么时候做"点进对应文档。
+
+### 5.1 引擎与渲染（可判定、有实测）
+
+| 缺口 | 缺什么 | 权威写处（含切换条件） |
+| --- | --- | --- |
+| 逐模型贴图 / UV | 外部 GLB 自带贴图不出（渲染器只有地表 4 槽材质）；须给 `MeshVertex` 加 UV + 逐网格材质绑定 | [ADR 0029](0029-a-world-asset-enrichment-model-and-scatter.md) / [ADR 0034](0034-object-instancing-and-hlod.md)（**须另开 ADR**） |
+| 逐物件 GPU 网格未移除 | 网格缓冲**没有下降**（实例化只净增 1.67 MB） | [ADR 0034](0034-object-instancing-and-hlod.md)「落地记录 → 已知缺口」 |
+| 实例化对象未做逐级联阴影过滤 | 每级都画全部实例（冗余、不漏投影） | [ADR 0034](0034-object-instancing-and-hlod.md) |
+| impostor / 合并式 HLOD / GPU-driven 剔除 | 远景与超大规模的下一步 | [ADR 0034](0034-object-instancing-and-hlod.md)「何时需要重新审视」 |
+| 四个性能旋钮待实测调优 | 实例化阈值 4 / LOD 距离 200 格 / 碰撞半径 128 格 / 聚类格距 0.5 格 | [plans/v0.7.md](../plans/v0.7.md) §3「阻塞 / 未决」 |
+| P99 与稳态帧时间需人工读数 | 本环境无法注入输入 / 截图 ⇒ 判据未闭环 | [plans/v0.6.md](../plans/v0.6.md) / [plans/v0.7.md](../plans/v0.7.md) / [plans/v0.8.md](../plans/v0.8.md) 的「阻塞 / 未决」 |
+| 室内变暗的目视读数（≥30%） | 机制与单测已落地，屏上亮度比须人工 | [ADR 0035](0035-modular-building-kit-and-enterable-spaces.md) / [plans/v0.8.md](../plans/v0.8.md) §3；**V0.9 的 W2 落地后可做 A/B 读数**（[plans/v0.9.md](../plans/v0.9.md) §5.5） |
+| **室内变暗参数化 + 成套建筑的摆放** | `--interior-darkening=<0~1>` 可调值；`[[building]].interior_darkening` 逐建筑覆盖；摆放模式内可调；**摆放 / 删除成套建筑** | [plans/v0.9.md](../plans/v0.9.md)（**当前阶段，未开工**；硬前置 = 先落决策） |
+| 正式美术 kit（CC0 / 自制） | 建筑目前是程序化代理体 | [ADR 0035](0035-modular-building-kit-and-enterable-spaces.md) 备选表 |
+| 嵌入地形（离线裁地形 + 留通道） | 地宫 / 洞府 / 半地穴；首期只放地形之上 | [ADR 0035](0035-modular-building-kit-and-enterable-spaces.md) 决策五 / 「何时需要重新审视」第 2 条 |
+| 逐顶点烘焙 AO / lightmap | 室内明暗的精确版（替代解析式围合体） | [ADR 0035](0035-modular-building-kit-and-enterable-spaces.md)「何时需要重新审视」第 1 条 |
+| 超大室内 = 独立空间 / 实例（load door） | 多层 / 大厅 / 院落的室内 | [ADR 0035](0035-modular-building-kit-and-enterable-spaces.md)「何时需要重新审视」第 3 条 |
+
+### 5.2 内容与玩法（含"待所有者给设定"）
+
+| 缺口 | 缺什么 | 权威写处（含切换条件） |
+| --- | --- | --- |
+| 地宫 / 洞府**内容** | 规则已定、内容未落；多套 kit / 院落级蓝图 / 地宫 / 洞府未做 | [ADR 0035](0035-modular-building-kit-and-enterable-spaces.md) / SKILL §五 判定表 |
+| 具名生物群系 | 当前只有**气候区间判据**；群系**命名**必须由所有者提供（AI 不得代拟） | [ADR 0033](0033-world-content-placement-and-streaming.md) / [world-setting.md](../world-setting.md) §1.2 |
+| 瀑布 / 河岸石 | 河岸点缀里未定义的部件（芦苇已有） | SKILL §五 判定表「二、河流」 |
+| 世界里的建筑命名与来历 | `spawn_hut` 目前**未命名、未解释** | [world-setting.md](../world-setting.md)（权威）/ SKILL 六.9 |
+| 器物破坏的"状态切换"口径 | 现为"爆炸命中即摧毁"；未接 `Intact → Broken` + 变黑占位，`prop_damage_threshold` / `prop_broken_tint` 只解析未消费 | [ADR 0013](0013-destructible-elements.md) / [ADR 0004](0004-hybrid-layered-world-representation.md) 层③ |
+| 凹形物件的多凸包分解 | 凸包会**填平凹形** ⇒ 保留中的岩石残骸该后果永久化 | [ADR 0016](0016-collapse-realism-impulse-material-debris.md) / [ADR 0018](0018-structural-support-and-representation-preserving-destruction.md) |
+| 建筑 / 物件的玩家自建 + 持久化 | `[[building]]` 未纳入可编辑层与保存器 | [ADR 0032](0032-object-palette-and-placement-mode.md) / [ADR 0035](0035-modular-building-kit-and-enterable-spaces.md)；**"摆放 + 存进可编辑层"已排在 [plans/v0.9.md](../plans/v0.9.md)（未开工）** |
+| 收集 / 物品栏 · 养成系统 · PvE 战斗 · NPC 行为 | 玩法骨架（**阶段目标，不是缺陷**） | [game-design.md](../game-design.md) §2.4 |
+
+### 5.3 存档与编辑器（整块未开工）
+
+| 缺口 | 缺什么 | 权威写处（含切换条件） |
+| --- | --- | --- |
+| 破坏 / 地形改动持久化 | 整块存档未开始；`.voxr` v2 的**字节布局须在首次实现前冻结** | [tech-plan-v2.0.md](../tech-plan-v2.0.md) §6 + §8 的 V0.3 |
+| 玩家状态 / 多槽存档 + 槽位 UI | 目前只有"秘境实例绑定"单槽 TOML 元数据存档 | [ADR 0030](0030-instance-save-slot.md) 备选表 |
+| 可视化编辑器 / gizmo / 网格吸附 / 重叠与悬空检测 / 撤销重做 / 多选与框选 / 拖拽已有物件 | 现有的是"选择器 + 摆放模式 + 幽灵预览"（已做） | [ADR 0032](0032-object-palette-and-placement-mode.md) §四 |
+| 河流创作工具（自己拉河） | 属于"场景编辑器"暂缓项，须先落 ADR | SKILL §五 判定表 / [ADR 0027](0027-water-representation.md) |
+| 离屏渲染真缩略图 | 选择器预览只看形状、不看材质 | [ADR 0032](0032-object-palette-and-placement-mode.md) 备选表 |
+
+### 5.4 暂缓项（**默认不实现，不是待办**）
+
+场景编辑器 · 脚本系统 · 多渲染后端 · 自研 ECS —— 4 项；**网络联机**已因 PvP 升格为"正式版目标"（仍当前不启动）。
+权威写处：`SKILL.md` §五「范围控制」。
+

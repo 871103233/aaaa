@@ -20,6 +20,7 @@ add_executable(voxel_tests
     character_jump_test.cpp
     character_model_test.cpp
     character_test.cpp
+    climate_test.cpp
     destruction_queue_test.cpp
     dig_volume_test.cpp
     dig_volume_residency_test.cpp
@@ -30,6 +31,7 @@ add_executable(voxel_tests
     gameplay_input_test.cpp
     ground_pick_test.cpp
     input_map_test.cpp
+    instance_batch_test.cpp
     landform_test.cpp
     level_manifest_test.cpp
     lighting_table_test.cpp
@@ -38,11 +40,14 @@ add_executable(voxel_tests
     mouse_capture_test.cpp
     object_edit_save_test.cpp
     object_layer_test.cpp
+    object_kit_test.cpp
     object_palette_test.cpp
+    object_placement_rule_test.cpp
     object_preview_test.cpp
     object_mesh_test.cpp
     object_scatter_test.cpp
     object_support_test.cpp
+    object_terrain_sampling_test.cpp
     orb_test.cpp
     premade_map_test.cpp
     premade_terrain_source_test.cpp

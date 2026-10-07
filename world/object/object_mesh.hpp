@@ -9,6 +9,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <set>
 #include <vector>
 
 namespace vx {
@@ -40,6 +42,10 @@ struct ObjectMeshSpec {
             //（形态 → 槽位的映射对"外部模型"没有意义：树与岩石同属 `Model`，需要不同槽位）。
             // 这里返回草槽只是让枚举穷尽、并作为"未指定 material_slot"时的约定默认值。
             return 0.0F;  // 草
+        case ObjectAssetKind::Kit:
+            // V0.8：建筑构件 = **代理体**（ADR 0035 决策二）⇒ 用**土**槽占位（最近似的褐色，与木箱同一口径）；
+            // 正式外观 = kit 美术资产或室内外专用材质槽（登记为后续，见 ADR 0035「何时重新审视」）。
+            return 1.0F;  // 土
     }
     return 1.0F;
 }
@@ -98,6 +104,48 @@ inline void AppendBox(MeshData& mesh, float halfX, float halfY, float halfZ, flo
         mesh.indices.push_back(base + 3U);
     }
 }
+
+/// **任意位置**的轴对齐盒：中心 `(centerX, centerY, centerZ)`、半尺寸 `(halfX, halfY, halfZ)`。
+///
+/// 与 `AppendBox` 的唯一差别是**没有"底面贴 `y = 0`"的约束** —— 建筑构件需要把板 / 墙 / 门楣
+/// 放在构件局部的任意高度（V0.8；`AppendBox` 的"底面贴地"口径对构件不适用）。
+/// 每个面 4 个独占顶点（面法线），绕组与 `AppendBox` 一致（从外部看逆时针）。
+inline void AppendBoxCentered(MeshData& mesh, float centerX, float centerY, float centerZ, float halfX, float halfY,
+                              float halfZ, float material) {
+    const float x0 = centerX - halfX;
+    const float x1 = centerX + halfX;
+    const float y0 = centerY - halfY;
+    const float y1 = centerY + halfY;
+    const float z0 = centerZ - halfZ;
+    const float z1 = centerZ + halfZ;
+
+    struct Face {
+        float n[3];
+        float v[4][3];
+    };
+    const Face faces[6] = {
+        { { 1.0F, 0.0F, 0.0F }, { { x1, y0, z0 }, { x1, y1, z0 }, { x1, y1, z1 }, { x1, y0, z1 } } },   // +X
+        { { -1.0F, 0.0F, 0.0F }, { { x0, y0, z0 }, { x0, y0, z1 }, { x0, y1, z1 }, { x0, y1, z0 } } },  // -X
+        { { 0.0F, 0.0F, 1.0F }, { { x0, y0, z1 }, { x1, y0, z1 }, { x1, y1, z1 }, { x0, y1, z1 } } },   // +Z
+        { { 0.0F, 0.0F, -1.0F }, { { x0, y0, z0 }, { x0, y1, z0 }, { x1, y1, z0 }, { x1, y0, z0 } } },  // -Z
+        { { 0.0F, 1.0F, 0.0F }, { { x0, y1, z0 }, { x0, y1, z1 }, { x1, y1, z1 }, { x1, y1, z0 } } },   // +Y
+        { { 0.0F, -1.0F, 0.0F }, { { x0, y0, z0 }, { x1, y0, z0 }, { x1, y0, z1 }, { x0, y0, z1 } } },  // -Y
+    };
+
+    for (const Face& face : faces) {
+        const std::uint32_t base = static_cast<std::uint32_t>(mesh.vertices.size());
+        for (const auto& p : face.v) {
+            mesh.vertices.push_back(MakeVertex(p[0], p[1], p[2], face.n[0], face.n[1], face.n[2], material));
+        }
+        mesh.indices.push_back(base + 0U);
+        mesh.indices.push_back(base + 1U);
+        mesh.indices.push_back(base + 2U);
+        mesh.indices.push_back(base + 0U);
+        mesh.indices.push_back(base + 2U);
+        mesh.indices.push_back(base + 3U);
+    }
+}
+
 
 /// 椭球：中心 `(0, halfY, 0)`、半轴 `(halfX, halfY, halfZ)`、底面落在 `y = 0`。
 ///
@@ -301,6 +349,60 @@ inline void AppendPortalRing(MeshData& mesh, float halfX, float halfY, float hal
     }
 }
 
+/// 构建一个**模块化建筑构件**的代理几何（V0.8；[ADR 0035](../../docs/adr/0035-modular-building-kit-and-enterable-spaces.md) 决策二）。
+///
+/// 口径（与其它形态共用同一套约定）：**构件局部原点 = 水平中心 / 底面中心**，`+Y` 向上，底面在 `y = 0`；
+/// 水平占地 = `2*half_extent.x × 2*half_extent.z`（解析期已强制它是 `module_blocks` 的整数倍）；
+/// 法线朝外、绕序从外部看逆时针、**无退化三角形**（与 `AppendBox` 同源实现）。
+///
+/// | 角色 | 几何 |
+/// | --- | --- |
+/// | `Floor` / `Roof` | 一块厚 `kKitSlabThicknessBlocks` 的板（顶面 = 可站面） |
+/// | `Wall` | 沿 Z 居中、厚 `kKitSlabThicknessBlocks` 的立板（高 = `2*half_extent.y`） |
+/// | `WallDoor` | 左 / 右两段立板 + 上方**门楣** ⇒ 洞口宽 `kKitDoorWidthBlocks`、净高 `kKitDoorClearanceBlocks` |
+///
+/// **可进入性的硬保证**：`WallDoor` 的洞口净高 = `kKitDoorClearanceBlocks`（2.2 格 > 角色总高 1.80 格）；
+/// 解析期另强制 `2*half_extent.y > kKitDoorClearanceBlocks`（门楣必须存在）⇒ 不会出现"门洞通到顶"的退化件。
+[[nodiscard]] inline MeshData BuildKitPieceMesh(const ObjectType& type) {
+    const float halfX = type.halfExtentX;
+    const float halfZ = type.halfExtentZ;
+    const float height = 2.0F * type.halfExtentY;
+    const float thickness = kKitSlabThicknessBlocks;
+    const float material = ObjectMaterialSlot(type.kind);
+
+    MeshData mesh;
+    switch (type.kitRole) {
+        case ObjectKitRole::Floor:
+        case ObjectKitRole::Roof:
+            // 板：底面贴 `y = 0`，顶面在 `y = thickness`。
+            object_mesh_detail::AppendBoxCentered(mesh, 0.0F, thickness * 0.5F, 0.0F, halfX, thickness * 0.5F, halfZ,
+                                                  material);
+            break;
+        case ObjectKitRole::Wall:
+            // 立板：占满模数格的**地面投影**，几何 = 沿 Z 居中的一块薄板（拼接时相邻件自然对齐）。
+            object_mesh_detail::AppendBoxCentered(mesh, 0.0F, height * 0.5F, 0.0F, halfX, height * 0.5F,
+                                                  thickness * 0.5F, material);
+            break;
+        case ObjectKitRole::WallDoor: {
+            // 左 / 右两段 + 门楣：洞口 = 宽 `kKitDoorWidthBlocks`、高 `kKitDoorClearanceBlocks`。
+            const float halfDoor  = kKitDoorWidthBlocks * 0.5F;
+            const float doorTop   = kKitDoorClearanceBlocks;
+            const float sideHalfX = (halfX - halfDoor) * 0.5F;              // 单侧板块的半宽
+            const float sideCenterX = halfDoor + sideHalfX;                 // 单侧板块的中心 |x|
+            object_mesh_detail::AppendBoxCentered(mesh, -sideCenterX, height * 0.5F, 0.0F, sideHalfX, height * 0.5F,
+                                                  thickness * 0.5F, material);
+            object_mesh_detail::AppendBoxCentered(mesh, sideCenterX, height * 0.5F, 0.0F, sideHalfX, height * 0.5F,
+                                                  thickness * 0.5F, material);
+            // 门楣（洞口上方到墙顶）—— 解析期已保证 `height > doorTop` ⇒ 高度为正，不产生退化件。
+            const float lintelHalfY = (height - doorTop) * 0.5F;
+            object_mesh_detail::AppendBoxCentered(mesh, 0.0F, doorTop + lintelHalfY, 0.0F, halfDoor, lintelHalfY,
+                                                  thickness * 0.5F, material);
+            break;
+        }
+    }
+    return mesh;
+}
+
 /// 构建物件的**局部**网格（底面中心为原点、`+Y` 向上、底面在 `y = 0`）。
 ///
 /// 渲染与碰撞**共用这一份 `MeshData`**（"谁画谁挡"同源，尺寸不可能漂移）：渲染侧由
@@ -333,6 +435,10 @@ inline MeshData BuildObjectMesh(const ObjectType& type, const ObjectMeshSpec& sp
         case ObjectAssetKind::Model:
             // V8：外部模型**不是**程序化几何 —— 由 `BuildObjectMeshFromModel` 产出（需要文件 IO，
             // 因此不放在本纯几何函数里）。这里留**空网格**，调用方（`game/main.cpp`）按形态分流。
+            break;
+        case ObjectAssetKind::Kit:
+            // V0.8：建筑构件 = **纯程序化代理体**（无文件 IO）⇒ 直接由 `BuildKitPieceMesh` 产出。
+            mesh = BuildKitPieceMesh(type);
             break;
     }
     return mesh;
@@ -433,6 +539,115 @@ inline MeshData BuildObjectMesh(const ObjectType& type, const ObjectMeshSpec& sp
         const float nz = vertex.normal[2];
         vertex.normal[0] = c * nx + s * nz;
         vertex.normal[2] = -s * nx + c * nz;
+    }
+    return out;
+}
+
+/// 生成一个**低模代理**（V0.7 H4 / [ADR 0034](../../docs/adr/0034-object-instancing-and-hlod.md) 决策四）：
+/// 用**顶点聚类**（vertex clustering）做简化，供远景 LOD 链使用。
+///
+/// 做法：把局部坐标按 `cellBlocks` 的立方格聚类（同格顶点合并为一个代表点：位置 = 簇内平均、
+/// 法线 = 平均后归一化、材质槽 = 簇内首个），再按簇 id 重建三角形并丢弃**退化片**（两簇相同）与重复片。
+/// 纯函数、**确定性**（红线 7；用 `std::map` 保证簇顺序与输入顺序无关），只在**加载期**调用。
+///
+/// 为什么用聚类而不是边坍缩：实现小、对任意网格鲁棒、顶点数随格距**单调下降**，且与拓扑 / 朝向无关
+/// （本工程的物件既有程序化形态也有外部低模，形态差异大）。`cellBlocks <= 0`、结果为空或代理顶点 `< 8`
+/// ⇒ **原样返回**（调用方据此决定是否真的使用代理 —— 若代理不比原网格小就没有意义）。
+///
+/// **已知取舍（登记在 ADR 0034）**：聚类会轻微改变轮廓 ⇒ 只应在**远处**（像素占有率很低）切换。
+[[nodiscard]] inline MeshData BuildLowPolyProxy(const MeshData& mesh, float cellBlocks) {
+    if (cellBlocks <= 0.0F || mesh.vertices.empty() || mesh.indices.empty()) {
+        return mesh;
+    }
+
+    struct Cluster {
+        float         position[3];
+        float         normalAccumulator[3];
+        float         material;
+        std::uint32_t count;
+    };
+
+    std::map<std::array<int, 3>, std::uint32_t> clusterOf;
+    std::vector<Cluster>                        clusters;
+    std::vector<std::uint32_t>                  vertexCluster(mesh.vertices.size(), 0U);
+    const float                                 invCell = 1.0F / cellBlocks;
+
+    for (std::size_t i = 0; i < mesh.vertices.size(); ++i) {
+        const MeshVertex& vertex = mesh.vertices[i];
+        const std::array<int, 3> key { static_cast<int>(std::floor(vertex.position[0] * invCell)),
+                                       static_cast<int>(std::floor(vertex.position[1] * invCell)),
+                                       static_cast<int>(std::floor(vertex.position[2] * invCell)) };
+        const auto found = clusterOf.find(key);
+        if (found == clusterOf.end()) {
+            const std::uint32_t id = static_cast<std::uint32_t>(clusters.size());
+            clusterOf.emplace(key, id);
+            clusters.push_back(Cluster { { vertex.position[0], vertex.position[1], vertex.position[2] },
+                                         { vertex.normal[0], vertex.normal[1], vertex.normal[2] }, vertex.material,
+                                         1U });
+            vertexCluster[i] = id;
+        } else {
+            Cluster& cluster = clusters[found->second];
+            cluster.position[0] += vertex.position[0];
+            cluster.position[1] += vertex.position[1];
+            cluster.position[2] += vertex.position[2];
+            cluster.normalAccumulator[0] += vertex.normal[0];
+            cluster.normalAccumulator[1] += vertex.normal[1];
+            cluster.normalAccumulator[2] += vertex.normal[2];
+            ++cluster.count;
+            vertexCluster[i] = found->second;
+        }
+    }
+
+    MeshData out;
+    out.vertices.reserve(clusters.size());
+    for (const Cluster& cluster : clusters) {
+        const float inv = 1.0F / static_cast<float>(cluster.count);
+        MeshVertex  vertex;
+        vertex.position[0] = cluster.position[0] * inv;
+        vertex.position[1] = cluster.position[1] * inv;
+        vertex.position[2] = cluster.position[2] * inv;
+        float nx = cluster.normalAccumulator[0];
+        float ny = cluster.normalAccumulator[1];
+        float nz = cluster.normalAccumulator[2];
+        const float lengthSquared = nx * nx + ny * ny + nz * nz;
+        if (lengthSquared > 1.0e-12F) {
+            const float invLength = 1.0F / std::sqrt(lengthSquared);
+            nx *= invLength;
+            ny *= invLength;
+            nz *= invLength;
+        } else {
+            nx = 0.0F;
+            ny = 1.0F;
+            nz = 0.0F;  // 退化（法线互相抵消）⇒ 回退 +Y（与 `MeshVertex` 缺省一致）
+        }
+        vertex.normal[0] = nx;
+        vertex.normal[1] = ny;
+        vertex.normal[2] = nz;
+        vertex.material  = cluster.material;
+        vertex.morph     = 0.0F;
+        out.vertices.push_back(vertex);
+    }
+
+    out.indices.reserve(mesh.indices.size());
+    std::set<std::array<std::uint32_t, 3>> seen;
+    for (std::size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
+        const std::uint32_t a = vertexCluster[mesh.indices[t + 0]];
+        const std::uint32_t b = vertexCluster[mesh.indices[t + 1]];
+        const std::uint32_t c = vertexCluster[mesh.indices[t + 2]];
+        if (a == b || b == c || a == c) {
+            continue;  // 退化片（合并后塌成一条线 / 一个点）
+        }
+        if (!seen.insert(std::array<std::uint32_t, 3> { a, b, c }).second) {
+            continue;  // 重复片
+        }
+        out.indices.push_back(a);
+        out.indices.push_back(b);
+        out.indices.push_back(c);
+    }
+
+    if (out.indices.empty() || out.vertices.size() < 8U) {
+        // 聚类过度（格距太大）⇒ 几何被塌成一两个面 / 空网格 ⇒ 回退原网格，绝不产生"退化代理"。
+        return mesh;
     }
     return out;
 }

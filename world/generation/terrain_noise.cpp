@@ -31,6 +31,8 @@ struct TerrainNoiseGenerator::Impl {
     FastNoiseLite caveA;
     FastNoiseLite caveB;
     FastNoiseLite riverJitter;
+    FastNoiseLite temperature;  ///< V0.6 C7：气候（温度 / 湿度）—— 只供内容放置判据
+    FastNoiseLite humidity;
 };
 
 TerrainNoiseGenerator::TerrainNoiseGenerator(std::uint64_t worldSeed, TerrainGenerationParams params)
@@ -93,6 +95,20 @@ TerrainNoiseGenerator::TerrainNoiseGenerator(std::uint64_t worldSeed, TerrainGen
     m_impl->riverJitter.SetFractalType(FastNoiseLite::FractalType_FBm);
     m_impl->riverJitter.SetFractalOctaves(2);
     m_impl->riverJitter.SetFrequency(params.river.jitterFrequency);
+
+    // 气候噪声（V0.6 C7）：两张独立的 2D 低频噪声（温度 / 湿度）。**只供内容放置判据** ——
+    // 不参与 `HeightUnits`，故启用 / 调参**不改变任何地形输出**（与高度图解耦，见 tech-plan-v2.0 §3.1）。
+    m_impl->temperature.SetSeed(DeriveChannelSeed(worldSeed, params.climate.temperatureSeedChannel));
+    m_impl->temperature.SetNoiseType(FastNoiseLite::NoiseType_OpenSimplex2);
+    m_impl->temperature.SetFractalType(FastNoiseLite::FractalType_FBm);
+    m_impl->temperature.SetFractalOctaves(2);
+    m_impl->temperature.SetFrequency(params.climate.temperatureFrequency);
+
+    m_impl->humidity.SetSeed(DeriveChannelSeed(worldSeed, params.climate.humiditySeedChannel));
+    m_impl->humidity.SetNoiseType(FastNoiseLite::NoiseType_OpenSimplex2);
+    m_impl->humidity.SetFractalType(FastNoiseLite::FractalType_FBm);
+    m_impl->humidity.SetFractalOctaves(2);
+    m_impl->humidity.SetFrequency(params.climate.humidityFrequency);
 }
 
 TerrainNoiseGenerator::~TerrainNoiseGenerator() = default;
@@ -163,6 +179,18 @@ float TerrainNoiseGenerator::CaveCarveAt(float worldX, float worldY, float world
 
 float TerrainNoiseGenerator::RiverJitterAt(float worldX, float worldZ) const noexcept {
     return m_impl->riverJitter.GetNoise(worldX, worldZ);
+}
+
+float TerrainNoiseGenerator::TemperatureAt(std::int64_t worldX, std::int64_t worldZ) const noexcept {
+    const float x = static_cast<float>(worldX);
+    const float z = static_cast<float>(worldZ);
+    return (m_impl->temperature.GetNoise(x, z) + 1.0F) * 0.5F;  // 归一化到 [0,1]（与 LandformMaskAt 同口径）
+}
+
+float TerrainNoiseGenerator::HumidityAt(std::int64_t worldX, std::int64_t worldZ) const noexcept {
+    const float x = static_cast<float>(worldX);
+    const float z = static_cast<float>(worldZ);
+    return (m_impl->humidity.GetNoise(x, z) + 1.0F) * 0.5F;
 }
 
 }  // namespace vx

@@ -67,6 +67,15 @@ public:
     /// 与其它噪声层使用**不同通道**（`params.river.seedChannel`），故河道走向与地形 / 材质抖动互不耦合。
     [[nodiscard]] float RiverJitterAt(float worldX, float worldZ) const noexcept;
 
+    /// **温度**（V0.6 C7；归一化到 `[0, 1]`，纯函数）。
+    ///
+    /// 与高度 / 地貌使用**不同通道**（`params.climate.temperatureSeedChannel`）⇒ 与高度图**解耦**。
+    /// 只供**内容放置判据**（`PlacementRule` 的温度区间）使用，不参与地形生成。
+    [[nodiscard]] float TemperatureAt(std::int64_t worldX, std::int64_t worldZ) const noexcept;
+
+    /// **湿度**（V0.6 C7；归一化到 `[0, 1]`，纯函数）。与温度使用不同通道（互不相关）。
+    [[nodiscard]] float HumidityAt(std::int64_t worldX, std::int64_t worldZ) const noexcept;
+
 private:
     struct Impl;                        ///< 隐藏 FastNoiseLite 类型，避免第三方头文件进入公共头。
     std::unique_ptr<Impl> m_impl;

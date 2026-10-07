@@ -5301,4 +5301,364 @@
 - 下一步 / 遗留：① 预览只表达形状与明暗（真材质需离屏真缩略图，切换条件已登记 ADR 0032 §四第 5 条）；
   ② 无 LOD / 降面（当前内容为 Kenney 低模；高面数模型会有可感知开销）；③ 本批**未提交**。
 
+## 2026-10-07  V0.6 立项 + C1/C2 落地：**大世界内容填充（地形感知放置 + 分块确定性）**（+ SKILL 归属表 / ADR 0033）
+
+- 需求（所有者 2026-10-07）：① 先问"大世界的**山川河流是地形生成的，合理吗、要不要改成物件层**"；② 要求"若这是最合理方案，
+  把**逐部件拆解表**写入笔记、以后照此开发"；③ 设定**开发主线 = 大世界地图 + 静态物体摆放 / 创造**并要求"**开始开发缺失的能力**"。
+- 做了什么：
+  1. **规范（笔记 → 可执行处）**：把「**逐部件归属判定表（山体 / 河流）**」写入 `SKILL.md` §五「地图与空间表示：静态资产优先」——
+     山体拆分 4 行（走势 / **细节造型** / 可进入空间 / 林木地被）、河流拆分 4 行（河道下切 / 水面 / 岸边点缀 / **创作工具**），
+     每行给**归哪层 + 依据 + 现状**，并写明"**宏观形体永远是高度场**"的例外（远景 / HLOD / 地标 / 可进入洞府）。
+  2. **决策**：新增 **[ADR 0033](adr/0033-world-content-placement-and-streaming.md)** 与 **`docs/plans/v0.6.md`**（阶段 V0.6）。
+  3. **代码（C1 + C2）**：**新增** `world/object/object_placement_rule.hpp`（**纯函数、header-only**）——
+     `PlacementRule`（`tech-plan §3.3` 四项判据：**坡度区间 / 高度带 / 地貌允许集 / 互斥间距 `cellBlocks`**）+
+     `PlacementSample` + `IsPlacementAllowed`（闭区间、`NaN` 一律拒绝）+ **`PlanTileCandidates`**（**分块确定性**候选点：
+     **tile 局部**抖动网格 ⇒ 点全在本 tile 内（**相邻 tile 不重复**）、同种子**逐位可复现**、格内位置 ∈ `[0.25, 0.75]×cell`
+     ⇒ **最小间距 > 0.5×cell**）；**新增** `tests/object_placement_rule_test.cpp`（**11 项**）。
+- 为什么：
+  - **结论 = "合理，但不整类改归属"**：业界一致 —— **宏观形体是高度场**（UE5 Landscape / Unity Terrain / Far Cry·Horizon），
+    **"山体细节造型"与"人工可进入空间"才用静态资产**（UE5 Foliage/Scatter、岩石崖壁网格、Modular Kit）。
+    故**补的是缺失的"中间层"**（地形感知的静态资产散布），**不是**把地块搬进物件层。
+  - **写入 SKILL 而不是 `learning-notes`**：按本仓文档分层（第六节），**规范属"施工规则"**（SKILL 每次会话必读、可检查），
+    `learning-notes` 只写"概念本身"；写错层会导致"以后照此开发"无处可查。
+  - **候选点做成 tile 局部**：这是**能接流式的前提** —— 只看"当前 tile + 种子"即可重建（红线 15），
+    且相邻 tile 不重复 ⇒ 随窗口增删时**不会重复 / 不会漏**；泊松盘需全局激活点列表（ADR 0029 已否决过同一路线）。
+  - **与 ADR 0029 的关系 = 补充而非取代**：圆域 `[[scatter]]`（局部手工散布）**保留**，新增 `[[scatter_tiled]]`（流式形态）。
+- 验证（命令 + 真实结果）：
+  1. **构建**：同一条命令内 `Launch-VsDevShell.ps1` → `cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4` + `/WX`）。
+  2. **测试**：`ctest --preset debug -j 6` ⇒ **656/656 passed**（较 V0.5 E4 基线 645 增 **11**：
+     `PlacementRule.*` 4 + `TileCandidates.*` 7）。
+  3. **门禁**：`check-banned-identifiers.ps1` ⇒ **scanned 214 file(s), 0 violation(s) / PASS**（212 → 214）。
+- 下一步 / 遗留：**C3**（`[[scatter_tiled]]` 配置解析 + 校验）→ C4（地形采样）→ **C5（接入 tile 常驻窗口的流式增删）** → C6。
+  **已登记降级**（沿用 ADR 0029 / ADR 0033）：无**实例化 / HLOD** ⇒ 密度受控、不得全图铺开；无**真实生物群系**（用 W3 地貌分区占位）。
+  本批**未提交**。
+
+## 2026-10-07  V0.6 C3 + C4 落地：**`[[scatter_tiled]]` 配置** + **地形采样纯函数**
+
+- 做了什么：
+  1. **C3 配置**（`world/object/object_layer.{hpp,cpp}`）：`ObjectTable` 增 **`tiledScatters`** 与 **`ObjectScatterTiled`**
+     （`typeId` / `seed` / `cellBlocks` / 坡度区间 / 高度带 / `allowPlains|Hills|Mountains`），解析 **`[[scatter_tiled]]`**；
+     **全部校验、非法即抛**（未知 `type` / `seed` 为负 / `cell_blocks ≤ 0` / 坡度区间倒置或 > 90 / 高度带倒置 /
+     `landforms` 空数组 / 未知值 / 非数组）；**不写本段 ⇒ 表为空（与引入前逐位一致）**；`MergeObjectTables` 追加该表。
+  2. **C4 地形采样**（**新增** `world/object/terrain_sampling.hpp`，纯函数、header-only）：
+     `SlopeDegreesFromGradient`（坡度 = `atan|∇h|`）、`SlopeDegreesFromNeighbors`（四邻**中心差分**）、
+     `SamplePlacement`（把"读高度 / 读地貌"抽象成**回调** ⇒ 不依赖 `TerrainWorld` / 噪声生成器，可单测）。
+  3. **测试**：`tests/object_layer_test.cpp` 增 **5 项**（解析 / 缺省 / 不写即空 / 7 类非法配置 / Merge 追加）+
+     **新增** `tests/object_terrain_sampling_test.cpp`（**9 项**：坡度换算 / 中心差分 / 平面与斜坡 / 退化 halfStep /
+     `SamplePlacement` 串联 `IsPlacementAllowed`）。
+- 为什么：
+  - **配置只加"能生效的"**：示例配置（`assets/maps/*_objects.toml` 的 `[[scatter_tiled]]`）**留到 C5** ——
+    在流式接线之前写进去就是"写了不生效"的**静默配置**，本仓明令禁止（ADR 0005 同一口径）。
+  - **地形采样走回调**：判据要能单测、且不能把 `world/object` 绑死到 `TerrainWorld`；回调注入把"读地形"与"判规则"解耦。
+  - **坡度用中心差分**：与后续 CDLOD / 高度场口径一致，且与采样间距无关（`atan(2)` 不随 `halfStep` 变）。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`Launch-VsDevShell.ps1` → `cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4` + `/WX`）。
+  2. **测试**：`ctest --preset debug -j 6` ⇒ **670/670 passed**（较 C1/C2 的 656 增 **14**）。
+  3. **门禁**：`check-banned-identifiers.ps1` ⇒ **scanned 216 file(s), 0 violation(s) / PASS**（214 → 216）。
+- 下一步 / 遗留：**C5**（把 `PlanTileCandidates` + `SamplePlacement` + `IsPlacementAllowed` **接入 tile 常驻窗口**：
+  tile 进入 ⇒ 生成该 tile 物件（复用 `addObjectSlot` 的渲染碰撞同源通路）；离开 ⇒ 移除；**分帧 + 预取**，窗口内数量有界）。
+  前置待裁决 = 物件网格构建 / 碰撞体是否下沉 worker（沿用 P6 口径）。本批**未提交**。
+
+## 2026-10-07  V0.6 C5 + C6 落地：**流式散布接入 tile 窗口**（内容随玩家移动增删）
+
+- 做了什么（`game/main.cpp`）：
+  1. **接线**：每帧在**地表 tile 安装段之后**调用 `reconcileStreamedObjects()`：
+     **移除** = 条目所在 tile 已出**内容半径**或已非常驻 ⇒ 整批回收；**生成** = 内容半径内、已常驻、且尚无条目的 tile
+     ⇒ 用 `PlanTileCandidates` 出候选点、`SamplePlacement`（**中心差分坡度** + 地表高度 + `LandformMaskAt`→`ClassifyLandform`）
+     采地形、`IsPlacementAllowed` 过四项判据，命中即落点（底面 Y 由 `world.QueryHeight` 求解）。
+  2. **预算与口径常量**：**内容半径 `kStreamedContentRadiusTiles = 8` tile（≈ 512 m）**、**每帧 `kStreamedTilesPerFrame = 2`**、
+     坡度半步 `1.0` 格。**为什么不是整个常驻窗口（33）**：4489 个 tile × 每 tile 物件会直接撞 draw call 预算（≤ 6000 次/帧）。
+  3. **槽位池复用**（红线 10）：`ObjectSlot` 增 `streamed` / `streamedTile`；卸载只 `DestroyObjectSlot` + 把下标放进自由表，
+     **绝不缩短 `objectSlots`** ⇒ 其余系统（剔除 / 支撑 / 破坏 / 渲染）持有的下标**恒稳定**，成本与世界总量无关。
+     把 `addObjectSlot` 重构为 `makeObjectSlot`（返回值）+ `addObjectSlot`（push_back），**加载期 / F2 就地摆放 / 流式**共用同一份。
+  4. **配置**：`assets/maps/world_a_objects.toml` 增 `[[scatter_tiled]]`（`boulder`，`cell_blocks = 40` ⇒ 1 点/tile、
+     `max_slope_deg = 45`、`landforms = ["hills","mountains"]`）；`object_layer.cpp` 增**传送门类型即抛**（L 层门需 `target_world`
+     与交互登记 ⇒ 流式生成会得到"按 E 没反应"的静默配置）。
+  5. **可观测**（进度可见）：启用 / **首个物件** / **首个 tile 移除** / **整窗对账完成（登记 tile 数、有物件的 tile 数、累计物件数）**。
+- 为什么：
+  - **内容半径而非全窗口**：常驻 4489 tile 会撞 [ADR 0024](../../docs/adr/0024-terrain-streaming-and-lod.md) 的 draw call 预算；
+    8 tile 与 ADR 0024 的 **Ring 0** 同尺度 ⇒ 近场细节；这是**预算旋钮**（已写进 [ADR 0033](../../docs/adr/0033-world-content-placement-and-streaming.md) 决策三的实施细化）。
+  - **主线程 + 每帧预算**（不新增线程契约）：沿用 P6 形态；实测新增成本落在**"安装"段（2.8~3.3 ms）**，量级可接受。
+  - **只标记不缩短数组**：避免"边遍历边改容器"，也避免把下标语义变成不稳定（与 SKILL 红线 10 的**对象池**口径一致）。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`Launch-VsDevShell.ps1` → `cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4` + `/WX`）。
+  2. **测试**：`ctest --preset debug -j 6` ⇒ **671/671 passed**（较 C1~C4 的 670 增 1：`ObjectTable.ScatterTiledRejectsPortalType`）。
+  3. **门禁**：`check-banned-identifiers.ps1` ⇒ **scanned 216 file(s), 0 violation(s) / PASS**。
+  4. **冒烟（静态）** `--world=world_a --auto-test`（`build\v06_c5_smoke2.*`）：
+     `流式散布…启用（规则 1 条、内容半径 8 tile）` → `**首个物件已生成** —— tile (-1,-8)、类型 [boulder]`
+     → `内容窗口**对账完成** —— 已登记 289 个 tile（其中 36 个有物件）、累计生成 36 个物件`；**stderr 空、无 ERROR**。
+  5. **冒烟（飞行）** `--world=world_a --auto-test --autofly=45`（`build\v06_c5_fly.*`）：出现
+     `**首个 tile 已随窗口移除**`（tile (-8,-8)）⇒ 移除路径生效；**无 ERROR**；帧尖峰 WARN 由**地表常驻**主导（既有 P6 形态），
+     本段 > 50 ms 帧 **1 帧（57.3 ms）**、逻辑拆分显示成本落在"安装"段。
+- 下一步 / 遗留：① **P99 需人工读 F1 面板**（本环境无法注入输入）；② **密度 / 画质调优**（内容半径、`cell_blocks`、
+     追加第二条规则）待 draw call 实测；③ 放开密度前须先做**实例化 / HLOD**（ADR 0029 决策四）。本批**未提交**。
+
+## 2026-10-07  V0.6 C7 落地：**气候（温度 + 湿度）判据**（内容放置的第五个判据）
+
+- 需求（所有者 2026-10-07）："**缺口内容哪些能实现，补充缺失内容**"。分诊后选定**唯一无需所有者裁决、也不触暂缓项**的一项 =
+  **气候 / 生物群系**（`tech-plan-v2.0.md` §3.1 早已规定"2D 温度与湿度出生物群系，且与高度图解耦"；也是 [ADR 0033](../../docs/adr/0033-world-content-placement-and-streaming.md) 已登记的 follow-up 第 2 条）。
+- 做了什么：
+  1. **噪声**：`TerrainNoiseGenerator` 增 **`TemperatureAt` / `HumidityAt`**（两张独立 2D 低频噪声，各归一化到 `[0,1]`，与 `LandformMaskAt` 同口径；通道 9 / 10）。
+  2. **配置**：`TerrainClimateParams` + `terrain.toml` 的 **`[climate]`**（**可选段**：缺省频率 0.0009 / 0.0014、通道 9 / 10；频率 > 0、通道为正面且**互不相同**，否则抛）。
+  3. **判据**：`PlacementRule` / `PlacementSample` 增**气候区间**（`min|maxTemperature`、`min|maxHumidity`；**缺省全区间 ⇒ 不约束**），`IsPlacementAllowed` 增两条闭区间判定；`SamplePlacement` 扩为**四条回调**（高度 / 地貌 / 温度 / 湿度）。
+  4. **配置**：`[[scatter_tiled]]` 增可选 `min_temperature` / `max_temperature` / `min_humidity` / `max_humidity`（值域 `[0,1]`、区间不得倒置，非法即抛）。
+  5. **接线**：`game/main.cpp` 的流式散布把温度 / 湿度一并采入判据；`assets/maps/world_a_objects.toml` 增**第二条规则**（`bush`：**只在偏湿的平原 / 丘陵**，`min_humidity = 0.55`）。
+- 为什么：
+  - **不发明"生物群系名"**：直接把**温度 / 湿度区间**作为判据（`SKILL 六.9`：世界观命名只能来自所有者）⇒ 命名留待所有者；
+    具名群系分类登记为 follow-up（ADR 0033「何时重新审视」第 2 条）。
+  - **与地形解耦**：两张气候噪声**不参与 `HeightUnits`** ⇒ 调气候 / 缺省都**不改变地形**（可判定不变量：世界指纹不变）。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`Launch-VsDevShell.ps1` → `cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4` + `/WX`）。
+  2. **测试**：`ctest --preset debug -j 6` ⇒ **680/680 passed**（较 C5/C6 的 671 增 **9**：`Climate.*` 5 + `PlacementRule.ClimateGateUsesClosedInterval`
+     + `SamplePlacement.*` 气候 2 + `ObjectTable.ScatterTiled{Parses,RejectsIllegal}ClimateRanges` 2）。
+  3. **门禁**：`check-banned-identifiers.sh` → **scanned 217 file(s), 0 violation(s) / PASS**。
+  4. **冒烟** `--world=world_a --auto-test`（`build\v06_c7_smoke.*`）：**世界指纹 `e78f5fe9c12cd6e9` 与引入气候判据之前完全相同**
+     ⇒ 气候与地形**逐位解耦**（端到端证据）；`流式散布…启用（规则 **2** 条）` → `对账完成：289 个 tile，其中 **66** 个有物件、累计 **69** 个物件`
+     （C5 时为 36 / 36 ⇒ 气候规则带来了新内容）；**stderr 无 ERROR / WARN**。
+- 下一步 / 遗留：① **P99 需人工读 F1 面板**；② **密度 / 阈值调优**（内容半径、`cell_blocks`、气候区间）待 draw call 实测；
+  ③ **具名生物群系分类**未做（需所有者给命名 / 语义）；④ 放开密度前须先做**实例化 / HLOD**（ADR 0029 决策四）。本批**未提交**。
+
+## 2026-10-07  SKILL 补两条硬规则 + V0.7 立项：**物件 GPU 实例化 + 远景 LOD 链**（解冻 P4）
+
+- 需求（所有者 2026-10-07）：① "补充 skill：任何开发工作都要**先结合业界标准和 3A 标准规范进行合理性评价**；做完以后的**进展和缺失内容要留痕**"；
+  ② "接下来考虑**物件实例化 / HLOD**，给出开发方案"（并三答冻结：**实例化 + 远景 LOD 链**（不做 impostor）/ 物理 **共享 Shape + 半径裁剪** / **新建阶段 V0.7**）。
+- 做了什么：
+  1. **SKILL 两条硬规则**：① 「业界标准优先」节增 **"先评价再动手"** —— 适用面扩到**一切开发工作**（含文档 / 配置 / 数据 / 脚本 / 重构），
+     动手前必须给 **业界参照（点名 2~3）+ 3A 基线判据 + 是否降级**，且**必须留痕**；② 新增 **「完工留痕：进展与缺失都必须落盘」** 节 ——
+     收工须同提交留 **进展**（devlog + 阶段计划）与**缺口**（devlog 遗留 + 计划"阻塞/未决" + **对应内容基线文档**），
+     每条缺口写清 **缺什么 / 为什么现在没做 / 切换条件**；DoD 增两条勾选项。
+  2. **ADR [0034](../docs/adr/0034-object-instancing-and-hlod.md)**（物件 GPU 实例化 + 远景 LOD 链 + 物理共享 Shape）与
+     **`docs/plans/v0.7.md`**（阶段 V0.7，任务 H0~H5，含 3A 三问 / 世界内一致性 / 验收对照）。
+  3. **解冻 P4** 并同步：`adr/README`（新增 0034 行 + v0.7 阶段行 + 0033 行标注"降级已解除"）、`engine-capabilities`
+     （原"冻结"行改为**已解冻/进行中**；物件层"未做 实例化/HLOD"改注排期）、`plans/v0.5.md` 的 P4 行、`game-design` 两行、ADR 0029 的 follow-up。
+- 为什么：
+  - **方案先落盘再动手**（SKILL §8 / 任务下发）：本轮**只落方案与规则，不动 C++**；H0 起才开工。
+  - **选型有依据（业界 + 平台实测）**：业界参照 **UE5 ISM/HISM**、**Unity GPU Instancing / BatchRendererGroup**、**Godot MultiMesh**、
+    **Jolt 共享 `Shape`**；并**核实了 `SDL3_gpu`**（顶点阶段 storage buffer、`SDL_DrawGPUIndexedPrimitives(instanceCount, firstInstance)`、
+    indirect、compute）⇒ **无需更底层后端**（不是纸面推断）。
+  - **旧路径保留不删**（SKILL §五）：实例化是**新增路径**，地表 tile / 动态网格 / 倒塌残骸继续走逐网格路径。
+- 验证（命令 + 真实结果）：
+  1. **门禁**：`check-banned-identifiers.ps1` ⇒ **scanned 217 file(s), 0 violation(s) / PASS**（SKILL 与全部文档改动后复跑）；
+  2. **本轮无代码改动**：`ctest` 仍为上一批的 **680/680**（未重跑，因未触碰 C++）；方案落盘后文档间链接一致（`adr/README` / `plans` / `engine-capabilities` / `game-design` / `file-index`）。
+- 下一步 / 遗留（缺口，按"缺什么 / 为什么没做 / 切换条件"三项登记）：
+  1. **H0~H5 全部未开始**：缺 = 物件实例化与远景 LOD 链的**实现**；为什么 = 本轮为方案阶段（先落盘后施工）；切换条件 = **H0 度量基线**完成即进 H1。
+  2. **实例化的阈值**（几个实例以下回落旧逐网格路径）**未定**：为什么 = 需 H0 的"物件数 ⇒ draw call / 帧时间"基线；切换条件 = H0 产出数字后定，并按实测复核。
+  3. **低模代理（LOD 链）的来源未定**（离线生成 vs 美术提供）：为什么 = 当前 A 世界模型是体量很小的 Kenney 低模，可能**不需要**代理；切换条件 = H4 前按实测顶点量决定，**决定后无论做与不做都须回写 ADR 0034**。
+  4. **逐模型贴图 / UV 仍未做**（与实例化并列的"全图铺开"前置）：为什么 = 需给 `MeshVertex` 加 UV 与逐网格材质绑定、触及渲染质量线 ⇒ **须另开 ADR**；切换条件 = 进入表现与深度阶段。
+  本批**未提交**。
+
+## 2026-10-07  V0.7 H0 落地：**网格缓冲显存记账 + 度量基线**（实例化前的判据来源）
+
+- 做了什么：
+  1. **记账补齐**（[ADR 0010](../../docs/adr/0010-render-quality-pipeline.md) 的记账义务原先**只统计纹理**）：
+     `RenderStats` 增 **`meshBytes`**（顶点 + 索引 + 骨骼矩阵）；`MeshRenderer` 在 `UploadMesh` / `UploadSkinnedMesh` 建缓冲时累加、
+     在 `ReleaseMesh` 用**饱和减法**回收、析构归零；`LogTextureAccounting` **改名 `LogVramAccounting`** 并按项打出
+     "纹理小计 / **网格缓冲** / 合计"；`MeshResources` 增 `vertexBytes` / `indexBytes` / `boneBytes`。
+  2. **可读性**：F1 面板新增只读行 **「网格缓冲显存」**（`UiLabel::MeshVram` + 复用 `%.2f MB` 格式；`ui-inventory` 同步）；
+     帧尖峰 WARN 行追加 **`网格缓冲 %.1f MB`** ⇒ 冒烟日志里可直接读到该数字。
+  3. **基线测量**（`--world=world_a --auto-test`，debug，2560×1440）：见 `plans/v0.7.md` §3 —— **网格缓冲 232.1 MB**、
+     纹理 214.67 MB ⇒ **合计 ≈ 446.8 MB**（ADR 0024 上限 640 MB）；物件 **208**（载入 139 + 流式 69）；
+     draw call 尖峰 **2745**（稳态 p50 既测 1386）；P99 待人工读 F1。
+- 为什么：
+  - **先有数字再优化**（SKILL §四「观测先于结论」）：实例化要解除的是"**逐物件 1 次绘制**"这条线性关系，
+    而"省下多少显存 / 新增实例缓冲多少"原先**无法核对**（网格缓冲不在账上）⇒ 必须先记账。
+  - **饱和减法**：`ReleaseMesh` 可能在"上传失败兜底"里被重复调用 ⇒ 记账不能下溢（防御性写法，不是过度设计）。
+  - **只加行不改语义**：F1 的既有行（纹理显存 / Draw Call / 三角形）**语义不变**，新增行只读、不与任何玩法状态交互。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`Launch-VsDevShell.ps1` → `cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4` + `/WX`）。
+  2. **测试**：`ctest --preset debug -j 6` ⇒ **680/680**（本批无新增用例：改动是**记账与展示**，由既有 `ui_text` 全标签遍历测试兜住标签表一致性）。
+  3. **门禁**：`check-banned-identifiers.ps1` ⇒ **217 文件 0 违规 / PASS**。
+  4. **冒烟**（`build\v07_h0_smoke.*`）：`GPU 显存记账（纹理 + 网格缓冲）… 网格缓冲 0.00 MB`（早期目标创建时的快照）
+     → 帧尖峰行出现 **`网格缓冲 232.1 MB`**（物件与地形装载后）⇒ 新记账**活的、可读**；
+     世界指纹 `e78f5fe9c12cd6e9` **未变**（记账不改任何渲染 / 世界结果）。
+- 下一步 / 遗留（缺口，按"缺什么 / 为什么没做 / 切换条件"三项登记）：
+  1. **H1 未开始**：缺 = 实例化管线变体 + 实例 storage buffer + 两个 vert；为什么 = H0 先立判据；切换条件 = 本批评审通过即开工。
+  2. **实例化阈值未定**：缺 = "低于几个实例走旧逐网格路径"的具体数字；为什么 = 需 H1 落地后按实测（同场景 N→1 的收益 vs 阈值以下不划算）；切换条件 = H1 完成后定并回写计划。
+  3. **"密度 ⇒ draw call"曲线只有单点**：缺 = 第二点（提高 `[[scatter_tiled]].cell_blocks` 复测）；为什么 = 与 H2 的"实例化前后"对比重复；切换条件 = **H2 落地时必须给出前后两点**。
+  4. **P99 / 稳态帧时间未测**：缺 = 该数字；为什么 = 本环境无法注入输入、须人工看 F1；切换条件 = 所有者人工读数（或在安静机器上跑 `tools/vx_stream_regression.ps1 -StrictV7`）。
+  本批**未提交**。
+
+## 2026-10-07  V0.7 H1~H4 落地：**GPU 实例化 + 物理共享 Shape + 远景 LOD 链**（物件规模化）
+
+- 做了什么：
+  1. **H1 引擎实例化路径**（新增，不替换旧路径）：`assets/shaders/mesh_instanced.vert` / `shadow_instanced.vert`
+     （逐实例 `modelToRender` 来自 **set 0 / binding 1 的只读 storage buffer**，用 `gl_InstanceIndex` 索引）；
+     `MeshRenderer` 增 **实例化主 / 阴影管线变体**（随 MSAA 档位重建，与主管线同生共死）、
+     `UploadInstancedMesh`（容量创建时定死）、`UploadInstances`（**每帧一次** map + 逐批 copy）、
+     `DrawInstancedBatches`（每原型**一次**绘制，`num_instances = 本帧实例数`）；纯函数
+     `engine/render/instance_batch.hpp`（`BuildInstanceModelToRender` / `PackInstanceTransforms`，8 个单测）。
+  2. **H2 物件层接入**：按 `ObjectType` 预建原型（加载期，**不在渲染帧创建**）；每帧复用既有视锥 + 遮挡剔除
+     结果按类型分组，可见实例数 ≥ **4** 走实例化（该类型物件**不再**逐网格提交），低于阈值 / 动态物件回落旧路径；
+     新增开关 **`--object-instancing=on|off`**（SKILL「已实现能力只允许用配置项关闭」）。
+  3. **H3 物理共享 Shape + 半径裁剪**：`PhysicsWorld` 增 `SharedMeshShape`（引用计数）+ `CreateSharedMeshShape` /
+     `AddStaticMeshBody` / `ReleaseSharedMeshShape`；每个 `ObjectType` **只构建一次** `MeshShape`（几何取未旋转
+     局部网格，朝向由**刚体旋转**承担 —— 与"把 yaw 烘进顶点"逐位等价）；静态物件体按 **128 格**半径裁剪
+     （入界立即建、越界分帧移除），开关 **`--object-collision-radius=<格>`**（`0` = 关闭）。
+  4. **H4 远景 LOD 链**：`world/object/object_mesh.hpp` 增 `BuildLowPolyProxy`（**顶点聚类**，纯函数 + 2 个单测）；
+     每个原型生成低模代理（只在其更小时才用）；按到渲染原点距离 **200 格**切换近 / 远两组实例，开关
+     **`--object-lod-distance=<格>`**（`0` = 关闭）。**不做 impostor**（ADR 0034 已登记）。
+- 为什么：
+  - **解除"逐物件 1 次绘制"这条线性关系**（ADR 0034 决策一）：H0 实测 draw call 尖峰 2745，其中物件是逐实例一次。
+  - **形状与构建成本与实例数解耦**（决策三）：原先是**每物件一个 `MeshShape`**（Jolt `MeshShape` 不可变、构建昂贵）。
+  - **远景顶点量下降**（决策四）：近处几何不变、远处换低模 ⇒ 切换点在**像素占有率 < 1%** 处完成（无可见 pop）。
+  - **不静默降级**：超实例容量 ⇒ 截断 + `WARN`；无原型 / 无共享形状 / 代理退化 ⇒ **明确回落旧路径并告警**。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4` + `/WX`）；两个新 vert 经
+     `glslc → SDL_shadercross` 产出 **SPIR-V + DXIL** 双格式。
+  2. **测试**：`ctest --preset debug` ⇒ **689/689**（新增 `instance_batch_test` 7 例 + `object_mesh_test` 代理 2 例）。
+  3. **门禁**：`check-banned-identifiers.ps1` ⇒ **219 文件 0 违规 / PASS**。
+  4. **H2 A/B 实测**（`--world=world_a --auto-test`，debug，2560×1440，`build\v07_h2_*.log`）：
+     - **关闭**实例化：draw call **2626**（首帧）→ **2800**（流式对账完成后，逐网格 1409）；
+     - **开启**：draw call **2219**（首帧）→ **2219**（流式完成后，逐网格 1280 + 10~12 批次）；
+     - ⇒ **物件 132 → 201（+52%）而 draw call 增量 = 0（≤ 类型数）** —— 判据「物件数 ×10 ⇒ draw call 增量 ≤ 类型数」成立；
+       同场景 draw call **−21%**（2800 → 2219）。
+  5. **H3 实测**：14 / 14 个类型建共享 Shape；物理体总数 **704（裁剪关）→ 643（128 格）**（本场景内容集中在出生点附近，
+     故降幅有限；机制保证**体数与内容半径解耦**）。`ctest` 物理用例（`Physics.*` / `VolumeCollision.*` …）**全绿**
+     ⇒ 「碰撞行为不变」成立。
+  6. **H4 实测**：**11 个类型**有低模代理，远景顶点 **1718 → 299（−83%）**；LOD 链生效（远处实例进代理批次），
+     draw call 2219 → 2227（+8，来自近 / 远拆批，仍远低于全逐网格的 2800）。
+  7. **显存（F1 / 日志）**：网格缓冲 **231.84 MB（1024 世界不变量）→ 233.51 MB** ⇒ 增量 **+1.67 MB**
+     （14 条实例缓冲 × 64 KB + 11 个代理原型的顶点 / 索引），远低于纹理小计 262.42 MB；合计 495.93 MB（ADR 0024 上限 640 MB）。
+- 下一步 / 遗留（缺口，按"缺什么 / 为什么没做 / 切换条件"三项登记）：
+  1. **逐物件 GPU 网格未移除 ⇒ 网格缓冲未下降（仅 +1.67 MB）**：缺 = "实例化省下的显存"；为什么 = 旧逐网格路径
+     必须保留（低于阈值 / 动态物件要回落，且**资源创建不得发生在渲染帧** ⇒ 不能"动态化时再上传网格"）；
+     切换条件 = 后续阶段把"动态化时按需上传网格"做成**加载 / 非热路径**后，再改为静态物件**不建**逐物件网格。
+  2. **四个旋钮为经验起点，待实测微调**：实例化阈值 **4**、LOD 距离 **200 格**、碰撞半径 **128 格**、聚类格距 **0.5 格**；
+     切换条件 = 所有者按 F1 / 尖峰日志实测后调（改的都是具名常量 + CLI 开关，不动结构）。
+  3. **实例化物件的阴影未做"逐级联过滤"**：为什么 = H1 为求正确先每级都画全部实例（冗余但**不会漏投影**）；
+     切换条件 = 需要再压 draw call 时，按 `shadow_cascade.hpp` 的判据给实例也做逐级列表。
+  4. **impostor / 合并式 HLOD proxy / GPU-driven 全剔除（indirect + compute）未做**：ADR 0034「何时需要重新审视」已写切换条件。
+  5. **P99 / 稳态帧时间仍未测**：同 H0 第 4 条（须人工读 F1）。
+  6. **逐模型贴图 / UV 仍未做**（与实例化并列的"全图铺开"前置）：须另开 ADR（见上一批第 4 条）。
+  本批**未提交**。
+
+## 2026-10-07  V0.8 落地：**建筑 kit / 人工可进入空间 + 最小室内变暗**（补上「人能进去」这一环）
+
+- 需求（所有者 2026-10-07）："**规划并开发建筑 kit / 人工可进入空间相关内容**"。经**事前提问**四答冻结：
+  ① 阶段 = **完整闭环**；② 资源 = **先用程序化代理体资产**（CC0 公共库近风格 kit 记为备选留痕）；
+  ③ 结合 = **首期只放地形之上**（其余方案登记留痕）；④ 光照 = **首期做最小室内变暗**；
+  并追加"**未覆盖的备选方案与后续工作记录留痕**"。决策见 [ADR 0035](adr/0035-modular-building-kit-and-enterable-spaces.md)，细则见 [`plans/v0.8.md`](plans/v0.8.md)。
+- **3A 基线三问（动手前）**：① **业界参照** = **UE5 Modular Building Kit + Grid Snapping** / **Unity ProBuilder** / **Godot GridMap**（模数化构件）；
+  室内明暗 = **UE5 Lightmass / Volumetric Lightmap**、**Unity Lightmap + Light Probes**；超大室内 = **Skyrim / Elden Ring 的 load door**；
+  ② **本项目判据** = 6 条可判定（**可进入**（洞口无几何 + 净高 ≥ 2.2 格）/ **模数对齐**（整除 ⇒ 接缝错位 0）/ **室内变暗**（≥30%）/
+  **性能**（构件 draw call 增量 ≤ 类型数）/ **持久化**（配置可加载可校验）/ **确定性**（红线 7））；
+  ③ **降级（所有者已确认）**：程序化代理体（非正式 kit）/ 只放地形之上（不裁地形）/ 室内变暗为**解析式近似**（非逐顶点烘焙）。
+- 做了什么：
+  1. **K1 数据形态 + 解析校验**（`world/object/object_layer.{hpp,cpp}`）：`ObjectAssetKind::Kit` + **`ObjectKitRole`**
+     （floor / wall / wall_door / roof）+ `ObjectType::kitRole / moduleBlocks` + **`ObjectBuilding` / `ObjectBuildingPiece`** +
+     `ObjectTable::buildings`；解析 `[[type]] kind="kit"` 与 `[[building]]`。**解析期强制的可判定不变量**：
+     `kit_role` / `module_blocks` **仅 `kit` 可给**；`module_blocks > 0`；**水平占地必须整除模数**（容差 `1e-4`）；
+     门洞墙必须 `2*half_extent.y > 2.2`（**留得下门楣**）且 `1.6 < 2*half_extent.x`（**留得下墙垛**）；
+     `[[building]]` 的 `id` 非空不重复、`pieces` 非空、`pieces[].type` 必须存在、**不得引用传送门**（构件项没有 `target_world`）。
+  2. **K2 构件几何**（`world/object/object_mesh.hpp`）：`AppendBoxCentered`（任意位置 AABB）+ **`BuildKitPieceMesh`** ——
+     地板 / 屋顶 = 有厚度的板（顶面 = 可站面）、墙 = 占满模数格的中间薄板、**门洞墙 = 墙垛 ×2 + 门楣，洞口区域没有任何几何**。
+  3. **K3 成套建筑展开**（`game/main.cpp`）：**锚点解算地表高度一次** + 构件按**相对偏移**堆叠（旋转与 `RotateMeshAboutY` 同源）；
+     构件复用**同一条装配路径**（`objectLayer.Place` + `addObjectSlot`）⇒ 渲染 / 碰撞 / 剔除 / V0.7 实例化 / 远景 LOD **零分叉**。
+  4. **K4 内容**（`assets/maps/world_a_objects.toml`）：4 个 kit 类型（`module_blocks = 4.0`）+ 1 座可进入小屋 `spawn_hut`
+     （4×4、门洞朝 +X、屋檐下沿 +3.3 格；6 个构件）。
+  5. **K5 最小室内变暗**（新增，跨层）：`ObjectEnclosure` + **`ComputeBuildingEnclosure`（纯函数）** ——
+     由**屋顶构件并集**求"世界 XZ 包围盒 + 屋檐下沿"方盒；整座建筑每个构件带**同一份**；
+     经**实例缓冲**（`mat4`(64) + 围合体 `vec4`×2 = **96 B**，`kInstancePoseBytes`）送到 GPU；
+     `mesh.frag` 新增 **`computeSkyVisibility`**（片元 XZ 在围合体内 **且** 是"室内的面"：朝内的竖墙面 / 不高于屋檐下沿的水平面）
+     ⇒ 把**环境项（天空光 / IBL）**乘 **0.45**（**暗 55%**）。**直接光不受影响**（它由级联阴影负责遮挡）。
+     配套：**含围合体的实例组不受实例化阈值（4）限制**（围合体只能经实例缓冲送到 GPU，回落逐网格路径会整段失效）。
+  6. **K6 文档**：本条目 + ADR 0035 + `plans/v0.8.md` + `adr/README`（0035 行 + v0.8 阶段行）+ `engine-capabilities` /
+     `game-design` / `file-index` / `learning-notes` 同步（备选方案与后续工作在 ADR 0035 留痕）。
+- 为什么：
+  - **"堆叠"只能来自成套声明**：逐件 `[[placement]]` 的 `y` 一律按地表求解 ⇒ "墙压地板、屋顶压墙"**必须**由
+    `[[building]].pieces[].offset.y` 给出（这是本阶段最核心的一条机制）。
+  - **可进入性做成"可判定不变量"而不是文档承诺**：解析期卡净高 + 几何侧**洞口无三角形**（单测锁定）⇒ 不是"应该能进去"。
+  - **室内变暗不要求烘焙**：本阶段构件是**共享原型**（同原型被多座建筑复用 ⇒ 逐原型烘焙**无法区分内外侧**），
+    而业界标准（Lightmass / Lightmap）需离线烘焙管线 ⇒ 取最接近的替代 = **解析式围合体 + 逐实例数据**（零新 GPU 资源、零运行期几何）。
+  - **零分叉**：构件必须复用既有装配路径，否则会出现"渲染一套、碰撞另一套"的经典分叉（V0.5 起一直守的口径）。
+- 踩坑（**已修，教训登记**）：`mesh.frag` 新增 `location 4/5` 输入后，**漏改 `mesh_skinned.vert`** ⇒
+  蒙皮主通道管线创建失败（`ERROR: Could not create graphics pipeline state! 0x80070057`）⇒ 启动即失败。
+  **教训**：改 `mesh.frag` 的输入契约**必须**先 `grep` 出**全部**与它配对的 vert（`mesh.vert` / `mesh_instanced.vert` / `mesh_skinned.vert`）再一次性改齐。
+- 验证（命令 + 真实结果）：
+  1. **构建**：`Launch-VsDevShell.ps1` → `cmake --build --preset debug` ⇒ 退出码 **0**、**零警告**（`/W4` + `/WX`）；
+     4 个 vert + `mesh.frag` 经 `glslc → SDL_shadercross` 产出 **SPIR-V + DXIL** 双格式。
+  2. **测试**：`ctest --preset debug` ⇒ **714/714 passed**（较 V0.7 基线 689 增 **25**：`object_kit_test` **22**
+     （几何 5 + 解析 12 + 围合体 5）+ `instance_batch_test` 增 **3**（记录步长 96 B / 围合体偏移与启用位 / 缺省禁用））。
+  3. **门禁**：`check-banned-identifiers.ps1` ⇒ **scanned 220 file(s), 0 violation(s) / PASS**（219 → 220）；自检 18 case。
+  4. **冒烟**（`--world=world_a --auto-test --manual-test=hut_enterable`，`build/v08_enclosure.log`）：
+     `成套建筑（V0.8 / ADR 0035）：1 座、展开 6 个构件（跳过 0）；其中 1 座带**围合体代理**（室内变暗 V0.8）` →
+     `物件层就绪 … 放置 145 / 139 个物件（… 成套建筑构件 6 个），类型表 18 项` →
+     `物件实例化：本帧 **14 个类型 / 138 个静态物件**走实例化`（V0.7 基线为 **10 类型 / 132 物件**；
+     多出的 4 个类型 = 4 个 kit 构件类，因"含围合体的组不受阈值限制"进入）→
+     draw call **2240（首帧）/ 2249（流式对账后）→ 2235 / 2243** ⇒ **零回归**（构件数少，改走实例化后略降）；
+     **stderr 无 ERROR**。
+- 下一步 / 遗留（缺口，按"缺什么 / 为什么没做 / 切换条件"三项登记，详见 `plans/v0.8.md` §3）：
+  1. **室内变暗的目视读数（≥30%）须人工**：缺 = 屏上亮度比；为什么 = 本环境无法向前台窗口注入输入 / 截图；
+     切换条件 = 所有者目视（或后续引入离屏截图设施）。机制与判据已落到 shader + 单测。
+  2. **嵌入地形（离线裁地形 + 留通道）未做**：首期只放地形之上 ⇒ 斜坡上会悬空 / 半埋；切换条件 = 出现"必须陷进地形"的需求。
+  3. **正式美术 kit（CC0 近风格）未接入**：前置 = 逐模型贴图 / UV（ADR 0034 已登记的同一缺口）；切换条件 = 表现与深度阶段。
+  4. **逐顶点烘焙 AO / lightmap、超大室内 = 独立空间实例、合并式 HLOD、建筑玩家自建 + 持久化、多套 kit / 院落蓝图 / 地宫 / 洞府**
+     全部未做（ADR 0035「备选方案」与「何时需要重新审视」已写切换条件）。
+  本批（V0.5 起全部改动）**未提交**。
+
+## 2026-10-07  文档收口：**修复过期的"现状"、补齐缺口索引**（无代码改动）
+
+- 背景（所有者 2026-10-07）："**将需要补充的文档全部补充并修复错误的地方**" —— 承接上一轮我报告的"文档与实际不符"。
+- **先报告再改**（SKILL 第八节）：上一轮已把不一致逐条报告给所有者，本轮在其指示下修正。
+- 做了什么：
+  1. **`SKILL.md` §五 逐部件归属判定表（山体 / 河流）**：
+     - 「崖壁 / 岩石 / 石林**细节造型**」现状由 **"缺（本表登记后开工）"** 改为 **"已实现"**（阶段 V0.6 C1~C7：
+       `[[scatter_tiled]]` 地形感知四项判据 + 气候 + 分块确定性候选点 + **流式增删**；A 世界有 `boulder` 规则）；
+     - 「林木 / 地被」由 **"有雏形，缺地形感知与流式"** 改为 **"已实现"**（V8 圆域 `[[scatter]]` + V0.6 C5 流式形态；A 世界有 `bush` 规则）；
+     - 「洞府 / 矿洞（可进入）」补注 **可进入空间的第一刀 = V0.8 建筑 kit**，并注明"嵌入地形未做（首期只放地形之上）"；
+     - 新增 **「现状」列的维护义务**：**任何阶段落地了表中某一行，必须同一次提交内回填该行** —— 本次过期正是因为没回填。
+  2. **`docs/adr/README.md`**：
+     - **新增 §五「已登记缺口汇总（未做 / 暂缓）」** —— 分 4 类（引擎与渲染 / 内容与玩法 / 存档与编辑器 / 暂缓项），
+       **每行只写"缺什么 + 权威写处"**，**不重述细节、不写第二份切换条件**（SSOT：细节与切换条件以链到的 ADR / 计划为准）；
+     - 修正阶段表的**过期标记**：`v0.3` 与 `v0.5` 两行的"**当前阶段**"（当前阶段已是 v0.8）；`v0.3` 补注"被三世界主线插入 ⇒ 实际执行 v0.5→v0.8，其剩余项仍未开工"。
+  3. **`docs/tech-plan-v2.0.md` §8**：补 **「阶段对齐（2026-10-07，补齐 V0.5 ~ V0.8）」** —— 四个阶段计划与其 ADR 的对应关系，
+     并指向 `adr/README` §五 的缺口总表；声明本节 V0.3（生成系统与持久化）/ V0.4（玩法与动态实体）**内容未被取代**、存档仍整块未开工。
+  4. **`docs/game-design.md`**：V0.6 行里"**物件实例化 / HLOD 已排期 v0.7**"改为"**已于 V0.7 落地**（`impostor` / 合并式 HLOD 仍未做）"；
+     摆放行的"未做"清单与物件层行的状态同步 V0.8；**新增「建筑 kit / 人工可进入空间」一行**（V0.8）。
+  5. **`docs/engine-capabilities.md`**：物件层行补 **V0.8 段**（kit 数据形态 / 构件几何 / 成套装配 / 最小室内变暗 + 仍缺清单）；
+     摆放行的"未做"里的"建筑 / 房间 kit"改为"**已于 V0.8 落地**"。
+  6. **`docs/adr/0032-...md`**：新增 **「落地回填（2026-10-07）」** —— kit 构件走 `category = "building"` ⇒ **自动进既有 `F2` 选择器**
+     （本 ADR 的分类机制无需改动）；备选表第 1 条的触发条件①"引入建筑 kit 后按材质区分构件"**已部分满足但暂不切换**
+     （当前 kit 是**程序化代理体**、单材质槽 ⇒ 看不出材质差异）；§四第 1 条（gizmo / 吸附 / 蓝图）仍是"何时重新审视"。
+  7. **`docs/world-setting.md` §1.3**（**该文件的维护义务要求"缺失写 `待补`、同一次提交内更新"**）：新增
+     「**建筑 / 可进入的人工空间**」行 —— 机制已落地（V0.8），但 `spawn_hut` 的**名称 / 来历 / 用途 / 势力全部 `待补`**；
+     并写明**构件角色与模数是机制、不构成设定**（SKILL 六.9：AI 不得代拟世界观）。
+- 为什么：① **过期文档会让接手者按"缺"重复施工**（SKILL 第八节"与实际不符时先报告再改"，本轮的过期正是漏了回填）；
+  ② 缺口散落在 6+ 份文档里，问"还剩什么没做"要翻遍全仓 ⇒ 建**纯索引**总表（**不复述结论**，避免第二事实源）。
+- 验证（无代码改动 ⇒ 不重跑构建 / 测试）：门禁 `check-banned-identifiers.ps1 -RepoRoot .` ⇒ **scanned 220 file(s), 0 violation(s) / PASS**；
+  新增链接全部为**相对 ADR 目录的正确路径**（`../plans/*.md`、`../world-setting.md` 等，已逐条核对）。
+- 下一步 / 遗留：**室内变暗的目视读数**与**其余缺口**（见 `adr/README.md` §五）均**未闭环**；本批**未提交**。
+
+## 2026-10-07  V0.9 立项（**只落需求**）：室内变暗参数化 + 成套建筑的摆放
+
+- 需求（所有者 2026-10-07 三答）：① 室内变暗的调试开关 = **可调值**（`--interior-darkening=<0~1>`，非二元 on/off）；
+  ② 追加"**能不能把这个功能做成可视化摆放时的功能参数**"⇒ 粒度裁定 = **C：全局默认 + 逐建筑覆盖 + 摆放成套建筑**；
+  ③ "**先把需求记录下来，然后补充交接包，提交并推送代码，我准备开新对话来实现后续开发工作**"。
+- 做了什么（**纯文档，零代码改动**）：
+  1. **新建 [`docs/plans/v0.9.md`](plans/v0.9.md)**（当前阶段）：需求 R1~R4 + 任务 W1~W6 + **硬前置 P3** + 5 条阻塞 + **交接要点**。
+     其中记录了两条**必须让所有者裁定的设计点**：R4 的"落点校验（平整地形 / 嵌入地形？）"与 R3 的"调参作用域（幽灵预览 vs 准星指向的既有建筑）"。
+  2. **`adr/README.md`**：阶段表加 v0.9 行（**当前阶段**）；§五缺口总表加一行（室内变暗参数化 + 摆放建筑），
+     并给"建筑自建 + 持久化""室内变暗目视读数"两行补上指向 v0.9 的说明。
+  3. **交接包核对**（新会话读完即可接手）：`plans/v0.9.md`（**当前阶段**）、`docs/devlog.md`（本条目）、
+     `docs/adr/README.md` §五（缺口总表）、`docs/file-index.md` / `docs/learning-notes.md` /
+     `docs/engine-capabilities.md` / `docs/game-design.md` 均已在上一轮或本轮同步到最新。
+- 为什么：
+  - **先落盘再施工**（SKILL 第八节 / 任务下发）：R4 会把"摆放单位"从"一件"改成"一套"，触及预览 / 落点 / 删除记账 / 保存 schema，
+    **属于要先有决策的改动** ⇒ 先把需求与前置写清，避免下一轮直接动手造成返工。
+  - **"功能参数"必须挂在有围合体的东西上**：单件 `[[placement]]` 没有屋顶并集 ⇒ 没有围合体 ⇒ 室内变暗对它无意义；
+    这正是 R4（摆放成套建筑）被列为 R2 / R3 前提的原因（已在 `plans/v0.9.md` §2 R4 写明）。
+  - **不启动暂缓项**：R3 是**扩既有摆放模式**，**不是**启动 SKILL §五 的"场景编辑器"（已在计划里写明"明确不做"）。
+- 验证：本批**无代码改动** ⇒ 不重跑构建 / 测试；门禁 `check-banned-identifiers.ps1 -RepoRoot .` ⇒ **scanned 220 file(s), 0 violation(s) / PASS**。
+- 下一步 / 遗留：**V0.9 W1（落决策）是硬前置** —— 未落决策不写代码；R4 的两条设计点待所有者裁定（见 `plans/v0.9.md` §5）。
+
+
+
+
+
+
+
+
+
+
+
 

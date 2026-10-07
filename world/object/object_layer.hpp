@@ -25,7 +25,34 @@ enum class ObjectAssetKind : std::uint8_t {
     /// **必须**带 `ObjectType::modelFile`；几何由 `BuildObjectMeshFromModel` 生成（等比装进 `half_extent` 的盒、底面贴地）。
     /// **注意**：本阶段只渲染**几何**，模型自带的贴图 / UV **不出**（渲染器只有地表 4 槽材质）—— 见 `plans/v0.5.md` §1.9。
     Model,
+    /// **模块化建筑构件**（V0.8；[ADR 0035](../../docs/adr/0035-modular-building-kit-and-enterable-spaces.md)）：
+    /// 人工可进入空间（建筑 / 房间）的**代理几何构件** —— 见 `ObjectKitRole`。
+    ///
+    /// **必须**带 `ObjectType::kitRole` 与 `moduleBlocks > 0`；几何由 `BuildKitPieceMesh` 生成
+    /// （程序化代理体：正式 kit 美术资产由后续阶段引入，见 ADR 0035 决策二）。
+    Kit,
 };
+
+/// **模块化 kit 的构件角色**（V0.8，配置 `kit_role`；**仅 `kind = "kit"` 可给**）。
+///
+/// 为什么需要"角色"而不是只给一段几何：构件必须**按统一模数对齐**才能拼成没有错缝的房间
+/// （业界参照：UE5 Modular Building Kit + Grid Snapping、Unity ProBuilder、Godot GridMap）；
+/// 角色还决定**可进入性**的关键尺寸（只有 `WallDoor` 留净高达标的门洞）。
+enum class ObjectKitRole : std::uint8_t {
+    Floor,     ///< 地板：有厚度的板，**顶面 = 可站面**（构件局部 `y ∈ [0, 厚度]`）
+    Wall,      ///< 墙：占满一个模数格的整块地面投影，几何 = 中间夹一层薄板
+    WallDoor,  ///< 带**门洞**的墙：洞口净高 ≥ `kKitDoorClearanceBlocks` ⇒ 角色可通过（可进入性的硬保证）
+    Roof,      ///< 屋顶：有厚度的板（与地板同形，语义为"封顶"）
+};
+
+/// 门洞的**最小净高**（格）：角色总高 1.80 格 ⇒ 留 0.4 格余量。低于它的门洞被解析期拒绝（非法即抛）。
+inline constexpr float kKitDoorClearanceBlocks = 2.2F;
+
+/// 墙板 / 地板 / 屋顶的**默认厚度**（格）与**墙默认高**（格）；由构件几何使用（模数由 `module_blocks` 给出）。
+inline constexpr float kKitSlabThicknessBlocks = 0.30F;
+inline constexpr float kKitWallHeightBlocks   = 3.00F;
+inline constexpr float kKitDoorWidthBlocks    = 1.60F;
+
 
 /// 物件类型（配置表 `[[type]]`）：静态资产的"模板"。
 struct ObjectType {
@@ -60,6 +87,17 @@ struct ObjectType {
     /// 值域固定（`IsValidObjectCategory`，非法即抛）：`vegetation` / `rock` / `prop` / `building` / `portal` / `misc`。
     /// **不按文件名 / 形态推断**（显式字段才可校验、可判定，见 [ADR 0032](../../docs/adr/0032-object-palette-and-placement-mode.md) 决策二）。
     std::string category = "misc";
+
+    /// **构件角色**（V0.8，配置 `kit_role`；**仅 `kind == Kit` 可给**，非法即抛）。
+    /// 默认 `Floor` ⇒ 对其它形态**无意义**（解析期会拒绝在非 `Kit` 上给出该字段）。
+    ObjectKitRole kitRole = ObjectKitRole::Floor;
+
+    /// **模数**（格，配置 `module_blocks`；**仅 `kind == Kit`** 必填且 `> 0`）。
+    ///
+    /// 语义：本构件的**水平占地**必须正好覆盖整数个模数格 ⇒ 解析期强制
+    /// `2*half_extent.x` 与 `2*half_extent.z` 都是 `module_blocks` 的整数倍（容差 1e-4）。
+    /// **为什么强制**：这是"拼起来不出现错缝"的**可判定不变量**（ADR 0035 判据③：同类构件接缝错位 = 0）。
+    float moduleBlocks = 0.0F;
 };
 
 /// 一条放置（配置表 `[[placement]]`）：把某个类型摆到世界坐标。
@@ -116,6 +154,35 @@ struct ObjectScatter {
     std::uint64_t seed    = 0;       ///< 确定性种子（同种子 ⇒ 同一布局）
 };
 
+/// **一条流式（地形感知）散布**（V0.6 C3，配置 `[[scatter_tiled]]`；[ADR 0033](../../docs/adr/0033-world-content-placement-and-streaming.md) 决策五）。
+///
+/// 与 `ObjectScatter`（**圆域**、局部手工散布）的差异：这是**按 tile 归属**的规则 —— 由 `PlanTileCandidates`
+/// 在每个 tile 内生成候选点，再按 `IsPlacementAllowed` 的地形判据过滤；内容随 **tile 常驻窗口**（ADR 0024）
+/// **增删**（ADR 0033 决策三）。字段 = `tech-plan-v2.0.md` §3.3 的四项判据（**坡度 / 高度带 / 地貌 / 互斥间距**）。
+///
+/// 缺省语义：**配置文件不写本段 ⇒ 本表为空 ⇒ 与引入本形态之前逐位一致**。
+struct ObjectScatterTiled {
+    std::string   typeId;                    ///< 引用 `ObjectTable::types` 里的 id（必须存在）
+    std::uint64_t seed = 0;                  ///< 确定性种子（同种子 + 同 tile ⇒ 同一批候选点）
+
+    float cellBlocks      = 16.0F;           ///< 互斥间距：抖动网格步长（格，必须 > 0）⇒ 最小间距 > `0.5 × cell`
+    float minSlopeDegrees = 0.0F;            ///< 坡度下界（度，含端点）
+    float maxSlopeDegrees = 45.0F;           ///< 坡度上界（度，含端点）
+    float minHeightBlocks = 0.0F;            ///< 高度带下界（格，含端点）
+    float maxHeightBlocks = 512.0F;          ///< 高度带上界（格，含端点）
+
+    bool allowPlains    = true;  ///< 是否允许落在平原（`landforms` 给出时只放列出的地貌）
+    bool allowHills     = true;  ///< 是否允许落在丘陵
+    bool allowMountains = true;  ///< 是否允许落在山川
+
+    /// **气候区间**（V0.6 C7，配置 `min_temperature` / `max_temperature` / `min_humidity` / `max_humidity`；
+    /// 值域 `[0, 1]`，闭区间）。缺省 = 全区间 ⇒ 不约束（与引入气候判据之前**逐位一致**）。
+    float minTemperature = 0.0F;
+    float maxTemperature = 1.0F;
+    float minHumidity    = 0.0F;
+    float maxHumidity    = 1.0F;
+};
+
 /// **一条删除项**（阶段 V0.5 的 E3，可编辑层配置 `[[remove]]`）：表达"删掉发布清单里的某个落点"。
 ///
 /// 匹配口径（[ADR 0032](../../docs/adr/0032-object-palette-and-placement-mode.md) 决策五）：**同 `typeId` 且平面距离 ≤ `tolerance`**。
@@ -127,8 +194,66 @@ struct ObjectRemoval {
     float       tolerance = 0.5F;  ///< 匹配容差（格，> 0）
 };
 
-/// 物件配置：**类型表 + 放置清单**，来自同一个 TOML（`assets/config/objects.toml`）。
+/// **成套建筑的一个构件**（V0.8，配置 `[[building]].pieces` 的一项）。
 ///
+/// 语义：相对**锚点**的偏移（未旋转，格）+ 附加朝向。构件世界位置 = 锚点（地表高度已解算）+ 旋转(偏移, 锚点 yaw)；
+/// 朝向 = 锚点 yaw + 本项 `yaw_deg`。**这是"堆叠"的唯一来源** —— 逐件 `[[placement]]` 的 y 一律按地表求解
+/// （见 `game/main.cpp`），因此"墙压在地板上、屋顶压在墙上"只能由成套声明给出相对高度。
+struct ObjectBuildingPiece {
+    std::string typeId;              ///< 引用 `ObjectTable::types` 里的 id（必须存在；不得是 `Portal`）
+    float       offsetX = 0.0F;      ///< 相对锚点的水平偏移（格，未旋转）
+    float       offsetY = 0.0F;      ///< 相对**锚点地表**的高度（格）—— 堆叠层高的来源
+    float       offsetZ = 0.0F;
+    float       yawDegrees = 0.0F;   ///< 相对锚点朝向的附加 yaw（度，绕 +Y）
+};
+
+/// **一座成套建筑**（V0.8，配置 `[[building]]`；[ADR 0035](../../docs/adr/0035-modular-building-kit-and-enterable-spaces.md) 决策三）。
+///
+/// 为什么需要它：ADR 0028 决策二要求"人工可进入空间 = 模块化 kit"；kit 由**多件**拼成、且**竖直方向要堆叠**，
+/// 而逐件 `[[placement]]` 的 y 会被地表高度覆盖 ⇒ 必须有"锚点 + 相对偏移"的成套声明。
+/// 锚点的地表高度在**加载期**解算一次（`game/main.cpp`），之后所有构件用同一个基准 ⇒ 不会各piece各贴各的地表。
+struct ObjectBuilding {
+    std::string id;                  ///< 唯一标识（同一配置表内不可重复）
+    float       x = 0.0F;            ///< 锚点平面位置（世界列坐标，格）
+    float       z = 0.0F;
+    float       yawDegrees = 0.0F;   ///< 锚点朝向（度）—— 整座建筑绕 Y 的朝向
+    std::vector<ObjectBuildingPiece> pieces;  ///< 构件清单（**非空**；按文件顺序 ⇒ 确定性）
+};
+
+struct ObjectTable;  // 前置声明：`ComputeBuildingEnclosure` 只按引用使用它（定义在下方）
+
+/// **一座建筑的「围合体」代理**（V0.8；[ADR 0035](../../docs/adr/0035-modular-building-kit-and-enterable-spaces.md) 决策四）。
+///
+/// 语义：把建筑的**屋顶构件**并集近似为一个**方盒**（世界 XZ 包围盒 + 屋檐下沿高度），供片元着色器
+/// 判定"该片元是否处在室内" ⇒ 是则把**环境项（天空光 / IBL）**按 `kInteriorSkyVisibility` 调暗。
+///
+/// 为什么需要（而不是逐顶点烘焙 AO）：本阶段 kit 构件是**共享原型**（同一原型被多座建筑复用，见 ADR 0034 实例化），
+/// 逐原型烘焙无法区分"墙的内侧 / 外侧"。业界标准做法（UE5 Lightmass / Volumetric Lightmap、Unity Lightmap + Light Probes）
+/// 需要**离线烘焙管线** —— 本阶段尚未具备 ⇒ 按「降级必须先问」的口径取**最接近的替代**：
+/// 用**解析式围合体**做实例级的天空可见性近似（无烘焙、无新 GPU 资源、零运行期几何）。
+/// **已知限制**：非轴对齐朝向（yaw 非 90° 倍数）时包围盒略大于真实footprint；屋檐下沿本身那一层不判定为室内。
+struct ObjectEnclosure {
+    bool  enabled  = false;  ///< false ⇒ 该建筑没有屋顶构件 ⇒ 不是"可进入空间"，不做室内变暗
+    float centerX  = 0.0F;   ///< 围合体中心 XZ（世界列坐标，格）
+    float centerZ  = 0.0F;
+    float halfX    = 0.0F;   ///< 围合体半尺寸 XZ（格），必须 > 0（否则 `enabled = false`）
+    float halfZ    = 0.0F;
+    float ceilingY = 0.0F;   ///< **屋檐下沿**的绝对世界高度（格）= 最低屋顶构件的底面高度
+};
+
+/// **纯函数、确定性**（红线 7）：由建筑声明 + 类型表 + 锚点地表高度，求该建筑的围合体代理。
+///
+/// 口径：
+///   - 只**统计 `kit_role = "roof"` 的构件**（它们决定"封顶"，也就决定"是不是室内"）；无屋顶 ⇒ `enabled = false`；
+///   - 构件水平包围盒 = 其**绕 Y 旋转后的 AABB**（`|cos|·hx + |sin|·hz`，轴对齐时精确）；
+///   - `ceilingY` 取**最低**屋顶构件的底面高度（= `anchorSurfaceY + offset.y`，因为屋顶构件的局部底面在 `y = 0`）；
+///   - 引用了不存在 / 非 `Kit` 构件的条目**跳过**（加载期 `ParseBuildings` 已保证存在，这里只做兜底）。
+///
+/// 前置条件：`anchorSurfaceY` = 该建筑锚点的**地表高度**（格），由调用方按地表求解。
+[[nodiscard]] ObjectEnclosure ComputeBuildingEnclosure(const ObjectBuilding& building, const ObjectTable& table,
+                                                       float anchorSurfaceY) noexcept;
+
+/// 物件配置：**类型表 + 放置清单**，来自同一个 TOML（`assets/config/objects.toml`）。
 /// 加载失败（文件缺失 / 语法错 / 字段缺失 / 取值非法 / `id` 重复 / `placement` 引用不存在的类型）
 /// 一律**抛 `std::runtime_error`** 并中止启动，**禁止**静默回退（与 `MapPreset` 同一口径，ADR 0005）。
 struct ObjectTable {
@@ -148,7 +273,9 @@ struct ObjectTable {
     std::vector<ObjectType>      types;       ///< 按文件顺序（确定性）
     std::vector<ObjectPlacement> placements;  ///< 按文件顺序（确定性）
     std::vector<ObjectScatter>   scatters;    ///< 按文件顺序（确定性；V8）
+    std::vector<ObjectScatterTiled> tiledScatters;  ///< 按文件顺序（确定性；V0.6 C3：`[[scatter_tiled]]` 流式形态）
     std::vector<ObjectRemoval>   removals;    ///< 按文件顺序（确定性；E3：可编辑层的删除项）
+    std::vector<ObjectBuilding>  buildings;   ///< 按文件顺序（确定性；V0.8：成套建筑）
 
     /// 从 TOML 文件加载并校验；失败抛 `std::runtime_error`。
     [[nodiscard]] static ObjectTable LoadFromFile(const std::filesystem::path& path);
@@ -169,7 +296,7 @@ struct ObjectTable {
 /// 把**可编辑层**（`overlay`，手工摆放的落点）**叠加**到**发布清单**（`base`）之上（阶段 V0.5 的 E1）。
 ///
 /// 语义（确定性，红线 7）：
-///   - 加载顺序 = **发布清单 → 应用 `overlay.removals` → 追加 `overlay.placements` → 追加 `overlay.scatters`**
+///   - 加载顺序 = **发布清单 → 应用 `overlay.removals` → 追加 `overlay.placements` → 追加 `overlay.scatters` → 追加 `overlay.tiledScatters`**
 ///     （[ADR 0032](../../docs/adr/0032-object-palette-and-placement-mode.md) 决策五）：先按删除项过滤 `base` 的落点
 ///     （`RemovePlacementsByRemoval`），再**按文件顺序追加**本层条目（不排序、不合并同 id 的条目）；
 ///   - `overlay` 的类型 id 与 `base` **重复 ⇒ 抛**（同一类型在两处定义 = 静默歧义，必须由作者消歧）；

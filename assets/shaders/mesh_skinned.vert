@@ -46,6 +46,10 @@ layout(location = 1) out vec3 v_normal;
 layout(location = 2) flat out float v_material;
 // W6e：逐网格不透明度（与 mesh.vert 同源；片元按 Bayer 抖动 discard 做 dither 淡出）。
 layout(location = 3) out float v_fade;
+// V0.8 室内变暗：蒙皮网格（主角 / NPC）**没有**围合体代理 ⇒ 恒写"未启用"（片元整段跳过）。
+// 位置必须与 mesh.vert / mesh_instanced.vert 一致（三者共用 mesh.frag）。
+layout(location = 4) flat out vec4 v_enclosureA;
+layout(location = 5) flat out vec4 v_enclosureB;
 
 void main() {
     // 线性混合蒙皮：权重已在 CPU 侧归一化，直接加权求和。
@@ -66,4 +70,7 @@ void main() {
     v_material         = -1.0;
     // W6e：逐网格不透明度（CPU 侧恒显式写入：不透明网格为 1.0，淡出中的主角 < 1.0）。
     v_fade             = meshTransform.meshParams.x;
+    // V0.8：蒙皮网格无围合体代理 ⇒ 启用位 0（片元不做室内变暗，逐位退回旧行为）。
+    v_enclosureA       = vec4(0.0);
+    v_enclosureB       = vec4(0.0);
 }

@@ -213,6 +213,32 @@ public:
     /// 返回 false 表示句柄无效、网格为空或重建失败；失败时保留旧形状。
     bool UpdateMesh(BodyHandle handle, const MeshDesc& desc);
 
+    // ---- 共享网格形状（V0.7 H3 / [ADR 0034](../../docs/adr/0034-object-instancing-and-hlod.md) 决策三）----
+
+    /// **可共享**的网格形状句柄（`id == 0` = 无效）。
+    ///
+    /// 语义：一份**未旋转**的局部三角网几何，可被多个静态体复用（引用计数，由 `PhysicsWorld` 持有）。
+    /// 用途：同一原型的 N 个物件（不同位置 / 朝向）只构建**一次** `MeshShape`（Jolt 的 `MeshShape` 不可变、
+    /// 构建昂贵）⇒ 形状内存与构建成本与实例数解耦。朝向由**刚体旋转**承担（不必把 yaw 烘进顶点）。
+    struct SharedMeshShape {
+        std::uint32_t id = 0;
+
+        [[nodiscard]] bool IsValid() const noexcept { return id != 0; }
+    };
+
+    /// 创建一个**可共享**的静态网格形状（几何取 `desc` 的局部顶点 / 索引；`origin*` 被忽略）。
+    /// 返回无效句柄表示失败（参数非法等），失败原因写入日志。
+    [[nodiscard]] SharedMeshShape CreateSharedMeshShape(const MeshDesc& desc);
+
+    /// 释放共享形状的**一个引用**；引用归零即从表里移除（Jolt 形状自身由 `ShapeRefC` 引用计数，
+    /// 因此即便仍被活着的刚体引用也不会悬垂）。无效句柄为无操作。
+    void ReleaseSharedMeshShape(SharedMeshShape shape) noexcept;
+
+    /// 用共享形状创建一个**静态**网格刚体：位置 = `origin`，朝向 = `rotation`
+    /// （几何保持原型局部坐标 ⇒ 与"把 yaw 烘进顶点 + 单位朝向"逐位等价）。形状无效 ⇒ 返回 0。
+    [[nodiscard]] BodyHandle AddStaticMeshBody(SharedMeshShape shape, const glm::dvec3& origin,
+                                               const glm::quat& rotation);
+
     /// 创建一个静态盒体碰撞体。返回无效句柄表示创建失败（半长非正等），失败原因写入日志。
     [[nodiscard]] BodyHandle AddStaticBox(const BoxDesc& desc);
 

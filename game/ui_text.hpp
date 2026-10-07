@@ -78,6 +78,7 @@ enum class UiLabel : int {
     Triangles,                    ///< 行标签：三角形数
     Vertices,                     ///< 行标签：顶点数
     TextureVram,                  ///< 行标签：纹理显存
+    MeshVram,                     ///< 行标签：**网格缓冲显存**（V0.7 H0 起纳入记账；顶点 + 索引 + 骨骼矩阵）
     TextureVramFormat,            ///< 纹理显存数值格式（`%.2f MB`）
     SectionCpuFrameTime,          ///< 分区：CPU 帧时间分解
     CpuLogicStep,                 ///< 行标签：逻辑步（物理 + 相机）
@@ -210,6 +211,7 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsEnglish = {
     "Triangles",
     "Vertices",
     "Texture VRAM",
+    "Mesh VRAM",
     "%.2f MB",
     "CPU frame time",
     "Logic (physics + camera)",
@@ -325,6 +327,7 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsChinese = {
     "三角形数",
     "顶点数",
     "纹理显存",
+    "网格缓冲显存",
     "%.2f MB",
     "CPU 帧时间分解",
     "逻辑步（物理 + 相机）",

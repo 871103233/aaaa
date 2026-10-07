@@ -955,4 +955,168 @@ TEST(MergeObjectTables, AppliesOverlayRemovalsToBaseBeforeAppending) {
     EXPECT_FLOAT_EQ(merged.placements[0].z, 9.0F);
 }
 
+// ---------------------------------------------------------------- V0.6 C3：`[[scatter_tiled]]`（流式 / 地形感知散布）
+
+/// 拼一份含单一类型 + `[[scatter_tiled]]` 的最小清单（`body` = `[[scatter_tiled]]` 的字段）。
+[[nodiscard]] std::string TiledToml(const std::string& body) {
+    return std::string("schema_version = 1\n\n[[type]]\nid = \"boulder\"\nkind = \"stone\"\n"
+                       "half_extent = [1.0, 1.0, 1.0]\ndestructible = false\n\n[[scatter_tiled]]\n") +
+           body;
+}
+
+TEST(ObjectTable, ParsesScatterTiledRule) {
+    const TempToml file("voxel_object_table_tiled_basic.toml", R"(
+schema_version = 1
+
+[[type]]
+id = "boulder"
+kind = "stone"
+half_extent = [1.0, 1.0, 1.0]
+destructible = false
+
+[[scatter_tiled]]
+type = "boulder"
+seed = 2001
+cell_blocks = 24.0
+min_slope_deg = 5.0
+max_slope_deg = 42.0
+min_height_blocks = 100.0
+max_height_blocks = 300.0
+landforms = ["hills", "mountains"]
+)");
+    const ObjectTable table = ObjectTable::LoadFromFile(file.path());
+    ASSERT_EQ(table.tiledScatters.size(), 1U);
+    const vx::ObjectScatterTiled& tiled = table.tiledScatters[0];
+    EXPECT_EQ(tiled.typeId, "boulder");
+    EXPECT_EQ(tiled.seed, 2001U);
+    EXPECT_FLOAT_EQ(tiled.cellBlocks, 24.0F);
+    EXPECT_FLOAT_EQ(tiled.minSlopeDegrees, 5.0F);
+    EXPECT_FLOAT_EQ(tiled.maxSlopeDegrees, 42.0F);
+    EXPECT_FLOAT_EQ(tiled.minHeightBlocks, 100.0F);
+    EXPECT_FLOAT_EQ(tiled.maxHeightBlocks, 300.0F);
+    EXPECT_FALSE(tiled.allowPlains);   // 只放了 hills / mountains
+    EXPECT_TRUE(tiled.allowHills);
+    EXPECT_TRUE(tiled.allowMountains);
+}
+
+TEST(ObjectTable, ScatterTiledDefaultsAllowEveryLandformAndUseStandardRanges) {
+    const TempToml file("voxel_object_table_tiled_defaults.toml", TiledToml("type = \"boulder\"\nseed = 7\n"));
+    const ObjectTable table = ObjectTable::LoadFromFile(file.path());
+    ASSERT_EQ(table.tiledScatters.size(), 1U);
+    const vx::ObjectScatterTiled& tiled = table.tiledScatters[0];
+    EXPECT_FLOAT_EQ(tiled.cellBlocks, 16.0F);
+    EXPECT_FLOAT_EQ(tiled.minSlopeDegrees, 0.0F);
+    EXPECT_FLOAT_EQ(tiled.maxSlopeDegrees, 45.0F);
+    EXPECT_FLOAT_EQ(tiled.minHeightBlocks, 0.0F);
+    EXPECT_FLOAT_EQ(tiled.maxHeightBlocks, 512.0F);
+    EXPECT_TRUE(tiled.allowPlains);
+    EXPECT_TRUE(tiled.allowHills);
+    EXPECT_TRUE(tiled.allowMountains);
+}
+
+TEST(ObjectTable, ScatterTiledDefaultsAreEmptyWhenSectionAbsent) {
+    // 不写 `[[scatter_tiled]]` ⇒ 表为空（与引入本形态之前逐位一致）。
+    const TempToml file("voxel_object_table_tiled_absent.toml", R"(
+schema_version = 1
+
+[[type]]
+id = "boulder"
+kind = "stone"
+half_extent = [1.0, 1.0, 1.0]
+destructible = false
+)");
+    const ObjectTable table = ObjectTable::LoadFromFile(file.path());
+    EXPECT_TRUE(table.tiledScatters.empty());
+}
+
+TEST(ObjectTable, ScatterTiledRejectsIllegalConfig) {
+    // 引用不存在的类型
+    ExpectLoadThrows(
+        TempToml("voxel_object_table_tiled_badtype.toml", TiledToml("type = \"missing\"\nseed = 1\n")).path());
+    // `cell_blocks` 非正
+    ExpectLoadThrows(TempToml("voxel_object_table_tiled_cell0.toml",
+                              TiledToml("type = \"boulder\"\nseed = 1\ncell_blocks = 0.0\n"))
+                         .path());
+    // 坡度区间倒置
+    ExpectLoadThrows(TempToml("voxel_object_table_tiled_slopeinv.toml",
+                              TiledToml("type = \"boulder\"\nseed = 1\nmin_slope_deg = 60.0\nmax_slope_deg = 30.0\n"))
+                         .path());
+    // 高度带倒置
+    ExpectLoadThrows(TempToml("voxel_object_table_tiled_heightinv.toml",
+                              TiledToml("type = \"boulder\"\nseed = 1\nmin_height_blocks = 400.0\nmax_height_blocks = 100.0\n"))
+                         .path());
+    // `landforms` 空数组
+    ExpectLoadThrows(TempToml("voxel_object_table_tiled_landempty.toml",
+                              TiledToml("type = \"boulder\"\nseed = 1\nlandforms = []\n"))
+                         .path());
+    // `landforms` 含未知值
+    ExpectLoadThrows(TempToml("voxel_object_table_tiled_landbad.toml",
+                              TiledToml("type = \"boulder\"\nseed = 1\nlandforms = [\"swamp\"]\n"))
+                         .path());
+    // `landforms` 不是数组
+    ExpectLoadThrows(TempToml("voxel_object_table_tiled_landnotarray.toml",
+                              TiledToml("type = \"boulder\"\nseed = 1\nlandforms = \"hills\"\n"))
+                         .path());
+}
+
+TEST(ObjectTable, ScatterTiledParsesClimateRanges) {
+    const TempToml file("voxel_object_table_tiled_climate.toml",
+                        TiledToml("type = \"boulder\"\nseed = 3\nmin_temperature = 0.2\nmax_temperature = 0.8\n"
+                                  "min_humidity = 0.55\n"));
+    const ObjectTable table = ObjectTable::LoadFromFile(file.path());
+    ASSERT_EQ(table.tiledScatters.size(), 1U);
+    EXPECT_FLOAT_EQ(table.tiledScatters[0].minTemperature, 0.2F);
+    EXPECT_FLOAT_EQ(table.tiledScatters[0].maxTemperature, 0.8F);
+    EXPECT_FLOAT_EQ(table.tiledScatters[0].minHumidity, 0.55F);
+    EXPECT_FLOAT_EQ(table.tiledScatters[0].maxHumidity, 1.0F);  // 缺省全区间
+}
+
+TEST(ObjectTable, ScatterTiledRejectsIllegalClimateRanges) {
+    // 温度区间倒置
+    ExpectLoadThrows(TempToml("voxel_object_table_tiled_tempinv.toml",
+                              TiledToml("type = \"boulder\"\nseed = 1\nmin_temperature = 0.9\nmax_temperature = 0.1\n"))
+                         .path());
+    // 湿度越界（> 1）
+    ExpectLoadThrows(TempToml("voxel_object_table_tiled_humoob.toml",
+                              TiledToml("type = \"boulder\"\nseed = 1\nmax_humidity = 1.5\n"))
+                         .path());
+    // 温度为负
+    ExpectLoadThrows(TempToml("voxel_object_table_tiled_tempneg.toml",
+                              TiledToml("type = \"boulder\"\nseed = 1\nmin_temperature = -0.1\n"))
+                         .path());
+}
+
+TEST(ObjectTable, ScatterTiledRejectsPortalType) {
+    // 传送门**不可流式**（需 target_world 与交互登记）⇒ 配置期即抛，避免"摆了却按 E 没反应"。
+    const TempToml file("voxel_object_table_tiled_portal.toml", R"(
+schema_version = 1
+
+[[type]]
+id = "gate"
+kind = "portal"
+half_extent = [1.0, 1.5, 0.2]
+destructible = false
+category = "portal"
+
+[[scatter_tiled]]
+type = "gate"
+seed = 1
+)");
+    ExpectLoadThrows(file.path());
+}
+
+TEST(MergeObjectTables, AppendsOverlayTiledScattersInFileOrder) {
+    ObjectTable base = MakeEmptyTable(true);
+    base.types.push_back(ObjectType { "base_type", ObjectAssetKind::Stone, 1.0F, 1.0F, 1.0F, false });
+
+    ObjectTable overlay = MakeEmptyTable(true);
+    overlay.tiledScatters.push_back(
+        vx::ObjectScatterTiled { "base_type", 7U, 16.0F, 0.0F, 45.0F, 0.0F, 512.0F, true, true, true });
+
+    const ObjectTable merged = MergeObjectTables(base, overlay);
+    ASSERT_EQ(merged.tiledScatters.size(), 1U);
+    EXPECT_EQ(merged.tiledScatters[0].typeId, "base_type");
+    EXPECT_EQ(merged.tiledScatters[0].seed, 7U);
+}
+
 }  // namespace

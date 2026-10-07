@@ -83,6 +83,7 @@ struct DebugStats {
     std::uint64_t triangleCount = 0;    ///< 最近一帧实际绘制的三角形数
     std::uint64_t vertexCount   = 0;    ///< 最近一帧实际绘制的顶点数
     std::uint64_t textureBytes  = 0;    ///< 当前纹理显存字节总量（含 mip 链）
+    std::uint64_t meshBytes     = 0;    ///< 当前**网格缓冲**显存字节总量（顶点 + 索引 + 骨骼；V0.7 H0）
     double        cpuLogicMs    = 0.0;  ///< 最近一帧逻辑步耗时（固定步循环：物理 + 相机，毫秒）
     double        cpuUiMs       = 0.0;  ///< 最近一帧 UI 构建耗时（毫秒）
     double        cpuRenderMs   = 0.0;  ///< 最近一帧渲染提交耗时（`RenderFrame` 及其内部上传，毫秒）

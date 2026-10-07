@@ -36,6 +36,13 @@ inline constexpr float kSurfaceDepthBiasConstant = 100.0F;
 inline constexpr float kSurfaceDepthBiasSlope    = 1.0F;
 inline constexpr float kSurfaceDepthBiasClamp    = 0.0F;
 
+// ---- 实例化（V0.7 H1 / ADR 0034）----
+//
+// 每个实例在 GPU 侧占 `mat4 modelToRender` + 两个 `vec4`（围合体代理，V0.8）= 96 字节
+// （std430 下 `mat4` 无隐式填充、两个 `vec4` 紧随其后 ⇒ 数组步长 96）。
+// 口径的**唯一事实来源** = `instance_batch.hpp` 的 `kInstancePoseBytes`（与着色器结构体逐字节对应）。
+inline constexpr std::uint32_t kInstanceTransformBytes = vx::kInstancePoseBytes;
+
 [[nodiscard]] std::vector<std::uint8_t> read_binary_file(const std::filesystem::path& path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) {
@@ -270,6 +277,14 @@ MeshRenderer::MeshRenderer(SDL_GPUDevice* device, SDL_Window* window, std::files
         create_shader_from_file(m_device, shader_dir / ("mesh_skinned.vert" + extension), SDL_GPU_SHADERSTAGE_VERTEX,
                                 artifact.format, ShaderResourceCounts { 0, 0, /*storageBuffers=*/2, /*uniformBuffers=*/1 });
 
+    // V0.7 H1：**实例化**顶点着色器 —— 与 mesh.vert 同源，但逐实例 `modelToRender` 来自
+    // set 0 / binding 1 的只读 storage buffer（`mat4[]`，用 `gl_InstanceIndex` 索引）⇒ 2 个顶点 storage buffer
+    // （binding 0 = 相机、binding 1 = 实例变换）。常驻到析构（理由同 `m_meshVertexShader`：实例化主通道管线
+    // 要随 MSAA 档位重建）。片元阶段仍复用 `mesh.frag`。
+    m_instancedVertexShader =
+        create_shader_from_file(m_device, shader_dir / ("mesh_instanced.vert" + extension), SDL_GPU_SHADERSTAGE_VERTEX,
+                                artifact.format, ShaderResourceCounts { 0, 0, /*storageBuffers=*/2, /*uniformBuffers=*/1 });
+
     // 全屏三角的**顶点阶段**（T20 的 `tonemap.vert`）：色调映射、天空（T67）与三条 IBL 烘焙管线共用。
     // 常驻到析构 —— 天空管线要随 MSAA 档位重建，重建时复用同一个 Shader 对象（与 m_meshVertexShader 同理由）。
     m_fullscreenVertexShader =
@@ -439,6 +454,23 @@ MeshRenderer::MeshRenderer(SDL_GPUDevice* device, SDL_Window* window, std::files
         m_shadowSkinnedPipeline = SDL_CreateGPUGraphicsPipeline(m_device, &skinnedShadowInfo);
         if (m_shadowSkinnedPipeline == nullptr) {
             throw std::runtime_error(std::string("创建蒙皮阴影管线失败：") + SDL_GetError());
+        }
+
+        // V0.7 H1：**实例化阴影管线** —— 与 `m_shadowPipeline` 只差顶点着色器（`shadow_instanced.vert`，
+        // 声明 2 个顶点 storage buffer：binding 0 = 本级光空间矩阵、binding 1 = 实例变换）。
+        // 顶点布局与 `shadow.vert` **相同**（只消费位置）⇒ 直接复用 `shadowVertexInput`；
+        // 阴影目标恒为单采样 ⇒ 构造期创建一次（不随 MSAA 档位变化）。**为什么必须补这一条**：
+        // 实例化物件在主通道可见，若阴影通道缺席就会"影子消失"——那是**可见回退**（同 T69 的蒙皮理由）。
+        m_shadowInstancedVertexShader =
+            create_shader_from_file(m_device, shader_dir / ("shadow_instanced.vert" + extension),
+                                    SDL_GPU_SHADERSTAGE_VERTEX, artifact.format,
+                                    ShaderResourceCounts { 0, 0, /*storageBuffers=*/2, /*uniformBuffers=*/1 });
+        SDL_GPUGraphicsPipelineCreateInfo instancedShadowInfo = shadowInfo;
+        instancedShadowInfo.vertex_shader                     = m_shadowInstancedVertexShader;
+        instancedShadowInfo.vertex_input_state                = shadowVertexInput;  // 只消费位置，与 shadow.vert 一致
+        m_shadowInstancedPipeline = SDL_CreateGPUGraphicsPipeline(m_device, &instancedShadowInfo);
+        if (m_shadowInstancedPipeline == nullptr) {
+            throw std::runtime_error(std::string("创建实例化阴影管线失败：") + SDL_GetError());
         }
         // **顺序要紧**：两条阴影管线都从 `shadowVertex` / `shadowFragment` 建好之后才能释放它们。
         // （SDL_gpu 不持有 shader 引用 ⇒ 先释放再用就是 use-after-free：实测会触发 D3D12 后端的
@@ -688,6 +720,24 @@ void MeshRenderer::CreateMainPipeline(std::uint32_t sampleCount) {
         throw std::runtime_error(std::string("创建蒙皮主通道管线失败：") + SDL_GetError());
     }
 
+    // V0.7 H1：**实例化主通道管线** —— 顶点布局 / 片元着色器 / 目标格式 / 采样数 / 剔除 / 深度状态与
+    // `m_pipeline` 完全相同，只把顶点着色器换成 `mesh_instanced.vert`（声明 2 个顶点 storage buffer）。
+    // 与 `m_pipeline` **同生共死**（随 MSAA 档位在此重建），**绝不**出现在 `RenderFrame` 热路径。
+    if (m_instancedPipeline != nullptr) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_instancedPipeline);
+        m_instancedPipeline = nullptr;
+    }
+    SDL_GPUGraphicsPipelineCreateInfo instancedInfo = info;
+    instancedInfo.vertex_shader                     = m_instancedVertexShader;
+    instancedInfo.vertex_input_state                = vertexInput;  // 与 MeshVertex 一致（物件的顶点布局同地表）
+    // `info` 上一步被改成了"带深度偏移"变体 ⇒ 这里必须**显式关掉**，否则物件会继承该偏移。
+    instancedInfo.rasterizer_state.enable_depth_bias = false;
+    m_instancedPipeline = SDL_CreateGPUGraphicsPipeline(m_device, &instancedInfo);
+    if (m_instancedPipeline == nullptr) {
+        m_pipelineSampleCount = 0;
+        throw std::runtime_error(std::string("创建实例化主通道管线失败：") + SDL_GetError());
+    }
+
     // W6：**水面管线**（顶点 = `m_meshVertexShader`、片元 = `water.frag`）—— 与主通道同生共死（随 MSAA 档位重建）。
     // 与主通道的差异（都是"水面"语义所必需）：① **alpha 混合**（半透明）；② **关闭背面剔除**
     // （水面 ribbon 从上下看都要可见）；③ **关闭深度写入**（水面不得遮挡其后的地形）。深度测试仍开启。
@@ -821,7 +871,15 @@ MeshRenderer::~MeshRenderer() {
         if (resources.indexBuffer != nullptr) {
             SDL_ReleaseGPUBuffer(m_device, resources.indexBuffer);
         }
+        // T69 / V0.7 H1：蒙皮网格的骨骼矩阵缓冲与实例化原型的实例缓冲（非对应类型恒为 nullptr）。
+        if (resources.boneMatrixBuffer != nullptr) {
+            SDL_ReleaseGPUBuffer(m_device, resources.boneMatrixBuffer);
+        }
+        if (resources.instanceBuffer != nullptr) {
+            SDL_ReleaseGPUBuffer(m_device, resources.instanceBuffer);
+        }
     }
+    m_stats.meshBytes = 0;  // V0.7 H0：记账随资源一并归零
     if (m_depthTexture != nullptr) {
         SDL_ReleaseGPUTexture(m_device, m_depthTexture);
     }
@@ -889,6 +947,13 @@ MeshRenderer::~MeshRenderer() {
     if (m_shadowSkinnedPipeline != nullptr) {
         SDL_ReleaseGPUGraphicsPipeline(m_device, m_shadowSkinnedPipeline);
     }
+    // V0.7 H1：实例化主通道管线（与 m_pipeline 同生共死）与实例化阴影管线。
+    if (m_instancedPipeline != nullptr) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_instancedPipeline);
+    }
+    if (m_shadowInstancedPipeline != nullptr) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_shadowInstancedPipeline);
+    }
     if (m_tonemapPipeline != nullptr) {
         SDL_ReleaseGPUGraphicsPipeline(m_device, m_tonemapPipeline);
     }
@@ -927,9 +992,20 @@ MeshRenderer::~MeshRenderer() {
     if (m_shadowSkinnedVertexShader != nullptr) {
         SDL_ReleaseGPUShader(m_device, m_shadowSkinnedVertexShader);
     }
+    // V0.7 H1：实例化顶点着色器（主通道 + 阴影通道各一条）同样常驻到析构。
+    if (m_instancedVertexShader != nullptr) {
+        SDL_ReleaseGPUShader(m_device, m_instancedVertexShader);
+    }
+    if (m_shadowInstancedVertexShader != nullptr) {
+        SDL_ReleaseGPUShader(m_device, m_shadowInstancedVertexShader);
+    }
     // 骨骼矩阵上传的常驻暂存缓冲（若有）。
     if (m_boneStagingBuffer != nullptr) {
         SDL_ReleaseGPUTransferBuffer(m_device, m_boneStagingBuffer);
+    }
+    // V0.7 H1：实例位姿上传的常驻暂存缓冲（若有）。
+    if (m_instanceStagingBuffer != nullptr) {
+        SDL_ReleaseGPUTransferBuffer(m_device, m_instanceStagingBuffer);
     }
     // T67：全屏三角的顶点 / 天空片元阶段同样常驻到析构（天空管线随 MSAA 档位重建）。
     if (m_fullscreenVertexShader != nullptr) {
@@ -959,6 +1035,9 @@ MeshHandle MeshRenderer::UploadMesh(const MeshData& mesh, const glm::dvec3& orig
     // 登记的容量 = 实际建出来的缓冲大小 ⇒ 后续 `UpdateMeshGeometry` 只允许写这个前缀之内。
     resources.vertexCount = vertexCapacity;
     resources.indexCount  = indexCapacity;
+    // V0.7 H0：显存记账（顶点 + 索引；蒙皮另有骨骼矩阵缓冲）。
+    resources.vertexBytes = static_cast<std::uint64_t>(vertexCapacity) * sizeof(MeshVertex);
+    resources.indexBytes  = static_cast<std::uint64_t>(indexCapacity) * sizeof(std::uint32_t);
     // 本帧实际绘制索引数由下面的 `UpdateMeshGeometry` 写（T42 的"变长网格"口径）。
     resources.usedIndexCount = 0;
     resources.emissive       = emissive;
@@ -980,6 +1059,7 @@ MeshHandle MeshRenderer::UploadMesh(const MeshData& mesh, const glm::dvec3& orig
         m_meshes.push_back(resources);
     }
     const MeshHandle handle { slot + 1 };
+    m_stats.meshBytes += resources.vertexBytes + resources.indexBytes;  // V0.7 H0：显存记账
 
     // **提交即走**（T75）：复用常驻暂存缓冲 + 单命令缓冲，**不建 transfer buffer、不等 fence**。
     // 这一步是"每块 2 次 `SDL_WaitForGPUFences`"的消除点（旧路径见 `create_and_upload_buffer`）。
@@ -1156,6 +1236,10 @@ MeshHandle MeshRenderer::UploadSkinnedMesh(const SkinnedMeshData& mesh, const gl
     resources.vertexCount     = static_cast<std::uint32_t>(mesh.vertices.size());
     resources.indexCount      = static_cast<std::uint32_t>(mesh.indices.size());
     resources.usedIndexCount  = 0;
+    // V0.7 H0：显存记账（顶点 + 索引 + 骨骼矩阵数组）。
+    resources.vertexBytes = static_cast<std::uint64_t>(mesh.vertices.size()) * sizeof(SkinnedVertex);
+    resources.indexBytes  = static_cast<std::uint64_t>(mesh.indices.size()) * sizeof(std::uint32_t);
+    resources.boneBytes   = static_cast<std::uint64_t>(jointCapacity) * sizeof(float) * 16U;
     // 世界原点登记（T41）：蒙皮网格的顶点是**网格局部坐标** ⇒ 每帧用 `SetMeshTransform` 推"原点 − 渲染原点"。
     resources.origin[0] = origin.x;
     resources.origin[1] = origin.y;
@@ -1173,6 +1257,7 @@ MeshHandle MeshRenderer::UploadSkinnedMesh(const SkinnedMeshData& mesh, const gl
         m_meshes.push_back(resources);
     }
     const MeshHandle handle { slot + 1 };
+    m_stats.meshBytes += resources.vertexBytes + resources.indexBytes + resources.boneBytes;  // V0.7 H0：显存记账
 
     // 初始几何上传：与 `UpdateMeshGeometry` 同一套"提交即走"路径（复用常驻暂存缓冲，不建 transfer buffer、不等 fence）。
     const std::uint32_t vertexBytes = static_cast<std::uint32_t>(mesh.vertices.size() * sizeof(SkinnedVertex));
@@ -1240,6 +1325,55 @@ MeshHandle MeshRenderer::UploadSkinnedMesh(const SkinnedMeshData& mesh, const gl
     SDL_SubmitGPUCommandBuffer(commandBuffer);
 
     m_meshes[slot].usedIndexCount = resources.indexCount;
+    return handle;
+}
+
+MeshHandle MeshRenderer::UploadInstancedMesh(const MeshData& prototype, std::uint32_t maxInstances) {
+    if (prototype.vertices.empty() || prototype.indices.empty() || maxInstances == 0U) {
+        return MeshHandle {};  // 前置条件不满足 ⇒ 无效句柄（不抛，见声明）
+    }
+
+    const std::uint32_t vertexCount = static_cast<std::uint32_t>(prototype.vertices.size());
+    const std::uint32_t indexCount  = static_cast<std::uint32_t>(prototype.indices.size());
+
+    MeshResources resources;
+    resources.instanced        = true;
+    resources.instanceCapacity = maxInstances;
+    resources.vertexBuffer     = create_buffer(m_device, SDL_GPU_BUFFERUSAGE_VERTEX,
+                                               vertexCount * static_cast<std::uint32_t>(sizeof(MeshVertex)));
+    resources.indexBuffer      = create_buffer(m_device, SDL_GPU_BUFFERUSAGE_INDEX,
+                                               indexCount * static_cast<std::uint32_t>(sizeof(std::uint32_t)));
+    // 实例数据数组（顶点阶段只读 storage buffer：`mat4` 变换 + 围合体 `vec4`×2）：**容量创建时定死**
+    // ⇒ 之后每帧只覆盖写入，不在渲染帧里创建 / 扩容任何 GPU 资源（SKILL 第四节硬规则 4）。字节计入 `meshBytes`（ADR 0010 记账）。
+    resources.instanceBuffer = create_buffer(m_device, SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ,
+                                             maxInstances * kInstanceTransformBytes);
+    resources.vertexCount    = vertexCount;
+    resources.indexCount     = indexCount;
+    resources.usedIndexCount = 0;  // 由下面的 `UpdateMeshGeometry` 写（= 原型索引数 ⇒ 本帧可见）
+    resources.vertexBytes    = static_cast<std::uint64_t>(vertexCount) * sizeof(MeshVertex);
+    resources.indexBytes     = static_cast<std::uint64_t>(indexCount) * sizeof(std::uint32_t);
+    resources.instanceBytes  = static_cast<std::uint64_t>(maxInstances) * kInstanceTransformBytes;
+    // 实例原型**不登记**世界原点：每个实例的世界位姿由 `InstanceBatch::poses` 逐帧给出（见 InstanceBatch），
+    // 故这里既不写 `origin` 也不用 `rotation`（保持缺省）。
+
+    std::uint32_t slot = 0;
+    if (!m_freeSlots.empty()) {
+        slot           = m_freeSlots.back();
+        m_freeSlots.pop_back();
+        m_meshes[slot] = resources;
+    } else {
+        slot = static_cast<std::uint32_t>(m_meshes.size());
+        m_meshes.push_back(resources);
+    }
+    const MeshHandle handle { slot + 1 };
+    m_stats.meshBytes += resources.vertexBytes + resources.indexBytes + resources.instanceBytes;
+
+    // 初始几何上传：与 `UploadMesh` 同一套"提交即走"路径（复用常驻暂存缓冲，不建 transfer buffer、不等 fence）。
+    // 实例缓冲的初值无需写：本帧没有 `UploadInstances` 之前 `instanceCount` 恒为 0 ⇒ 不会被绘制。
+    if (!UpdateMeshGeometry(handle, prototype, glm::dvec3(0.0, 0.0, 0.0))) {
+        ReleaseMesh(handle);
+        throw std::runtime_error("UploadInstancedMesh：原型几何上传失败（容量不足或 GPU 命令提交失败）");
+    }
     return handle;
 }
 
@@ -1319,6 +1453,85 @@ void MeshRenderer::UploadSkinningMatrices(SDL_GPUCommandBuffer* commandBuffer) {
     }
 }
 
+bool MeshRenderer::UploadInstances(SDL_GPUCommandBuffer* commandBuffer, const InstanceBatch* batches,
+                                   std::size_t batchCount) {
+    // 先把所有实例化原型标记为"本帧不可见" —— 只有本帧真正提供的批次才会被重新计数。
+    // 否则上一帧留下的 `instanceCount` 会让**本帧不再提交**的批次继续被绘制（陈旧实例）。
+    for (MeshResources& resources : m_meshes) {
+        if (resources.instanced) {
+            resources.instanceCount = 0;
+        }
+    }
+    if (batches == nullptr || batchCount == 0) {
+        return true;  // 本帧无实例批次：零上传、零拷贝
+    }
+
+    // 统计本帧要上传的总字节，并把超容量的批次**截断**（不静默：记 WARN 含数量，ADR 0034）。
+    struct PendingBatch {
+        std::uint32_t       slot   = 0;        ///< `m_meshes` 槽位（0 基）
+        const InstancePose* poses  = nullptr;  ///< 该批的世界位姿数组
+        std::uint32_t       offset = 0;        ///< 暂存缓冲内的字节偏移
+        std::uint32_t       bytes  = 0;        ///< 本批写入字节
+        std::uint32_t       used   = 0;        ///< 本批实例数（已按容量截断）
+    };
+    std::vector<PendingBatch> pending;
+    pending.reserve(batchCount);
+    std::uint32_t totalBytes = 0;
+    for (std::size_t i = 0; i < batchCount; ++i) {
+        const InstanceBatch& batch = batches[i];
+        if (!batch.prototype.IsValid() || batch.prototype.id > m_meshes.size() || batch.poses == nullptr ||
+            batch.count == 0U) {
+            continue;
+        }
+        const MeshResources& resources = m_meshes[batch.prototype.id - 1];
+        if (!resources.instanced || resources.instanceBuffer == nullptr) {
+            continue;
+        }
+        std::uint32_t used = batch.count;
+        if (used > resources.instanceCapacity) {
+            VX_LOG_WARN("实例批次超容量：原型槽位 %u 请求 %u 实例 > 容量 %u ⇒ 截断（不静默，见 ADR 0034）",
+                        batch.prototype.id, batch.count, resources.instanceCapacity);
+            used = resources.instanceCapacity;
+        }
+        const std::uint32_t bytes = used * kInstanceTransformBytes;
+        pending.push_back(PendingBatch { batch.prototype.id - 1, batch.poses, totalBytes, bytes, used });
+        totalBytes += bytes;
+    }
+    if (pending.empty()) {
+        return true;
+    }
+    if (!EnsureStagingBuffer(m_instanceStagingBuffer, m_instanceStagingCapacity, totalBytes)) {
+        VX_LOG_WARN("实例位姿暂存缓冲分配失败（%u 字节）⇒ 本帧跳过实例绘制", totalBytes);
+        return false;
+    }
+
+    // **一次 map**：把所有批次的位姿按序打包成渲染相对 `mat4` 写进暂存缓冲（禁止逐实例上传，SKILL 硬规则 3）。
+    {
+        void* mapped = SDL_MapGPUTransferBuffer(m_device, m_instanceStagingBuffer, /*cycle=*/true);
+        if (mapped == nullptr) {
+            VX_LOG_WARN("实例位姿暂存缓冲映射失败 ⇒ 本帧跳过实例绘制");
+            return false;
+        }
+        auto* base = static_cast<std::uint8_t*>(mapped);
+        for (const PendingBatch& item : pending) {
+            const std::uint32_t written = PackInstanceTransforms(item.poses, item.used, item.used, m_renderOrigin,
+                                                                 reinterpret_cast<float*>(base + item.offset));
+            m_meshes[item.slot].instanceCount = written;
+        }
+        SDL_UnmapGPUTransferBuffer(m_device, m_instanceStagingBuffer);
+    }
+
+    // **一次 copy pass**：逐批拷到各自原型的实例缓冲（**不**新建任何 GPU 资源）。
+    SDL_GPUCopyPass* copyPass = SDL_BeginGPUCopyPass(commandBuffer);
+    for (const PendingBatch& item : pending) {
+        SDL_GPUTransferBufferLocation source { m_instanceStagingBuffer, item.offset };
+        SDL_GPUBufferRegion           destination { m_meshes[item.slot].instanceBuffer, 0, item.bytes };
+        SDL_UploadToGPUBuffer(copyPass, &source, &destination, /*cycle=*/false);
+    }
+    SDL_EndGPUCopyPass(copyPass);
+    return true;
+}
+
 void MeshRenderer::SetMeshTransform(MeshHandle handle, const glm::dvec3& origin, const glm::quat& rotation) noexcept {
     if (!handle.IsValid() || handle.id > m_meshes.size()) {
         return;
@@ -1376,6 +1589,14 @@ void MeshRenderer::ReleaseMesh(MeshHandle handle) noexcept {
     if (resources.boneMatrixBuffer != nullptr) {
         SDL_ReleaseGPUBuffer(m_device, resources.boneMatrixBuffer);
     }
+    // V0.7 H1：实例化原型还有一块实例变换 storage buffer（非实例化网格恒为 nullptr）。
+    if (resources.instanceBuffer != nullptr) {
+        SDL_ReleaseGPUBuffer(m_device, resources.instanceBuffer);
+    }
+    // V0.7 H0：显存记账回收（**饱和减法**，重复释放不会下溢）。
+    const std::uint64_t freedBytes =
+        resources.vertexBytes + resources.indexBytes + resources.boneBytes + resources.instanceBytes;
+    m_stats.meshBytes = (m_stats.meshBytes >= freedBytes) ? (m_stats.meshBytes - freedBytes) : 0ULL;
     resources = MeshResources {};
     m_freeSlots.push_back(slot);
 }
@@ -1900,10 +2121,11 @@ void MeshRenderer::UploadShadowMatrices(SDL_GPUCommandBuffer* commandBuffer) {
     SDL_EndGPUCopyPass(copyPass);
 }
 
-void MeshRenderer::LogTextureAccounting(std::uint32_t width, std::uint32_t height) const {
-    // ADR 0010 的记账义务：把纹理显存**按项**打到日志（首次创建与每次尺寸 / 档位变化各记一次），
+void MeshRenderer::LogVramAccounting(std::uint32_t width, std::uint32_t height) const {
+    // ADR 0010 的记账义务：把 **GPU 显存**按项打到日志（首次创建与每次尺寸 / 档位变化各记一次），
     // 这样"预算是否达标"可以直接在日志里核对，不必依赖面板读数或截图。
     // T23 起把 MSAA 颜色目标与 MSAA 深度目标也列出，使"开 / 关 MSAA 的代价"可直接对比。
+    // V0.7 H0 起**网格缓冲**（顶点 + 索引 + 骨骼矩阵）一并入账 —— 原先只统计纹理，无法核对 ADR 0024 的 VRAM 预算。
     std::uint64_t materialBytes = 0;
     for (const std::uint64_t bytes : m_textureArrayBytes) {
         materialBytes += bytes;
@@ -1914,20 +2136,22 @@ void MeshRenderer::LogTextureAccounting(std::uint32_t width, std::uint32_t heigh
         static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height) * 4ULL;
     const std::uint64_t msaaDepthBytes = (m_depthBytes > baseDepthBytes) ? (m_depthBytes - baseDepthBytes) : 0ULL;
     const std::uint64_t msaaTotalBytes = m_msaaColorBytes + msaaDepthBytes;
-    const double        totalMb        = static_cast<double>(m_stats.textureBytes) / kBytesPerMb;
+    const double        textureMb      = static_cast<double>(m_stats.textureBytes) / kBytesPerMb;
+    const double        meshMb         = static_cast<double>(m_stats.meshBytes) / kBytesPerMb;
+    const double        vramMb         = static_cast<double>(m_stats.textureBytes + m_stats.meshBytes) / kBytesPerMb;
     const double        shadowShare    = (m_stats.textureBytes > 0)
                                              ? 100.0 * static_cast<double>(m_shadowTextureBytes) /
                                                    static_cast<double>(m_stats.textureBytes)
                                              : 0.0;
-    VX_LOG_INFO("GPU 纹理显存记账：材质数组 %.2f MB + 深度目标 %.2f MB + HDR 目标 %.2f MB + "
+    VX_LOG_INFO("GPU 显存记账（纹理 + 网格缓冲）：材质数组 %.2f MB + 深度目标 %.2f MB + HDR 目标 %.2f MB + "
                 "阴影 %u 级 %u² %.2f MB（占 %.1f%%）+ MSAA %u×（颜色 %.2f MB + 深度 %.2f MB = %.2f MB）"
-                "+ 环境贴图 %.2f MB = 合计 %.2f MB（交换链 %ux%u）",
+                "+ 环境贴图 %.2f MB = 纹理小计 %.2f MB；**网格缓冲 %.2f MB** ⇒ 合计 %.2f MB（交换链 %ux%u）",
                 static_cast<double>(materialBytes) / kBytesPerMb, static_cast<double>(baseDepthBytes) / kBytesPerMb,
                 static_cast<double>(m_hdrBytes) / kBytesPerMb, m_shadowTextureCascades, m_shadowTextureResolution,
                 static_cast<double>(m_shadowTextureBytes) / kBytesPerMb, shadowShare, m_msaaSampleCount,
                 static_cast<double>(m_msaaColorBytes) / kBytesPerMb, static_cast<double>(msaaDepthBytes) / kBytesPerMb,
                 static_cast<double>(msaaTotalBytes) / kBytesPerMb,
-                static_cast<double>(m_environmentBytes) / kBytesPerMb, totalMb, width, height);
+                static_cast<double>(m_environmentBytes) / kBytesPerMb, textureMb, meshMb, vramMb, width, height);
 }
 
 void MeshRenderer::DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURenderPass* pass, const MeshHandle* meshes,
@@ -2079,6 +2303,105 @@ void MeshRenderer::DrawMeshes(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURender
     }
 }
 
+void MeshRenderer::DrawInstancedBatches(SDL_GPUCommandBuffer* commandBuffer, SDL_GPURenderPass* pass,
+                                        const InstanceBatch* batches, std::size_t batchCount,
+                                        SDL_GPUGraphicsPipeline* instancedPipeline,
+                                        SDL_GPUBuffer* matrixStorageBuffer, bool pushEmissive,
+                                        EmissivePushState& emissiveState, MeshTransformPushState& transformState) {
+    if (batches == nullptr || batchCount == 0U || instancedPipeline == nullptr) {
+        return;
+    }
+    // 全部批次共用同一条实例化管线（差异只在各自的顶点 / 实例缓冲）⇒ 本通道只绑一次。
+    SDL_BindGPUGraphicsPipeline(pass, instancedPipeline);
+
+    for (std::size_t i = 0; i < batchCount; ++i) {
+        const MeshHandle handle = batches[i].prototype;
+        if (!handle.IsValid() || handle.id > m_meshes.size()) {
+            continue;
+        }
+        const MeshResources& resources = m_meshes[handle.id - 1];
+        if (!resources.instanced || resources.instanceBuffer == nullptr || resources.vertexBuffer == nullptr ||
+            resources.indexBuffer == nullptr) {
+            continue;
+        }
+        // 本帧实例数由 `UploadInstances` 写入（0 ⇒ 本帧不可见 / 未上传 ⇒ 跳过）。
+        if (resources.instanceCount == 0U || resources.usedIndexCount == 0U) {
+            continue;
+        }
+
+        // 顶点 storage buffer：binding 0 = 相机 / 该级光空间矩阵，binding 1 = 本原型的实例变换。
+        // 实例缓冲**逐原型**不同 ⇒ 每批都要重绑（两次绑定，与批次数的两倍成正比、与物件数无关）。
+        SDL_GPUBuffer* storageBuffers[2] = { matrixStorageBuffer, resources.instanceBuffer };
+        SDL_BindGPUVertexStorageBuffers(pass, 0, storageBuffers, 2);
+
+        // 逐批推 `MeshTransformUniform`：矩阵字段被实例化着色器**忽略**（矩阵来自实例缓冲），
+        // 只有 `meshParams.x`（逐批不透明度）生效 ⇒ 与 `DrawMeshes` 同一套去重推送。
+        {
+            MeshTransformUniform transform;  // 缺省 = 单位矩阵（平移分量已由实例缓冲给出）+ 不透明
+            transform.meshParams[0] = resources.opacity;
+            const float* matrix = &transform.modelToRender[0][0];
+            bool changed = !transformState.pushed || transformState.opacity != transform.meshParams[0] ||
+                           transformState.morphStep != transform.meshParams[1] ||
+                           transformState.morphStartDistance != transform.meshParams[2] ||
+                           transformState.morphEndDistance != transform.meshParams[3];
+            for (int element = 0; element < 16 && !changed; ++element) {
+                changed = transformState.matrix[element] != matrix[element];
+            }
+            if (changed) {
+                SDL_PushGPUVertexUniformData(commandBuffer, 0, &transform, static_cast<Uint32>(sizeof(transform)));
+                transformState.pushed             = true;
+                transformState.opacity            = transform.meshParams[0];
+                transformState.morphStep          = transform.meshParams[1];
+                transformState.morphStartDistance = transform.meshParams[2];
+                transformState.morphEndDistance   = transform.meshParams[3];
+                for (int element = 0; element < 16; ++element) {
+                    transformState.matrix[element] = matrix[element];
+                }
+            }
+        }
+
+        // 自发光（片元槽 3）：与 `DrawMeshes` 同义 —— **必须**在实例绘制前给出确定值，
+        // 否则会继承上一条（可能是自发光网格的）绘制留下的 uniform。实例原型当前恒为非自发光 ⇒ 推零值。
+        if (pushEmissive) {
+            struct EmissiveParams {
+                float emissive[4];
+            };
+            EmissiveParams params {};
+            if (resources.emissive) {
+                params.emissive[0] = m_emissiveColor[0];
+                params.emissive[1] = m_emissiveColor[1];
+                params.emissive[2] = m_emissiveColor[2];
+                params.emissive[3] = 1.0F;
+            }
+            const bool changed = !emissiveState.pushed || emissiveState.color[0] != params.emissive[0] ||
+                                 emissiveState.color[1] != params.emissive[1] ||
+                                 emissiveState.color[2] != params.emissive[2] ||
+                                 emissiveState.strength != params.emissive[3];
+            if (changed) {
+                SDL_PushGPUFragmentUniformData(commandBuffer, 3, &params, static_cast<Uint32>(sizeof(params)));
+                emissiveState.pushed   = true;
+                emissiveState.color[0] = params.emissive[0];
+                emissiveState.color[1] = params.emissive[1];
+                emissiveState.color[2] = params.emissive[2];
+                emissiveState.strength = params.emissive[3];
+            }
+        }
+
+        SDL_GPUBufferBinding vertexBinding { resources.vertexBuffer, 0 };
+        SDL_BindGPUVertexBuffers(pass, 0, &vertexBinding, 1);
+        SDL_GPUBufferBinding indexBinding { resources.indexBuffer, 0 };
+        SDL_BindGPUIndexBuffer(pass, &indexBinding, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+
+        // **一次绘制**画完整批：`num_instances = 本帧实例数` ⇒ draw call 与物件数解耦（ADR 0034 决策一）。
+        SDL_DrawGPUIndexedPrimitives(pass, resources.usedIndexCount, resources.instanceCount, /*first_index=*/0,
+                                     /*vertex_offset=*/0, /*first_instance=*/0);
+
+        ++m_stats.drawCalls;
+        m_stats.triangleCount += static_cast<std::uint64_t>(resources.usedIndexCount / 3U) * resources.instanceCount;
+        m_stats.vertexCount += static_cast<std::uint64_t>(resources.usedIndexCount) * resources.instanceCount;
+    }
+}
+
 void MeshRenderer::UploadCameraUniform(SDL_GPUCommandBuffer* commandBuffer) {
     void* mapped = SDL_MapGPUTransferBuffer(m_device, m_cameraTransferBuffer, /*cycle=*/true);
     if (mapped == nullptr) {
@@ -2097,7 +2420,7 @@ void MeshRenderer::UploadCameraUniform(SDL_GPUCommandBuffer* commandBuffer) {
 
 bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, const SDL_FColor& clearColor,
                                IRenderOverlay* overlay, const ShadowCascadeDrawList* shadowLists,
-                               std::size_t shadowListCount) {
+                               std::size_t shadowListCount, const InstanceBatch* batches, std::size_t batchCount) {
     SDL_GPUCommandBuffer* commandBuffer = SDL_AcquireGPUCommandBuffer(m_device);
     if (commandBuffer == nullptr) {
         throw std::runtime_error(std::string("SDL_AcquireGPUCommandBuffer 失败：") + SDL_GetError());
@@ -2135,6 +2458,10 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
     // T69：把本帧所有**脏**蒙皮网格的骨骼矩阵整块上传（每个蒙皮网格一次；无蒙皮更新时零成本）。
     // 放在这里（主 / 阴影通道之前）⇒ 两个通道读到的都是本帧同一份矩阵。
     UploadSkinningMatrices(commandBuffer);
+    // V0.7 H1：把本帧所有**实例批次**的位姿一次上传（每个原型一次；无实例批次时零成本）。
+    // 放在这里（主 / 阴影通道之前）⇒ 两个通道读到的是**同一份**实例缓冲 ⇒ 阴影与几何不可能错位（ADR 0034）。
+    // 失败（暂存分配 / 映射失败）时内部已 WARN ⇒ 本帧不画实例，这里只需丢弃返回值。
+    (void)UploadInstances(commandBuffer, batches, batchCount);
     // 阴影关闭时不上传矩阵（省一次每帧的小拷贝；着色器也整体跳过采样）。
     if (m_shadowUniformValid && m_shadowUniform.enabled > 0.5F) {
         UploadShadowMatrices(commandBuffer);
@@ -2142,7 +2469,7 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
 
     // 显存记账（ADR 0010）：仅在渲染目标被（重）创建的帧打印一次，避免逐帧刷屏。
     if (m_textureAccountingDirty) {
-        LogTextureAccounting(width, height);
+        LogVramAccounting(width, height);
         m_textureAccountingDirty = false;
     }
 
@@ -2199,6 +2526,12 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
                        /*skinnedPipeline=*/m_shadowSkinnedPipeline,
                        /*primaryStorageBuffer=*/m_shadowMatrixBuffers[cascade], shadowEmissiveState,
                        shadowTransformState, /*waterPipeline=*/nullptr, /*waterPass=*/false);
+            // V0.7 H1：实例化物件在阴影通道同样投影（否则"影子消失" = 可见回退）。与 `DrawMeshes` 共用
+            // 本级的去重状态（推送的是"命令缓冲里当前生效的值"，两段连续绘制之间不会错推）。
+            // H1 阶段不做逐级联剔除 ⇒ 每级都画全部实例（H2 随物件层接入补逐级过滤）。
+            DrawInstancedBatches(commandBuffer, shadowPass, batches, batchCount, m_shadowInstancedPipeline,
+                                 /*matrixStorageBuffer=*/m_shadowMatrixBuffers[cascade], /*pushEmissive=*/false,
+                                 shadowEmissiveState, shadowTransformState);
             SDL_EndGPURenderPass(shadowPass);
         }
     }
@@ -2328,6 +2661,13 @@ bool MeshRenderer::RenderFrame(const MeshHandle* meshes, std::size_t meshCount, 
                /*depthBiasedPipeline=*/m_pipelineDepthBiased, /*skinnedPipeline=*/m_skinnedPipeline,
                /*primaryStorageBuffer=*/m_cameraUniformBuffer, emissiveState, transformState,
                /*waterPipeline=*/nullptr, /*waterPass=*/false);
+
+    // V0.7 H1：实例化物件（不透明）—— 与地表 / 体积共用同一批采样器与片元 uniform（本通道前面已绑 / 已推），
+    // 每原型**一次**绘制（`num_instances = 本帧可见实例数`）⇒ draw call 与物件数解耦（ADR 0034 决策一）。
+    // 放在水面通道**之前**（水面是其后的半透明叠加层，需最后绘制）。
+    DrawInstancedBatches(commandBuffer, pass, batches, batchCount, m_instancedPipeline,
+                         /*matrixStorageBuffer=*/m_cameraUniformBuffer, /*pushEmissive=*/true, emissiveState,
+                         transformState);
 
     // ---- W6：水面通道（ADR 0027）—— 主通道内**最后**绘制，半透明叠加在地形之上 ----
     // 为什么单独一遍：`water.frag` 的唯一 uniform 块在**片元槽 0**，而该槽平时被"材质"占用

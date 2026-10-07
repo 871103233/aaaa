@@ -260,6 +260,26 @@ TerrainGenerationParams TerrainGenerationParams::LoadFromFile(const std::filesys
     }
     params.river.seedChannel = static_cast<std::uint64_t>(riverChannel);
 
+    // [climate] 段（V0.6 C7：温度 / 湿度；**可选** —— 缺省用代码默认频率与通道 9 / 10）。
+    // 只供**内容放置判据**使用、**不参与地形生成** ⇒ 缺省不会改变任何既有输出（既有地形预设无需改）。
+    if (const toml::table* climate = document["climate"].as_table(); climate != nullptr) {
+        TerrainClimateParams& climateParams = params.climate;
+        climateParams.temperatureFrequency  = ReadPositiveNumber(*climate, path, "temperature_frequency");
+        climateParams.humidityFrequency     = ReadPositiveNumber(*climate, path, "humidity_frequency");
+        const std::int64_t temperatureChannel = ReadInt(*climate, path, "temperature_seed_channel");
+        const std::int64_t humidityChannel    = ReadInt(*climate, path, "humidity_seed_channel");
+        if (temperatureChannel <= 0 || humidityChannel <= 0) {
+            throw std::runtime_error(Describe(path, "temperature_seed_channel/humidity_seed_channel") +
+                                     "（[climate]）必须为正整数");
+        }
+        if (temperatureChannel == humidityChannel) {
+            throw std::runtime_error(Describe(path, "temperature_seed_channel/humidity_seed_channel") +
+                                     "（[climate]）必须不同（否则温度与湿度完全相关 ⇒ 判据退化）");
+        }
+        climateParams.temperatureSeedChannel = static_cast<std::uint64_t>(temperatureChannel);
+        climateParams.humiditySeedChannel    = static_cast<std::uint64_t>(humidityChannel);
+    }
+
     return params;
 }
 
