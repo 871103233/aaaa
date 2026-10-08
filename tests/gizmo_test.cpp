@@ -85,4 +85,51 @@ TEST(Gizmo, GizmoMeshesAreNonEmpty) {
     const vx::MeshData ring = BuildGizmoRingMesh(1.6, 0.14);
     EXPECT_FALSE(ring.vertices.empty());
     EXPECT_FALSE(ring.indices.empty());
+
+    const vx::MeshData plane = vx::BuildGizmoPlaneMesh(0.5);
+    EXPECT_FALSE(plane.vertices.empty());
+    EXPECT_FALSE(plane.indices.empty());
+}
+
+// ---- V0.11 / A8：中心平面手柄（XZ 内任意方向）与屏幕恒定尺度 ----
+
+TEST(Gizmo, PlaneHandleWinsNearCenter) {
+    // (0.2, 0.0) 同时落在 X 轴盒内 ⇒ 必须由**平面手柄优先**夺走（"想自由拖却点到轴"是缺陷）。
+    const GizmoLayout layout = LayoutAt(0.0, 10.0, 0.0);
+    EXPECT_EQ(PickGizmoHandle(DownRay(0.2, 0.0), layout, 100.0), GizmoHandle::Plane);
+    EXPECT_EQ(PickGizmoHandle(DownRay(0.0, 0.2), layout, 100.0), GizmoHandle::Plane);
+    EXPECT_EQ(PickGizmoHandle(DownRay(0.3, -0.3), layout, 100.0), GizmoHandle::Plane);
+}
+
+TEST(Gizmo, OutsidePlaneHalfExtentFallsBackToAxis) {
+    GizmoLayout layout = LayoutAt(0.0, 10.0, 0.0);
+    layout.planeHalfExtent = 0.3;
+    EXPECT_EQ(PickGizmoHandle(DownRay(0.5, 0.0), layout, 100.0), GizmoHandle::TranslateX)
+        << "平面手柄只占中心一小块 ⇒ 外侧仍是轴";
+    EXPECT_EQ(PickGizmoHandle(DownRay(0.0, 1.2), layout, 100.0), GizmoHandle::TranslateZ);
+}
+
+TEST(Gizmo, WorldScaleIsScreenConstantWhenUnclamped) {
+    // 屏幕恒定 ⇒ 世界尺度 ∝ 相机距离（同一视口 / FOV / 目标像素）。
+    const double near = vx::GizmoWorldScale(10.0, 70.0F, 1080.0F, 90.0, /*modelRadius=*/0.0, 1.5, 0.01, 100.0);
+    const double far  = vx::GizmoWorldScale(20.0, 70.0F, 1080.0F, 90.0, 0.0, 1.5, 0.01, 100.0);
+    EXPECT_NEAR(far, near * 2.0, 1.0e-9);
+    EXPECT_GT(near, 0.0);
+}
+
+TEST(Gizmo, WorldScalePicksUpTheModelSizeFloor) {
+    // 模型很大时，手柄必须**伸出模型之外**（不被包住）⇒ 由模型半径给下限。
+    const double smallModel = vx::GizmoWorldScale(10.0, 70.0F, 1080.0F, 90.0, /*modelRadius=*/0.5, 1.5, 0.01, 100.0);
+    const double bigModel   = vx::GizmoWorldScale(10.0, 70.0F, 1080.0F, 90.0, /*modelRadius=*/8.0, 1.5, 0.01, 100.0);
+    EXPECT_NEAR(bigModel, 12.0, 1.0e-9) << "8 × 1.5 = 12 格 ⇒ 箭头伸出一座大建筑之外";
+    EXPECT_LT(smallModel, bigModel);
+}
+
+TEST(Gizmo, WorldScaleClampsAndToleratesDegenerateViewport) {
+    EXPECT_DOUBLE_EQ(vx::GizmoWorldScale(10.0, 70.0F, 1080.0F, 90.0, 0.0, 1.5, 2.0, 5.0), 2.0)
+        << "低于下限 ⇒ 取 minWorldSize";
+    EXPECT_DOUBLE_EQ(vx::GizmoWorldScale(10000.0, 70.0F, 1080.0F, 90.0, 0.0, 1.5, 0.01, 50.0), 50.0)
+        << "高于上限 ⇒ 取 maxWorldSize";
+    EXPECT_DOUBLE_EQ(vx::GizmoWorldScale(10.0, 70.0F, /*viewportHeightPixels=*/0.0F, 90.0, 0.0, 1.5, 0.7, 5.0), 0.7)
+        << "视口非法 ⇒ 退回下限（调用方仍能拿到一个可用尺度）";
 }

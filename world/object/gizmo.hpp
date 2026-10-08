@@ -10,7 +10,8 @@
 
 namespace vx {
 
-/// **gizmo 的可交互手柄**（V0.11 / I4；[ADR 0038](../../docs/adr/0038-construction-editor-and-runtime-separation.md) 决策四）。
+/// **gizmo 的可交互手柄**（V0.11 / I4；[ADR 0038](../../docs/adr/0038-construction-editor-and-runtime-separation.md) 决策四；
+/// V0.11 / A8 增 `Plane`，见 [ADR 0041](../../docs/adr/0041-immersive-modify-mode-and-editor-camera.md)）。
 ///
 /// 口径：**平移只做水平两轴（X / Z）** —— 物件底面由**地表高度**求解（`y` 是地形的函数），
 /// 允许沿 Y 拖动会造出"悬空物件"，与 ADR 0032 / V0.11 I2 的"底面贴地 / 不悬空"契约冲突。
@@ -19,17 +20,21 @@ enum class GizmoHandle : std::uint8_t {
     None,
     TranslateX,  ///< 沿世界 +X 平移
     TranslateZ,  ///< 沿世界 +Z 平移
+    Plane,       ///< **中心平面手柄**：在 **XZ 水平面内任意方向**平移（V0.11 / A8；`y` 仍由地表决定 ⇒ 不悬空）
     RotateY,     ///< 绕世界 Y 轴旋转（yaw）
 };
 
-/// gizmo 在**世界坐标**中的布局（原点 = 选中物件的位置；尺度随物件大小自适应）。
+/// gizmo 在**世界坐标**中的布局（原点 = 选中物件的**包围盒半高**处；尺度**由调用方按"屏幕空间恒定"求解**）。
 struct GizmoLayout {
-    double x            = 0.0;   ///< 原点
+    double x            = 0.0;   ///< 原点（物件包围盒中心：**半高**，避免被大模型挡住）
     double y            = 0.0;
     double z            = 0.0;
     double axisLength   = 2.0;   ///< 平移箭头长度（格）
     double handleRadius = 0.20;  ///< 箭头 / 环带的**有效拾取半径**（格，略大于视觉厚度 ⇒ 好点中）
     double ringRadius   = 1.6;   ///< 旋转环半径（格）
+    /// **中心平面手柄的半边长**（格）：射线命中以原点为中心、边长 `2 × 本值` 的 XZ 方块 ⇒ 判为 `Plane`。
+    /// **优先于轴线**（中心区域归平面手柄，避免"想自由拖却点到轴"）。
+    double planeHalfExtent = 0.5;
 };
 
 /// 世界坐标**射线**（`dir` 须为**单位向量**）。
@@ -77,9 +82,10 @@ struct GizmoRay {
 /// **纯函数**：射线与 gizmo 手柄求交，返回**最近**命中的手柄（无命中 = `GizmoHandle::None`）。
 ///
 /// 口径（与视觉一致、可判定）：
+///   - `Plane`（**优先**）：射线命中以原点为中心、半边长 `planeHalfExtent` 的**扁方块**（XZ 平面手柄）；
 ///   - `TranslateX` / `TranslateZ`：射线 × 该轴箭头的**轴对齐盒**（沿轴 `axisLength`、截面 `handleRadius`）；
 ///   - `RotateY`：射线 × **水平面 `y = 原点 y`**，命中点**到原点的水平半径**落在 `ringRadius ± handleRadius` 内。
-/// 三者取**最近**者（避免"环带挡住箭头"这类歧义）。`maxDistance` 之外的命中忽略。
+/// 平面手柄**优先**（中心区域归它）；其余三者取**最近**者（避免"环带挡住箭头"这类歧义）。`maxDistance` 之外的命中忽略。
 [[nodiscard]] inline GizmoHandle PickGizmoHandle(const GizmoRay& ray, const GizmoLayout& gizmo,
                                                  double maxDistance) noexcept {
     GizmoHandle best   = GizmoHandle::None;
@@ -88,13 +94,20 @@ struct GizmoRay {
     const double len   = gizmo.axisLength;
 
     double t = 0.0;
-    // +X 箭头：从原点到 (x + len, y, z)，截面半径 r。
+    // ① 中心平面手柄（**优先**）：扁方块（y 方向也只留一层厚度 ⇒ 视线越平越难点，符合"俯视拖平面"的直觉）。
+    const double planeHalfY = std::max(r, gizmo.planeHalfExtent * 0.35);
+    if (GizmoRayHitsAabb(ray, gizmo.x - gizmo.planeHalfExtent, gizmo.y - planeHalfY, gizmo.z - gizmo.planeHalfExtent,
+                         gizmo.x + gizmo.planeHalfExtent, gizmo.y + planeHalfY, gizmo.z + gizmo.planeHalfExtent, t) &&
+        t < bestT) {
+        return GizmoHandle::Plane;  // 命中即以平面手柄为准（不再与轴线比远近）
+    }
+    // ② +X 箭头：从原点到 (x + len, y, z)，截面半径 r。
     if (GizmoRayHitsAabb(ray, gizmo.x - r, gizmo.y - r, gizmo.z - r, gizmo.x + len, gizmo.y + r, gizmo.z + r, t) &&
         t < bestT) {
         best  = GizmoHandle::TranslateX;
         bestT = t;
     }
-    // +Z 箭头。
+    // ③ +Z 箭头。
     if (GizmoRayHitsAabb(ray, gizmo.x - r, gizmo.y - r, gizmo.z - r, gizmo.x + r, gizmo.y + r, gizmo.z + len, t) &&
         t < bestT) {
         best  = GizmoHandle::TranslateZ;
@@ -204,6 +217,38 @@ struct GizmoRay {
     appendLayer(1.0F);
     appendLayer(-1.0F);
     return mesh;
+}
+
+/// 中心**平面手柄**的局部网格（V0.11 / A8）：以原点为中心的**扁方块**（XZ 平面、薄），
+/// 视觉与 `PickGizmoHandle` 的 `planeHalfExtent` 判据**逐字对应**。
+[[nodiscard]] inline MeshData BuildGizmoPlaneMesh(double halfExtent) {
+    MeshData mesh;
+    const float half = static_cast<float>(halfExtent);
+    object_mesh_detail::AppendBoxCentered(mesh, 0.0F, 0.0F, 0.0F, half, half * 0.3F, half, 0.0F);
+    return mesh;
+}
+
+/// **纯函数**：gizmo 的**世界尺度**（格）——"**屏幕空间恒定**"与"**不低于模型自身比例**"取大者（V0.11 / A8）。
+///
+/// 两个诉求（[ADR 0041](../../docs/adr/0041-immersive-modify-mode-and-editor-camera.md)）：
+///   ① **屏幕空间恒定**（Unity `Handles` / UE5 / Blender 的口径）：手柄在屏幕上的像素尺寸恒定
+///      ⇒ 世界尺度 ∝ 相机距离——`worldPerPixel = 2·tan(fov/2)·distance / viewportHeight`，
+///      乘上目标像素数即得世界尺度 ⇒ **再远也点得到**；
+///   ② **不低于模型比例**：手柄必须**伸出模型之外**，否则大模型会把手柄整个包住 ⇒ 看不见、点不到。
+///
+/// 取**两者较大值**并钳到 `[minWorldSize, maxWorldSize]`。`modelRadius` ≤ 0 / 视口非法 ⇒ 只按屏幕恒定。
+[[nodiscard]] inline double GizmoWorldScale(double cameraDistance, float verticalFovDegrees,
+                                            float viewportHeightPixels, double targetPixels, double modelRadius,
+                                            double modelSizeRatio, double minWorldSize, double maxWorldSize) noexcept {
+    double worldPerPixel = 0.0;
+    if (viewportHeightPixels > 1.0F && cameraDistance > 0.0) {
+        constexpr double kPi       = 3.14159265358979323846;
+        const double     halfFov   = static_cast<double>(verticalFovDegrees) * kPi / 360.0;
+        worldPerPixel = 2.0 * std::tan(halfFov) * cameraDistance / static_cast<double>(viewportHeightPixels);
+    }
+    const double screenSized = worldPerPixel * targetPixels;
+    const double modelSized  = (modelRadius > 0.0) ? modelRadius * modelSizeRatio : 0.0;
+    return std::clamp(std::max(screenSized, modelSized), minWorldSize, maxWorldSize);
 }
 
 }  // namespace vx

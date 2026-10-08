@@ -235,6 +235,7 @@ voxel-engine/
 | `game/mouse_capture.hpp` | 鼠标捕获状态机（**纯函数**：`Esc` 释放 / 点击重捕获；**重捕获点击先于笔刷判定被消费**，避免误挖）。**物理层**（光标是否锁定），与 `input_context.hpp` 的**逻辑层**正交、不合并 |
 | `game/input_context.hpp` | **输入上下文栈 + 动作归属表**（V0.11 / A6，**纯函数**、header-only）：`InputContext`（自由活动 / 建造 / 修改 / 修改-拖动 / 模态）+ `InputContextState` + **`OwnerOf(state, action)`（「按键 ↔ 谁生效」的单一权威）** + **`EscPopTarget`（`Esc` 栈顶弹出）**；未被子上下文 claim 的动作**穿透到 base** ⇒ 移动/飞行三模式同源（[ADR 0040](adr/0040-input-context-stack-and-action-ownership-table.md)） |
 | `game/gameplay_input.hpp` | 游戏输入**抑制**决策（**纯函数**：由 `InputContext` 派生 —— `Modal` ⇒ 三类全量抑制，其余 ⇒ 全放行）。**不采信** ImGui 的 `WantCapture*`（只读叠加层不抑制，V0.9 回归口径） |
+| `game/screen_ray.hpp` | **屏幕像素 → 世界射线**（V0.11 / A8，**纯函数**：`ScreenPointToRay` —— 由视图投影矩阵 + 视口尺寸 + 光标像素反投影；**自由光标拾取**的前提，见 [ADR 0041](adr/0041-immersive-modify-mode-and-editor-camera.md)） |
 | `game/system_panel.hpp` | ESC 系统面板（显示模式 / 分辨率 / 音量 / 退出）；**不碰 SDL、不写文件**，只回报"用户做了什么" |
 | `game/ui_font.hpp` | UI 字体**三级解析**（仓库 `assets/fonts/` → 系统 CJK → 无）与加载 |
 | `game/ui_text.hpp` | **标签缝**：所有 UI 标签的唯一取词处（命中 CJK 用中文，否则整表英文；**禁止绕过**，有单测与源码扫描防护） |

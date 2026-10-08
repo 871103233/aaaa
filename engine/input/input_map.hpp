@@ -59,8 +59,25 @@ public:
     /// 平台层：累积本帧鼠标相对位移（由鼠标移动事件驱动）。
     void AddMouseDelta(float deltaX, float deltaY) noexcept;
 
+    /// 平台层：记录鼠标的**绝对位置**（窗口客户区像素；由鼠标移动事件驱动）。
+    ///
+    /// 用途（V0.11 / A8）：**自由光标**的界面（编辑器式拾取）需要"光标在屏幕上的位置"，
+    /// 仅靠相对位移（`LookX` / `LookY`）无法把光标映射回世界射线。
+    /// 相对模式（鼠标捕获）下本值仍在更新，但无屏幕意义。
+    void SetMousePosition(float x, float y) noexcept;
+
+    /// 平台层：累积本帧**滚轮**增量（由滚轮事件驱动；向上为正）。
+    void AddMouseWheel(float delta) noexcept;
+
     /// 每帧一次（固定步循环之外）：提交本帧原始输入，重算全部动作状态并清除上一帧的 pressed。
     void BeginFrame() noexcept;
+
+    /// 只读查询：鼠标**绝对位置**（窗口客户区像素，左上角为原点）。
+    [[nodiscard]] float MouseX() const noexcept { return m_mouseX; }
+    [[nodiscard]] float MouseY() const noexcept { return m_mouseY; }
+
+    /// 消费本帧滚轮增量：首次调用返回本帧累计值并清零，同帧再次调用返回 0。
+    [[nodiscard]] float ConsumeWheel() noexcept;
 
     /// 只读查询：动作在本帧的状态快照。
     [[nodiscard]] ActionState State(ActionId action) const noexcept;
@@ -104,6 +121,12 @@ private:
     float m_mouseDeltaY = 0.0F;  ///< 本帧已提交的垂直位移
     float m_pendingDeltaX = 0.0F;  ///< 事件阶段累积、待 `BeginFrame` 提交
     float m_pendingDeltaY = 0.0F;
+
+    /// V0.11 / A8：鼠标**绝对位置**（窗口客户区像素）与**本帧滚轮**增量。
+    float m_mouseX       = 0.0F;
+    float m_mouseY       = 0.0F;
+    float m_wheelDelta   = 0.0F;  ///< 本帧已提交的滚轮增量（由 `BeginFrame` 提交）
+    float m_pendingWheel = 0.0F;  ///< 事件阶段累积、待 `BeginFrame` 提交
 };
 
 }  // namespace vx

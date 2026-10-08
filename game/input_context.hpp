@@ -115,6 +115,8 @@ namespace detail {
     row[ActionIndex(ActionId::PlacementToggleNeighborSnap)] = InputOwner::AlwaysOn;
     row[ActionIndex(ActionId::PlacementToggleGridSnap)]     = InputOwner::AlwaysOn;
     row[ActionIndex(ActionId::ToggleSystemPanel)]           = InputOwner::AlwaysOn;
+    /// V0.11 / A8：`F3` = **修改模式开关**（无面板、直接进 / 出）—— 面板级热键（`F1` / `F2` 同族）。
+    row[ActionIndex(ActionId::ModifyModeToggle)]            = InputOwner::AlwaysOn;
 
     // ---- 特殊项（与上下文无关）----
     /// T14 遗留：`Esc` 语义统一后**已解绑**（见 `action_state.hpp`）⇒ 恒无效果。
@@ -132,6 +134,10 @@ namespace detail {
             row[ActionIndex(ActionId::PlacementDarkenDown)]  = InputOwner::Inactive;
             row[ActionIndex(ActionId::PlacementDarkenUp)]    = InputOwner::Inactive;
             row[ActionIndex(ActionId::PlacementRemove)]      = InputOwner::Inactive;
+            // V0.11 / A8：编辑器相机与"删选中"只在修改模式有意义 ⇒ 其余上下文一律消费但不生效。
+            row[ActionIndex(ActionId::CameraLookHold)]       = InputOwner::Inactive;
+            row[ActionIndex(ActionId::CameraPan)]            = InputOwner::Inactive;
+            row[ActionIndex(ActionId::DeleteSelected)]       = InputOwner::Inactive;
             break;
         case InputContext::Build:
             // 建造模式：左键 = 放下（**夺走 base 的光球**）；`E` = 旋转 ⇒ 让位（**不触发传送门交互**）。
@@ -142,11 +148,15 @@ namespace detail {
             row[ActionIndex(ActionId::PlacementLandingMode)] = InputOwner::Build;
             row[ActionIndex(ActionId::PlacementDarkenDown)]  = InputOwner::Build;
             row[ActionIndex(ActionId::PlacementDarkenUp)]    = InputOwner::Build;
-            row[ActionIndex(ActionId::PlacementRemove)]      = InputOwner::Build;
+            row[ActionIndex(ActionId::PlacementRemove)]      = InputOwner::Build;   // 建造模式：右键 = 删除指向物件（不变）
+            row[ActionIndex(ActionId::CameraLookHold)]       = InputOwner::Inactive;
+            row[ActionIndex(ActionId::CameraPan)]            = InputOwner::Inactive;
+            row[ActionIndex(ActionId::DeleteSelected)]       = InputOwner::Inactive;
             break;
         case InputContext::Modify:
         case InputContext::ModifyDrag:
             // 修改模式：左键 = 选中 / 拖动（**夺走 base 的光球**）；`E` 让位；摆放专有键**消费但不生效**。
+            // V0.11 / A8（甲派 UE5 口径）：**右键 = 环视**（原"右键删除"在本模式让位）、中键 = 平移、`Delete` = 删选中。
             row[ActionIndex(ActionId::Attack)]               = InputOwner::Modify;
             row[ActionIndex(ActionId::Interact)]             = InputOwner::Inactive;
             row[ActionIndex(ActionId::PlacementRotateLeft)]  = InputOwner::Inactive;
@@ -154,7 +164,10 @@ namespace detail {
             row[ActionIndex(ActionId::PlacementLandingMode)] = InputOwner::Inactive;
             row[ActionIndex(ActionId::PlacementDarkenDown)]  = InputOwner::Inactive;
             row[ActionIndex(ActionId::PlacementDarkenUp)]    = InputOwner::Inactive;
-            row[ActionIndex(ActionId::PlacementRemove)]      = InputOwner::Modify;
+            row[ActionIndex(ActionId::PlacementRemove)]      = InputOwner::Inactive;
+            row[ActionIndex(ActionId::CameraLookHold)]       = InputOwner::Modify;
+            row[ActionIndex(ActionId::CameraPan)]            = InputOwner::Modify;
+            row[ActionIndex(ActionId::DeleteSelected)]       = InputOwner::Modify;
             if (context == InputContext::ModifyDrag) {
                 // 拖动期间：鼠标位移**归 gizmo**（相机本帧不转）—— 这是 `ModifyDrag` 存在的唯一理由。
                 row[ActionIndex(ActionId::LookX)] = InputOwner::Modify;

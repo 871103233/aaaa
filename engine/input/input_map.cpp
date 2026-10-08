@@ -32,12 +32,25 @@ void InputMap::AddMouseDelta(float deltaX, float deltaY) noexcept {
     m_pendingDeltaY += deltaY;
 }
 
+void InputMap::SetMousePosition(float x, float y) noexcept {
+    m_mouseX = x;
+    m_mouseY = y;
+}
+
+void InputMap::AddMouseWheel(float delta) noexcept {
+    m_pendingWheel += delta;
+}
+
 void InputMap::BeginFrame() noexcept {
     // 提交事件阶段累积的鼠标位移，并清空累积器：下一帧不会再重复上一帧的位移。
     m_mouseDeltaX   = m_pendingDeltaX;
     m_mouseDeltaY   = m_pendingDeltaY;
     m_pendingDeltaX = 0.0F;
     m_pendingDeltaY = 0.0F;
+
+    // V0.11 / A8：滚轮同样"每帧提交一次"（绝对位置则直接读，事件阶段已更新）。
+    m_wheelDelta   = m_pendingWheel;
+    m_pendingWheel = 0.0F;
 
     for (std::size_t i = 0; i < kActionCount; ++i) {
         const Binding& binding = m_bindings[i];
@@ -103,6 +116,12 @@ float InputMap::ConsumeValue(ActionId action) noexcept {
     const float  value = state.value;
     state.value        = 0.0F;
     return value;
+}
+
+float InputMap::ConsumeWheel() noexcept {
+    const float delta = m_wheelDelta;
+    m_wheelDelta      = 0.0F;  // 同帧内第二次消费必然为 0
+    return delta;
 }
 
 }  // namespace vx

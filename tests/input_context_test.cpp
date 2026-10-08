@@ -101,8 +101,29 @@ TEST(InputContext, ModifyOwnsAttackAndKeepsCameraOnBase) {
     EXPECT_EQ(OwnerOf(kModify, ActionId::PlacementLandingMode), InputOwner::Inactive);
     EXPECT_EQ(OwnerOf(kModify, ActionId::PlacementDarkenDown), InputOwner::Inactive);
     EXPECT_EQ(OwnerOf(kModify, ActionId::PlacementDarkenUp), InputOwner::Inactive);
-    EXPECT_EQ(OwnerOf(kModify, ActionId::PlacementRemove), InputOwner::Modify);
+    // V0.11 / A8（甲派 UE5）：修改模式内**右键让位给环视** ⇒ `PlacementRemove`（原"右键删除"）改为消费但不生效。
+    EXPECT_EQ(OwnerOf(kModify, ActionId::PlacementRemove), InputOwner::Inactive);
+    EXPECT_EQ(OwnerOf(kModify, ActionId::CameraLookHold), InputOwner::Modify) << "右键按住 = 环视";
+    EXPECT_EQ(OwnerOf(kModify, ActionId::CameraPan), InputOwner::Modify) << "中键 = 平移";
+    EXPECT_EQ(OwnerOf(kModify, ActionId::DeleteSelected), InputOwner::Modify) << "Delete = 删选中";
     EXPECT_EQ(OwnerOf(kModify, ActionId::LookX), InputOwner::Free) << "未拖动 ⇒ 位移仍归相机";
+}
+
+TEST(InputContext, EditorCameraAndDeleteAreModifyOnly) {
+    // 编辑器相机 / 删选中只在修改模式有意义 ⇒ 其余上下文一律"消费但不生效"（不会静默改到别的东西）。
+    const std::array<ActionId, 3> modifyOnly {
+        ActionId::CameraLookHold,
+        ActionId::CameraPan,
+        ActionId::DeleteSelected,
+    };
+    for (const ActionId action : modifyOnly) {
+        EXPECT_EQ(OwnerOf(kFreeRoam, action), InputOwner::Inactive);
+        EXPECT_EQ(OwnerOf(kBuild, action), InputOwner::Inactive);
+        EXPECT_EQ(OwnerOf(kModifyDrag, action), InputOwner::Modify);
+    }
+    // 建造模式：右键仍是"删除指向物件"（本模式内 `PlacementRemove` 归 `Build`，不被 A8 改义影响）。
+    EXPECT_EQ(OwnerOf(kBuild, ActionId::PlacementRemove), InputOwner::Build);
+    EXPECT_EQ(OwnerOf(kFreeRoam, ActionId::PlacementRemove), InputOwner::Inactive);
 }
 
 TEST(InputContext, ModifyDragMovesLookToTheGizmo) {
@@ -131,11 +152,11 @@ TEST(InputContext, ModalBlocksAllGameplayInput) {
 }
 
 TEST(InputContext, PanelLevelHotkeysSurviveModalPanels) {
-    const std::array<ActionId, 10> hotkeys {
+    const std::array<ActionId, 11> hotkeys {
         ActionId::ToggleDebugPanel,          ActionId::PickPlacement,               ActionId::PlacementSave,
         ActionId::PlacementUndo,             ActionId::PlacementRedo,               ActionId::PlacementModifierCtrl,
         ActionId::PlacementToggleRotateHold, ActionId::PlacementToggleNeighborSnap, ActionId::PlacementToggleGridSnap,
-        ActionId::ToggleSystemPanel,
+        ActionId::ToggleSystemPanel,         ActionId::ModifyModeToggle,
     };
     for (const ActionId action : hotkeys) {
         EXPECT_EQ(OwnerOf(kModal, action), InputOwner::AlwaysOn)

@@ -36,6 +36,7 @@
 #include "object/object_placement_rule.hpp"  // V0.6 C5：流式散布（地形感知放置规则）
 #include "object/placement_snap.hpp"         // V0.11 I1/I1c：放置吸附与对齐 + 邻居优先吸附（纯函数；ADR 0038 决策四）
 #include "object/placement_validation.hpp"   // V0.11 I2：重叠合法性（2D 有向矩形 SAT，纯函数）
+#include "screen_ray.hpp"                    // V0.11 A8：屏幕像素 → 世界射线（自由光标拾取；纯函数）
 #include "object/object_scatter.hpp"  // V8：程序化散布（纯函数）
 #include "object/object_support.hpp"
 #include "object/terrain_sampling.hpp"  // V0.6 C5：地形采样（坡度 / 高度 / 地貌）
@@ -1089,6 +1090,18 @@ constexpr float kGizmoRingBand   = 0.14F;
 constexpr float kGizmoDegreesPerPixel = 0.35F;
 /// gizmo 手柄的 tint（X 红 / Z 蓝 / 旋转黄）+ 强度。
 constexpr float kGizmoTintStrength = 0.9F;
+// V0.11 / A8（ADR 0041）：gizmo 的**锚点与尺度**口径 —— 锚点 = 物件（或整座建筑）包围盒**中心（半高）**；
+// 尺度 = **随模型大小**（`包围盒半径 × 比例`，并钳到上下限）⇒ 大模型不会把手柄整个包住。
+constexpr float  kGizmoModelSizeRatio    = 1.4F;   ///< 手柄尺度 / 模型包围盒半径
+constexpr double kGizmoMinScale          = 0.6;    ///< 最小尺度（格；小物件也要点得中）
+constexpr double kGizmoMaxScale          = 24.0;   ///< 最大尺度（格；大建筑也不过夸张）
+constexpr double kGizmoAxisThicknessRatio = 0.045; ///< 轴杆粗细 / 尺度（与 I4 的 0.07/2.0 同量级）
+// V0.11 / A8（ADR 0041）：**编辑器相机**手感（修改模式：右键环视 / 中键平移 / 滚轮推拉 / 右键+WASD 飞）。
+constexpr float kEditorCameraSpeedPerSecond = 18.0F;  ///< 飞行速度（格/秒）
+constexpr float kEditorPanPerPixel          = 0.06F;  ///< 中键平移（格/像素）
+constexpr float kEditorZoomPerNotch         = 1.0F;   ///< 滚轮每格推拉（格）
+constexpr float kEditorCameraMinDistance    = 1.0F;   ///< 推拉下限（格）
+constexpr float kEditorCameraMaxDistance    = 120.0F; ///< 推拉上限（格）
 /// 拖动期间被移动物件的**半透明**反馈不透明度。
 constexpr float kGizmoDragOpacity = 0.65F;
 
@@ -3012,7 +3025,9 @@ int main(int argc, char** argv) {
         input.BindKey(vx::ActionId::PaletteConfirm, SDL_SCANCODE_RETURN);      // V0.5 E3：选择器确认
         input.BindKey(vx::ActionId::PlacementRotateLeft, SDL_SCANCODE_Q);      // V0.5 E3：摆放模式左旋
         input.BindKey(vx::ActionId::PlacementRotateRight, SDL_SCANCODE_E);     // V0.5 E3：摆放模式右旋（模式内让位）
-        input.BindKey(vx::ActionId::PlacementRepeatLast, SDL_SCANCODE_F3);     // V0.5 E3：重复上次
+        // V0.11 / A8（ADR 0041）：`F3` **让位给「修改模式」开关**（无面板、直接进 / 出）；
+        // 「重复上次」不再占热键，改为 **`F2` 物件选择器里的按钮**（能力不删，只换入口）。
+        input.BindKey(vx::ActionId::ModifyModeToggle, SDL_SCANCODE_F3);
         input.BindKey(vx::ActionId::PlacementSave, SDL_SCANCODE_F5);           // V0.5 E3：保存可编辑层
         input.BindMouseButton(vx::ActionId::PlacementRemove, SDL_BUTTON_RIGHT);  // V0.5 E3：摆放模式删除
         input.BindKey(vx::ActionId::PlacementLandingMode, SDL_SCANCODE_T);        // V0.9：成套建筑落点模式循环
@@ -3028,6 +3043,10 @@ int main(int argc, char** argv) {
         input.BindKey(vx::ActionId::PlacementModifierCtrl, SDL_SCANCODE_LCTRL);
         input.BindKey(vx::ActionId::PlacementModifierCtrl, SDL_SCANCODE_RCTRL);
         input.BindMouseButton(vx::ActionId::Attack, SDL_BUTTON_LEFT);   // T27：左键 = 发射光球（摆放模式内 = 放下）
+        // V0.11 / A8（ADR 0041）：**编辑器相机**（甲派 UE5 口径）+ 修改模式删除。
+        input.BindMouseButton(vx::ActionId::CameraLookHold, SDL_BUTTON_RIGHT);   // 按住右键 = 环视
+        input.BindMouseButton(vx::ActionId::CameraPan, SDL_BUTTON_MIDDLE);       // 中键拖 = 平移
+        input.BindKey(vx::ActionId::DeleteSelected, SDL_SCANCODE_DELETE);        // Delete = 删选中物件
         input.BindMouseAxis(vx::ActionId::LookX, vx::MouseAxis::X);
         input.BindMouseAxis(vx::ActionId::LookY, vx::MouseAxis::Y);
 
@@ -5044,7 +5063,10 @@ int main(int argc, char** argv) {
             // 抑制"进模式那一帧的这次点击"：面板按钮的那次按下在松手前一直有效
             // （否则关面板恢复捕获后会立刻射出一颗光球，见 `fireSuppressUntilRelease` 的说明）。
             fireSuppressUntilRelease = true;
-            mouseCaptured            = window.SetRelativeMouseMode(captureBeforePanel);  // 关面板 ⇒ 恢复打开前捕获
+            // V0.11 / A8h：摆放模式是**玩法态** ⇒ 进入后**必定锁定光标**（不再回落到"打开面板前的状态"）。
+            // 为什么改：从修改模式进摆放时，`captureBeforePanel` 早被 `enterModifyMode` 复位为 false，
+            // 照原口径会把光标**留在自由状态**（摆放的准星与相机转动都会失据）。
+            mouseCaptured            = window.SetRelativeMouseMode(true);
             if (placeIsBuilding) {
                 VX_LOG_INFO("摆放模式（V0.9 建筑）：进入，建筑 [%s]（Q/E 旋转、左键放下、右键删除整座、T 落点模式 %s、"
                             "[ ] 调室内变暗 %.2f、F3 重复、F5 保存、Esc 退出）",
@@ -5076,6 +5098,24 @@ int main(int argc, char** argv) {
             }
             previewTypeId.clear();
             VX_LOG_INFO("摆放模式（E3/V0.9）：退出");
+        };
+        /// V0.11 / A8：**重复上次**（类型 + 朝向）—— `F3` 让位给「修改模式」后，本能力改由 **`F2` 面板按钮**触发。
+        /// 逻辑与 `F3` 时代**逐字一致**（能力不删，只换入口；见 [ADR 0041](../../docs/adr/0041-immersive-modify-mode-and-editor-camera.md)）。
+        const auto repeatLastPlacement = [&]() {
+            const std::string repeatTypeId = lastPlaceTypeId;
+            const float       repeatYawDeg = lastPlaceYawDeg;
+            if (repeatTypeId.empty()) {
+                pickFeedback = "no last type";
+                VX_LOG_WARN("摆放模式（E3）：面板「重复上次」还没有「上次」可重复（先按 F2 选一个模型并放下）");
+                return;
+            }
+            enterPlacement(repeatTypeId);
+            if (placementMode) {
+                placementYawDeg = repeatYawDeg;  // 重复"上次"的类型**与朝向**
+                lastPlaceYawDeg = repeatYawDeg;
+                VX_LOG_INFO("摆放模式（E3）：「重复上次」—— 类型 [%s]、朝向 %.1f°", repeatTypeId.c_str(),
+                            static_cast<double>(repeatYawDeg));
+            }
         };
         const auto saveEditLayer = [&]() {
             // V0.11 / D1：清单门控（**所有入口点统一生效**：F5 / 面板按钮 / 退出自动保存）。
@@ -5434,11 +5474,11 @@ int main(int argc, char** argv) {
         /// 右键删除：拾取准星指向的**最近**物件 ⇒ 释放网格 + 碰撞体 + 实体，并记入**编辑层**。
         /// 记账分流（ADR 0032 决策五）：**本层新增**的落点直接从本层删掉；**发布清单 / 散布**来的落点记一条 `[[remove]]`。
         /// V0.9 / ADR 0036 决策四：命中**成套建筑**的构件 ⇒ **删除整座**，并按 `[[remove_building]]`（**按 id**）记账。
-        const auto deleteObjectUnderCrosshair = [&]() {
-            ObjectSlot* target = pickObjectUnderCrosshair();
+        const auto deleteObjectUnderCrosshair = [&](ObjectSlot* explicitTarget = nullptr) {
+            ObjectSlot* target = (explicitTarget != nullptr) ? explicitTarget : pickObjectUnderCrosshair();
             if (target == nullptr) {
                 pickFeedback = "no object";
-                VX_LOG_WARN("摆放模式（E3/V0.9）：右键指向 %.0f 格内没有可删除的物件",
+                VX_LOG_WARN("摆放模式（E3/V0.9）：没有可删除的物件（准星指向 / 选中项为空，%.0f 格内）",
                             static_cast<double>(kPickMaxDistance));
                 return;
             }
@@ -5833,7 +5873,15 @@ int main(int argc, char** argv) {
         vx::MeshHandle gizmoXHandle {};
         vx::MeshHandle gizmoZHandle {};
         vx::MeshHandle gizmoRingHandle {};
+        vx::MeshHandle gizmoPlaneHandle {};  ///< V0.11 / A8：中心**平面手柄**（XZ 内任意方向）的网格
+        /// 当前手柄网格对应的**尺度**（格）—— 变了才重建（不在每帧创建 GPU 资源，SKILL §四）。
+        double         gizmoMeshScale = 0.0;
         bool           gizmoMeshesReady = false;
+        /// V0.11 / A7：手柄**本帧是否可见** —— 由 `drawGizmo` / `hideGizmo` / `releaseGizmoMeshes` 共同维护，
+        /// 渲染提交段**只读**这个标志把三只手柄推入绘制列表（此前漏加 ⇒ 上传了却从不提交 ⇒ 看不见）。
+        bool           gizmoVisible = false;
+        /// V0.11 / A8：**修改模式的编辑器相机锚点**（角色位置；进模式时锁定，之后只由相机操作改变）。
+        glm::vec3      modifyCameraAnchor { 0.0F };
 
         /// 拖动中被移动的**槽位**：局部偏移（相对锚点、未旋转）+ 自身 yaw（相对锚点）⇒ 每帧按新位姿重算渲染位姿。
         struct GizmoDragTarget {
@@ -5855,6 +5903,14 @@ int main(int argc, char** argv) {
         double                       gizmoDragDraftX = 0.0;
         double                       gizmoDragDraftZ = 0.0;
         float                        gizmoDragDraftYaw = 0.0F;
+        // V0.11 / A8：**拖动基准**（自由光标 + 平面 / 环都靠"按下的那一刻"为基准 ⇒ 不跳变）。
+        double                       gizmoDragPlaneY = 0.0;  ///< 拖动平面的高度（= gizmo 可视中心的高度）
+        double                       gizmoDragGrabHitX = 0.0;  ///< 按下时光标射线与拖动平面的交点
+        double                       gizmoDragGrabHitZ = 0.0;
+        double                       gizmoDragGrabAngleDeg = 0.0;  ///< 按下时环平面上的极角（旋转用）
+        float                        gizmoDragGrabYaw = 0.0F;      ///< 按下时的 yaw（旋转用）
+        vx::GizmoLayout              gizmoDragLayout {};           ///< 按下时冻结的布局（拖动中只平移中心）
+        double                       gizmoDragCenterOffsetY = 0.0;  ///< 可视中心相对物件底面锚点的高度差
         std::vector<GizmoDragTarget> gizmoDragTargets;
 
         const auto findSlotById = [&](std::uint32_t id) -> ObjectSlot* {
@@ -5869,23 +5925,62 @@ int main(int argc, char** argv) {
             return nullptr;
         };
 
-        const auto ensureGizmoMeshes = [&]() {
-            if (gizmoMeshesReady) {
+        /// V0.11 / A8 缺陷修复：**成套建筑定义的权威查找**（运行期）。
+        ///
+        /// 为什么不能只用 `objects.FindBuilding`：`objects` 是**启动时**由"发布清单 + 可编辑层"合并出的
+        /// **快照**，此后运行期**不再更新**；而玩家的移动 / 放置只写 `editLayerState`（可编辑层）。
+        /// 用陈旧快照当拖动锚点会出现两条缺陷（所有者 2026-10-09 实测"移动后，下次再移动时又回到了原位置"）：
+        ///   ① **本层建筑**被就地移动后，`objects` 里仍是**旧坐标** ⇒ 下次拖动的锚点 = 旧位置 ⇒ 一按手柄就弹回去；
+        ///   ② **移动 / 放置后新建**的建筑 id 只存在于 `editLayerState` ⇒ 在 `objects` 里查不到 ⇒ 第二次拖动直接失败。
+        /// 口径：**先查可编辑层（运行期权威），再退回合并快照（发布清单里的建筑）**。
+        const auto findBuildingDef = [&](const std::string& id) -> const vx::ObjectBuilding* {
+            if (const vx::ObjectBuilding* fresh = editLayerState.FindBuilding(id); fresh != nullptr) {
+                return fresh;
+            }
+            return objects.FindBuilding(id);
+        };
+
+        /// V0.11 / A8：按**尺度**建（或复用）手柄网格。尺度变了 ⇒ 释放重建（**只在"选中变化 / 尺度变化"时发生**，
+        /// 不在每帧创建资源；尺度本身只随**选中的模型**变化，不随相机距离变化 ⇒ 不会连续重建）。
+        const auto ensureGizmoMeshes = [&](double scale) {
+            if (gizmoMeshesReady && std::abs(scale - gizmoMeshScale) < 1.0e-6) {
                 return;
             }
-            gizmoXHandle = renderer.UploadMesh(vx::BuildGizmoAxisMesh(kGizmoAxisLength, kGizmoAxisThickness),
-                                               glm::dvec3(0.0));
-            gizmoZHandle = renderer.UploadMesh(vx::BuildGizmoAxisMesh(kGizmoAxisLength, kGizmoAxisThickness),
-                                               glm::dvec3(0.0));
-            gizmoRingHandle = renderer.UploadMesh(vx::BuildGizmoRingMesh(kGizmoRingRadius, kGizmoRingBand),
-                                                 glm::dvec3(0.0));
-            gizmoMeshesReady = gizmoXHandle.IsValid() && gizmoZHandle.IsValid() && gizmoRingHandle.IsValid();
+            // 先释放旧缓冲（**不动**选中 / 拖动状态 —— 那些是"选择"不是"资源"）。
+            if (gizmoXHandle.IsValid()) {
+                renderer.ReleaseMesh(gizmoXHandle);
+            }
+            if (gizmoZHandle.IsValid()) {
+                renderer.ReleaseMesh(gizmoZHandle);
+            }
+            if (gizmoRingHandle.IsValid()) {
+                renderer.ReleaseMesh(gizmoRingHandle);
+            }
+            if (gizmoPlaneHandle.IsValid()) {
+                renderer.ReleaseMesh(gizmoPlaneHandle);
+            }
+            gizmoXHandle     = vx::MeshHandle {};
+            gizmoZHandle     = vx::MeshHandle {};
+            gizmoRingHandle  = vx::MeshHandle {};
+            gizmoPlaneHandle = vx::MeshHandle {};
+            gizmoMeshesReady = false;
+            gizmoVisible     = false;
+
+            const float thickness = static_cast<float>(scale * kGizmoAxisThicknessRatio);
+            gizmoXHandle = renderer.UploadMesh(vx::BuildGizmoAxisMesh(scale, thickness), glm::dvec3(0.0));
+            gizmoZHandle = renderer.UploadMesh(vx::BuildGizmoAxisMesh(scale, thickness), glm::dvec3(0.0));
+            gizmoRingHandle =
+                renderer.UploadMesh(vx::BuildGizmoRingMesh(scale * 0.85, scale * 0.075), glm::dvec3(0.0));
+            gizmoPlaneHandle = renderer.UploadMesh(vx::BuildGizmoPlaneMesh(scale * 0.22), glm::dvec3(0.0));
+            gizmoMeshScale   = scale;
+            gizmoMeshesReady = gizmoXHandle.IsValid() && gizmoZHandle.IsValid() && gizmoRingHandle.IsValid() &&
+                               gizmoPlaneHandle.IsValid();
             if (!gizmoMeshesReady) {
-                VX_LOG_WARN("gizmo（V0.11/I4）：手柄网格上传失败 ⇒ 本次运行内不显示 gizmo");
+                VX_LOG_WARN("gizmo（V0.11/A8）：手柄网格上传失败 ⇒ 本次运行内不显示 gizmo");
             }
         };
 
-        /// 释放 gizmo 手柄网格（离开摆放模式时调用；与 `previewHandle` 同一释放口径，避免占槽位）。
+        /// 释放 gizmo 手柄网格（离开编辑模式时调用；与 `previewHandle` 同一释放口径，避免占槽位）。
         const auto releaseGizmoMeshes = [&]() {
             if (gizmoXHandle.IsValid()) {
                 renderer.ReleaseMesh(gizmoXHandle);
@@ -5896,15 +5991,22 @@ int main(int argc, char** argv) {
             if (gizmoRingHandle.IsValid()) {
                 renderer.ReleaseMesh(gizmoRingHandle);
             }
+            if (gizmoPlaneHandle.IsValid()) {
+                renderer.ReleaseMesh(gizmoPlaneHandle);
+            }
             gizmoXHandle      = vx::MeshHandle {};
             gizmoZHandle      = vx::MeshHandle {};
             gizmoRingHandle   = vx::MeshHandle {};
+            gizmoPlaneHandle  = vx::MeshHandle {};
+            gizmoMeshScale    = 0.0;
             gizmoMeshesReady  = false;
+            gizmoVisible      = false;
             gizmoSelectedSlotId = 0;
             gizmoDragging     = false;
         };
 
         const auto hideGizmo = [&]() {
+            gizmoVisible = false;  // V0.11 / A7：不显示 ⇒ 也不进本帧绘制列表
             if (gizmoXHandle.IsValid()) {
                 renderer.SetMeshOpacity(gizmoXHandle, 0.0F);
             }
@@ -5914,12 +6016,16 @@ int main(int argc, char** argv) {
             if (gizmoRingHandle.IsValid()) {
                 renderer.SetMeshOpacity(gizmoRingHandle, 0.0F);
             }
+            if (gizmoPlaneHandle.IsValid()) {
+                renderer.SetMeshOpacity(gizmoPlaneHandle, 0.0F);
+            }
         };
 
-        /// 画 gizmo（X 红 / Z 蓝 / 旋转黄；**世界轴**，不随物件朝向旋转）。
-        const auto drawGizmo = [&](const glm::dvec3& origin) {
-            ensureGizmoMeshes();
+        /// 画 gizmo（X 红 / Z 蓝 / 旋转黄 / 中心平面青；**世界轴**，不随物件朝向旋转）。
+        const auto drawGizmo = [&](const glm::dvec3& origin, const vx::GizmoLayout& layout) {
+            ensureGizmoMeshes(layout.axisLength);
             if (!gizmoMeshesReady) {
+                gizmoVisible = false;
                 return;
             }
             const glm::quat identity(1.0F, 0.0F, 0.0F, 0.0F);
@@ -5927,12 +6033,19 @@ int main(int argc, char** argv) {
             renderer.SetMeshTransform(gizmoZHandle, origin,
                                       glm::angleAxis(glm::radians(-90.0F), glm::vec3(0.0F, 1.0F, 0.0F)));
             renderer.SetMeshTransform(gizmoRingHandle, origin, identity);
+            renderer.SetMeshTransform(gizmoPlaneHandle, origin, identity);
             renderer.SetMeshOpacity(gizmoXHandle, 1.0F);
             renderer.SetMeshOpacity(gizmoZHandle, 1.0F);
             renderer.SetMeshOpacity(gizmoRingHandle, 1.0F);
+            renderer.SetMeshOpacity(gizmoPlaneHandle, 1.0F);
             renderer.SetMeshTint(gizmoXHandle, 0.95F, 0.20F, 0.20F, kGizmoTintStrength);
             renderer.SetMeshTint(gizmoZHandle, 0.25F, 0.45F, 0.95F, kGizmoTintStrength);
             renderer.SetMeshTint(gizmoRingHandle, 0.95F, 0.85F, 0.20F, kGizmoTintStrength);
+            renderer.SetMeshTint(gizmoPlaneHandle, 0.35F, 0.85F, 0.95F, kGizmoTintStrength);
+            // V0.11 / A7 缺陷修复：上面"上传 + 定位 + 染色"都对，但**从未把三只手柄放进本帧的绘制列表**
+            // （`frameHandles`）⇒ `RenderFrame` 不提交它们 ⇒ **玩家永远看不到手柄**（所有者 2026-10-08 实测）。
+            // 可见性只在这里与 `hideGizmo` 维护，渲染提交段读同一个标志 ⇒ 不会再次分叉。
+            gizmoVisible = true;
         };
 
         /// 世界点 → 屏幕像素（`false` = 在相机背后）。
@@ -5950,34 +6063,91 @@ int main(int argc, char** argv) {
             return true;
         };
 
-        /// 准星射线。
-        const auto gizmoRayFromCrosshair = [&]() {
+        /// **指针（自由光标）的世界射线**（V0.11 / A8）：把**光标像素**反投影回世界。
+        ///
+        /// 为什么不用屏幕正中：修改模式是**编辑器式**界面（[ADR 0041](../../docs/adr/0041-immersive-modify-mode-and-editor-camera.md)），
+        /// 光标可自由移动 ⇒ 拾取必须跟随**光标位置**，"看到哪里就点哪里"才成立。
+        const auto pointerRay = [&]() -> vx::ScreenRay {
             const vx::CameraView view = camera.Evaluate(1.0, &cameraQuery);
-            const glm::vec3     dir  = AimDirection(camera, cameraQuery);
+            return vx::ScreenPointToRay(view.viewProjection, input.MouseX(), input.MouseY(),
+                                        static_cast<float>(clientSize.width), static_cast<float>(clientSize.height));
+        };
+
+        /// 把 `ScreenRay` 转成 gizmo 拾取用的 `GizmoRay`（同一根射线，换载体）。
+        const auto gizmoRayFromPointer = [&]() {
+            const vx::ScreenRay screenRay = pointerRay();
             vx::GizmoRay        ray;
-            ray.ox = view.eye.x;
-            ray.oy = view.eye.y;
-            ray.oz = view.eye.z;
-            ray.dx = dir.x;
-            ray.dy = dir.y;
-            ray.dz = dir.z;
+            ray.ox = screenRay.origin.x;
+            ray.oy = screenRay.origin.y;
+            ray.oz = screenRay.origin.z;
+            ray.dx = screenRay.direction.x;
+            ray.dy = screenRay.direction.y;
+            ray.dz = screenRay.direction.z;
             return ray;
         };
 
-        /// 针对**当前选中**槽位的手柄拾取（粘性选中 ⇒ 手柄伸出物件之外也能点中）。
+        /// **gizmo 布局**（V0.11 / A8，[ADR 0041](../../docs/adr/0041-immersive-modify-mode-and-editor-camera.md)）：
+        /// 锚点 = 物件（**成套建筑则整座**）包围盒的**中心（半高）**；尺度 = **随模型大小**（钳到上下限）。
+        /// 目的：① 大模型不再把手柄整个包住（看不见 / 点不到）；② 手柄始终"伸出模型之外"。
+        const auto gizmoLayoutForSlot = [&](const ObjectSlot& slot) -> vx::GizmoLayout {
+            glm::vec3 minimum = slot.bounds.valid ? slot.bounds.min : glm::vec3(slot.position);
+            glm::vec3 maximum = slot.bounds.valid ? slot.bounds.max : glm::vec3(slot.position);
+            if (!slot.buildingId.empty()) {
+                // 成套建筑：取**整座**的并集包围盒 ⇒ 手柄锚在整座中心、尺度按整座算（不会被任一构件包住）。
+                for (const ObjectSlot& other : objectSlots) {
+                    if (other.removed || other.buildingId != slot.buildingId || !other.bounds.valid) {
+                        continue;
+                    }
+                    minimum = glm::min(minimum, other.bounds.min);
+                    maximum = glm::max(maximum, other.bounds.max);
+                }
+            }
+            const glm::vec3 center = (minimum + maximum) * 0.5F;
+            const double    radius = 0.5 * static_cast<double>(glm::length(maximum - minimum));
+            const double    scale  = std::clamp(radius * static_cast<double>(kGizmoModelSizeRatio), kGizmoMinScale,
+                                                kGizmoMaxScale);
+            vx::GizmoLayout layout;
+            layout.x               = center.x;
+            layout.y               = center.y;
+            layout.z               = center.z;
+            layout.axisLength      = scale;
+            layout.handleRadius    = scale * 0.12;
+            layout.ringRadius      = scale * 0.85;
+            layout.planeHalfExtent = scale * 0.22;
+            return layout;
+        };
+
+        /// 针对**当前选中**槽位的手柄拾取（粘性选中 ⇒ 手柄伸出物件之外也能点中；按**光标位置**拾取）。
         const auto pickGizmoHandleForSelection = [&]() -> vx::GizmoHandle {
             const ObjectSlot* slot = findSlotById(gizmoSelectedSlotId);
             if (slot == nullptr) {
                 return vx::GizmoHandle::None;
             }
-            vx::GizmoLayout layout;
-            layout.x            = slot->position.x;
-            layout.y            = slot->position.y;
-            layout.z            = slot->position.z;
-            layout.axisLength   = kGizmoAxisLength;
-            layout.handleRadius = kGizmoHandleRadius;
-            layout.ringRadius   = kGizmoRingRadius;
-            return vx::PickGizmoHandle(gizmoRayFromCrosshair(), layout, static_cast<double>(kPickMaxDistance));
+            return vx::PickGizmoHandle(gizmoRayFromPointer(), gizmoLayoutForSlot(*slot),
+                                       static_cast<double>(kPickMaxDistance));
+        };
+
+        /// **光标射线**拾取最近的物件槽（修改模式用；`nullptr` = 光标没指向物件）。
+        const auto pickObjectUnderCursor = [&]() -> ObjectSlot* {
+            const vx::ScreenRay screenRay = pointerRay();
+            const glm::vec3     origin(static_cast<float>(screenRay.origin.x), static_cast<float>(screenRay.origin.y),
+                                       static_cast<float>(screenRay.origin.z));
+            const glm::vec3 direction(static_cast<float>(screenRay.direction.x),
+                                      static_cast<float>(screenRay.direction.y),
+                                      static_cast<float>(screenRay.direction.z));
+            ObjectSlot* target = nullptr;
+            float       bestT  = kPickMaxDistance;
+            for (ObjectSlot& slot : objectSlots) {
+                if (slot.removed || !slot.bounds.valid) {
+                    continue;
+                }
+                float t = 0.0F;
+                if (RayHitsAabb(origin, direction, slot.bounds, t) && t < bestT) {
+                    bestT  = t;
+                    target = &slot;
+                }
+            }
+            return target;
         };
 
         const auto beginGizmoDrag = [&](vx::GizmoHandle handle) {
@@ -5992,7 +6162,7 @@ int main(int argc, char** argv) {
             if (!selected->buildingId.empty()) {
                 gizmoDragBuildingId = selected->buildingId;
                 gizmoDragTypeId.clear();
-                const vx::ObjectBuilding* def = objects.FindBuilding(gizmoDragBuildingId);
+                const vx::ObjectBuilding* def = findBuildingDef(gizmoDragBuildingId);
                 if (def == nullptr) {
                     gizmoDragging = false;
                     return;
@@ -6035,18 +6205,96 @@ int main(int argc, char** argv) {
             gizmoDragDraftX   = gizmoDragAnchorX;
             gizmoDragDraftZ   = gizmoDragAnchorZ;
             gizmoDragDraftYaw = gizmoDragAnchorYaw;
+            // V0.11 / A8：记录**按下时刻的基准**（拖动平面 + 光标交点 + 环极角）⇒ 平面 / 环拖动**不跳变**，
+            // 且严格"跟着光标走"（而不是"水平位移 × 系数"）。
+            const vx::GizmoLayout grabLayout = gizmoLayoutForSlot(*selected);
+            gizmoDragLayout        = grabLayout;
+            gizmoDragCenterOffsetY = static_cast<double>(grabLayout.y) - gizmoDragAnchorY;
+            gizmoDragPlaneY     = grabLayout.y;
+            gizmoDragGrabYaw    = gizmoDragAnchorYaw;
+            gizmoDragGrabHitX   = gizmoDragAnchorX;
+            gizmoDragGrabHitZ   = gizmoDragAnchorZ;
+            gizmoDragGrabAngleDeg = 0.0;
+            const vx::ScreenRay grabRay = pointerRay();
+            if (std::abs(grabRay.direction.y) > 1.0e-9) {
+                const double t = (gizmoDragPlaneY - grabRay.origin.y) / grabRay.direction.y;
+                if (t > 0.0) {
+                    gizmoDragGrabHitX = grabRay.origin.x + t * grabRay.direction.x;
+                    gizmoDragGrabHitZ = grabRay.origin.z + t * grabRay.direction.z;
+                    vx::GizmoLayout angleLayout;
+                    angleLayout.x = gizmoDragAnchorX;
+                    angleLayout.z = gizmoDragAnchorZ;
+                    gizmoDragGrabAngleDeg = vx::GizmoAngleDegrees(angleLayout, gizmoDragGrabHitX, gizmoDragGrabHitZ);
+                }
+            }
             pickFeedback      = "gizmo drag";
-            VX_LOG_INFO("gizmo（V0.11/I4）：开始拖动 %s（目标 [%s]）—— 松开左键提交",
-                        handle == vx::GizmoHandle::RotateY ? "旋转环" : (handle == vx::GizmoHandle::TranslateX ? "X 轴" : "Z 轴"),
+            const char* handleToken = (handle == vx::GizmoHandle::Plane)        ? "中心平面（自由方向）"
+                                      : (handle == vx::GizmoHandle::RotateY)    ? "旋转环"
+                                      : (handle == vx::GizmoHandle::TranslateX) ? "X 轴"
+                                                                               : "Z 轴";
+            VX_LOG_INFO("gizmo（V0.11/A8）：开始拖动 %s（目标 [%s]）—— 松开左键提交", handleToken,
                         gizmoDragBuildingId.empty() ? gizmoDragTypeId.c_str() : gizmoDragBuildingId.c_str());
         };
 
-        /// 每帧按**鼠标位移**推进拖动（位移来自 `LookX`/`LookY`；拖动期间相机不转）。
-        const auto updateGizmoDrag = [&](float mouseDx, float mouseDy) {
+        /// V0.11 / A8h：**拖动中的"草稿位姿"**（与 `updateGizmoDrag` 的渲染反馈**同一份公式**）。
+        ///
+        /// 为什么需要一个独立入口：静态物件走**实例化**渲染，其位姿取自 `slot.position` / `slot.yawDegrees`
+        /// （见渲染段的 `InstancePose`），`renderer.SetMeshTransform` 对它们**完全不生效** ⇒
+        /// 拖动期间画面**不动**，只有松手提交（销毁 + 重建槽位）才看得到结果
+        /// （所有者 2026-10-09 实测："拖动黄色光圈旋转时模型没有跟随旋转，只有松手后才旋转"）。
+        /// 实例收集 / 逐网格剔除改用本函数给出的草稿位姿 ⇒ 拖动**逐帧跟随**。
+        /// 返回 `false` = 该槽位**不在**本次拖动集合里（此时调用方应回落到 `slot.position`）。
+        const auto gizmoDragPoseForSlot = [&](std::uint32_t slotId, glm::dvec3& outOrigin,
+                                              float& outYawDegrees) -> bool {
+            if (!gizmoDragging) {
+                return false;
+            }
+            constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
+            const double     yawRad    = static_cast<double>(gizmoDragDraftYaw) * kDegToRad;
+            const double     cosYaw    = std::cos(yawRad);
+            const double     sinYaw    = std::sin(yawRad);
+            float            surfaceY  = static_cast<float>(gizmoDragAnchorY);
+            (void)world.QueryHeight(static_cast<float>(gizmoDragDraftX), static_cast<float>(gizmoDragDraftZ), surfaceY);
+            for (const GizmoDragTarget& target : gizmoDragTargets) {
+                if (target.slotId != slotId) {
+                    continue;
+                }
+                outOrigin =
+                    glm::dvec3(gizmoDragDraftX + (cosYaw * target.localOffset.x + sinYaw * target.localOffset.z),
+                               static_cast<double>(surfaceY) + target.localOffset.y,
+                               gizmoDragDraftZ + (-sinYaw * target.localOffset.x + cosYaw * target.localOffset.z));
+                outYawDegrees = gizmoDragDraftYaw + target.pieceYawDeg;
+                return true;
+            }
+            return false;
+        };
+
+        /// 每帧推进拖动：**轴**用鼠标位移投影（像素级精确）；**中心平面 / 旋转环**用**光标射线 ∩ 拖动平面**
+        /// （V0.11 / A8 ⇒ "任意方向移动"与"跟着光标转"；拖动期间相机不转）。
+        const auto updateGizmoDrag = [&](float mouseDx, float mouseDy, const vx::ScreenRay& cursorRay) {
             if (!gizmoDragging) {
                 return;
             }
-            if (gizmoDragHandle == vx::GizmoHandle::TranslateX || gizmoDragHandle == vx::GizmoHandle::TranslateZ) {
+            // 光标射线与**拖动平面**（`y = gizmoDragPlaneY`，即 gizmo 可视中心的高度）的交点。
+            bool   havePlaneHit = false;
+            double hitX         = 0.0;
+            double hitZ         = 0.0;
+            if (std::abs(cursorRay.direction.y) > 1.0e-9) {
+                const double t = (gizmoDragPlaneY - cursorRay.origin.y) / cursorRay.direction.y;
+                if (t > 0.0) {
+                    hitX         = cursorRay.origin.x + t * cursorRay.direction.x;
+                    hitZ         = cursorRay.origin.z + t * cursorRay.direction.z;
+                    havePlaneHit = true;
+                }
+            }
+            if (gizmoDragHandle == vx::GizmoHandle::Plane) {
+                // 中心平面手柄：**XZ 平面内任意方向**平移（增量 = 光标命中点相对"按下时的命中点"）⇒ 不跳变。
+                if (havePlaneHit) {
+                    gizmoDragDraftX = gizmoDragAnchorX + (hitX - gizmoDragGrabHitX);
+                    gizmoDragDraftZ = gizmoDragAnchorZ + (hitZ - gizmoDragGrabHitZ);
+                }
+            } else if (gizmoDragHandle == vx::GizmoHandle::TranslateX ||
+                       gizmoDragHandle == vx::GizmoHandle::TranslateZ) {
                 // 把鼠标位移投到该轴在**屏幕上的方向**上 ⇒ 每像素对应的世界距离 = 1 / 屏幕像素长度。
                 const glm::dvec3 anchor(gizmoDragAnchorX, gizmoDragAnchorY, gizmoDragAnchorZ);
                 const glm::dvec3 axis = (gizmoDragHandle == vx::GizmoHandle::TranslateX) ? glm::dvec3(1.0, 0.0, 0.0)
@@ -6067,7 +6315,18 @@ int main(int argc, char** argv) {
                     }
                 }
             } else {
-                gizmoDragDraftYaw += mouseDx * kGizmoDegreesPerPixel;
+                // 旋转环：**跟着光标走** —— yaw = 按下时的 yaw +（当前极角 − 按下极角）〔归一化到 (−180, 180]〕。
+                if (havePlaneHit) {
+                    vx::GizmoLayout angleLayout;
+                    angleLayout.x = gizmoDragAnchorX;
+                    angleLayout.z = gizmoDragAnchorZ;
+                    const double currentAngle = vx::GizmoAngleDegrees(angleLayout, hitX, hitZ);
+                    const double delta        = vx::GizmoYawDeltaDegrees(gizmoDragGrabAngleDeg, currentAngle);
+                    gizmoDragDraftYaw         = gizmoDragGrabYaw + static_cast<float>(delta);
+                } else {
+                    // 退化兜底（视线几乎与环平面平行 ⇒ 交点不可用）：退回"水平位移 × 灵敏度"（旧口径）。
+                    gizmoDragDraftYaw += mouseDx * kGizmoDegreesPerPixel;
+                }
                 gizmoDragDraftYaw = std::fmod(gizmoDragDraftYaw + 360.0F, 360.0F);
             }
             // 吸附（与 I1 同口径；开关关 ⇒ 步长 0 = 不吸附）。
@@ -6113,6 +6372,23 @@ int main(int argc, char** argv) {
             float newSurfaceY = static_cast<float>(gizmoDragAnchorY);
             (void)world.QueryHeight(static_cast<float>(newX), static_cast<float>(newZ), newSurfaceY);
 
+            // V0.11 / A8 缺陷修复：**无位移、无旋转 ⇒ 不提交**。
+            // 为什么需要：允许「拖动已选中物件本体 = 自由平移」之后，**单击本体**也会走一次 begin → commit；
+            // 若不设此闸，单击就会留下一条编辑记录（对非本层物件甚至是 `[[remove]]` + `[[placement]]` 各一条）。
+            // 判据取**吸附前**的草稿（`gizmoDragDraft*`）与锚点之差 —— 若拿吸附后的 `newX/newZ` 比，
+            // 一个"没动的单击"也会因锚点不在网格上而被判成位移（把物件吸附到格点）。
+            constexpr double kGizmoNoOpEpsilon = 1.0e-4;  // 0.1 mm 量级：真实拖动远大于它
+            double           yawDiff = std::fmod(static_cast<double>(gizmoDragDraftYaw) - static_cast<double>(gizmoDragAnchorYaw), 360.0);
+            if (yawDiff > 180.0) {
+                yawDiff -= 360.0;
+            } else if (yawDiff < -180.0) {
+                yawDiff += 360.0;
+            }
+            if (std::abs(gizmoDragDraftX - gizmoDragAnchorX) < kGizmoNoOpEpsilon &&
+                std::abs(gizmoDragDraftZ - gizmoDragAnchorZ) < kGizmoNoOpEpsilon && std::abs(yawDiff) < kGizmoNoOpEpsilon) {
+                return;  // `gizmoDragging` 已在函数开头置 false ⇒ 不留半途状态
+            }
+
             vx::EditCommand command;
             if (gizmoDragBuildingId.empty()) {
                 command.kind                     = vx::EditOpKind::MoveObject;
@@ -6155,7 +6431,7 @@ int main(int argc, char** argv) {
                 return;
             }
             // ---- 成套建筑 ----
-            const vx::ObjectBuilding* def = objects.FindBuilding(gizmoDragBuildingId);
+            const vx::ObjectBuilding* def = findBuildingDef(gizmoDragBuildingId);
             if (def == nullptr) {
                 return;
             }
@@ -6231,6 +6507,46 @@ int main(int argc, char** argv) {
                 VX_LOG_INFO("鼠标捕获：关（窗口失焦，平台层已自动释放；点击窗口可重新捕获）");
             }
 
+            // V0.11 / A8（[ADR 0041](../../docs/adr/0041-immersive-modify-mode-and-editor-camera.md)）：**修改模式的进入 / 退出**。
+            // 进入 = 关掉任何面板 + **释放鼠标捕获（自由光标）** + **相机脱离角色并固定在当前位姿** + 角色隐藏（渲染侧）；
+            // 退出 = 恢复鼠标捕获 + 恢复跟随（下一帧 `StepCharacter` 会把相机拉回角色身后）。
+            const auto enterModifyMode = [&]() {
+                debugOverlay.CloseObjectPalette();
+                debugOverlay.ClosePortalMenu();
+                if (debugOverlay.SystemPanelOpen()) {
+                    debugOverlay.ToggleSystemPanel();
+                }
+                exitPlacement();
+                modifyMode          = true;
+                gizmoSelectedSlotId = 0;
+                gizmoDragging       = false;
+                (void)window.SetRelativeMouseMode(false);  // 自由光标（编辑器式界面）
+                mouseCaptured            = false;
+                captureBeforePanel       = false;  // V0.11 / A8 缺陷修复：面板开合不再把捕获"恢复"回来（本模式恒自由光标）
+                fireSuppressUntilRelease = true;           // 抑制"进模式那一刻的这次点击"
+                jumpRequested            = false;
+                const vx::PhysicsWorld::CharacterState state = physics.GetCharacterState(character);
+                modifyCameraAnchor = glm::vec3(static_cast<float>(state.position.x),
+                                               static_cast<float>(state.position.y),
+                                               static_cast<float>(state.position.z));
+                camera.SnapTo(modifyCameraAnchor);  // 镜头**不跳变**：先锁在角色当前的注视点上
+                VX_LOG_INFO("修改模式（V0.11/A8）：**进入**（自由光标 · 镜头固定 · 角色隐藏）—— 左键 = 选中 / 拖手柄 · "
+                            "按住右键 = 环视 · 中键拖 = 平移 · 滚轮 = 推拉 · 右键+WASD = 飞 · `Delete` = 删选中 · "
+                            "`F3`/`Esc` = 退出");
+            };
+            const auto exitModifyMode = [&]() {
+                if (gizmoDragging) {
+                    commitGizmoDrag();  // 兜底：退出时把半途的拖动提交掉（不留未提交状态）
+                }
+                modifyMode          = false;
+                gizmoSelectedSlotId = 0;
+                hideGizmo();
+                releaseGizmoMeshes();
+                mouseCaptured            = window.SetRelativeMouseMode(true);  // 恢复捕获（自由活动 / 建造都直接操作世界）
+                fireSuppressUntilRelease = true;
+                VX_LOG_INFO("修改模式（V0.11/A8）：**退出**（恢复光标捕获与角色跟随）");
+            };
+
             // V0.11 / A6：**输入上下文的唯一采集口** —— 由"模式 + 三个模态面板 + gizmo 拖动"组成
             //（[ADR 0040](../../docs/adr/0040-input-context-stack-and-action-ownership-table.md)）。
             // 玩法输入抑制 / 动作归属 / `Esc` 栈顶弹出**全部**由它派生（原先三处各判各的，新增模式要改多处）。
@@ -6261,10 +6577,9 @@ int main(int argc, char** argv) {
                     }
                     case vx::EscTarget::ExitModify: {
                         // V0.11 / I4 修订：修改模式内 `Esc` **先退模式**（不打开系统面板）。
-                        modifyMode          = false;
-                        gizmoSelectedSlotId = 0;
-                        jumpRequested       = false;
-                        VX_LOG_INFO("修改模式（V0.11/I4）：退出（Esc）");
+                        // V0.11 / A8：改走统一的 `exitModifyMode`（恢复捕获 / 释放手柄 / 提交半途拖动）。
+                        exitModifyMode();
+                        jumpRequested = false;
                         break;
                     }
                     case vx::EscTarget::ExitBuild: {
@@ -6309,6 +6624,16 @@ int main(int argc, char** argv) {
                 }
             }
 
+            // V0.11 / A8（[ADR 0041](../../docs/adr/0041-immersive-modify-mode-and-editor-camera.md)）：**`F3` = 修改模式开关**
+            // —— **无面板、直接进 / 出**（甲派 UE5 的工具直达口径）。面板级热键 ⇒ 与 `F1`/`F2` 同为 `AlwaysOn`。
+            if (input.ConsumePressed(vx::ActionId::ModifyModeToggle)) {
+                if (modifyMode) {
+                    exitModifyMode();
+                } else {
+                    enterModifyMode();
+                }
+            }
+
             // 起 ImGui 帧（任一面板可见时）：必须先于读取捕获标志，且早于玩法输入处理。
             // 捕获期间让 ImGui 忽略鼠标（相对模式坐标无意义），避免误判悬停而抑制视角。
             // T24：ImGui 帧开销计入 UI 构建耗时（NewFrame 与面板构建是两段，累加）。
@@ -6340,7 +6665,12 @@ int main(int argc, char** argv) {
             // "已被捕获消费"，随后消费掉鼠标左键边沿，使这次点击绝不会落到发射上。
             // 面板（系统面板 / V9 传送门菜单）打开时整体跳过：此时点击属于面板控件，绝不能触发重捕获。
             // 该顺序由单测钉死。
-            if (inputContextTop != vx::InputContext::Modal) {
+            // V0.11 / A8 缺陷修复：**修改模式内跳过整个捕获状态机**。
+            // 为什么必须跳过：修改模式是**自由光标**的编辑器态（[ADR 0041](../../docs/adr/0041-immersive-modify-mode-and-editor-camera.md)），
+            // 而本状态机的语义是"未捕获时点一下就重新捕获"。玩家在修改模式里**点左键选物件**必然触发它 ⇒
+            // 鼠标被**重新捕获**：光标被锁住（"光标不动"）、鼠标位移转而去转相机（"镜头动"）—— 所有者 2026-10-08 实测报告的两条现象。
+            // 捕获的**进入 / 退出**改由 `enterModifyMode` / `exitModifyMode` 独占负责（进模式释放、退模式恢复），口径单一。
+            if (inputContextTop != vx::InputContext::Modal && !modifyMode) {
                 const bool anyClickEdge = input.Pressed(vx::ActionId::Attack);
                 // `escapePressed` 恒为 false：Esc 已改由上面的系统面板消费（T15 统一语义）。
                 const vx::MouseCaptureDecision captureDecision =
@@ -6445,27 +6775,32 @@ int main(int argc, char** argv) {
             // 形态：`F2` ⇒ 二级列表（一级 = 仓库 / 类别、二级 = 模型 / 类型）⇒ 选「进入」⇒ 摆放模式：
             //   幽灵预览（同源几何 + 抖动淡出）+ `Q`/`E` 旋转 + 左键放下 + 右键删除 + `F3` 重复 + `F5` 保存 + `Esc` 退出。
             // **模式内让位**：左键不发光球（上面的 `fireHeld`）、`E` 不触发传送门交互（下面消费 `Interact`）、`Esc` 先退模式。
+            // V0.11 / A8h：**模式互斥的唯一入口**（进建造 ⇒ 必须先**完整退出修改**）。
+            // `enterModifyMode` 早就 `exitPlacement()`；反向此前只把 `modifyMode` 置 false、**跳过了拆除**
+            //（手柄不释放 / 半途拖动不提交 / 光标捕获不恢复）⇒ 所有者实测"修改模式里按 F2 还能进建造模式"。
+            // 三条走进建造的路径（面板按钮 / `Enter` / 「重复上次」）**都走这里**，避免再漏。
+            const auto exitModifyBeforePlacement = [&]() {
+                if (modifyMode) {
+                    exitModifyMode();  // 唯一职责方：提交半途拖动 + 释放手柄 + 恢复捕获
+                }
+            };
             {
                 // 消费选择器动作（由**上一帧末**的 ImGui 构建产生；`Take` 后清零 ⇒ 只生效一次）。
                 const vx::PaletteRequest paletteRequest = debugOverlay.TakePaletteRequest();
                 if (paletteRequest.action != vx::PaletteRequest::Action::None) {
                     jumpRequested = false;
                     if (paletteRequest.action == vx::PaletteRequest::Action::EnterPlacement) {
-                        // 面板在按钮点击时已关闭；`enterPlacement` 负责恢复捕获（回到打开前的状态）。
+                        // 面板在按钮点击时已关闭；`enterPlacement` 负责锁定光标（玩法态）。
+                        exitModifyBeforePlacement();
                         enterPlacement(paletteRequest.typeId);
                     } else if (paletteRequest.action == vx::PaletteRequest::Action::EnterModify) {
-                        // V0.11 / I4 修订：**修改模式**（与摆放互斥）—— 恢复捕获（供准星指向 / 拖动）。
-                        exitPlacement();
-                        modifyMode          = true;
-                        gizmoSelectedSlotId = 0;
-                        const vx::PanelCaptureTransition transition =
-                            vx::DecidePanelCaptureTransition(/*opening=*/false, captureBeforePanel);
-                        if (transition.captureRequested) {
-                            mouseCaptured = window.SetRelativeMouseMode(true);
-                        }
-                        // 抑制"进模式那一帧的这次点击"（与 `enterPlacement` 同口径）：否则关面板恢复捕获后会立刻射出一颗光球。
-                        fireSuppressUntilRelease = true;
-                        VX_LOG_INFO("修改模式（V0.11/I4）：**进入** —— 准星点击已有物件选中并拖动手柄调整；`Esc` 退出");
+                        // V0.11 / A8：面板「修改模式」按钮**同样**走统一的进入路径（自由光标 / 镜头固定 / 角色隐藏）。
+                        // `F3` 是**直达**入口；面板按钮保留（SKILL §五：不得删除既有能力）。
+                        enterModifyMode();
+                    } else if (paletteRequest.action == vx::PaletteRequest::Action::RepeatLast) {
+                        // V0.11 / A8：`F3` 让位给修改模式 ⇒「**重复上次**」改由本按钮触发（能力不删、只换入口）。
+                        exitModifyBeforePlacement();
+                        repeatLastPlacement();
                     } else if (paletteRequest.action == vx::PaletteRequest::Action::Save) {
                         // 面板保持打开 ⇒ 不恢复捕获（仍释放，供继续点控件）。
                         // V0.10 / S9：与 F5 同口径 —— 没有未保存改动时不写盘（避免空写），给出可见反馈。
@@ -6501,6 +6836,7 @@ int main(int argc, char** argv) {
                 if (selectedTypeId.empty()) {
                     VX_LOG_WARN("物件选择器（E3）：二级列表为空 ⇒ `Enter` 无法进入摆放模式");
                 } else {
+                    exitModifyBeforePlacement();  // V0.11 / A8h：模式互斥（进建造 ⇒ 先完整退出修改）
                     enterPlacement(selectedTypeId);
                     if (placementMode) {
                         debugOverlay.CloseObjectPalette();
@@ -6584,6 +6920,54 @@ int main(int argc, char** argv) {
                 } else {
                     palette.previewTriangles.clear();
                 }
+            }
+
+            // V0.11 / A8（[ADR 0041](../../docs/adr/0041-immersive-modify-mode-and-editor-camera.md)）：**编辑器相机**
+            // —— 修改模式内按**甲派 UE5 口径**操作：**按住右键 = 环视**、**中键拖 = 平移**、**滚轮 = 推拉**、**右键 + WASD = 飞**。
+            //
+            // 关键：相机**脱离角色**（不再由 `StepCharacter` 的 `Advance` 跟随 —— 本模式内**不调用** `StepCharacter`）
+            // ⇒ 这就是"**固定镜头**"：进入时的位姿被锁定，此后只由上面四种相机操作改变。
+            // 说明：编辑器相机按**帧**推进（它是**相机操作**，不是物理 / 角色逻辑，红线 11 不适用）；
+            // 角色在修改模式内**不动**（鼠标未捕获 ⇒ `command` 恒为零）。
+            if (modifyMode) {
+                const bool lookHold = input.Held(vx::ActionId::CameraLookHold);
+                const glm::vec3 forward = AimDirection(camera, cameraQuery);
+                glm::vec3       right   = glm::cross(forward, glm::vec3(0.0F, 1.0F, 0.0F));
+                if (glm::length(right) > 1.0e-6F) {
+                    right = glm::normalize(right);
+                } else {
+                    right = glm::vec3(1.0F, 0.0F, 0.0F);
+                }
+                if (lookHold) {
+                    camera.AddYaw(-lookX * kLookSensitivity);
+                    camera.AddPitch(-lookY * kLookSensitivity);
+                }
+                const float wheel = input.ConsumeWheel();
+                if (wheel != 0.0F) {
+                    camera.SetFollowDistance(std::clamp(camera.FollowDistance() - wheel * kEditorZoomPerNotch,
+                                                        kEditorCameraMinDistance, kEditorCameraMaxDistance));
+                }
+                if (input.Held(vx::ActionId::CameraPan)) {
+                    // 中键拖 = 平移（沿相机右向 + 世界上方向；与 UE5 的"中键平移"同义）。
+                    modifyCameraAnchor += right * (-lookX * kEditorPanPerPixel) + glm::vec3(0.0F, 1.0F, 0.0F) *
+                                                                                      (lookY * kEditorPanPerPixel);
+                }
+                if (lookHold) {
+                    // 右键 + WASD = 飞（前 / 后沿视线、左 / 右沿相机右向、上 / 下沿世界 Y）。
+                    const float f = (input.Held(vx::ActionId::MoveForward) ? 1.0F : 0.0F) -
+                                    (input.Held(vx::ActionId::MoveBackward) ? 1.0F : 0.0F);
+                    const float s = (input.Held(vx::ActionId::MoveRight) ? 1.0F : 0.0F) -
+                                    (input.Held(vx::ActionId::MoveLeft) ? 1.0F : 0.0F);
+                    const float u = (input.Held(vx::ActionId::Jump) ? 1.0F : 0.0F) -
+                                    (input.Held(vx::ActionId::FlyDown) ? 1.0F : 0.0F);
+                    glm::vec3   move = forward * f + right * s + glm::vec3(0.0F, 1.0F, 0.0F) * u;
+                    const float length = glm::length(move);
+                    if (length > 1.0e-6F) {
+                        modifyCameraAnchor += (move / length) *
+                                              (kEditorCameraSpeedPerSecond * static_cast<float>(frameDeltaSeconds));
+                    }
+                }
+                camera.SnapTo(modifyCameraAnchor);  // 相机**不跟随角色**（= 固定镜头 / 自由相机）
             }
 
             if (placementMode) {
@@ -6691,18 +7075,23 @@ int main(int argc, char** argv) {
                 }
                 hideGizmo();  // 本模式不显示 gizmo（若刚从修改模式切来，清掉上一帧的残留）
             } else if (modifyMode) {
-                // V0.11 / I4 修订：**修改模式** —— 点击已有物件选中 + 拖动手柄改 transform；**不放置、不发光球**。
-                // V0.11 / A6：模式内让位（`E` **不触发**传送门交互；摆放专有键 `T` / `[` / `]` 消费但**不生效**）
-                // 已由**归属表 + 表驱动让位循环**统一处理（见上方），此处不再逐键手写。
+                // V0.11 / A8（[ADR 0041](../../docs/adr/0041-immersive-modify-mode-and-editor-camera.md)）：**沉浸式修改模式** ——
+                // **自由光标**拾取（按光标像素反投影）+ 拖手柄改 transform；**不放置、不发光球**。
                 hoveredBuildingId.clear();
+                const vx::ScreenRay cursorRay = pointerRay();
 
                 const vx::GizmoHandle handleHover = pickGizmoHandleForSelection();
                 if (gizmoDragging) {
-                    updateGizmoDrag(lookX, lookY);  // 位移改由 gizmo 消费（相机本帧不转，见上方）
+                    updateGizmoDrag(lookX, lookY, cursorRay);
                     float dragSurfaceY = static_cast<float>(gizmoDragAnchorY);
                     (void)world.QueryHeight(static_cast<float>(gizmoDragDraftX), static_cast<float>(gizmoDragDraftZ),
                                             dragSurfaceY);
-                    drawGizmo(glm::dvec3(gizmoDragDraftX, dragSurfaceY, gizmoDragDraftZ));
+                    // 拖动中：手柄跟着**草稿位置**走（布局按按下时冻结 ⇒ 尺度不变、中心随物件平移）。
+                    vx::GizmoLayout dragLayout = gizmoDragLayout;
+                    dragLayout.x = gizmoDragDraftX;
+                    dragLayout.y = static_cast<double>(dragSurfaceY) + gizmoDragCenterOffsetY;
+                    dragLayout.z = gizmoDragDraftZ;
+                    drawGizmo(glm::dvec3(dragLayout.x, dragLayout.y, dragLayout.z), dragLayout);
                     if (!input.Held(vx::ActionId::Attack)) {
                         commitGizmoDrag();  // 松开左键 ⇒ 提交
                     }
@@ -6710,21 +7099,39 @@ int main(int argc, char** argv) {
                     if (attackPressedEdge) {
                         if (handleHover != vx::GizmoHandle::None) {
                             beginGizmoDrag(handleHover);  // 左键**按在手柄上 = 拖动**
-                        } else if (ObjectSlot* hovered = pickObjectUnderCrosshair(); hovered != nullptr) {
-                            gizmoSelectedSlotId = hovered->id;  // **点击已有物件 ⇒ 选中**
-                            pickFeedback        = "selected";
-                            VX_LOG_INFO("修改模式（V0.11/I4）：**已选中** [%s]（拖 X/Z 箭头平移 · 拖环旋转；"
-                                        "左键点空处取消 · Esc 退出）",
-                                        (hovered->type != nullptr) ? hovered->type->id.c_str() : "object");
+                        } else if (ObjectSlot* hovered = pickObjectUnderCursor(); hovered != nullptr) {
+                            // V0.11 / A8②：**拖动"已选中物件"的本体 = XZ 任意方向平移**。
+                            // 为什么需要：中心平面手柄锚在**包围盒半高**（模型 / 建筑内部）⇒ 大模型会把它整个包住、
+                            // 点不到（所有者 2026-10-09 反馈"还是只能两个方向移动"）；而"拖动本体"**不受遮挡影响**，
+                            // 也是 UE5 / Blender 视口左键的共同口径（拖动已选中的对象 = 自由平移）。
+                            const ObjectSlot* selectedSlot = findSlotById(gizmoSelectedSlotId);
+                            const bool sameTarget =
+                                (hovered->id == gizmoSelectedSlotId) ||
+                                (selectedSlot != nullptr && !selectedSlot->buildingId.empty() &&
+                                 selectedSlot->buildingId == hovered->buildingId);
+                            if (sameTarget) {
+                                beginGizmoDrag(vx::GizmoHandle::Plane);  // 本体拖动 = 自由方向（与中心方块同一条路径）
+                            } else {
+                                gizmoSelectedSlotId = hovered->id;  // **光标点击已有物件 ⇒ 选中**
+                                pickFeedback        = "selected";
+                                VX_LOG_INFO("修改模式（V0.11/A8）：**已选中** [%s]（**直接拖物体本体** = 任意方向平移 · "
+                                            "拖箭头 = 单轴 · 拖环 = 旋转；`Delete` 删除 · 左键点空处取消 · `F3`/`Esc` 退出）",
+                                            (hovered->type != nullptr) ? hovered->type->id.c_str() : "object");
+                            }
                         } else {
                             gizmoSelectedSlotId = 0;  // 点击空处 ⇒ 取消选中
                         }
                     }
-                    if (input.ConsumePressed(vx::ActionId::PlacementRemove)) {
-                        deleteObjectUnderCrosshair();  // 右键删除仍可用（与摆放模式同口径）
+                    if (input.ConsumePressed(vx::ActionId::DeleteSelected)) {
+                        // V0.11 / A8：**`Delete` = 删除选中物件**（甲派 UE5 口径；走 I3 撤销栈）。
+                        if (ObjectSlot* selected = findSlotById(gizmoSelectedSlotId); selected != nullptr) {
+                            deleteObjectUnderCrosshair(selected);
+                        }
+                        gizmoSelectedSlotId = 0;  // 删掉之后选中必然失效（含"删整座"的情形）
                     }
                     if (const ObjectSlot* selected = findSlotById(gizmoSelectedSlotId); selected != nullptr) {
-                        drawGizmo(selected->position);
+                        const vx::GizmoLayout layout = gizmoLayoutForSlot(*selected);
+                        drawGizmo(glm::dvec3(layout.x, layout.y, layout.z), layout);
                     } else {
                         hideGizmo();
                     }
@@ -6747,23 +7154,12 @@ int main(int argc, char** argv) {
             // `F3` 重复上次：面板打开时**不生效**（避免与面板控件抢输入；边沿照常消费）。
             // V0.11 / A6：`F3`（重复上次）在**模态面板打开时不生效** —— 由**归属表**给出（`Modal ⇒ Blocked`）。
             // 此处按**当前**面板状态重取上下文（同帧前面可能刚按 `F2` 打开选择器），与原先 `AnyBlockingPanelOpen()` 同口径。
+            // V0.11 / A8：`F3` 已**让位给「修改模式」**（见上面 `ModifyModeToggle`）⇒ `PlacementRepeatLast` **不再绑定热键**；
+            // 其能力保留为 **`F2` 面板按钮**（`PaletteRequest::Action::RepeatLast`）。本分支保留为"无键位也不会有残余边沿"的兜底。
             if (vx::OwnerOf(makeInputContext(), vx::ActionId::PlacementRepeatLast) != vx::InputOwner::Free) {
                 (void)input.ConsumePressed(vx::ActionId::PlacementRepeatLast);
             } else if (input.ConsumePressed(vx::ActionId::PlacementRepeatLast)) {
-                const std::string repeatTypeId = lastPlaceTypeId;
-                const float       repeatYawDeg = lastPlaceYawDeg;
-                if (repeatTypeId.empty()) {
-                    pickFeedback = "no last type";
-                    VX_LOG_WARN("摆放模式（E3）：`F3` 还没有「上次」可重复（先按 F2 选一个模型并放下）");
-                } else {
-                    enterPlacement(repeatTypeId);
-                    if (placementMode) {
-                        placementYawDeg = repeatYawDeg;  // 重复"上次"的类型**与朝向**
-                        lastPlaceYawDeg = repeatYawDeg;
-                        VX_LOG_INFO("摆放模式（E3）：`F3` 重复上次 —— 类型 [%s]、朝向 %.1f°",
-                                    repeatTypeId.c_str(), static_cast<double>(repeatYawDeg));
-                    }
-                }
+                repeatLastPlacement();
             }
             // `F5` 保存（V0.10 / S9）：**面板打开时也生效** —— 此前它被静默吞掉（设计上让位面板控件），
             // 玩家会以为"已经存了"（所有者 2026-10-07 实测反馈的诱因之一）。`F5` 不与 ImGui 控件冲突，
@@ -6834,7 +7230,10 @@ int main(int argc, char** argv) {
             int objectSupportStepCounter = 0;
             stepTimer.Begin();  // P5：固定步子相位
             for (int step = 0; step < plan.steps; ++step) {
-                StepCharacter(physics, character, camera, command, flying, jumpAssist);
+                // V0.11 / A8：修改模式内**不推进角色**（相机已脱离角色 ⇒ 固定镜头；角色保持原地不动）。
+                if (!modifyMode) {
+                    StepCharacter(physics, character, camera, command, flying, jumpAssist);
+                }
 
                 // T33：推进**动态刚体**（倒塌整体）—— 重力已在启动时设为 `-kGravity`（与角色同一口径）。
                 // 随后做落定检测：连续 `settle_steps` 个固定步低于阈值 ⇒ 转为"待回写"（本帧末体素化回写）。
@@ -7778,10 +8177,15 @@ int main(int argc, char** argv) {
                     if (prototype == instancePrototypeByType.end() || !prototype->second.IsValid()) {
                         continue;  // 无原型 ⇒ 旧路径
                     }
+                    // V0.11 / A8h：**拖动中的物件**用**草稿位姿**（实例化路径不看 `SetMeshTransform`），
+                    // 并**跳过剔除**（拖动中 `slot.bounds` 仍是拖动前的位置 ⇒ 照它剔除会误杀）。
+                    glm::dvec3 dragOrigin;
+                    float      dragYawDegrees = 0.0F;
+                    const bool dragging       = gizmoDragPoseForSlot(slot.id, dragOrigin, dragYawDegrees);
                     // 相关判据 = 主视锥可见（且未被遮挡）**或** 可能落进任一阴影盒（见 `castsIntoAnyCascade`）。
                     // 后者保证"视锥外但会给视野内投影"的物件不至于丢阴影（ADR 0034 判据④ 阴影一致）。
                     const bool mainVisible =
-                        VisibleToFrustum(frustum, slot.bounds, renderOrigin) && !occludedStatic(slot.bounds);
+                        dragging || (VisibleToFrustum(frustum, slot.bounds, renderOrigin) && !occludedStatic(slot.bounds));
                     if (!mainVisible && !castsIntoAnyCascade(slot.bounds)) {
                         continue;
                     }
@@ -7789,8 +8193,9 @@ int main(int argc, char** argv) {
                         ++instancedMainVisible;
                     }
                     vx::InstancePose pose;
-                    pose.origin   = slot.position;
-                    pose.rotation = glm::angleAxis(glm::radians(slot.yawDegrees), glm::vec3(0.0F, 1.0F, 0.0F));
+                    pose.origin   = dragging ? dragOrigin : slot.position;
+                    pose.rotation = glm::angleAxis(glm::radians(dragging ? dragYawDegrees : slot.yawDegrees),
+                                                   glm::vec3(0.0F, 1.0F, 0.0F));
                     // V0.8 室内变暗（ADR 0035 决策四）：把该物件所属建筑的围合体代理透传给 GPU
                     // （室外物件保持 `enclosureEnabled = false` ⇒ 片元整段跳过）。
                     pose.enclosureEnabled  = slot.enclosure.enabled;
@@ -7863,7 +8268,12 @@ int main(int argc, char** argv) {
                         instancedTypeIds.end()) {
                     continue;  // 该类型的静态物件已进实例化批次 ⇒ 不重复提交
                 }
-                if (VisibleToFrustum(frustum, slot.bounds, renderOrigin) && !occludedStatic(slot.bounds)) {
+                // V0.11 / A8h：拖动中的物件**跳过剔除**（`slot.bounds` 仍是拖动前的位置，照它剔除会误杀）；
+                // 其位姿已由 `updateGizmoDrag` 每帧 `SetMeshTransform` 推给渲染器。
+                glm::dvec3 dragOrigin;
+                float      dragYawDegrees = 0.0F;
+                const bool dragging = gizmoDragPoseForSlot(slot.id, dragOrigin, dragYawDegrees);
+                if (dragging || (VisibleToFrustum(frustum, slot.bounds, renderOrigin) && !occludedStatic(slot.bounds))) {
                     frameHandles.push_back(slot.handle);
                     ++visibleObjects;
                 }
@@ -7881,6 +8291,16 @@ int main(int argc, char** argv) {
             if (placementMode && previewHit.has_value() && previewHandle.IsValid()) {
                 frameHandles.push_back(previewHandle);
             }
+            // V0.11 / A7 缺陷修复：**gizmo 手柄**（修改模式内选中物件时可见：X 红 / Z 蓝箭头 + 黄环）。
+            // 此前**漏加进本帧的绘制列表** ⇒ 手柄上传了却从不提交 ⇒ 玩家看不到（所有者 2026-10-08 实测）。
+            // 可见性 = `gizmoVisible`（由 `drawGizmo` / `hideGizmo` 维护，与置不透明度同源）⇒ 不会分叉。
+            // 与幽灵预览同口径：**只进主通道**，不进任何阴影列表（它是编辑手柄，不该投影）。
+            if (gizmoVisible && gizmoMeshesReady) {
+                frameHandles.push_back(gizmoXHandle);
+                frameHandles.push_back(gizmoZHandle);
+                frameHandles.push_back(gizmoRingHandle);
+                frameHandles.push_back(gizmoPlaneHandle);  // V0.11 / A8：中心平面手柄
+            }
             // W6：水面（半透明；在主通道**最后**绘制 ⇒ 追加在列表末尾）。水面**不投影阴影**
             // （`DrawMeshes` 在阴影通道按 `waterPass` 跳过它）⇒ 不进任何阴影列表。
             if (waterHandle.IsValid()) {
@@ -7891,7 +8311,7 @@ int main(int argc, char** argv) {
             // （保持不透明管线 ⇒ 无深度排序问题）。
             // W6d 的"过近隐藏"能力仍保留、仍关闭（`targetHideDistance = 0` ⇒ 判据恒 false ⇒ 主角恒提交）。
             // 动态网格（主角 / 光球 / 倒塌整体）数量少且每帧在动 ⇒ 不参与静态盒剔除，进**每一级**阴影。
-            if (characterMesh.IsValid() && !vx::ShouldHideFollowTarget(view, camera.Settings())) {
+            if (characterMesh.IsValid() && !modifyMode && !vx::ShouldHideFollowTarget(view, camera.Settings())) {
                 renderer.SetMeshOpacity(characterMesh, vx::FollowTargetFadeOpacity(view, camera.Settings()));
                 frameHandles.push_back(characterMesh);
                 shadowDynamicHandles.push_back(characterMesh);

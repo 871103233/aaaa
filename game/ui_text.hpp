@@ -163,6 +163,8 @@ enum class UiLabel : int {
 
     // ---- 修改模式（V0.11 / I4 修订；`F2` 面板入口 + 屏幕中央指示器）----
     ObjectPaletteModify,          ///< 按钮：进入**修改模式**（选中已有物件并拖动调整）
+    /// V0.11 / A8：按钮「**重复上次**」（`F3` 让位给修改模式后，本能力改由面板按钮触发）。
+    ObjectPaletteRepeatLast,
     ModifyModeIndicator,          ///< 指示器：修改模式（未选中）
     ModifySelectedIndicator,      ///< 指示器：修改模式（已选中）
 
@@ -298,9 +300,10 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsEnglish = {
     "Rotate hold-to-turn: %s  [Z]",
     "Snap prefer neighbor: %s  [X]",
     "Snap world grid: %s  [B]",
-    "Modify Mode",
-    "Modify mode: click an object to select  (click empty to deselect, Esc to exit)",
-    "Selected: drag X/Z arrows to move, ring to rotate",
+    "Modify Mode (F3)",
+    "Repeat last (type + facing)",
+    "Modify mode: click an object to select  (F3/Esc exit; RMB look, MMB pan, wheel zoom, Delete remove)",
+    "Selected: drag the object body or the centre square = free move, arrows = single axis, ring = rotate  (Delete removes)",
 };
 
 /// 中文标签表：仅当**成功加载 CJK 字体**时启用（此时不可能缺字）。
@@ -429,9 +432,10 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsChinese = {
     "旋转长按模式：%s（按 Z 切换）",
     "邻居优先吸附：%s（按 X 切换）",
     "世界网格吸附：%s（按 B 切换）",
-    "修改模式",
-    "修改模式：点击物体选中（左键点空处取消 · Esc 退出）",
-    "已选中：拖 X/Z 箭头平移 · 拖环旋转",
+    "修改模式（F3）",
+    "重复上次（类型 + 朝向）",
+    "修改模式：点击物体选中（F3/Esc 退出；右键环视 · 中键平移 · 滚轮推拉 · Delete 删除）",
+    "已选中：拖物体本体 或 中心方块 = 任意方向平移 · 拖箭头 = 单轴 · 拖环 = 旋转（Delete 删除）",
 };
 
 /// 纯函数：判断字符串是否**只含 ASCII 字节**（`cjkFontAvailable = false` 时的硬约束）。

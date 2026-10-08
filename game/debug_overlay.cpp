@@ -443,6 +443,11 @@ void DebugOverlay::BuildObjectPalette() {
         m_objectPaletteOpen = false;  // 关面板 → 进修改模式（捕获由 game 层恢复）
     }
     ImGui::SameLine();
+    // V0.11 / A8：`F3` 让位给「修改模式」⇒「**重复上次**」改由本按钮触发（能力不删、只换入口）。
+    if (ImGui::Button(UiText(UiLabel::ObjectPaletteRepeatLast, cjk))) {
+        m_paletteRequest = PaletteRequest { PaletteRequest::Action::RepeatLast, std::string {} };
+    }
+    ImGui::SameLine();
     if (ImGui::Button(UiText(UiLabel::ObjectPaletteSave, cjk))) {
         m_paletteRequest = PaletteRequest { PaletteRequest::Action::Save, std::string {} };
     }
@@ -471,20 +476,26 @@ void DebugOverlay::BuildUI(const DebugStats& stats, SystemPanelContext& panelCon
     // V0.5 E3：物件选择器（居中模态二级列表）。同样放在 `!m_visible` 早退**之前**。
     BuildObjectPalette();
 
-    // V0.11 / I4 修订：**修改模式的屏幕中央指示器**（只读叠加；不参与输入抑制、不影响玩法）。
+    // V0.11 / I4 修订：**修改模式的模式指示器**（只读叠加；不参与输入抑制、不影响玩法）。
     // 为什么要它（所有者 2026-10-08）：摆放与"修改（选中并拖动）"是**两种模式**，屏幕上需要一眼看清当前在哪一种。
+    // V0.11 / A8h（所有者 2026-10-09）：① **文案从屏幕正中移到右上角**（原来压住操作）；
+    //   ② 文案**加背景色 + 同色边框**（亮底 / 暗底都看得清）。
+    // V0.11 / A8i（所有者 2026-10-09）：③ **去掉屏幕中心图标** —— 修改模式是**自由光标**（看到哪就点到哪），
+    //   屏幕正中那枚十字已无实际含义（不是准星、也不指示拾取点）⇒ 只保留右上角的模式文案。
     if (m_modifyActive) {
         ImDrawList*    foreground = ImGui::GetForegroundDrawList();
         const ImGuiIO& io         = ImGui::GetIO();
-        const ImVec2   center(io.DisplaySize.x * 0.5F, io.DisplaySize.y * 0.5F);
-        const ImU32    color = m_modifyHasSelection ? IM_COL32(120, 230, 120, 220) : IM_COL32(240, 240, 240, 200);
-        const float    arm   = 10.0F;
-        foreground->AddLine(ImVec2(center.x - arm, center.y), ImVec2(center.x + arm, center.y), color, 2.0F);
-        foreground->AddLine(ImVec2(center.x, center.y - arm), ImVec2(center.x, center.y + arm), color, 2.0F);
-        foreground->AddCircle(center, 3.0F, color, 12, 2.0F);
+        const ImU32    glow = m_modifyHasSelection ? IM_COL32(120, 230, 120, 235) : IM_COL32(245, 245, 245, 235);
         const char*  text = UiText(m_modifyHasSelection ? UiLabel::ModifySelectedIndicator : UiLabel::ModifyModeIndicator, cjk);
         const ImVec2 size = ImGui::CalcTextSize(text);
-        foreground->AddText(ImVec2(center.x - size.x * 0.5F, center.y + arm + 6.0F), color, text);
+        const float  padX = 10.0F;
+        const float  padY = 6.0F;
+        const ImVec2 textPos(io.DisplaySize.x - size.x - padX - 12.0F, 12.0F + padY);
+        const ImVec2 boxMin(textPos.x - padX, textPos.y - padY);
+        const ImVec2 boxMax(textPos.x + size.x + padX, textPos.y + size.y + padY);
+        foreground->AddRectFilled(boxMin, boxMax, IM_COL32(0, 0, 0, 175), 6.0F);
+        foreground->AddRect(boxMin, boxMax, glow, 6.0F, 0, 1.5F);
+        foreground->AddText(textPos, glow, text);
     }
 
     // 常驻坐标 HUD（屏幕左上角，只读）：与 F1 面板相互独立，不需要开面板就能看到当前位置。

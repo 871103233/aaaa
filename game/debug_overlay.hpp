@@ -62,6 +62,8 @@ struct PaletteRequest {
         EnterModify,     ///< V0.11：进入**修改模式**（选中已有物件并拖动调整；不放置）
         Save,            ///< 保存到可编辑层
         Cancel,          ///< 关闭面板，不改变状态
+        /// V0.11 / A8：**重复上次**（原 `F3` 热键；`F3` 让位给修改模式后改由面板按钮触发 —— 能力不删、只换入口）。
+        RepeatLast,
     };
 
     Action      action = Action::None;

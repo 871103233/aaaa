@@ -119,6 +119,12 @@ bool Window::pump_events(InputMap& input) noexcept {
                 break;
             case SDL_EVENT_MOUSE_MOTION:
                 input.AddMouseDelta(event.motion.xrel, event.motion.yrel);
+                // V0.11 / A8：同时记录**绝对位置**（自由光标拾取需要；SDL3 的 motion 事件带窗口坐标）。
+                input.SetMousePosition(event.motion.x, event.motion.y);
+                break;
+            case SDL_EVENT_MOUSE_WHEEL:
+                // V0.11 / A8：滚轮增量（向右为正；游戏中只用 y）。
+                input.AddMouseWheel(event.wheel.y);
                 break;
             case SDL_EVENT_MOUSE_BUTTON_DOWN:
                 input.SetMouseButtonDown(event.button.button, true);

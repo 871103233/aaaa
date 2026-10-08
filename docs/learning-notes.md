@@ -519,6 +519,33 @@
 - 易错点或关键取舍：① **手柄拾取要有优先级且取最近**（轴杆与环带重叠处按最近者，否则"想转却平移"）；② **旋转角跨 ±180° 必须归一化**（否则物件瞬间反转一圈）；③ **"摆放"与"修改（选中 / 拖动）"必须分成两种模式**（同一条左键不能既"放下"又"拖动"；用"悬停即选中"会让 gizmo 在摆放时不断弹出并被误触 —— 本项目 I4 初版即此坑，I4b 拆开）；④ 拖动期间**必须屏蔽相机转向**（鼠标位移改给 gizmo），且**世界轴**手柄不随物件朝向旋转；⑤ **手柄伸出物件之外 ⇒ 选中须先"点击确立"**（选中是粘性的，手柄才能点中）；模式切换必须有**可见指示**（本项目 = 屏幕中央十字，白 / 绿区分未选 / 已选）。
 - 相关：`world/object/gizmo.hpp`、`tests/gizmo_test.cpp`、`docs/plans/v0.11.md`（I4）、`docs/learning-notes.md` Q45
 
+### 运行期权威 vs 启动快照（Runtime Authority vs Startup Snapshot）
+
+- 一句话定义：程序里**同时**存在"**启动时算出来的一份表**"和"**运行期被改的那份表**"时，**必须明确哪一份说了算**；
+  拿快照去回答"现在是什么"的问题，就会出现"改过了却按旧值算"的鬼打墙。
+- 在本项目里是什么：物件层有 **`objects`**（= 发布清单 + 可编辑层，`MergeObjectTables` **只在启动跑一次** ⇒ **快照、运行期不更新**）
+  与 **`editLayerState`**（= 可编辑层，**玩家每次移动 / 放置都写它** ⇒ **运行期权威**）。
+  V0.11 / A8g 缺陷：成套建筑的**拖动锚点**取自 `objects.FindBuilding(id)->x/z` ⇒ **本层建筑**被就地移动后锚点仍是旧坐标
+  ⇒ **一按手柄就弹回原位置**；`findBuildingDef` 改为**先查 `editLayerState`、再退回 `objects`** 后消失。
+- 易错点或关键取舍：① **"只读发布数据"与"可写运行数据"合并出的表是快照**——一旦分开维护，就必须**声明权威方**，
+  并在**每个查询点**都问"我要的是**现在的值**还是**启动时的值**"；② 快照本身**不是 bug**（省去每帧合并），
+  **默认拿快照当现状**才是 bug；③ 排查口诀：**"改了却没用" ⇒ 先查读的是不是启动快照**。
+- 相关：[`game/main.cpp`](../game/main.cpp)（`objects` / `editLayerState` / `findBuildingDef`）、[ADR 0041](adr/0041-immersive-modify-mode-and-editor-camera.md) 决策 4、`docs/devlog.md` 2026-10-09 A8g
+
+### 逐网格变换 vs 实例化位姿（Per-mesh Transform vs Instanced Pose）
+
+- 一句话定义：同一个"画一个物件"的请求，渲染器可能走**两套互不相通的位姿来源** —— 逐网格路径读**每网格登记的变换**
+  （`SetMeshTransform`），实例化路径读**实例缓冲里的位姿**（由 CPU 每帧从**实体数据**填）。**改了一套、另一套照旧**。
+- 在本项目里是什么：`MeshRenderer::SetMeshTransform`（写 `MeshResources::origin/rotation`）与 **`InstancePose`**
+  （渲染段从 `ObjectSlot::position` / `yawDegrees` 填，走 `UploadInstancedMesh` 的原型批次并配 `kObjectInstanceMinCount` 阈值）。
+  V0.11 / A8h 缺陷：拖动 gizmo 只调了前者 ⇒ **实例化物件（大多数静态物件 / 成套建筑构件）拖动期间画面纹丝不动**，
+  松手提交（销毁 + 重建槽位）才一次性看到结果 —— 表现为"拖黄环旋转只有松手后才转"。
+- 易错点或关键取舍：① **"看得见"必须覆盖两条路径** —— 任何"逐帧改位姿"的交互，**先问这个物件走哪条渲染路径**；
+  ② 两套来源要**同源**（本项目抽出 `gizmoDragPoseForSlot` 作单一真相，两条路径都查它）；
+  ③ 位姿变了**包围盒也要跟着**，否则剔除会误杀（本项目对"拖动中的槽位"直接**跳过剔除**）；
+  ④ 实例化还带来"**不透明度只能整批**"的副作用 ⇒ 逐物件的淡出反馈只在逐网格路径生效。
+- 相关：`engine/render/mesh_renderer.{hpp,cpp}`（`SetMeshTransform` / `InstanceBatch`）、`game/main.cpp`（`gizmoDragPoseForSlot`）、[ADR 0034](adr/0034-object-instancing-and-hlod.md)、`docs/devlog.md` 2026-10-09 A8h
+
 ### 交互模式（自由活动 / 建造 / 修改；Mode / Tool）
 
 - 一句话定义：把"玩家当前在干什么"显式建模为**互斥的模式（工具）**，每个模式给**同一条输入**（尤其左键）**不同的含义**；模式切换要有**可见指示**。
@@ -553,6 +580,23 @@
   ④ 与 `MouseCapture`（**物理层**：光标是否锁定）**正交**，**不合并**。
 - 相关：[ADR 0040](adr/0040-input-context-stack-and-action-ownership-table.md)、`game/input_context.hpp`、
   `.trae/skills/voxel-engine-dev-standards/SKILL.md`（《输入上下文栈与动作归属表》）、`docs/ui-inventory.md`（权威矩阵 ↔ 归属表**逐格一致**）、`tests/input_context_test.cpp`
+
+### 编辑器相机 / 自由光标（Editor Camera / Free Cursor）
+
+- 一句话定义：编辑态把**相机操作**从鼠标左键挪到**右键 / 中键 / Alt + 滚轮**，把**左键整条让给"选择与拖手柄"**，
+  同时**释放鼠标捕获让光标可见、可点到任意像素** —— 这是"看到哪里就选哪里"的前提。
+- 为什么需要 / 业界同源：**UE5 Level Editor 视口**（左键选、**按住右键环视**、中键平移、滚轮推拉、**右键+`WASD` 飞**、`Delete` 删选中）、
+  **Unity Scene View**（左键选、`Alt`+左键环视、中键平移、滚轮缩放）、**Godot 编辑器**（中键环视 / `Shift`+中键平移）、
+  **Blender**（中键环视）—— 四家**高度一致**：**左键专供编辑，相机挪到右键·中键·Alt**。
+- 在本项目里是什么：修改模式（`F3` 进出）= **沉浸式编辑观察态**（[ADR 0041](adr/0041-immersive-modify-mode-and-editor-camera.md)）——
+  释放鼠标捕获（自由光标）+ **相机脱离角色并固定**（本模式内不推进角色，改用编辑器相机锚点 + `camera.SnapTo`）+ **角色隐藏**；
+  **拾取按光标像素**（`game/screen_ray.hpp` 的 `ScreenPointToRay` 反投影），不再用屏幕正中准星。
+- 易错点或关键取舍：① **"固定镜头"不等于"相机锁死"** —— 业界没有"锁死"，因为那样**背后的物件永远够不到**；
+  正解是"**左键让给编辑** + 相机按键另给"；② 自由光标与"相对鼠标模式"互斥（前者要光标可见 ⇒ 必须**退出捕获**）；
+  ③ 相机脱离角色后**角色移动指令自然为零**（未捕获鼠标）⇒ `WASD` 才可安全改义为相机；
+  ④ gizmo 的"**屏幕空间恒定尺寸**"需要给渲染变换加 **scale**（本仓库的变换块被 fade / morph 占满）⇒ 本阶段只做"**随模型大小**"。
+- 相关：[ADR 0041](adr/0041-immersive-modify-mode-and-editor-camera.md)、`game/screen_ray.hpp`、`game/main.cpp`（`enterModifyMode` / 编辑器相机段）、
+  `engine/input/input_map.hpp`（绝对光标位置 + 滚轮）、`docs/ui-inventory.md`（修改模式小节 + 权威矩阵）
 
 ---
 

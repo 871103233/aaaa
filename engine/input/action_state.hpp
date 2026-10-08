@@ -41,6 +41,10 @@ enum class ActionId : std::uint8_t {
     PlacementUndo,                ///< V0.11 / I3：撤销上一次编辑层操作（`Ctrl+Z`）
     PlacementRedo,                ///< V0.11 / I3：重做上一次被撤销的操作（`Ctrl+Y`）
     PlacementModifierCtrl,        ///< V0.11 / I3：编辑修饰键（`Ctrl`）—— 用于把 `Z` 区分为"撤销（Ctrl+Z）"与"旋转长按开关（Z）"
+    ModifyModeToggle,             ///< V0.11 / A8：**修改模式开关**（`F3`；**无面板、直接进 / 出**）—— 见 ADR 0041
+    CameraLookHold,               ///< V0.11 / A8：编辑器相机**按住环视**（鼠标右键；仅修改模式；甲派 UE5 口径）
+    CameraPan,                    ///< V0.11 / A8：编辑器相机**平移**（鼠标中键；仅修改模式）
+    DeleteSelected,               ///< V0.11 / A8：**删除选中物件**（`Delete`；仅修改模式；走 I3 撤销栈）
 
     Count,
 };
