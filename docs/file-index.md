@@ -237,10 +237,12 @@ voxel-engine/
 | `game/gameplay_input.hpp` | 游戏输入**抑制**决策（**纯函数**：由 `InputContext` 派生 —— `Modal` ⇒ 三类全量抑制，其余 ⇒ 全放行）。**不采信** ImGui 的 `WantCapture*`（只读叠加层不抑制，V0.9 回归口径） |
 | `game/screen_ray.hpp` | **屏幕像素 → 世界射线**（V0.11 / A8，**纯函数**：`ScreenPointToRay` —— 由视图投影矩阵 + 视口尺寸 + 光标像素反投影；**自由光标拾取**的前提，见 [ADR 0041](adr/0041-immersive-modify-mode-and-editor-camera.md)） |
 | `game/system_panel.hpp` | ESC 系统面板（显示模式 / 分辨率 / 音量 / 退出）；**不碰 SDL、不写文件**，只回报"用户做了什么" |
+| `game/test_mode.hpp` | **测试模式解析**（T85 / G13，**纯函数**）：`ParseTestModeFromArguments` 由 `--auto-test` / `--manual-test="项1;项2"`（按 `;` 切分、丢弃空项、可多次给出）解析出**自动 / 人工 + 待人工确认项列表**；`IsOptionArgument` 区分"启动开关"与位置参数。**只读展示**（由 F1 面板置顶横幅消费），不改玩法 |
 | `game/ui_font.hpp` | UI 字体**三级解析**（仓库 `assets/fonts/` → 系统 CJK → 无）与加载 |
 | `game/ui_text.hpp` | **标签缝**：所有 UI 标签的唯一取词处（命中 CJK 用中文，否则整表英文；**禁止绕过**，有单测与源码扫描防护） |
 | `game/ui_theme.hpp` | UI 统一主题（**唯一**样式入口 `ApplyUiTheme`） |
 | `engine/platform/settings.hpp` | 系统设置读写（TOML，落盘到 `SDL_GetPrefPath`）+ **唯一音频增益入口** `ApplyMasterVolumeGain` |
+| `engine/platform/console.hpp` | **控制台 UTF-8 输出**（V0.10 / S10）：`EnableUtf8ConsoleOutput()` 把本进程所附控制台的代码页切到 **65001**（工程内面向人的字符串统一 UTF-8，否则中文日志在 Windows 终端乱码）；**返回实际生效的代码页**供调用方写日志（可判定证据）；**无附加控制台 / 非 Windows ⇒ 空操作**，不抛、不分配堆 |
 
 ---
 

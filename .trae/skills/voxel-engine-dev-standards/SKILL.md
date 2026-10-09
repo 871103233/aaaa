@@ -25,7 +25,7 @@ description: Enforces this voxel engine repo's architecture and coding standards
 | 1 | 本文件 `SKILL.md` | 规则是什么（红线、分层、DoD、范围控制） |
 | 2 | `docs/devlog.md` | 已经做完什么、还剩什么（**看文末最新条目**） |
 | 3 | `docs/plans/<当前阶段>.md` | **当前阶段的任务分解、顺序、进度与下一步**（见第六.4 节） |
-| 4 | `docs/tech-plan-v1.3.md` | 技术决策与备选方案（选了哪个、为什么） |
+| 4 | `docs/tech-plan-v2.0.md` | 技术决策与备选方案（选了哪个、为什么）。**现行 = v2.0**；`docs/tech-plan-v1.3.md` **部分被取代**，只有其 **§0.1** 声明的沿用章节仍有效（见 `docs/adr/README.md` §二） |
 | 5 | `docs/file-index.md` | 目录结构与各层职责（什么该放哪里） |
 | 6 | `docs/learning-notes.md` | 名词与概念（不懂的先查这里，**不要重复问**） |
 
@@ -136,6 +136,10 @@ description: Enforces this voxel engine repo's architecture and coding standards
 ④ **提示的位置**（V0.11 / A8h + A8i）：模式文案画在**右上角 + 半透明底色**（**不得压在屏幕正中**——会遮挡操作）；
    修改模式是**自由光标** ⇒ **屏幕正中不放任何图标 / 准星**（画了会误导"这里是拾取点"）。
    面板入口的按钮文案**须带快捷键备注**（如「修改模式（F3）」）—— 入口与其热键在 UI 上**可对应**。
+⑤ **旋转的"角"必须与引擎施加旋转的手性一致**（V0.11 / A8j）：物件旋转按 `glm::angleAxis(yaw, +Y)` 施加
+   （**绕 `+Y` 的正向把 `+X` 转向 `−Z`**）⇒ 环面的"角"一律走 **`GizmoAngleDegrees`（`atan2(−dz, dx)`）**，
+   **不得**用"数学习惯"的 `atan2(+dz, dx)`，也**不得在调用点再补一次取反**（会双重反向）。
+   判据：**拖环时物件与光标同向转**（有单测 `Gizmo.RingAngleFollowsEngineYawHandedness` 钉住）。
 
 **二、硬规则（可检查；违反即返工）**
 

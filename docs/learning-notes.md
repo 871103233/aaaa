@@ -546,6 +546,18 @@
   ④ 实例化还带来"**不透明度只能整批**"的副作用 ⇒ 逐物件的淡出反馈只在逐网格路径生效。
 - 相关：`engine/render/mesh_renderer.{hpp,cpp}`（`SetMeshTransform` / `InstanceBatch`）、`game/main.cpp`（`gizmoDragPoseForSlot`）、[ADR 0034](adr/0034-object-instancing-and-hlod.md)、`docs/devlog.md` 2026-10-09 A8h
 
+### 角度约定与手性（Handedness / Angle Convention）
+
+- 一句话定义：同一个"角度"，在**几何侧**与**引擎变换侧**可能取**相反的正方向**；不先对齐手性就直接相加减，结果就是"**转反了**"。
+- 在本项目里是什么：环面的角 `GizmoAngleDegrees` 若取 `atan2(+dz, dx)`（从 +X 起、朝 **+Z** 为正），
+  而物件旋转按 `glm::angleAxis(yaw, +Y)` 施加（**正向把 +X 转向 −Z**）⇒ 拖环时**物件朝光标的反方向转**。
+  V0.11 / A8j 修复 = 改成 `atan2(−dz, dx)`（**与引擎 `+Y` 同手性**），并加单测 `Gizmo.RingAngleFollowsEngineYawHandedness` 钉住。
+- 易错点或关键取舍：① **"角 → 变换"必须在同一手性下**（本项目 = 右手系、绕 `+Y`；`+yaw` 把 `+X` 转向 `−Z`）；
+  ② **修正要放在"量的定义"处**（纯函数 + 注释 + 单测），**不要在各调用点分别取反**（改一处、漏一处，且与主路径叠成双重反向）；
+  ③ 自查口诀：要"**顺着光标**"这类手感判据，**拿一个已知点（如 +X）实演一遍**，别只看数值是否"正合理"；
+  ④ 顺带：`atan2(−0.0, −1)` 取 **−180**（±180 边界）—— 与 +180 等价，用**增量归一化**（`GizmoYawDeltaDegrees`）兜住即可。
+- 相关：`world/object/gizmo.hpp`（`GizmoAngleDegrees` / `GizmoYawDeltaDegrees`）、`tests/gizmo_test.cpp`、[ADR 0041](adr/0041-immersive-modify-mode-and-editor-camera.md) 决策 4、`docs/devlog.md` 2026-10-09 A8j
+
 ### 交互模式（自由活动 / 建造 / 修改；Mode / Tool）
 
 - 一句话定义：把"玩家当前在干什么"显式建模为**互斥的模式（工具）**，每个模式给**同一条输入**（尤其左键）**不同的含义**；模式切换要有**可见指示**。
