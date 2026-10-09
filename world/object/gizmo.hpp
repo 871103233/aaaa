@@ -129,10 +129,16 @@ struct GizmoRay {
     return best;
 }
 
-/// **纯函数**：环平面上一点相对环心的**极角**（度，`atan2`，`[-180, 180]`）。
+/// **纯函数**：环平面上一点相对环心的**偏航角**（度，`[-180, 180]`）—— **与引擎 `+Y` 旋转同手性**
+/// （从 `+X` 起、**朝 `−Z` 为正**；等价于 `atan2(−dz, dx)`）。
+///
+/// 为什么是 `−dz` 而不是 `dz`：物件的旋转最终按 `glm::angleAxis(yaw, +Y)` 施加，而**绕 `+Y` 的正向旋转把 `+X` 转向 `−Z`**
+/// （右手系）。若这里取 `atan2(+dz, dx)`（"数学习惯"的普通极角），算出的角位移**与引擎旋转手性相反**
+/// ⇒ 拖环时**物件朝光标的反方向转**（所有者 2026-10-09 实测缺陷："拖动黄色环的转动方向反了"）。
+/// ⇒ 口径：环的角位移**一律用本函数换算**，不要在调用点再补一次取反（会双重反向）。
 [[nodiscard]] inline double GizmoAngleDegrees(const GizmoLayout& gizmo, double px, double pz) noexcept {
     constexpr double kRadToDeg = 180.0 / 3.14159265358979323846;
-    return std::atan2(pz - gizmo.z, px - gizmo.x) * kRadToDeg;
+    return std::atan2(-(pz - gizmo.z), px - gizmo.x) * kRadToDeg;
 }
 
 /// **纯函数**：从"起始角"到"当前角"的 **yaw 增量**（度），归一化到 `(-180, 180]`。

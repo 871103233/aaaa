@@ -302,8 +302,8 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsEnglish = {
     "Snap world grid: %s  [B]",
     "Modify Mode (F3)",
     "Repeat last (type + facing)",
-    "Modify mode: click an object to select  (F3/Esc exit; RMB look, MMB pan, wheel zoom, Delete remove)",
-    "Selected: drag the object body or the centre square = free move, arrows = single axis, ring = rotate  (Delete removes)",
+    "Modify mode: click an object to select  (F3/Esc exit; RMB look, MMB pan, wheel zoom, RMB+WASD fly, Delete remove)",
+    "Selected: drag the object body or the centre square = free move, arrows = single axis, ring = rotate  (RMB+WASD fly, Delete removes)",
 };
 
 /// 中文标签表：仅当**成功加载 CJK 字体**时启用（此时不可能缺字）。
@@ -434,8 +434,8 @@ inline constexpr std::array<const char*, kUiLabelCount> kUiLabelsChinese = {
     "世界网格吸附：%s（按 B 切换）",
     "修改模式（F3）",
     "重复上次（类型 + 朝向）",
-    "修改模式：点击物体选中（F3/Esc 退出；右键环视 · 中键平移 · 滚轮推拉 · Delete 删除）",
-    "已选中：拖物体本体 或 中心方块 = 任意方向平移 · 拖箭头 = 单轴 · 拖环 = 旋转（Delete 删除）",
+    "修改模式：点击物体选中（F3/Esc 退出；右键环视 · 中键平移 · 滚轮推拉 · 右键+WASD 飞 · Delete 删除）",
+    "已选中：拖物体本体 或 中心方块 = 任意方向平移 · 拖箭头 = 单轴 · 拖环 = 旋转（右键+WASD 飞 · Delete 删除）",
 };
 
 /// 纯函数：判断字符串是否**只含 ASCII 字节**（`cjkFontAvailable = false` 时的硬约束）。

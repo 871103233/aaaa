@@ -17,6 +17,7 @@ namespace {
 
 using vx::BuildGizmoAxisMesh;
 using vx::BuildGizmoRingMesh;
+using vx::GizmoAngleDegrees;
 using vx::GizmoHandle;
 using vx::GizmoLayout;
 using vx::GizmoRay;
@@ -75,6 +76,21 @@ TEST(Gizmo, YawDeltaIsNormalizedAcrossBoundary) {
     EXPECT_NEAR(GizmoYawDeltaDegrees(-170.0, 170.0), -20.0, 1.0e-9);
     EXPECT_NEAR(GizmoYawDeltaDegrees(0.0, 90.0), 90.0, 1.0e-9);
     EXPECT_NEAR(GizmoYawDeltaDegrees(30.0, 10.0), -20.0, 1.0e-9);
+}
+
+// V0.11 / A8j 缺陷修复：环角必须**与引擎 `+Y` 旋转同手性**（从 +X 起、**朝 −Z 为正**）。
+// 判据：光标自 +X 移到 **−Z** ⇒ **正** 90°，移到 **+Z** ⇒ **负** 90°。
+// 为什么 +Z 是负的：`yaw += delta` 后物件的 +X 要**跟着光标**走 —— 绕 `+Y` 正向旋转把 +X 转向 **−Z**
+// ⇒ 光标走向 −Z 时 yaw 必须**增大**。若这里符号反了，拖环时物件会**朝光标的反方向**转
+// （所有者 2026-10-09 实测："拖动黄色环的转动方向反了"）。
+TEST(Gizmo, RingAngleFollowsEngineYawHandedness) {
+    const GizmoLayout layout = LayoutAt(0.0, 10.0, 0.0);
+    EXPECT_NEAR(GizmoAngleDegrees(layout, 1.0, 0.0), 0.0, 1.0e-9);      // +X
+    EXPECT_NEAR(GizmoAngleDegrees(layout, 0.0, -1.0), 90.0, 1.0e-9);   // −Z ⇒ +90°
+    EXPECT_NEAR(GizmoAngleDegrees(layout, 0.0, 1.0), -90.0, 1.0e-9);   // +Z ⇒ −90°
+    // −X 落在 ±180 边界上：`atan2(−0.0, −1)` 取 **−180**（正负号对增量无影响 —— `GizmoYawDeltaDegrees`
+    // 会把它归一化到 `(-180, 180]`，−180 与 +180 等价）。
+    EXPECT_NEAR(GizmoAngleDegrees(layout, -1.0, 0.0), -180.0, 1.0e-9);  // −X
 }
 
 TEST(Gizmo, GizmoMeshesAreNonEmpty) {
